@@ -11,6 +11,7 @@ import {
   TokenBucket,
   bytesToConn,
   canonicalIp,
+  classifyAddress,
   connToText,
   createAuthBlob,
   createChallenge,
@@ -20,6 +21,8 @@ import {
   encodeKick,
   encodeRoomInfo,
   encodeRoomList,
+  filterCandidate,
+  filterSdp,
   generateIdentity,
   identityFromKey,
   identityToKey,
@@ -30,6 +33,7 @@ import {
   parseRoomList,
   sdpMids,
   srflxAddress,
+  toNativeIceServers,
   verifyAuthBlob,
   type RoomInfo,
 } from '../../src/net/index.js';
@@ -158,6 +162,99 @@ describe('ICE candidates', () => {
     }
     expect(parseCandidate(cases[1]!)).toEqual({ address: '192.168.1.2', type: 'host' });
     expect(sdpMids('v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:data\r\nm=audio 9\r\n')).toEqual(['data', '1']);
+  });
+
+  it('classifies candidate addresses', () => {
+    const cases: [string, string][] = [
+      ['127.0.0.1', 'loopback'],
+      ['::1', 'loopback'],
+      ['10.1.2.3', 'private'],
+      ['172.16.0.1', 'private'],
+      ['172.31.255.255', 'private'],
+      ['172.32.0.1', 'public'],
+      ['192.168.1.20', 'private'],
+      ['100.64.0.1', 'private'],
+      ['100.128.0.1', 'public'],
+      ['fd12:3456::1', 'private'],
+      ['fc00::1', 'private'],
+      ['169.254.10.1', 'linklocal'],
+      ['fe80::1%eth0', 'linklocal'],
+      ['0.0.0.0', 'reserved'],
+      ['::', 'reserved'],
+      ['224.0.0.1', 'reserved'],
+      ['ff02::1', 'reserved'],
+      ['::ffff:192.168.0.1', 'private'],
+      ['8.8.8.8', 'public'],
+      ['2001:4860::8888', 'public'],
+      ['3b0c4a1e-6f0f-4a8b-9b8e-6b9f0f3c2b1a.local', 'mdns'],
+      ['example.com', 'invalid'],
+    ];
+    for (const [ip, cls] of cases) expect(classifyAddress(ip), ip).toBe(cls);
+  });
+
+  it('filters local candidates and SDP by policy (privacy)', () => {
+    const host = (ip: string) => `candidate:1 1 UDP 2122252543 ${ip} 50000 typ host`;
+    const srflxWithBase = 'candidate:2 1 UDP 1686052607 203.0.113.9 50001 typ srflx raddr 192.168.1.2 rport 50000';
+    const relay = 'candidate:3 1 UDP 16777215 10.0.0.7 3478 typ relay raddr 192.168.1.2 rport 50000';
+    // default 'public'
+    expect(filterCandidate(host('192.168.1.2'), 'public')).toBeNull();
+    expect(filterCandidate(host('127.0.0.1'), 'public')).toBeNull();
+    expect(filterCandidate(host('fe80::1'), 'public')).toBeNull();
+    expect(filterCandidate(host('abc.local'), 'public')).toBeNull();
+    expect(filterCandidate(host('198.51.100.4'), 'public')).toBe(host('198.51.100.4'));
+    expect(filterCandidate(srflxWithBase, 'public')).toBe(
+      'candidate:2 1 UDP 1686052607 203.0.113.9 50001 typ srflx raddr 0.0.0.0 rport 0',
+    );
+    expect(filterCandidate(relay, 'public')).toBe('candidate:3 1 UDP 16777215 10.0.0.7 3478 typ relay raddr 0.0.0.0 rport 0');
+    expect(filterCandidate('garbage', 'public')).toBeNull();
+    // 'private' (LAN), 'all', predicate
+    expect(filterCandidate(host('192.168.1.2'), 'private')).toBe(host('192.168.1.2'));
+    expect(filterCandidate(host('127.0.0.1'), 'private')).toBeNull();
+    expect(filterCandidate(srflxWithBase, 'private')).toBe(srflxWithBase);
+    expect(filterCandidate(host('127.0.0.1'), 'all')).toBe(host('127.0.0.1'));
+    expect(filterCandidate(host('192.0.2.1'), (c) => c.address !== '192.0.2.1')).toBeNull();
+
+    const sdp = [
+      'v=0',
+      'o=rtc 1 0 IN IP4 127.0.0.1',
+      'm=application 44311 UDP/DTLS/SCTP webrtc-datachannel',
+      'c=IN IP4 192.168.1.2',
+      'a=mid:0',
+      'a=candidate:1 1 UDP 2114977791 192.168.1.2 44311 typ host',
+      'a=candidate:2 1 UDP 1686052607 203.0.113.9 44311 typ srflx raddr 192.168.1.2 rport 44311',
+      '',
+    ].join('\r\n');
+    expect(filterSdp(sdp, 'public')).toBe(
+      [
+        'v=0',
+        'o=rtc 1 0 IN IP4 127.0.0.1',
+        'm=application 9 UDP/DTLS/SCTP webrtc-datachannel',
+        'c=IN IP4 0.0.0.0',
+        'a=mid:0',
+        'a=candidate:2 1 UDP 1686052607 203.0.113.9 44311 typ srflx raddr 0.0.0.0 rport 0',
+        '',
+      ].join('\r\n'),
+    );
+    expect(filterSdp(sdp, 'private')).toBe(sdp);
+    expect(filterSdp(sdp, 'all')).toBe(sdp);
+  });
+
+  it('normalizes ICE servers (libdatachannel URLs, objects, browser RTCIceServer)', () => {
+    expect(
+      toNativeIceServers([
+        'stun:stun.l.google.com:19302',
+        { hostname: 'turn.example.org', port: 3478, username: 'u', password: 'p', relayType: 'TurnUdp' },
+        { urls: ['stun:stun.example.org', 'turn:turn.example.org:3479?transport=tcp'], username: 'us:er', credential: 'p@ss/w' },
+        { urls: 'turns:[2001:db8::1]', username: 'a', credential: 'b' },
+      ]),
+    ).toEqual([
+      'stun:stun.l.google.com:19302',
+      { hostname: 'turn.example.org', port: 3478, username: 'u', password: 'p', relayType: 'TurnUdp' },
+      'stun:stun.example.org',
+      { hostname: 'turn.example.org', port: 3479, username: 'us:er', password: 'p@ss/w', relayType: 'TurnTcp' },
+      { hostname: '2001:db8::1', port: 5349, username: 'a', password: 'b', relayType: 'TurnTls' },
+    ]);
+    expect(() => toNativeIceServers([{ urls: 'http://nope' }])).toThrow(/invalid ICE server url/);
   });
 });
 

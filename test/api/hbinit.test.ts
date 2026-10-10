@@ -15,7 +15,7 @@ beforeAll(async () => {
 });
 afterAll(async () => {
   await env.master.close();
-  shutdownAll();
+  await shutdownAll();
 });
 
 const HBS = `{

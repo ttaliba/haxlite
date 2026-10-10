@@ -24,7 +24,7 @@ beforeAll(async () => {
 afterAll(async () => {
   official?.dispose();
   await env.master.close();
-  shutdownAll();
+  await shutdownAll();
 });
 
 const HBS = `{

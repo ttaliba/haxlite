@@ -43,7 +43,7 @@ console.log('stopped ' + performance.now());
 
 afterAll(async () => {
   await env.master.close();
-  shutdownAll();
+  await shutdownAll();
   removePackage(OUT);
 });
 

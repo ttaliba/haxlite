@@ -14,8 +14,9 @@
  * Flags: --impl haxlite,official,nodehaxball  --reps 3  --warmup 15  --window 60
  *        --n 4,10,20 (game)  --k 1,5,10 (rooms)  --out bench/results/<scenario>.json
  *        --host-node-args "--cpu-prof --cpu-prof-dir=DIR" (diagnostics only)
- *        --max-foreign 60 (re-run a repetition when other processes on the
- *        machine used more than this % of one core during the window)
+ *        --max-foreign 100 --attempts 2 (re-run a repetition when other processes
+ *        on the machine used more than this % of one core during the window; after
+ *        `attempts` tries the least noisy one is kept and flagged `noisy`)
  *
  * Process layout per repetition (each process fresh):
  *   this process ── FakeMaster (HTTP + signaling WS, 127.0.0.1)
@@ -51,7 +52,8 @@ const WARMUP_S = Number(flag('warmup', scenario === 'idle' ? '10' : '15'));
 const WINDOW_S = Number(flag('window', scenario === 'idle' ? '200' : '60'));
 const NS = list(flag('n', '4,10,20')).map(Number);
 const KS = list(flag('k', '1,5,10')).map(Number);
-const MAX_FOREIGN = Number(flag('max-foreign', '60'));
+const MAX_FOREIGN = Number(flag('max-foreign', '100'));
+const ATTEMPTS = Number(flag('attempts', '2'));
 const OUT = flag('out', path.join(ROOT, `bench/results/${scenario}.json`));
 const CLIENTS_PER_PROC = 10;
 /** Extra node flags for the host process only, e.g. "--cpu-prof --cpu-prof-dir=/tmp/prof" (diagnostics). */
@@ -238,7 +240,7 @@ async function runOnce(spec: RunSpec): Promise<Any> {
 
 async function runWithRetry(spec: RunSpec): Promise<Any> {
   const discarded: Any[] = [];
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
     let r: Any;
     try {
       r = await runOnce(spec);
@@ -252,7 +254,7 @@ async function runWithRetry(spec: RunSpec): Promise<Any> {
     if (foreign > MAX_FOREIGN) {
       console.log(`    noisy (foreign load ${foreign.toFixed(0)} % of a core), repeating`);
       discarded.push({ ...r, discardedAsNoisy: true });
-      await sleep(10_000);
+      await sleep(5_000);
       continue;
     }
     r.discarded = discarded;
@@ -349,7 +351,7 @@ function info(): Any {
     haxliteBuildSha: buildSha,
     versions: { 'haxball.js': pkg('haxball.js'), 'node-haxball': pkg('node-haxball'), 'node-datachannel': pkg('node-datachannel'), '@webrtc-node/webrtc': pkg('@webrtc-node/webrtc') },
     command: `node --experimental-transform-types --import ./bench/ts-resolve.mjs bench/net/run.ts ${argv.join(' ')}`,
-    params: { IMPLS, REPS, WARMUP_S, WINDOW_S, NS, KS, MAX_FOREIGN, CLIENTS_PER_PROC, HOST_NODE_ARGS },
+    params: { IMPLS, REPS, WARMUP_S, WINDOW_S, NS, KS, MAX_FOREIGN, ATTEMPTS, CLIENTS_PER_PROC, HOST_NODE_ARGS },
   };
 }
 

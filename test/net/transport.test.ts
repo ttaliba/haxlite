@@ -22,11 +22,6 @@ const transports: HostTransport[] = [];
 const clients: RawClient[] = [];
 
 beforeAll(async () => {
-  if (process.env.NDC_LOG) {
-    const { createRequire } = await import('node:module');
-    const req = createRequire(import.meta.url);
-    req(`@node-datachannel/linux-x64-gnu/node_datachannel.node`).initLogger(process.env.NDC_LOG);
-  }
   master = await FakeMaster.start();
 });
 
@@ -244,6 +239,75 @@ describe('handshake and identity', () => {
     await withTimeout(c3.channelsClosed, 5000, 'c3 closed');
     expect(joined).toBe(0);
     expect(t.connectionCount).toBe(0);
+  });
+});
+
+describe('ICE privacy and deployment options', () => {
+  it("default policy never sends non-public host addresses; withholding every candidate still connects (peer-reflexive)", async () => {
+    const seen: string[] = [];
+    const { roomId, t } = await startHost({
+      iceCandidatePolicy: (c) => {
+        seen.push(c.address);
+        return false;
+      },
+      iceServers: [{ urls: 'stun:127.0.0.1:9' }], // browser-style entry accepted (unreachable: no srflx)
+    });
+    const j = nextJoin(t);
+    const c = join(roomId);
+    await j;
+    await c.whenOpen();
+    expect(seen.length).toBeGreaterThan(0);
+    expect(c.answerSdp).not.toBeNull();
+    expect(c.answerSdp!).not.toMatch(/a=candidate:/);
+    expect(c.answerSdp!).toMatch(/c=IN IP[46] (0\.0\.0\.0|::)\r\n/);
+    expect(c.answerCandidates.filter((x) => x.candidate.length > 0)).toEqual([]);
+  });
+
+  it("'all' exposes host candidates; portRange bounds the ICE port", async () => {
+    const { roomId, t } = await startHost({ iceCandidatePolicy: 'all', portRange: [41000, 41010] });
+    const j = nextJoin(t);
+    const c = join(roomId);
+    await j;
+    const lines = [...(c.answerSdp ?? '').split('\r\n').filter((l) => l.startsWith('a=candidate:')).map((l) => l.slice(2)), ...c.answerCandidates.map((x) => x.candidate)];
+    const host = lines.map((l) => l.split(' ')).filter((p) => p[7] === 'host');
+    expect(host.length).toBeGreaterThan(0);
+    for (const p of host) {
+      expect(Number(p[5])).toBeGreaterThanOrEqual(41000);
+      expect(Number(p[5])).toBeLessThanOrEqual(41010);
+    }
+  });
+
+  it('a throwing host callback is reported, never crashes the process', async () => {
+    const errors: Error[] = [];
+    const { roomId, t } = await startHost();
+    t.onError = (e) => errors.push(e);
+    const j = new Promise<Peer>((resolve) => {
+      t.onPeerJoin = (peer) => {
+        resolve(peer);
+        throw new Error('onPeerJoin bug');
+      };
+    });
+    const c = join(roomId);
+    const peer = await withTimeout(j, 15_000, 'join');
+    await c.whenOpen();
+    const got = new Promise<void>((resolve) => {
+      t.onPeerMessage = () => {
+        resolve();
+        throw new Error('onPeerMessage bug');
+      };
+    });
+    c.send(0, Uint8Array.of(1));
+    await withTimeout(got, 5000, 'message');
+    const closed = new Promise<void>((resolve) => {
+      t.onPeerClose = () => {
+        resolve();
+        throw new Error('onPeerClose bug');
+      };
+    });
+    c.close();
+    await withTimeout(closed, 15_000, 'close');
+    expect(peer.state).toBe('closed');
+    expect(errors.map((e) => e.message)).toEqual(['onPeerJoin bug', 'onPeerMessage bug', 'onPeerClose bug']);
   });
 });
 

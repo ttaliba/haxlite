@@ -325,7 +325,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     if (liveRooms === 0 && hx.shutdownWebRtcOnLastStop !== false) {
       // let pending native callbacks drain first
       await new Promise<void>((r) => setImmediate(r));
-      if (liveRooms === 0) shutdownWebRtc();
+      if (liveRooms === 0) await shutdownWebRtc();
     }
   }
 

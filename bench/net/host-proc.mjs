@@ -16,6 +16,7 @@
 // IPC in : {cmd:'game'} | {cmd:'measure-start', eld, sampleMs} | {cmd:'measure-stop'} | {cmd:'players'}
 // IPC out: {type:'link', room, id, tCreate, tLink} | {type:'game', players} |
 //          {type:'stats', …} | {type:'players', counts} | {type:'error', message}
+import { readdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { monitorEventLoopDelay, performance, PerformanceObserver } from 'node:perf_hooks';
 import path from 'node:path';
@@ -195,6 +196,38 @@ async function nodeHaxballFactory() {
 
 let meas = null;
 
+/**
+ * Per-thread CPU ticks (Linux /proc/self/task/<tid>/stat, utime+stime, 1/100 s):
+ * tells the JS main thread apart from libuv/V8 workers and the native WebRTC
+ * threads (libdatachannel / usrsctp / juice). Read only at window start/end.
+ */
+function threadTicks() {
+  const out = new Map();
+  try {
+    for (const tid of readdirSync('/proc/self/task')) {
+      try {
+        const st = readFileSync(`/proc/self/task/${tid}/stat`, 'utf8');
+        const name = st.slice(st.indexOf('(') + 1, st.lastIndexOf(')'));
+        const f = st.slice(st.lastIndexOf(')') + 2).split(' ');
+        out.set(tid, { name, ticks: Number(f[11]) + Number(f[12]) });
+      } catch {}
+    }
+  } catch {}
+  return out;
+}
+
+function threadBreakdown(before, after, wallMs) {
+  const byName = {};
+  for (const [tid, t] of after) {
+    const d = t.ticks - (before.get(tid)?.ticks ?? 0);
+    const key = tid === String(process.pid) ? 'main (JS)' : t.name.replace(/[0-9]+$/, '#');
+    byName[key] = (byName[key] ?? 0) + d;
+  }
+  const pct = {};
+  for (const [k, v] of Object.entries(byName)) if (v > 0) pct[k] = +((v * 10 / wallMs) * 100).toFixed(2);
+  return pct;
+}
+
 function startMeasure({ eld = true, sampleMs = 1000 } = {}) {
   const h = eld ? monitorEventLoopDelay({ resolution: 10 }) : null;
   h?.enable();
@@ -212,6 +245,7 @@ function startMeasure({ eld = true, sampleMs = 1000 } = {}) {
     gc,
     t0: performance.now(),
     cpu0: process.cpuUsage(),
+    threads0: threadTicks(),
     mem0: process.memoryUsage(),
     samples: [],
     last: { t: performance.now(), cpu: process.cpuUsage() },
@@ -234,6 +268,7 @@ function stopMeasure() {
   clearInterval(m.timer);
   const t1 = performance.now();
   const cpu = process.cpuUsage(m.cpu0);
+  const threads1 = threadTicks();
   const mem = process.memoryUsage();
   m.obs.disconnect();
   const wallMs = t1 - m.t0;
@@ -274,6 +309,7 @@ function stopMeasure() {
     gcCount: m.gc.count,
     gcMs: m.gc.ms,
     eld,
+    threadsPct: threadBreakdown(m.threads0, threads1, wallMs),
     cpuPctSeries: m.samples.map((s) => +s.cpuPct.toFixed(3)),
   };
 }

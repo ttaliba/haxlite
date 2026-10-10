@@ -200,7 +200,8 @@ describe('HostRoom wire protocol (raw client)', () => {
   }, 60_000);
 
   it('a late joiner gets queued future events in its snapshot', async () => {
-    const { host, roomId } = await startHost({ inputDelayFrames: 30 }); // host pause lands 30 frames later
+    // 120 frames (2 s) so b's join completes before the pause applies, even on a loaded machine
+    const { host, roomId } = await startHost({ inputDelayFrames: 120 }); // host pause lands 120 frames later
     const a = await rawJoin(roomId, 'a');
     host.startGame();
     host.pauseGame(true);

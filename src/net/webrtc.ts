@@ -19,10 +19,16 @@
  *    next `cleanup()` (`CloseAll`/`CleanupAll`) then dereferences freed memory
  *    (SIGSEGV, or SIGABRT from `free()`). The window is a GC between
  *    `dc.close()` (or a remote close) and the next event-loop turn, so it hit
- *    ~1 in 10 test runs. Fix: every wrapper is kept strongly reachable here
- *    until its native close is confirmed (DataChannel `closed`, PeerConnection
- *    state `closed`), and {@link shutdownWebRtc} waits for that before calling
- *    `cleanup()`.
+ *    ~1 in 10 full test runs (SIGSEGV, SIGABRT, or a deadlock inside
+ *    `cleanup()` → `DataChannelWrapper::CleanupAll` → `~ThreadSafeCallback`).
+ *    Worse, libdatachannel sometimes never emits `closed` at all for a
+ *    channel closed from both ends at once (seen on the unreliable channel,
+ *    ~1 per 1000 sessions), so its wrapper is *guaranteed* to dangle once
+ *    collected. Fix: every wrapper is kept strongly reachable here until its
+ *    native close is confirmed (DataChannel `closed`, PeerConnection state
+ *    `closed`) — channels that never confirm stay referenced until
+ *    `cleanup()` — and {@link shutdownWebRtc} waits for the PeerConnections
+ *    before calling `cleanup()`.
  *
  * Closes are also deferred to `setImmediate` ({@link closeNative}) so the
  * library is never re-entered from inside one of its own callbacks.
@@ -38,8 +44,8 @@ import {
 type ErrorSink = ((err: Error) => void) | null | undefined;
 
 /** Wrappers whose native close has not been confirmed yet (kept strongly reachable). */
-const livePcs = new Set<PeerConnection>();
-const liveDcs = new Set<DataChannel>();
+const livePcs = new Map<PeerConnection, string>();
+const liveDcs = new Map<DataChannel, { name: string; pc: PeerConnection }>();
 /** Wrappers whose close() was requested but not executed yet. */
 const closeQueue: (PeerConnection | DataChannel)[] = [];
 let closeScheduled = false;
@@ -49,17 +55,51 @@ let drainWaiters: (() => void)[] = [];
 export interface WebRtcStats {
   /** PeerConnections created and not yet confirmed closed. */
   peerConnections: number;
-  /** DataChannels created and not yet confirmed closed. */
+  /** DataChannels not yet confirmed closed whose PeerConnection is still live. */
   dataChannels: number;
+  /**
+   * DataChannels whose PeerConnection is closed but whose own `closed` event
+   * never came. libdatachannel loses it now and then (~1 in 1000 sessions,
+   * always the unreliable channel, when both sides close at once); such a
+   * wrapper must stay referenced until `cleanup()` (see the module comment),
+   * so these are a tiny bounded leak, not live connections.
+   */
+  orphanedDataChannels: number;
   /** close() calls queued for the next `setImmediate`. */
   pendingCloses: number;
   /** Total natives created since load (PCs + DCs). */
   created: number;
 }
 
+/** Names of the natives not yet confirmed closed (diagnostics: `pc-name` / `pc-name/label [state]`). */
+export function liveWebRtcObjects(): string[] {
+  const out: string[] = [];
+  for (const [pc, name] of livePcs) out.push(`${name} [${safeState(() => pc.state())}]`);
+  for (const [dc, r] of liveDcs) {
+    out.push(`${r.name} [${safeState(() => (dc.isOpen() ? 'open' : 'not open'))}${livePcs.has(r.pc) ? '' : ', orphaned'}]`);
+  }
+  return out;
+}
+
+function safeState(f: () => string): string {
+  try {
+    return f();
+  } catch {
+    return 'destroyed';
+  }
+}
+
 /** Live native objects (leak tracking / diagnostics). */
 export function webRtcStats(): WebRtcStats {
-  return { peerConnections: livePcs.size, dataChannels: liveDcs.size, pendingCloses: closeQueue.length, created: createdCount };
+  let orphans = 0;
+  for (const r of liveDcs.values()) if (!livePcs.has(r.pc)) orphans++;
+  return {
+    peerConnections: livePcs.size,
+    dataChannels: liveDcs.size - orphans,
+    orphanedDataChannels: orphans,
+    pendingCloses: closeQueue.length,
+    created: createdCount,
+  };
 }
 
 function report(onError: ErrorSink, err: unknown): void {
@@ -86,8 +126,9 @@ export function guard<A extends unknown[]>(fn: (...args: A) => void, onError: Er
   };
 }
 
+/** Every PeerConnection confirmed closed (remaining DataChannels are orphans). */
 function released(): void {
-  if (livePcs.size === 0 && liveDcs.size === 0 && closeQueue.length === 0 && drainWaiters.length > 0) {
+  if (livePcs.size === 0 && closeQueue.length === 0 && drainWaiters.length > 0) {
     const w = drainWaiters;
     drainWaiters = [];
     for (const f of w) f();
@@ -98,7 +139,7 @@ function released(): void {
  * Drops our strong reference one turn later, after the binding's own cleanup
  * for the `closed` callback (it runs right after the JS callback returns).
  */
-function releaseLater<T>(set: Set<T>, obj: T): void {
+function releaseLater<T>(set: Map<T, unknown>, obj: T): void {
   setImmediate(() => {
     set.delete(obj);
     released();
@@ -116,7 +157,7 @@ export interface PeerConnectionHandlers {
 export function createPeerConnection(name: string, config: RtcConfig, h: PeerConnectionHandlers): PeerConnection {
   const pc = new PeerConnection(name, config);
   createdCount++;
-  livePcs.add(pc);
+  livePcs.set(pc, name);
   try {
     const onState = h.onStateChange;
     pc.onStateChange(
@@ -150,7 +191,7 @@ export function createDataChannel(
 ): DataChannel {
   const dc = pc.createDataChannel(label, init);
   createdCount++;
-  liveDcs.add(dc);
+  liveDcs.set(dc, { name: `${livePcs.get(pc) ?? '?'}/${label}`, pc });
   const onClosed = h.onClosed;
   // `closed` first: it is what releases the wrapper.
   dc.onClosed(
@@ -200,9 +241,10 @@ let shutdownPromise: Promise<void> | null = null;
  * threads alive; call this once when the process is done with WebRTC (after
  * every HostTransport has been stopped) so Node can exit.
  *
- * Waits (up to `timeoutMs`) until every PeerConnection/DataChannel has
- * confirmed its close, then calls node-datachannel's `cleanup()` (calling it
- * earlier is what used to crash). If new natives are created while waiting
+ * Waits (up to `timeoutMs`) until every PeerConnection has confirmed its
+ * close, then calls node-datachannel's `cleanup()` while every DataChannel
+ * wrapper that did not confirm its own close is still referenced (calling it
+ * with collectable wrappers is what used to crash). If new natives are created while waiting
  * (a room was started again), the cleanup is skipped. Safe to call several
  * times and without awaiting.
  */
@@ -217,10 +259,10 @@ export function shutdownWebRtc(timeoutMs = 5_000): Promise<void> {
 
 async function doShutdown(timeoutMs: number): Promise<void> {
   const generation = createdCount;
-  if (livePcs.size > 0 || liveDcs.size > 0 || closeQueue.length > 0) {
+  if (livePcs.size > 0 || closeQueue.length > 0) {
     // ask every live native to close (normally the transports already did)
-    for (const dc of liveDcs) closeNative(dc);
-    for (const pc of livePcs) closeNative(pc);
+    for (const dc of liveDcs.keys()) closeNative(dc);
+    for (const pc of livePcs.keys()) closeNative(pc);
     await new Promise<void>((resolve) => {
       const t = setTimeout(resolve, timeoutMs);
       t.unref?.();

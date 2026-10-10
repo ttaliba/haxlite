@@ -60,7 +60,7 @@ export class RawClient {
     this.ws.binaryType = 'nodebuffer';
     this.closed = new Promise((resolve) => this.ws.on('close', (code) => resolve(code)));
     this.ws.on('error', () => {});
-    this.ws.on('open', () => void this.start());
+    this.ws.on('open', () => void this.start().catch(() => this.close()));
     this.ws.on('message', (data: Buffer) => this.onSignal(new Uint8Array(data)));
   }
 
@@ -179,10 +179,11 @@ export class RawClient {
       }
       pc.setLocalDescription('offer');
       await gathered;
+      if (this.pc !== pc) return; // closed meanwhile
+      const local = pc.localDescription();
+      if (local === null) return;
       // Candidates are trickled only after the answer is applied (see `ownCandidates`).
-      sdp = pc
-        .localDescription()!
-        .sdp.split('\r\n')
+      sdp = local.sdp.split('\r\n')
         .filter((l) => !l.startsWith('a=candidate:') && l !== 'a=end-of-candidates')
         .join('\r\n');
     }

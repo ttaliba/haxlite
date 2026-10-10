@@ -110,6 +110,21 @@ describe('HostTransport + node-haxball client', () => {
     expect(t.peers.length).toBe(0);
   });
 
+  it('connects with every host candidate withheld (iceCandidatePolicy: client reaches us peer-reflexively)', async () => {
+    let withheld = 0;
+    const { t, fakeRoom } = await startHost({
+      iceCandidatePolicy: () => {
+        withheld++;
+        return false;
+      },
+    });
+    const joined = new Promise<Peer>((resolve) => (t.onPeerJoin = (peer) => resolve(peer)));
+    nhJoin(fakeRoom.id);
+    const peer = await withTimeout(joined, 20_000, 'peer join');
+    expect(peer.channelOpen).toEqual([true, true, true]);
+    expect(withheld).toBeGreaterThan(0);
+  });
+
   it('rejects a wrong password with 4101 (no WebRTC peer created)', async () => {
     const { t, fakeRoom } = await startHost({ password: 'right' });
     const rejected: number[] = [];

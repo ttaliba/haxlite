@@ -14,7 +14,7 @@ beforeAll(async () => {
 });
 afterAll(async () => {
   await env.master.close();
-  shutdownAll();
+  await shutdownAll();
 });
 
 const rejectionsSince = (n: number) => env.master.rejections.slice(n).map((r) => r.code);

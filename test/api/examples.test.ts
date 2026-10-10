@@ -21,7 +21,7 @@ beforeAll(async () => {
 }, 60_000);
 afterAll(async () => {
   await env.master.close();
-  shutdownAll();
+  await shutdownAll();
   removePackage(OUT);
 });
 

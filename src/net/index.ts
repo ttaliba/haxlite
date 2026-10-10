@@ -78,4 +78,4 @@ export {
   type ParsedCandidate,
 } from './ice.js';
 export * from './constants.js';
-export { shutdownWebRtc, webRtcStats, type WebRtcStats } from './webrtc.js';
+export { liveWebRtcObjects, shutdownWebRtc, webRtcStats, type WebRtcStats } from './webrtc.js';

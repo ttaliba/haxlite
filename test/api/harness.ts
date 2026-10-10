@@ -130,8 +130,8 @@ export async function join(
 }
 
 /** afterAll of every file. */
-export function shutdownAll(): void {
-  shutdownWebRtc();
+export async function shutdownAll(): Promise<void> {
+  await shutdownWebRtc();
   cleanupNodeHaxball();
 }
 
