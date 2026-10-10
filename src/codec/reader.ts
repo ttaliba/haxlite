@@ -2,8 +2,10 @@
  * Binary reader (clean-room equivalent of the official StreamReader).
  *
  * Big-endian by default with explicit `*LE` variants. Reads past the end throw
- * (RangeError from DataView for fixed-size reads, CodecError otherwise), as the
+ * (the DataView RangeError for fixed-size reads, CodecError otherwise), as the
  * official reader does; on the network path any throw means "drop the peer".
+ * Fixed-size reads use byte arithmetic (no DataView per input buffer), and
+ * {@link Reader.reset} re-targets a reader, so decoding allocates nothing.
  *
  * `bytes()` returns zero-copy subarrays of the input; use `bytesCopy()` if the
  * slice must outlive the input buffer.
@@ -11,16 +13,34 @@
 import { CodecError } from './errors.js';
 import { decodeHaxUtf8 } from './utf8.js';
 
+const OOB = 'Offset is outside the bounds of the DataView';
+
+// Scratch for float decoding (no DataView per input buffer).
+const F64 = new Float64Array(1);
+const F32 = new Float32Array(1);
+const F64B = new Uint8Array(F64.buffer);
+const F32B = new Uint8Array(F32.buffer);
+const HOST_LE = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
 export class Reader {
   /** Current read position (relative to the start of `data`). */
   pos = 0;
-  readonly data: Uint8Array;
-  private readonly view: DataView;
+  /** Input bytes (replaced by {@link reset}). */
+  data: Uint8Array;
 
   constructor(data: Uint8Array | ArrayBuffer, offset = 0) {
     this.data = data instanceof Uint8Array ? data : new Uint8Array(data);
-    this.view = new DataView(this.data.buffer, this.data.byteOffset, this.data.byteLength);
     this.pos = offset;
+  }
+
+  /**
+   * Re-targets this reader at new input (no allocation): lets a long-lived
+   * reader decode every incoming message. Returns `this`.
+   */
+  reset(data: Uint8Array, offset = 0): this {
+    this.data = data;
+    this.pos = offset;
+    return this;
   }
 
   get length(): number {
@@ -32,88 +52,100 @@ export class Reader {
     return this.data.length - this.pos;
   }
 
+  /** Position of an `n`-byte fixed-size read; throws like DataView past the end. */
+  private take(n: number): number {
+    const p = this.pos;
+    if (p + n > this.data.length) throw new RangeError(OOB);
+    this.pos = p + n;
+    return p;
+  }
+
   // ---------------------------------------------------------------- integers
+  // Byte arithmetic instead of a DataView: no view object per input buffer.
 
   u8(): number {
-    return this.view.getUint8(this.pos++);
+    const p = this.pos;
+    if (p >= this.data.length) throw new RangeError(OOB);
+    this.pos = p + 1;
+    return this.data[p]!;
   }
 
   i8(): number {
-    return this.view.getInt8(this.pos++);
+    return (this.u8() << 24) >> 24;
   }
 
   u16(): number {
-    const v = this.view.getUint16(this.pos);
-    this.pos += 2;
-    return v;
+    const p = this.take(2);
+    const d = this.data;
+    return (d[p]! << 8) | d[p + 1]!;
   }
 
   i16(): number {
-    const v = this.view.getInt16(this.pos);
-    this.pos += 2;
-    return v;
+    return (this.u16() << 16) >> 16;
   }
 
   u32(): number {
-    const v = this.view.getUint32(this.pos);
-    this.pos += 4;
-    return v;
+    return this.i32() >>> 0;
   }
 
   i32(): number {
-    const v = this.view.getInt32(this.pos);
-    this.pos += 4;
-    return v;
+    const p = this.take(4);
+    const d = this.data;
+    return (d[p]! << 24) | (d[p + 1]! << 16) | (d[p + 2]! << 8) | d[p + 3]!;
   }
 
   f32(): number {
-    const v = this.view.getFloat32(this.pos);
-    this.pos += 4;
-    return v;
+    return this.float32(false);
   }
 
   f64(): number {
-    const v = this.view.getFloat64(this.pos);
-    this.pos += 8;
-    return v;
+    return this.float64(false);
   }
 
   // ------------------------------------------------------- little-endian ops
 
   u16LE(): number {
-    const v = this.view.getUint16(this.pos, true);
-    this.pos += 2;
-    return v;
+    const p = this.take(2);
+    const d = this.data;
+    return d[p]! | (d[p + 1]! << 8);
   }
 
   i16LE(): number {
-    const v = this.view.getInt16(this.pos, true);
-    this.pos += 2;
-    return v;
+    return (this.u16LE() << 16) >> 16;
   }
 
   u32LE(): number {
-    const v = this.view.getUint32(this.pos, true);
-    this.pos += 4;
-    return v;
+    return this.i32LE() >>> 0;
   }
 
   i32LE(): number {
-    const v = this.view.getInt32(this.pos, true);
-    this.pos += 4;
-    return v;
+    const p = this.take(4);
+    const d = this.data;
+    return d[p]! | (d[p + 1]! << 8) | (d[p + 2]! << 16) | (d[p + 3]! << 24);
   }
 
   f32LE(): number {
-    const v = this.view.getFloat32(this.pos, true);
-    this.pos += 4;
-    return v;
+    return this.float32(true);
   }
 
   f64LE(): number {
-    const v = this.view.getFloat64(this.pos, true);
-    this.pos += 8;
-    return v;
+    return this.float64(true);
+  }
+
+  private float32(le: boolean): number {
+    const p = this.take(4);
+    const d = this.data;
+    if (le === HOST_LE) for (let i = 0; i < 4; i++) F32B[i] = d[p + i]!;
+    else for (let i = 0; i < 4; i++) F32B[i] = d[p + 3 - i]!;
+    return F32[0]!;
+  }
+
+  private float64(le: boolean): number {
+    const p = this.take(8);
+    const d = this.data;
+    if (le === HOST_LE) for (let i = 0; i < 8; i++) F64B[i] = d[p + i]!;
+    else for (let i = 0; i < 8; i++) F64B[i] = d[p + 7 - i]!;
+    return F64[0]!;
   }
 
   // ------------------------------------------------------------------ varint

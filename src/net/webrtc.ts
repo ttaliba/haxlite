@@ -126,6 +126,20 @@ export function guard<A extends unknown[]>(fn: (...args: A) => void, onError: Er
   };
 }
 
+/**
+ * {@link guard} for one-argument callbacks (the per-message hot path): same
+ * guarantee without the rest-parameter array per call.
+ */
+export function guard1<T>(fn: (arg: T) => void, onError: ErrorSink): (arg: T) => void {
+  return (arg: T) => {
+    try {
+      fn(arg);
+    } catch (err) {
+      report(onError, err);
+    }
+  };
+}
+
 /** Every PeerConnection confirmed closed (remaining DataChannels are orphans). */
 function released(): void {
   if (livePcs.size === 0 && closeQueue.length === 0 && drainWaiters.length > 0) {
@@ -201,7 +215,7 @@ export function createDataChannel(
     }, h.onError),
   );
   if (h.onOpen) dc.onOpen(guard(h.onOpen, h.onError));
-  if (h.onMessage) dc.onMessage(guard(h.onMessage, h.onError));
+  if (h.onMessage) dc.onMessage(guard1(h.onMessage, h.onError));
   return dc;
 }
 

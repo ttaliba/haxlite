@@ -16,9 +16,25 @@
 // `[4][f64 frame][f64 t]` on uu; RTT = arrival − t. Host CPU = process.cpuUsage()
 // of the host process over the measurement window (all threads, incl.
 // libdatachannel's), divided by the number of players (load clients + probe).
-import { fork, type ChildProcess } from 'node:child_process';
+//
+// A/B flags (docs/07 «Pasada de ligereza — red»):
+//   --src <dir>      load host/edge code from a compiled build (e.g.
+//                    node_modules/.cache/haxlite-bench-net/<variant>/dist) instead of src/
+//   --loss <pct>     drop this % of the UDP packets between the edge (127.0.0.2) and the
+//                    host tunnel (127.0.0.3), both directions, with an nftables rule
+//                    (Linux, root; players' traffic is not touched). Removed at the end.
+//   --edge-webrtc <json>  extra EdgeServer `webrtc` options (e.g. '{"enableIceUdpMux":true}')
+//   --edge-opts <json>    extra host `edge` options
+import { execFileSync, fork, type ChildProcess } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+/** Module of the code under test: src/ (default) or a compiled build (`--src`). */
+function mod(rel: string): string {
+  const base = process.env.EDGE_BENCH_SRC;
+  return base ? pathToFileURL(path.resolve(base, `${rel}.js`)).href : `../src/${rel}.js`;
+}
 
 const ROLE = process.argv[2];
 const EDGE_IP = '127.0.0.2';
@@ -34,13 +50,14 @@ const send = (m: unknown) => process.send?.(m);
 
 // ======================================================================= edge child
 async function edgeMain(): Promise<void> {
-  const { EdgeServer } = await import('../src/edge/index.js');
+  const { EdgeServer } = (await import(mod('edge/index'))) as typeof import('../src/edge/index.js');
   process.on('disconnect', () => process.exit(0));
+  const extra = JSON.parse(process.env.EDGE_BENCH_WEBRTC || '{}');
   const edge = await EdgeServer.start({
     host: EDGE_IP,
     port: 0,
     keys: [KEY],
-    webrtc: { bindAddress: EDGE_IP, iceServers: [], iceCandidatePolicy: 'all' },
+    webrtc: { bindAddress: EDGE_IP, iceServers: [], iceCandidatePolicy: 'all', ...extra },
   });
   let cpu0 = process.cpuUsage();
   let t0 = performance.now();
@@ -59,10 +76,14 @@ async function edgeMain(): Promise<void> {
 // ======================================================================= host child
 async function hostMain(): Promise<void> {
   const [masterUrl, edgeUrl, dataPlane] = process.argv.slice(3);
-  const { HostTransport } = await import('../src/net/index.js');
-  const { HostRoom, createHostRoomState } = await import('../src/host/index.js');
+  const { HostTransport } = (await import(mod('net/index'))) as typeof import('../src/net/index.js');
+  const { HostRoom, createHostRoomState } = (await import(mod('host/index'))) as typeof import('../src/host/index.js');
   process.on('disconnect', () => process.exit(0));
-  const edge = edgeUrl && edgeUrl !== '-' ? { url: edgeUrl, key: `${KEY.id}:${KEY.secret}`, bindAddress: HOST_IP, dataPlane: dataPlane as 'webrtc' | 'ws' } : null;
+  const extra = JSON.parse(process.env.EDGE_BENCH_EDGE_OPTS || '{}');
+  const edge =
+    edgeUrl && edgeUrl !== '-'
+      ? { url: edgeUrl, key: `${KEY.id}:${KEY.secret}`, bindAddress: HOST_IP, dataPlane: dataPlane as 'webrtc' | 'ws', ...extra }
+      : null;
   const transport = new HostTransport({
     token: 'thr1.bench',
     masterUrl,
@@ -226,6 +247,8 @@ async function runMode(mode: string, players: number, seconds: number, seed: num
   for (const c of rooms) setTimeout(() => drive(c), Math.floor(rnd() * 200));
   await new Promise((r) => setTimeout(r, 3000)); // warm-up
 
+  const lossPct = Number(arg('loss', '0'));
+  if (lossPct > 0 && mode !== 'direct') setLoss(lossPct);
   hostProc.send({ cmd: 'measure-start' });
   edgeProc?.send({ cmd: 'measure-start' });
   const w = new Writer(32);
@@ -242,6 +265,8 @@ async function runMode(mode: string, players: number, seconds: number, seed: num
   }, 50);
   await new Promise((r) => setTimeout(r, seconds * 1000));
   clearInterval(pinger);
+  await new Promise((r) => setTimeout(r, 1000)); // let late (retransmitted) pongs arrive
+  setLoss(0);
   const hostCpu = next<{ cpuMs: number; wallMs: number; rssMb: number }>(hostProc, 'cpu');
   hostProc.send({ cmd: 'measure-stop' });
   const edgeCpu = edgeProc ? next<{ cpuMs: number; wallMs: number }>(edgeProc, 'cpu') : null;
@@ -284,7 +309,36 @@ async function runMode(mode: string, players: number, seconds: number, seed: num
   return res;
 }
 
+const NFT_TABLE = 'haxlite_bench_loss';
+let lossInstalled = false;
+/** Random drop of UDP between the edge and the host tunnel (nftables, both directions); 0 removes it. */
+function setLoss(pct: number): void {
+  if (lossInstalled) {
+    try {
+      execFileSync('nft', ['delete', 'table', 'inet', NFT_TABLE]);
+    } catch {
+      /* already gone */
+    }
+    lossInstalled = false;
+  }
+  if (pct <= 0) return;
+  const per10k = String(Math.round(pct * 100));
+  const rules = [
+    `add table inet ${NFT_TABLE}`,
+    `add chain inet ${NFT_TABLE} in { type filter hook input priority 0; policy accept; }`,
+    `add rule inet ${NFT_TABLE} in ip saddr ${HOST_IP} ip daddr ${EDGE_IP} meta l4proto udp numgen random mod 10000 < ${per10k} drop`,
+    `add rule inet ${NFT_TABLE} in ip saddr ${EDGE_IP} ip daddr ${HOST_IP} meta l4proto udp numgen random mod 10000 < ${per10k} drop`,
+  ];
+  execFileSync('nft', ['-f', '-'], { input: rules.join('\n') });
+  lossInstalled = true;
+}
+process.on('exit', () => setLoss(0));
+
 async function orchestrate(): Promise<void> {
+  const src = arg('src', '');
+  if (src) process.env.EDGE_BENCH_SRC = path.resolve(src);
+  process.env.EDGE_BENCH_WEBRTC = arg('edge-webrtc', '{}');
+  process.env.EDGE_BENCH_EDGE_OPTS = arg('edge-opts', '{}');
   const players = Number(arg('players', '8'));
   const seconds = Number(arg('seconds', '20'));
   const runs = Number(arg('runs', '1'));

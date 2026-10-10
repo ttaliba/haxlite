@@ -241,6 +241,13 @@ export interface HaxliteConfig {
   heartbeatFrames?: number;
   /** Frames between CheckConsistency events [600]. */
   checksumIntervalFrames?: number;
+  /**
+   * While a game runs, simulate at least every N frames even without
+   * messages [4 = 66.7 ms; official ≈ 3]. Bounds the latency of per-frame
+   * callbacks (onGameTick, onTeamGoal…) and the staleness of getters;
+   * integer 1–600 or Infinity (only at heartbeats/messages).
+   */
+  maxWakeFrames?: number;
   /** Ping event period in ms [3000]. */
   pingIntervalMs?: number;
 
@@ -327,6 +334,8 @@ export interface HaxliteRoomExtensions {
   heartbeatFrames: number;
   /** CheckConsistency period (frames). */
   checksumIntervalFrames: number;
+  /** Catch-up bound while a game runs (frames, or Infinity). Live-tunable. */
+  maxWakeFrames: number;
   /** Current room link (null until the master assigns it). */
   readonly roomLink: string | null;
   /** Current frame number of the host clock. */

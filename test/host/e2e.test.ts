@@ -191,8 +191,8 @@ describe('HostRoom E2E with node-haxball clients (official defaults)', () => {
       host.stopGame();
       await sleep(100);
       const internals = host as Any;
-      expect(internals.timer).toBeNull();
-      expect(internals.pingTimer).toBeNull();
+      expect(internals.clockEntry.wakeAt).toBe(Infinity); // no wake-up requested from the shared clock
+      expect(internals.nextPingAt).toBe(Infinity);
       const f0 = host.frame;
       await sleep(200);
       expect(host.frame).toBe(f0); // nothing ran

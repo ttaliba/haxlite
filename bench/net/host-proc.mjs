@@ -87,8 +87,28 @@ function earlySendDelay(PeerConnection, delayMs = 40) {
 // Each adapter: { id, players(): number[] (ids of connected clients),
 //                 setTeam(id, team), startGame() }
 
+/**
+ * A/B variants (diagnostics, src/net tuning): impl `haxlite:<name>` reads
+ * `HAXLITE_BENCH_VARIANTS` = JSON `{ "<name>": { dist?, transport?, sctp?, logger? } }`:
+ * another compiled build (path relative to the repo), extra HostTransport
+ * options, node-datachannel `setSctpSettings(…)` and `initLogger(level)`.
+ */
+function variantOf(name) {
+  if (!name.startsWith('haxlite:')) return {};
+  const all = JSON.parse(process.env.HAXLITE_BENCH_VARIANTS ?? '{}');
+  const v = all[name.slice('haxlite:'.length)];
+  if (v === undefined) throw new Error(`unknown variant ${name}`);
+  return v;
+}
+
 async function haxliteFactory() {
-  const dist = path.join(ROOT, 'node_modules/.cache/haxlite-bench/dist');
+  const variant = variantOf(impl);
+  const dist = path.resolve(ROOT, variant.dist ?? 'node_modules/.cache/haxlite-bench/dist');
+  if (variant.sctp || variant.logger) {
+    const ndc = createRequire(path.join(dist, 'x.js'))('node-datachannel');
+    if (variant.logger) ndc.initLogger(variant.logger);
+    if (variant.sctp) ndc.setSctpSettings(variant.sctp);
+  }
   const { HostRoom, createHostRoomState } = await import(pathToFileURL(path.join(dist, 'host/index.js')).href);
   const { HostTransport } = await import(pathToFileURL(path.join(dist, 'net/index.js')).href);
   return (i, onLink) => {
@@ -98,6 +118,7 @@ async function haxliteFactory() {
       public: true,
       maxPlayers: MAX_PLAYERS,
       roomInfo: { name: `bench ${i}`, flag: GEO.code, lat: GEO.lat, lon: GEO.lon },
+      ...variant.transport,
     });
     // HAXLITE_HOST_OPTS (diagnostics only, never set for the published results):
     // extra HostRoom options, e.g. '{"heartbeatFrames":9}'.
@@ -240,6 +261,14 @@ function threadTicks() {
   return out;
 }
 
+function countFds() {
+  try {
+    return readdirSync('/proc/self/fd').length;
+  } catch {
+    return null;
+  }
+}
+
 function threadBreakdown(before, after, wallMs) {
   const byName = {};
   for (const [tid, t] of after) {
@@ -334,6 +363,8 @@ function stopMeasure() {
     gcMs: m.gc.ms,
     eld,
     threadsPct: threadBreakdown(m.threads0, threads1, wallMs),
+    threadCount: threads1.size,
+    fdCount: countFds(),
     cpuPctSeries: m.samples.map((s) => +s.cpuPct.toFixed(3)),
   };
 }
@@ -341,9 +372,10 @@ function stopMeasure() {
 // ------------------------------------------------------------- main
 
 const factories = { haxlite: haxliteFactory, official: officialFactory, nodehaxball: nodeHaxballFactory };
-if (!factories[impl]) throw new Error(`unknown impl ${impl}`);
+const factory = factories[impl.split(':')[0]];
+if (!factory) throw new Error(`unknown impl ${impl}`);
 const T_IMPORT0 = performance.now();
-const create = await factories[impl]();
+const create = await factory();
 const T_READY = performance.now();
 const rooms = [];
 for (let i = 0; i < ROOMS; i++) {

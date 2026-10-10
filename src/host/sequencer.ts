@@ -204,7 +204,7 @@ export class Sequencer {
         ++c;
       }
     } finally {
-      if (c > 0) list.splice(0, c);
+      if (c > 0) dropFirst(list, c);
       this.depth--;
     }
   }
@@ -243,7 +243,11 @@ export class Sequencer {
       ++at;
     }
     ev.order = order;
-    list.splice(at, 0, ev);
+    // in-place insert (splice would allocate its result array)
+    let i = list.length;
+    list.push(ev);
+    for (; i > at; i--) list[i] = list[i - 1]!;
+    list[at] = ev;
   }
 
   private applyEvent(ev: RoomEvent): void {
@@ -352,7 +356,7 @@ export class Sequencer {
     w.u8(HostMsg.FrameSync);
     w.u32(this.frame);
     w.u32(this.eventCounter);
-    this.sink.broadcast(w.finish(), Channel.Unreliable);
+    this.sink.broadcast(w.finishShared(), Channel.Unreliable);
     this.lastHeartbeatFrame = this.frame;
   }
 
@@ -411,8 +415,15 @@ export class Sequencer {
     const w = this.out.reset();
     w.u8(HostMsg.Event);
     writeEventFrame(w, ev);
-    this.sink.broadcast(w.finish(), channel);
+    this.sink.broadcast(w.finishShared(), channel);
   }
+}
+
+/** Removes the first `n` items in place (splice would allocate its result array). */
+function dropFirst<T>(list: T[], n: number): void {
+  const len = list.length;
+  for (let i = n; i < len; i++) list[i - n] = list[i]!;
+  list.length = len - n;
 }
 
 /** Message 6 `[6][u8 type][payload]`: an event for one client, outside the sequence (official `Ef`). */
@@ -430,5 +441,5 @@ export function encodePong(w: Writer, hostFrame: number, echo: number): Uint8Arr
   w.u8(HostMsg.Pong);
   w.f64(hostFrame);
   w.f64(echo);
-  return w.finish();
+  return w.finishShared();
 }

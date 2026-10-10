@@ -15,11 +15,16 @@
 import { CodecError } from './errors.js';
 import { encodeHaxUtf8Into, haxUtf8Length, standardUtf8Encode } from './utf8.js';
 
+/** Largest output {@link Writer.finishShared} caches a view for. */
+export const SHARED_VIEW_MAX = 256;
+
 export class Writer {
   /** Current write position (= number of bytes written). May be moved back to patch earlier fields. */
   pos = 0;
   private buf: Uint8Array;
   private view: DataView;
+  /** {@link finishShared} views by length (dropped when the buffer grows). */
+  private views: (Uint8Array | undefined)[] | null = null;
 
   constructor(initialCapacity = 256) {
     if (initialCapacity < 1) initialCapacity = 1;
@@ -56,6 +61,7 @@ export class Writer {
     next.set(this.buf);
     this.buf = next;
     this.view = new DataView(next.buffer);
+    this.views = null;
   }
 
   // ---------------------------------------------------------------- integers
@@ -285,6 +291,22 @@ export class Writer {
   /** Zero-copy view of the written bytes; invalidated by the next write/reset. */
   finish(): Uint8Array {
     return this.buf.subarray(0, this.pos);
+  }
+
+  /**
+   * Like {@link finish}, but for outputs of up to {@link SHARED_VIEW_MAX}
+   * bytes returns a view object cached per length, so a long-lived writer
+   * that sends small messages allocates nothing per message. Same validity
+   * as `finish()` (until the next write/reset); never keep the result.
+   */
+  finishShared(): Uint8Array {
+    const n = this.pos;
+    if (n > SHARED_VIEW_MAX) return this.buf.subarray(0, n);
+    let views = this.views;
+    if (views === null) views = this.views = [];
+    let v = views[n];
+    if (v === undefined) v = views[n] = this.buf.subarray(0, n);
+    return v;
   }
 
   /** Alias of {@link finish} (zero-copy), matching node-haxball's naming. */

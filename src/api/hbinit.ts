@@ -147,6 +147,11 @@ function checkFrames(name: string, v: number, min: number, max: number): number 
   return v;
 }
 
+/** An integer in [1, 600] or Infinity. */
+function checkWakeFrames(v: number): number {
+  return v === Infinity ? v : checkFrames('maxWakeFrames', v, 1, 600);
+}
+
 function copyDiscProps(props: DiscPropertiesUpdate | null | undefined): DiscPropsInput {
   const out: Record<string, number | null> = {};
   if (props == null) return out;
@@ -185,6 +190,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     inputDelayFrames: checkFrames('inputDelayFrames', hx.inputDelayFrames ?? 2, 1, 60),
     heartbeatFrames: checkFrames('heartbeatFrames', hx.heartbeatFrames ?? 7, 1, 600),
     checksumIntervalFrames: checkFrames('checksumIntervalFrames', hx.checksumIntervalFrames ?? 600, 1, 1 << 20),
+    maxWakeFrames: checkWakeFrames(hx.maxWakeFrames ?? 4),
   };
 
   const httpOpts = { masterUrl: hx.masterUrl, agent: hx.agent };
@@ -223,6 +229,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     inputDelayFrames: knobs.inputDelayFrames,
     heartbeatFrames: knobs.heartbeatFrames,
     checksumIntervalFrames: knobs.checksumIntervalFrames,
+    maxWakeFrames: knobs.maxWakeFrames,
     pingIntervalMs: hx.pingIntervalMs,
   });
 
@@ -364,6 +371,12 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     },
     set checksumIntervalFrames(v: number) {
       host.checksumIntervalFrames = checkFrames('checksumIntervalFrames', v, 1, 1 << 20);
+    },
+    get maxWakeFrames() {
+      return host.maxWakeFrames;
+    },
+    set maxWakeFrames(v: number) {
+      host.maxWakeFrames = checkWakeFrames(v);
     },
     get roomLink() {
       return roomLink;

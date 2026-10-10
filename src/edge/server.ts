@@ -304,7 +304,6 @@ export class EdgeServer {
         });
       });
     }
-    this.keepAliveTimer = setInterval(() => this.keepAlive(), this.limits.keepAliveMs);
     const every = this.opts.statsLogIntervalMs ?? 0;
     if (every > 0) this.statsTimer = setInterval(() => this.logStats(), every);
   }
@@ -345,6 +344,7 @@ export class EdgeServer {
     if (this.closed) return;
     this.closed = true;
     if (this.keepAliveTimer !== null) clearInterval(this.keepAliveTimer);
+    this.keepAliveTimer = null;
     if (this.statsTimer !== null) clearInterval(this.statsTimer);
     for (const s of [...this.sessions]) s.close(EdgeCloseCode.Shutdown, 'edge shutting down');
     for (const c of this.wss.clients) c.terminate();
@@ -438,6 +438,8 @@ export class EdgeServer {
       const remote = req.socket.remoteAddress ?? '?';
       const s = new EdgeSession(this, ws, this.nextSessionId++, remote);
       this.sessions.add(s);
+      // keep-alive pings only while there is a tunnel to keep alive
+      if (this.keepAliveTimer === null) this.keepAliveTimer = setInterval(() => this.keepAlive(), this.limits.keepAliveMs);
     });
   };
 
@@ -469,6 +471,10 @@ export class EdgeServer {
 
   /** @internal */ removeSession(s: EdgeSession): void {
     this.sessions.delete(s);
+    if (this.sessions.size === 0 && this.keepAliveTimer !== null) {
+      clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
+    }
   }
 }
 
@@ -650,6 +656,11 @@ class EdgeSession {
       this.deliver((data[1]! << 8) | data[2]!, type - EdgeMsg.Data0, data.subarray(3));
       return;
     }
+    if (type === EdgeMsg.Multicast) {
+      if (this.key === null) throw new Error('not authenticated');
+      if (this.phase === SPhase.Ready && this.wsData) this.onMulticast(data, 1);
+      return;
+    }
     const r = new Reader(data);
     r.u8();
     switch (type) {
@@ -691,9 +702,6 @@ class EdgeSession {
       case EdgeMsg.PeerClose:
         this.closePeer(r.u16(), null);
         return;
-      case EdgeMsg.Multicast:
-        if (this.phase === SPhase.Ready && this.wsData) this.onMulticast(r);
-        return;
       default:
         throw new Error(`unknown message type ${type}`);
     }
@@ -709,26 +717,21 @@ class EdgeSession {
       return;
     }
     if (msg.length < 3) return;
-    try {
-      const r = new Reader(msg, 2);
-      const type = r.u8();
-      if (type === EdgeMsg.PeerClose) this.closePeer(r.u16(), null);
-      else if (type === EdgeMsg.Multicast) this.onMulticast(r);
-    } catch {
-      /* malformed: ignore */
-    }
+    // in-band control `[u16 0][u8 type]…`, parsed in place (multicasts are hot: every broadcast)
+    const type = msg[2]!;
+    if (type === EdgeMsg.Multicast) this.onMulticast(msg, 3);
+    else if (type === EdgeMsg.PeerClose && msg.length >= 5) this.closePeer((msg[3]! << 8) | msg[4]!, null);
   }
 
-  /** `[u8 channel][u8 n][u16 slot × n][payload]`. */
-  private onMulticast(r: Reader): void {
-    const ch = r.u8();
-    const n = r.u8();
-    const at = r.pos;
-    const end = at + 2 * n;
-    if (end > r.length) return;
-    const payload = r.data.subarray(end);
-    const d = r.data;
-    for (let i = at; i < end; i += 2) this.deliver((d[i]! << 8) | d[i + 1]!, ch, payload);
+  /** `[u8 channel][u8 n][u16 slot × n][payload]` starting at `at`: one payload view for every slot. */
+  private onMulticast(d: Buffer, at: number): void {
+    if (at + 2 > d.length) return;
+    const ch = d[at]!;
+    const start = at + 2;
+    const end = start + 2 * d[at + 1]!;
+    if (end > d.length) return;
+    const payload = d.subarray(end);
+    for (let i = start; i < end; i += 2) this.deliver((d[i]! << 8) | d[i + 1]!, ch, payload);
   }
 
   // ---------------------------------------------------------------- auth + data plane
@@ -771,7 +774,6 @@ class EdgeSession {
     this.edge.log(`session ${this.id}: key "${k.cfg.id}" from ${this.remote} (data plane ${webrtc ? 'webrtc' : 'ws'})`);
     if (this.deadline !== null) clearTimeout(this.deadline);
     this.deadline = null;
-    this.sweepTimer = setInterval(() => this.sweep(), 1000);
     if (webrtc) {
       this.phase = SPhase.DataPlane;
       this.deadline = setTimeout(() => this.close(EdgeCloseCode.Timeout, 'data plane timeout'), lim.dataPlaneTimeoutMs);
@@ -869,6 +871,8 @@ class EdgeSession {
     const peer = new EdgePeer(slot);
     this.peers.set(slot, peer);
     this.pendingCount++;
+    // negotiation timeouts: swept once per second while a negotiation is pending
+    if (this.sweepTimer === null) this.sweepTimer = setInterval(() => this.sweep(), 1000);
     k.peers++;
     const policy = this.edge.icePolicy;
     const ev: PeerLinkEvents = {
@@ -967,6 +971,10 @@ class EdgeSession {
     const t = this.edge.limits.channelOpenTimeoutMs;
     for (const p of this.peers.values()) {
       if (p.bucket === null && now - p.createdAt > t) this.closePeer(p.slot, EdgePeerClose.Failed);
+    }
+    if (this.pendingCount <= 0 && this.sweepTimer !== null) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
     }
   }
 

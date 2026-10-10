@@ -384,8 +384,32 @@ export class HostTransport {
         }),
       onError: (err) => this.reportError(err),
     });
-    this.sweepTimer = setInterval(() => this.safely(() => this.sweep()), this.opts.sweepIntervalMs ?? 1000);
   }
+
+  /**
+   * Arms the housekeeping timer. It only runs while there is something to
+   * sweep (a negotiation, a connected peer, a deferred close or join-rate
+   * state): an empty room has no periodic timer besides the signaling
+   * keep-alive.
+   */
+  private ensureSweep(): void {
+    if (this.sweepTimer !== null || !this.running) return;
+    this.sweepTimer = setInterval(this.sweepTick, this.opts.sweepIntervalMs ?? 1000);
+  }
+
+  private readonly sweepTick = (): void => {
+    this.safely(() => this.sweep());
+    if (
+      this.sweepTimer !== null &&
+      this.pending.size === 0 &&
+      this.connected.length === 0 &&
+      this.deferredDestroy.length === 0 &&
+      (this.joinLimiter === null || this.joinLimiter.size === 0)
+    ) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
+  };
 
   /** Closes signaling and every peer (joined peers get onPeerClose 'shutdown'). */
   stop(): void {
@@ -608,6 +632,7 @@ export class HostTransport {
         srflx.push(ip);
       }
     }
+    if (this.joinLimiter !== null) this.ensureSweep(); // prunes the limiter's buckets
     if (this.joinLimiter !== null && !this.joinLimiter.take(offer.ip)) {
       this.reject(offer, this.opts.joinRateLimit?.code ?? RejectCode.TooManyPending, 'join rate limit');
       return;
@@ -636,6 +661,7 @@ export class HostTransport {
 
     const peer = new Peer(offer, srflx, performance.now());
     this.pending.set(peer.id, peer);
+    this.ensureSweep();
     const hook = this.opts.onJoinRequest;
     if (hook === undefined) {
       this.negotiate(peer, offer);
@@ -717,7 +743,14 @@ export class HostTransport {
           if (peer.state === 'negotiating') this.failNegotiation(peer, `channel ${index} closed`);
           else if (peer.state !== 'closed') this.closePeer(peer, 'closed');
         }),
-      onMessage: (index, msg) => this.safely(() => this.onChannelMessage(peer, index, msg)),
+      // hot path: no per-message closure (same guarantee as `safely`)
+      onMessage: (index, msg) => {
+        try {
+          this.onChannelMessage(peer, index, msg);
+        } catch (err) {
+          this.reportError(err);
+        }
+      },
       onAbuse: (kind) =>
         this.safely(() => {
           if (peer.state === 'negotiating' || peer.state === 'validating') this.failNegotiation(peer, `edge ${kind}`);
@@ -932,7 +965,14 @@ export class HostTransport {
     const data = msg;
     if (state === 'joined') {
       const cb = this.onPeerMessage;
-      if (cb !== null) this.callUser(() => cb(peer, data, channel));
+      if (cb !== null) {
+        // inlined `callUser` (hot path: no per-message closure)
+        try {
+          cb(peer, data, channel);
+        } catch (err) {
+          this.reportError(err);
+        }
+      }
       return;
     }
     if (state === 'challenged' && data.length > 0 && data[0] === 0) {
@@ -1028,8 +1068,10 @@ export class HostTransport {
       const ji = this.joined.indexOf(peer);
       if (ji >= 0) this.joined.splice(ji, 1);
     }
-    if (deferNative && this.running) this.deferredDestroy.push(peer);
-    else this.destroyNative(peer);
+    if (deferNative && this.running) {
+      this.deferredDestroy.push(peer);
+      this.ensureSweep();
+    } else this.destroyNative(peer);
     if (state === 'joined') {
       const cb = this.onPeerClose;
       if (cb !== null) this.callUser(() => cb(peer, reason));

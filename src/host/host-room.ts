@@ -3,10 +3,12 @@
  * glue of `HBInit`), on top of {@link HostTransport} and {@link Sequencer}.
  *
  *   clock      frame = ((now - start) * 0.06) | 0, every pending frame is
- *              simulated on each wake-up (official `Wa.Da`). Wake-ups are
- *              timers aligned to the next frame that has work: every frame
- *              while a game runs, else the next heartbeat / checksum / queued
- *              event. No players and no game = no timers at all.
+ *              simulated on each wake-up (official `Wa.Da`). Wake-ups come
+ *              from ONE process-wide timer ({@link hostClock}) aligned to the
+ *              next frame that has work: heartbeat / checksum (/ queued event
+ *              without a game), the Ping event, and while a game runs at
+ *              least every `maxWakeFrames`. No players and no game = no
+ *              wake-ups at all. Every client message catches up first.
  *   messages   client msg 1 -> {@link Sequencer.clientMessage}, msg 2 -> pong
  *              (msg 4); any error -> "Bad actor" (KickBanPlayer broadcast + close).
  *   joins      JoinRoom event, then the snapshot (msg 1) to the new client.
@@ -50,6 +52,7 @@ import {
 } from '../room/index.js';
 import { defaultStadiums, parseHbs, type Disc, type Stadium } from '../sim/index.js';
 import { ReplayRecorder } from '../replay/index.js';
+import { ClockEntry, hostClock } from './clock.js';
 import {
   ProtocolViolation,
   Sequencer,
@@ -70,6 +73,12 @@ export const HostDefaults = {
   checksumIntervalFrames: 600,
   /** `setInterval(() => D.oc(da.V(D)), 3e3)`. */
   pingIntervalMs: 3000,
+  /**
+   * While a game runs, catch up at least every 4 frames (66.7 ms; the
+   * official host runs every 50 ms = ~3 frames). With the default heartbeat
+   * of 7 frames that is 2 wake-ups per heartbeat (~17/s, official 20/s).
+   */
+  maxWakeFrames: 4,
 } as const;
 
 export interface HostRoomOptions {
@@ -94,6 +103,15 @@ export interface HostRoomOptions {
   checksumIntervalFrames?: number;
   /** Ping event period (default 3000 ms). Only runs while clients are connected. */
   pingIntervalMs?: number;
+  /**
+   * While a game runs, the host simulates at least every this many frames
+   * even when no message arrives (default 4 = 66.7 ms; official ≈ 3). It
+   * bounds how late per-frame hooks (`onGameTick`, `onTeamGoal`, …) fire and
+   * how stale queries are between messages; frames are always simulated
+   * one by one (batched like the official 50 ms loop), so the result is the
+   * same. Lower = more wake-ups; `Infinity` = only at heartbeats/messages.
+   */
+  maxWakeFrames?: number;
   /** Clock (ms) for tests. Default `performance.now`. */
   now?: () => number;
 }
@@ -192,8 +210,6 @@ export class HostRoom {
   readonly state: RoomState;
   readonly transport: HostTransport;
   readonly sequencer: Sequencer;
-  heartbeatFrames: number;
-  checksumIntervalFrames: number;
   readonly pingIntervalMs: number;
   /** `.hbr2` recorder (one per room, reused): see {@link startRecording}. */
   readonly recorder = new ReplayRecorder();
@@ -225,19 +241,30 @@ export class HostRoom {
   /** off `wh`. */
   private nextPlayerId = 1;
   private running = false;
-  private timer: NodeJS.Timeout | null = null;
-  private timerFrame = -1;
-  private pingTimer: NodeJS.Timeout | null = null;
+  private hbFrames: number;
+  private csFrames: number;
+  private wakeFrames: number;
+  /** Registration in the shared clock (wake-up callback bound once). */
+  private readonly clockEntry = new ClockEntry(() => this.onWake());
+  /** Frame / ping time last handed to the clock (avoids re-arming when unchanged). */
+  private wakeFrame = NaN;
+  private wakePing = NaN;
+  /** Room-clock ms of the next Ping event (Infinity while no client is ready). */
+  private nextPingAt = Infinity;
   private readonly deferred: (() => void)[] = [];
   private flushing = false;
   private readonly pongWriter = new Writer(32);
+  /** Reused for every client message (a nested message gets its own). */
+  private readonly reader = new Reader(new Uint8Array(0));
+  private readerBusy = false;
 
   constructor(opts: HostRoomOptions) {
     this.transport = opts.transport;
     this.state = opts.state ?? createHostRoomState();
     this.now = opts.now ?? (() => performance.now());
-    this.heartbeatFrames = opts.heartbeatFrames ?? HostDefaults.heartbeatFrames;
-    this.checksumIntervalFrames = opts.checksumIntervalFrames ?? HostDefaults.checksumIntervalFrames;
+    this.hbFrames = opts.heartbeatFrames ?? HostDefaults.heartbeatFrames;
+    this.csFrames = opts.checksumIntervalFrames ?? HostDefaults.checksumIntervalFrames;
+    this.wakeFrames = HostRoom.checkWakeFrames(opts.maxWakeFrames ?? HostDefaults.maxWakeFrames);
     this.pingIntervalMs = opts.pingIntervalMs ?? HostDefaults.pingIntervalMs;
     const sink: SequencerSink = {
       // one tunnel message for everyone when the players are behind a haxlite Edge
@@ -273,6 +300,7 @@ export class HostRoom {
       if (cb !== null) this.callUser(() => cb(link));
     };
     this.publishPlayerCount();
+    hostClock.add(this.clockEntry);
     t.start();
     this.schedule();
   }
@@ -281,9 +309,9 @@ export class HostRoom {
   stop(): void {
     if (!this.running) return;
     this.running = false;
-    this.clearTimer();
-    if (this.pingTimer !== null) clearInterval(this.pingTimer);
-    this.pingTimer = null;
+    hostClock.remove(this.clockEntry);
+    this.wakeFrame = this.wakePing = NaN;
+    this.nextPingAt = Infinity;
     this.transport.stop();
     this.deferred.length = 0;
     this.recorder.cancel();
@@ -291,6 +319,38 @@ export class HostRoom {
 
   get isRunning(): boolean {
     return this.running;
+  }
+
+  /** Frames between heartbeats (msg 3). Live-tunable. */
+  get heartbeatFrames(): number {
+    return this.hbFrames;
+  }
+  set heartbeatFrames(v: number) {
+    this.hbFrames = v;
+    this.schedule();
+  }
+
+  /** Frames between CheckConsistency events. Live-tunable. */
+  get checksumIntervalFrames(): number {
+    return this.csFrames;
+  }
+  set checksumIntervalFrames(v: number) {
+    this.csFrames = v;
+    this.schedule();
+  }
+
+  /** Catch-up bound while a game runs (see {@link HostRoomOptions.maxWakeFrames}). Live-tunable. */
+  get maxWakeFrames(): number {
+    return this.wakeFrames;
+  }
+  set maxWakeFrames(v: number) {
+    this.wakeFrames = HostRoom.checkWakeFrames(v);
+    this.schedule();
+  }
+
+  private static checkWakeFrames(v: number): number {
+    if (!(v >= 1)) throw new RangeError(`maxWakeFrames must be >= 1 (got ${v})`);
+    return v === Infinity ? v : Math.floor(v);
   }
 
   /** Current frame (as of the last catch-up; call {@link update} to catch up now). */
@@ -550,6 +610,11 @@ export class HostRoom {
       return;
     }
     this.invoke(fn);
+    this.settle();
+  }
+
+  /** After a top-level operation: run the actions deferred by hooks, then re-arm the clock. */
+  private settle(): void {
     if (this.deferred.length > 0 && !this.flushing) {
       this.flushing = true;
       try {
@@ -598,57 +663,96 @@ export class HostRoom {
     const seq = this.sequencer;
     const n = this.targetFrame() - seq.frame;
     if (n > 0) seq.advance(n);
-    seq.periodic(this.heartbeatFrames, this.checksumIntervalFrames);
+    seq.periodic(this.hbFrames, this.csFrames);
   }
 
-  private clearTimer(): void {
-    if (this.timer !== null) clearTimeout(this.timer);
-    this.timer = null;
-    this.timerFrame = -1;
-  }
-
-  /** Pre-bound so the per-frame timer allocates nothing. */
+  /** Pre-bound so wake-ups allocate nothing. */
   private readonly catchUpFn = (): void => this.catchUp();
+  private readonly pingFn = (): void => this.broadcastPings();
 
-  private readonly onTimer = (): void => {
-    this.timer = null;
-    this.timerFrame = -1;
-    this.run(this.catchUpFn);
-  };
+  /** Shared clock callback: Ping event if due, else catch up. */
+  private onWake(): void {
+    this.wakeFrame = NaN; // always hand the clock a fresh wake-up time
+    if (!this.running) return;
+    const now = this.now();
+    if (now >= this.nextPingAt) {
+      // setInterval-like cadence; never fire twice in a row after a stall
+      let next = this.nextPingAt + this.pingIntervalMs;
+      if (next <= now) next = now + this.pingIntervalMs;
+      this.nextPingAt = next;
+      this.run(this.pingFn);
+    } else {
+      this.run(this.catchUpFn);
+    }
+  }
 
-  /** Arms one timer for the next frame with work (none when idle). */
+  /**
+   * Next frame with work, or Infinity: with ready clients the next heartbeat
+   * and CheckConsistency (and, without a game, the next queued event); with a
+   * game, at least every `maxWakeFrames` (spread evenly inside each
+   * heartbeat period so heartbeats keep their exact frames).
+   */
+  private nextWakeFrame(): number {
+    const seq = this.sequencer;
+    const frame = seq.frame;
+    const hb = this.hbFrames;
+    const clients = this.ready.length > 0;
+    let next = Infinity;
+    if (clients) {
+      next = seq.lastHeartbeatFrame + hb;
+      const cs = seq.lastChecksumFrame + this.csFrames;
+      if (cs < next) next = cs;
+    }
+    if (this.state.gameState !== null) {
+      const mw = this.wakeFrames;
+      if (!clients) {
+        const f = frame + (mw < hb ? mw : hb);
+        if (f < next) next = f;
+      } else if (mw < hb) {
+        // k catch-ups per heartbeat period: lastHeartbeat + ceil(i * hb / k)
+        const base = seq.lastHeartbeatFrame;
+        const k = Math.ceil(hb / mw);
+        for (let i = 1; i < k; i++) {
+          const f = base + Math.ceil((i * hb) / k);
+          if (f > frame) {
+            if (f < next) next = f;
+            break;
+          }
+        }
+      }
+    } else if (clients && seq.queue.length > 0) {
+      const q = seq.queue[0]!.frame;
+      if (q < next) next = q;
+    }
+    return next <= frame ? frame + 1 : next;
+  }
+
+  /** Tells the shared clock when this room next has work (nothing when idle). */
   private schedule(): void {
     if (!this.running) return;
-    const seq = this.sequencer;
-    const hasGame = this.state.gameState !== null;
-    if (!hasGame && this.ready.length === 0) {
-      this.clearTimer();
+    const frame = this.nextWakeFrame();
+    const ping = this.nextPingAt;
+    if (frame === this.wakeFrame && ping === this.wakePing) return;
+    this.wakeFrame = frame;
+    this.wakePing = ping;
+    if (frame === Infinity && ping === Infinity) {
+      hostClock.set(this.clockEntry, Infinity);
       return;
     }
-    let next: number;
-    if (hasGame) {
-      next = seq.frame + 1;
-    } else {
-      next = seq.lastHeartbeatFrame + this.heartbeatFrames;
-      const cs = seq.lastChecksumFrame + this.checksumIntervalFrames;
-      if (cs < next) next = cs;
-      if (seq.queue.length > 0 && seq.queue[0]!.frame < next) next = seq.queue[0]!.frame;
-      if (next <= seq.frame) next = seq.frame + 1;
-    }
-    if (this.timer !== null && this.timerFrame === next) return;
-    this.clearTimer();
-    this.timerFrame = next;
-    const delay = Math.ceil(this.startTime + next / TICKS_PER_MS - this.now());
-    this.timer = setTimeout(this.onTimer, delay > 0 ? delay : 0);
+    const now = this.now();
+    let delay = this.startTime + frame / TICKS_PER_MS - now;
+    const pingDelay = ping - now;
+    if (pingDelay < delay) delay = pingDelay;
+    // exact boundary: the clock rounds up and adds its own slack
+    hostClock.set(this.clockEntry, performance.now() + (delay > 0 ? delay : 0));
   }
 
+  /** Starts / stops the 3 s Ping event with the first / last ready client. */
   private updatePingTimer(): void {
-    const want = this.running && this.ready.length > 0;
-    if (want && this.pingTimer === null) {
-      this.pingTimer = setInterval(() => this.run(() => this.broadcastPings()), this.pingIntervalMs);
-    } else if (!want && this.pingTimer !== null) {
-      clearInterval(this.pingTimer);
-      this.pingTimer = null;
+    if (this.running && this.ready.length > 0) {
+      if (this.nextPingAt === Infinity) this.nextPingAt = this.now() + this.pingIntervalMs;
+    } else {
+      this.nextPingAt = Infinity;
     }
   }
 
@@ -741,15 +845,26 @@ export class HostRoom {
     return c instanceof HostConnection ? c : null;
   }
 
-  /** official `Wa.Jh`. */
+  /** official `Wa.Jh` (allocation-free: no closure, reused reader). */
   private handleMessage(peer: Peer, data: Uint8Array): void {
     const c = this.connectionOf(peer);
     if (c === null || c.closed) return;
-    this.run(() => {
+    if (this.sequencer.busy) {
+      this.deferred.push(() => this.processMessage(c, data));
+      return;
+    }
+    this.processMessage(c, data);
+    this.settle();
+  }
+
+  private processMessage(c: HostConnection, data: Uint8Array): void {
+    try {
       if (c.closed) return;
       this.catchUp();
+      const nested = this.readerBusy;
+      const r = nested ? new Reader(data) : this.reader.reset(data);
+      this.readerBusy = true;
       try {
-        const r = new Reader(data);
         const type = r.u8();
         if (type === ClientMsg.Event) this.sequencer.clientMessage(c, r, this.now());
         else if (type === ClientMsg.Ping) this.handlePing(c, r);
@@ -757,8 +872,12 @@ export class HostRoom {
         if (r.remaining > 0) throw new ProtocolViolation('trailing bytes');
       } catch (err) {
         this.badActor(c, err);
+      } finally {
+        this.readerBusy = nested;
       }
-    });
+    } catch (err) {
+      this.reportError(err);
+    }
   }
 
   /** official `Wa.Kh`: store the declared ping, answer with the host frame (+ Sb) and the echo. */
