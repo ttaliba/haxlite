@@ -1,0 +1,50 @@
+{
+ "info": {
+  "node": "v22.22.0",
+  "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+  "nproc": 4,
+  "TICKS": 200000,
+  "ROUNDS": 5,
+  "WARMUP": 20000
+ },
+ "runs": [
+  {
+   "date": "2026-10-10T21:18:05.308Z",
+   "rows": [
+    {
+     "label": "Classic, 8 players (13 discs)",
+     "haxliteNs": 1030.772675,
+     "officialNs": 1902.455825,
+     "speedup": 1.8456599317594446,
+     "haxliteHeapGrowthKiB": 18.0546875
+    },
+    {
+     "label": "Huge, 25 players (30 discs)",
+     "haxliteNs": 3432.7076,
+     "officialNs": 6746.472555,
+     "speedup": 1.9653501961541961,
+     "haxliteHeapGrowthKiB": 0.15625
+    }
+   ]
+  },
+  {
+   "date": "2026-10-10T21:18:20.339Z",
+   "rows": [
+    {
+     "label": "Classic, 8 players (13 discs)",
+     "haxliteNs": 1083.04067,
+     "officialNs": 1831.636255,
+     "speedup": 1.6911980369121316,
+     "haxliteHeapGrowthKiB": 18.0546875
+    },
+    {
+     "label": "Huge, 25 players (30 discs)",
+     "haxliteNs": 3376.52046,
+     "officialNs": 6844.184015,
+     "speedup": 2.026993200864537,
+     "haxliteHeapGrowthKiB": 0.15625
+    }
+   ]
+  }
+ ]
+}

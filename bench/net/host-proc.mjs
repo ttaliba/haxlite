@@ -98,7 +98,10 @@ async function haxliteFactory() {
       maxPlayers: MAX_PLAYERS,
       roomInfo: { name: `bench ${i}`, flag: GEO.code, lat: GEO.lat, lon: GEO.lon },
     });
-    const host = new HostRoom({ transport, state: createHostRoomState({ roomName: `bench ${i}`, noPlayer: true }) });
+    // HAXLITE_HOST_OPTS (diagnostics only, never set for the published results):
+    // extra HostRoom options, e.g. '{"heartbeatFrames":9}'.
+    const extra = process.env.HAXLITE_HOST_OPTS ? JSON.parse(process.env.HAXLITE_HOST_OPTS) : {};
+    const host = new HostRoom({ transport, state: createHostRoomState({ roomName: `bench ${i}`, noPlayer: true }), ...extra });
     host.onError = (e) => send({ type: 'error', message: `haxlite onError: ${e?.stack ?? e}` });
     host.onRoomLink = (link) => onLink(link);
     host.start();
