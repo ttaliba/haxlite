@@ -56,6 +56,7 @@ Dependencias permitidas (de arriba abajo, nunca al revés):
 | `src/net/` | backend HTTP, WS de señalización, transporte WebRTC, handshake/identidad, bans, flood | **ingeniero C** |
 | `src/host/` | secuenciador/netcode | fase 2 |
 | `src/api/` | capa compatible con `HBInit` | fase 2 |
+| `src/edge/` | haxlite Edge: gateway WebRTC que oculta la IP del host (servidor + CLI); el lado host es `src/net/edge-client.ts` (`HostTransportOptions.edge`). Ver [09](09-haxlite-edge.md) | ingeniero E |
 | `test/oracle/` | oráculos diferenciales (node-haxball y el script oficial) | fundación |
 | `test/<módulo>/` | tests de cada módulo | dueño del módulo |
 

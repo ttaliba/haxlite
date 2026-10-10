@@ -16,6 +16,12 @@
  * (CIDR/auth bans, join rate limit, pre-join hook, allowNullAuth=false) are
  * opt-in.
  *
+ * Where the player PeerConnections live is a {@link PeerBackend}: this
+ * process ({@link LocalPeerBackend}, default) or a remote haxlite Edge
+ * (`edge: {url, key}` → `EdgePeerBackend`, docs/09), which keeps this
+ * machine's address away from players. Everything above (admission, answer
+ * timing, challenge, handshake, flood, timeouts, bans) is identical for both.
+ *
  * Usage:
  * ```ts
  * const t = new HostTransport({ token, public: true, roomInfo: { name: 'My room' } });

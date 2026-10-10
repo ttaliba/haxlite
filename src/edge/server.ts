@@ -701,7 +701,8 @@ class EdgeSession {
 
   /** Data-plane frame from the host on tunnel channel `ch`. */
   private onDcMessage(ch: number, msg: Buffer): void {
-    if (this.phase !== SPhase.Ready || msg.length < 2) return;
+    // DataPlane too: the host may see the channels open (and use them) a moment before we do
+    if ((this.phase !== SPhase.Ready && this.phase !== SPhase.DataPlane) || msg.length < 2) return;
     const slot = (msg[0]! << 8) | msg[1]!;
     if (slot !== 0) {
       this.deliver(slot, ch, msg.subarray(2));
@@ -856,7 +857,8 @@ class EdgeSession {
   private onPeerOpen(slot: number, sdp: string): void {
     const k = this.key!;
     const lim = this.edge.limits;
-    if (this.phase !== SPhase.Ready) return this.refuse(slot, EdgePeerClose.Failed, 'data plane not ready');
+    // DataPlane is accepted: the host may see the tunnel channels open a moment before the edge does
+    if (this.phase !== SPhase.Ready && this.phase !== SPhase.DataPlane) return this.refuse(slot, EdgePeerClose.Failed, 'not ready');
     if (slot === 0 || this.peers.has(slot)) return this.refuse(slot, EdgePeerClose.Limit, 'slot in use');
     if (this.peers.size >= lim.maxPeersPerSession) return this.refuse(slot, EdgePeerClose.Limit, 'session peer limit');
     if (k.peers >= this.edge.peerQuota(k)) return this.refuse(slot, EdgePeerClose.Limit, 'key peer quota');

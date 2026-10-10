@@ -142,6 +142,14 @@ are thrown synchronously, as official.
 * E2E with node-haxball clients (`test/host/e2e*.test.ts`): byte-identical confirmed states,
   all consistency checks pass, kicks/admin kicks/bans/clearBan, late join, replay.
 
+## haxlite Edge
+
+With `new HostTransport({ …, edge: { url, key } })` (or `HBInit({ haxlite: { edge } })`) the
+player PeerConnections live on a remote haxlite Edge and this process never talks to players
+(docs/09-haxlite-edge.md). Nothing changes for HostRoom except that broadcasts go through
+`transport.broadcastTo(this.ready, channel, data)`, which the edge backend turns into one
+multicast tunnel message (the local backend loops `send`).
+
 ## Deviations from the official host
 
 * Precise frame-aligned timers instead of `setInterval(Da, 50)` (frame math identical;

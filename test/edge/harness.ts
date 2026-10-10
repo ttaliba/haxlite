@@ -24,7 +24,8 @@ export function makeKey(id: string): TestKey {
   return { id, secret, key: `${id}:${secret}` };
 }
 
-export async function startEdge(keys: TestKey[], opts: Partial<EdgeServerOptions> = {}): Promise<EdgeServer> {
+export async function startEdge(keys: TestKey[], options: Partial<EdgeServerOptions> = {}): Promise<EdgeServer> {
+  const { webrtc, ...opts } = options;
   return EdgeServer.start({
     host: EDGE_IP,
     port: 0,
@@ -36,7 +37,7 @@ export async function startEdge(keys: TestKey[], opts: Partial<EdgeServerOptions
       // secure default ('public'): host/tunnel loopback candidates are dropped
       // and connections come up through peer-reflexive discovery
       iceCandidatePolicy: 'all',
-      ...opts.webrtc,
+      ...webrtc,
     },
     log: process.env.EDGE_DEBUG ? (m) => console.log(`[edge] ${m}`) : undefined,
     ...opts,

@@ -83,6 +83,11 @@ Complementos:
 
 ### Nivel 3: algo delante (si los niveles 1–2 no alcanzan)
 
+> **Implementado:** [haxlite Edge (doc 09)](09-haxlite-edge.md). Un gateway WebRTC en un
+> servidor protegido termina las conexiones de los jugadores; el host solo abre un túnel
+> saliente hacia él y nunca habla con los jugadores. Funciona con el cliente oficial y no
+> depende de TURN ni del bug de relay-only de libjuice.
+
 - **Proxy UDP tipo NAT** en la misma ciudad, sobre hosting protegido. Funciona con el cliente oficial: se simuló un proxy por flujo con 3 clientes y DTLS/SCTP funcionaron. Es más simple que TURN, pero exige que el host **nunca** envíe directo (firewall de salida) y una IP de origen que nunca se haya expuesto.
 - **TURN propio endurecido:** el puerto 3478 cerrado a todo salvo el host, `no-tcp-relay`, cuotas, coturn ≥ 4.17.2 y hosting con filtrado aguas arriba.
 - **Cloudflare Spectrum UDP o Magic Transit:** oculta el origen y absorbe el ataque, pero es Enterprise. Hay que desactivar los encabezados Proxy Protocol (SPP/PROXY v2) porque rompen STUN/DTLS.

@@ -29,7 +29,13 @@ export {
   type JoinInfo,
   type ListedRoom,
   type RoomInfo,
+  EdgeError,
+  type EdgeOptions,
+  type EdgeBackendStats,
 } from './net/index.js';
+
+// ---- haxlite Edge (WebRTC gateway that hides the host's IP, docs/09)
+export { EdgeServer, type EdgeServerOptions, type EdgeKeyConfig, type EdgeStats } from './edge/index.js';
 
 // ---- replays (.hbr2)
 export { readReplay, writeReplay, ReplayData, ReplayPlayer, ReplayRecorder } from './replay/index.js';
@@ -47,3 +53,4 @@ export * as room from './room/index.js';
 export * as net from './net/index.js';
 export * as host from './host/index.js';
 export * as replay from './replay/index.js';
+export * as edge from './edge/index.js';

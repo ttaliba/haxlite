@@ -3,6 +3,10 @@
  * node-haxball clients): bad key, WebSocket data plane, two hosts on one
  * edge, tunnel drop + reconnect, edge flood limiter, stats endpoint.
  */
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { FakeMaster } from '../fake-master/index.js';
 import { nodeHaxballFor } from '../fake-master/node-haxball.js';
@@ -101,6 +105,49 @@ describe('haxlite Edge tunnel', () => {
       open.leave();
     } finally {
       await room.haxlite.stop();
+    }
+  }, 60_000);
+
+  it('wss:// (TLS) control channel, certificate reload', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'haxlite-edge-tls-'));
+    const certFile = path.join(dir, 'cert.pem');
+    const keyFile = path.join(dir, 'key.pem');
+    try {
+      execFileSync('openssl', [
+        'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-days', '1',
+        '-subj', '/CN=haxlite-edge-test', '-addext', `subjectAltName=IP:${EDGE_IP}`, '-keyout', keyFile, '-out', certFile,
+      ], { stdio: 'ignore' });
+    } catch {
+      console.warn('openssl not available: TLS test skipped');
+      return;
+    }
+    const tlsEdge = await startEdge([keyA], { tls: { certFile, keyFile } });
+    try {
+      expect(tlsEdge.url()).toMatch(/^wss:\/\//);
+      // an untrusted certificate is refused by the host (non-fatal: it keeps retrying)
+      const t = new HostTransport({ token: 'x', masterUrl: master.httpBase, edge: edgeConfig(tlsEdge, keyA, { reconnectMinMs: 5000 }) });
+      const errs: Error[] = [];
+      t.onError = (err) => errs.push(err);
+      t.start();
+      await waitFor(() => errs.length > 0, 5000, 'tls error');
+      expect((errs[0] as EdgeError).kind).toBe('connect');
+      t.stop();
+      // trusted (pinned CA): works end to end
+      const e = await E2E.start({
+        shared: { master, nh },
+        transport: { edge: edgeConfig(tlsEdge, keyA, { wsOptions: { ca: readFileSync(certFile) } }) },
+      });
+      try {
+        await e.join('tls');
+        await waitFor(() => e.host.state.players.length === 2, 5000, 'joined');
+        tlsEdge.reloadTls();
+        expect(backendOf(e).stats().state).toBe('ready');
+      } finally {
+        await e.close();
+      }
+    } finally {
+      await tlsEdge.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   }, 60_000);
 

@@ -19,6 +19,7 @@ Todo sale de leer el código, que en ambos casos está minificado; no se captur�
 | 06 | [Arquitectura de haxlite](docs/06-arquitectura-haxlite.md) | Host propio en TypeScript: módulos, reglas de código y oráculos de prueba (`npm test`) |
 | 07 | [Benchmarks](docs/07-benchmarks.md) | CPU, memoria, GC y lag: haxlite vs host oficial vs node-haxball |
 | 08 | [Ocultar y proteger la IP](docs/08-ocultar-ip.md) | Por qué se ve la IP, fuga de relay-only en libjuice, Cloudflare TURN, anti-DDoS, firewall `haxguard`, IP por jugador |
+| 09 | [haxlite Edge](docs/09-haxlite-edge.md) | Gateway WebRTC que oculta la IP del host: arquitectura, despliegue (TLS, systemd, firewall), seguridad, configuración y overhead medido |
 
 ## haxlite: uso
 
