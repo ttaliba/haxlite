@@ -321,7 +321,9 @@ mensajes con menos trabajo JS. Evidencia:
    así que lo que pesa es la **frecuencia** de despertares (60/s vs 20/s), no la asignación del
    `Timeout`. Con varias salas los timers coinciden en el mismo ciclo del loop y el coste crece
    poco.
-3. **No son los heartbeats**: con `heartbeatFrames: 9` (cadencia ≈ oficial) la CPU no baja
+3. **No es un artefacto del monitor de lag**: sin `monitorEventLoopDelay` la diferencia se
+   mantiene (N = 4: haxlite 4,91 (4,85–5,12) % vs oficial 4,46 (4,46–4,60) %, `diag-noeld.json`).
+4. **No son los heartbeats**: con `heartbeatFrames: 9` (cadencia ≈ oficial) la CPU no baja
    (`diag-heartbeat9.json`: N = 4 5,68 %, N = 20 22,5 %).
 
 Impacto: ~0,3–0,5 % de un núcleo por proceso (no por cliente). Es el precio de enviar heartbeats y
@@ -379,8 +381,9 @@ un frame (16,7 ms) en p99.
   añadirían jitter que aquí no se mide.
 * Los clientes son node-haxball, no navegadores; los dos shims de §1.1 son necesarios para ellos.
 * El monitor de lag (timer de 10 ms) y el muestreo de 1 s también consumen CPU dentro del proceso
-  medido, igual para los tres (orden de 0,5–1 punto según §5.1); los valores absolutos de CPU en
-  partida lo incluyen. Ver `diag-noeld.json` para la medida sin monitor.
+  medido, igual para los tres: **≈ 0,7–0,8 puntos** (N = 4 sin monitor, `diag-noeld.json`:
+  haxlite 4,91 %, oficial 4,46 %, frente a 5,71 % / 5,17 % con monitor en la misma máquina). Los
+  valores absolutos de CPU en partida y K salas lo incluyen; las diferencias entre hosts no cambian.
 * El host oficial corre en `haxball.js` (Node, `@webrtc-node/webrtc`, pako sustituido por zlib),
   no en el navegador headless de haxball.com; node-haxball usa su propio `node-datachannel` 0.25.
 * En K salas el oficial y node-haxball evalúan/crean una instancia por sala en el mismo proceso;

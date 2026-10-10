@@ -77,7 +77,7 @@ export class E2E {
   }
 
   static async start(
-    opts: Partial<HostRoomOptions> & {
+    opts: Partial<Omit<HostRoomOptions, 'transport'>> & {
       transport?: Partial<ConstructorParameters<typeof HostTransport>[0]>;
       shared?: { master: FakeMaster; nh: Any };
     } = {},
