@@ -18,6 +18,8 @@
  *        ev.B = byId; ev.apply(roomState))
  *   vb = event registry (vb.Ci() registers ids 0..23)
  *   w  = Stadium (w.Fd() = built-in stadiums)
+ *   Wa = host runner (Mh client event, oc host event, rg advance, Zd heartbeat,
+ *        Wh checksum, $h snapshot), Za = its per-connection state
  *
  * Use it to confirm node-haxball == official for a scenario (see
  * cross-oracle.test.ts), or directly as the reference for physics/rules.
@@ -36,6 +38,9 @@ interface OfficialInternals {
   m: Any;
   vb: Any;
   w: Any;
+  /** Host runner (`Wa extends Ma`) and its per-connection state (`Za`): used by test/host. */
+  Wa: Any;
+  Za: Any;
 }
 
 let cached: OfficialInternals | null = null;
@@ -48,7 +53,7 @@ export function officialInternals(): OfficialInternals {
   const start = src.indexOf('(function(wa) {');
   const end = src.lastIndexOf('F.sh();');
   if (start < 0 || end < 0 || end < start) throw new Error('official headless script layout changed (haxball.js upgraded?)');
-  const body = `${src.slice(start, end)}__capture({ Ta, L, A, m, vb, w });\n})(window);`;
+  const body = `${src.slice(start, end)}__capture({ Ta, L, A, m, vb, w, Wa, Za });\n})(window);`;
   const fakeWindow = {
     setTimeout,
     clearTimeout,

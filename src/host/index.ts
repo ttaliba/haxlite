@@ -1,8 +1,28 @@
 /**
- * src/host — sequencer / netcode (PHASE 2): host frame clock (60 Hz,
- * catch-up loop), event scheduling (frame + order, clamp to [frame, frame+20],
- * input delay 2), broadcast (msg 2), frame sync (msg 3), join snapshot
- * (msg 1), CheckConsistency every 600 frames, Ping event every 3 s.
- * See docs/04.
+ * src/host — the authoritative host engine (sequencer / netcode): 60 Hz
+ * frame clock with catch-up, client event scheduling (official `Wa.Mh`),
+ * host events (`oc`), heartbeats (msg 3), join snapshot (msg 1),
+ * CheckConsistency, pings, kicks/bans, host actions and `.hbr2` recording.
+ * See src/host/README.md (facade contract) and docs/04.
  */
-export {};
+export {
+  HostConnection,
+  HostDefaults,
+  HostRoom,
+  createHostRoomState,
+  type DiscProperties,
+  type DiscPropsInput,
+  type HostRoomOptions,
+  type Scores,
+} from './host-room.js';
+export {
+  MovingAverage,
+  ProtocolViolation,
+  Sequencer,
+  SequencerClient,
+  encodePong,
+  encodeTargetedEvent,
+  type BeforeOperationHook,
+  type SequencerOptions,
+  type SequencerSink,
+} from './sequencer.js';

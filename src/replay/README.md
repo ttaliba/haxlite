@@ -54,10 +54,12 @@ This is exactly the official `Ma.rg` loop (`apply → Ab(ev)` … `Ca.Da(1)`, `d
    ```
    This covers both official apply paths: the per-frame queue drain (`Ma.rg`) and the
    immediate apply of an event that arrives for the current frame (`Ma.Cf`). Record
-   **all** applied events, including host-generated `CheckConsistency`, `Ping`,
+   **all** applied events, including host-generated `Ping`,
    `SetPlayerSync`, chat indicators, inputs, and events whose `apply` turns out to be a
    no-op (rejected admin action). Do **not** record events that never reach `apply`
-   (dropped by `checkClientSender`/`validate`/rate limits). Call it after `apply`
+   (dropped by `checkClientSender`/`validate`/rate limits), nor `CheckConsistency`:
+   the official host only broadcasts it and never applies it, so the official recorder
+   never sees it. Call it after `apply`
    because the official recorder serializes the event object after applying it.
    When not recording, `onEvent` is a single boolean test; the host may also skip the
    call with `if (recorder.isRecording)`.
