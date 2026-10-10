@@ -34,7 +34,7 @@ afterEach(() => {
 
 afterAll(async () => {
   await master?.close();
-  shutdownWebRtc();
+  await shutdownWebRtc();
   cleanupNodeHaxball();
 });
 

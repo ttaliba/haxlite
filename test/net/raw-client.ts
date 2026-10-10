@@ -4,13 +4,14 @@
  * node-datachannel + haxlite's codec/auth helpers. Lets tests drive what a
  * node-haxball client can't (custom offers, floods, raw messages).
  */
-import { PeerConnection, type DataChannel } from 'node-datachannel';
+import type { DataChannel, PeerConnection } from 'node-datachannel';
 import { WebSocket } from 'ws';
 import { Reader, Writer, deflateRaw, inflateRaw } from '../../src/codec/index.js';
 import { CHANNELS } from '../../src/net/constants.js';
 import { createAuthBlob, type PlayerIdentity } from '../../src/net/auth.js';
 import { encodeHandshake, type JoinPlayerInfo } from '../../src/net/handshake.js';
 import type { IceCandidateInit } from '../../src/net/ice.js';
+import { closeNative, createDataChannel, createPeerConnection } from '../../src/net/webrtc.js';
 
 export interface RawJoinOptions {
   wsBase: string;
@@ -109,18 +110,8 @@ export class RawClient {
     } catch {
       /* ignore */
     }
-    for (const dc of this.channels) {
-      try {
-        dc.close();
-      } catch {
-        /* ignore */
-      }
-    }
-    try {
-      this.pc?.close();
-    } catch {
-      /* ignore */
-    }
+    for (const dc of this.channels) closeNative(dc);
+    if (this.pc !== null) closeNative(this.pc);
     this.pc = null;
   }
 
@@ -139,48 +130,66 @@ export class RawClient {
       return;
     }
     let sdp = 'v=0\r\n';
-    const cands: IceCandidateInit[] = [];
     if (!o.signalingOnly) {
-      const pc = new PeerConnection('raw-client', { iceServers: [] });
-      this.pc = pc;
+      let gatheredResolve!: () => void;
       const gathered = new Promise<void>((resolve) => {
-        pc.onGatheringStateChange((s) => s === 'complete' && resolve());
+        gatheredResolve = resolve;
         setTimeout(resolve, 500);
       });
-      pc.onLocalCandidate((c, mid) => {
-        const line = c.startsWith('a=') ? c.slice(2) : c;
-        const cand = { candidate: line, sdpMid: mid, sdpMLineIndex: 0 };
-        if (sdp === 'v=0\r\n') cands.push(cand);
-        else this.sendSignal(4, jsonPayload(cand));
-      });
+      // Explicit negotiation only: auto-negotiation races the explicit offer below.
+      const pc = createPeerConnection(
+        'raw-client',
+        { iceServers: [], disableAutoNegotiation: true },
+        {
+          onGatheringStateChange: (s) => s === 'complete' && gatheredResolve(),
+          onLocalCandidate: (c, mid) => {
+            const line = c.startsWith('a=') ? c.slice(2) : c;
+            const cand = { candidate: line, sdpMid: mid, sdpMLineIndex: 0 };
+            if (this.answerApplied) this.sendSignal(4, jsonPayload(cand));
+            else this.ownCandidates.push(cand);
+          },
+        },
+      );
+      this.pc = pc;
       for (let i = 0; i < CHANNELS.length; i++) {
         const cfg = CHANNELS[i]!;
-        const dc = pc.createDataChannel(cfg.label, {
-          negotiated: true,
-          id: i,
-          unordered: !cfg.ordered,
-          ...(cfg.reliable ? {} : { maxRetransmits: 0 }),
-        });
+        const dc = createDataChannel(
+          pc,
+          cfg.label,
+          {
+            negotiated: true,
+            id: i,
+            unordered: !cfg.ordered,
+            ...(cfg.reliable ? {} : { maxRetransmits: 0 }),
+          },
+          {
+            onOpen: () => {
+              if (++this.openCount === CHANNELS.length) for (const w of this.openWaiters.splice(0)) w();
+            },
+            onClosed: () => {
+              if (!this.dcClosed) {
+                this.dcClosed = true;
+                this.resolveDcClosed();
+              }
+            },
+            onMessage: (m) => this.onData(i, m),
+          },
+        );
         this.channels.push(dc);
-        dc.onOpen(() => {
-          if (++this.openCount === CHANNELS.length) for (const w of this.openWaiters.splice(0)) w();
-        });
-        dc.onClosed(() => {
-          if (!this.dcClosed) {
-            this.dcClosed = true;
-            this.resolveDcClosed();
-          }
-        });
-        dc.onMessage((m) => this.onData(i, m));
       }
       pc.setLocalDescription('offer');
       await gathered;
-      sdp = pc.localDescription()!.sdp;
+      // Candidates are trickled only after the answer is applied (see `ownCandidates`).
+      sdp = pc
+        .localDescription()!
+        .sdp.split('\r\n')
+        .filter((l) => !l.startsWith('a=candidate:') && l !== 'a=end-of-candidates')
+        .join('\r\n');
     }
     const w = new Writer(1024);
     w.u8(o.reverse ? 1 : 0);
     w.string(sdp);
-    w.json([...cands, ...(o.extraCandidates ?? [])]);
+    w.json(o.extraCandidates ?? []);
     w.u16(o.version ?? 9);
     w.nullableString(o.password ?? null);
     this.sendSignal(1, w.finish());
@@ -189,14 +198,24 @@ export class RawClient {
   private onSignal(msg: Uint8Array): void {
     const type = msg[0];
     if (msg.length <= 1 || this.pc === null) return;
-    const r = new Reader(inflateRaw(msg.subarray(1)));
-    if (type === 1) {
-      const sdp = r.string();
-      const cands = r.json<IceCandidateInit[]>();
-      this.pc.setRemoteDescription(sdp, 'answer');
-      for (const c of cands) this.addCandidate(c);
-    } else if (type === 4) {
-      this.addCandidate(r.json<IceCandidateInit>());
+    try {
+      const r = new Reader(inflateRaw(msg.subarray(1)));
+      if (type === 1) {
+        const sdp = r.string();
+        const cands = r.json<IceCandidateInit[]>();
+        this.answerSdp = sdp;
+        this.answerCandidates = cands;
+        this.pc.setRemoteDescription(sdp, 'answer');
+        for (const c of cands) this.addCandidate(c);
+        this.answerApplied = true;
+        for (const c of this.ownCandidates.splice(0)) this.sendSignal(4, jsonPayload(c));
+      } else if (type === 4) {
+        const c = r.json<IceCandidateInit>();
+        this.answerCandidates.push(c);
+        this.addCandidate(c);
+      }
+    } catch (err) {
+      this.signalError = err as Error;
     }
   }
 
@@ -224,6 +243,22 @@ export class RawClient {
   }
 
   private challengeSeen = false;
+  /**
+   * Our candidates, held back until the host's answer is applied. If the host
+   * knew them earlier it would start ICE checks at once, and over loopback
+   * libdatachannel can then run the DTLS handshake before
+   * `setRemoteDescription(answer)` has stored the remote fingerprint: the
+   * handshake fails with "certificate verify failed / unknown CA" (or the
+   * answer throws "Got a remote candidate without ICE transport"). Browser
+   * clients don't have this race.
+   */
+  private readonly ownCandidates: IceCandidateInit[] = [];
+  private answerApplied = false;
+  /** Answer SDP and candidates received from the host (privacy tests). */
+  answerSdp: string | null = null;
+  answerCandidates: IceCandidateInit[] = [];
+  /** Error applying the host's answer/candidates, if any. */
+  signalError: Error | null = null;
 }
 
 function jsonPayload(v: unknown): Uint8Array {

@@ -9,7 +9,7 @@ beforeAll(async () => {
 });
 afterAll(async () => {
   await shared?.master.close();
-  shutdownAll();
+  await shutdownAll();
 });
 
 describe('HostRoom netcode knobs', () => {

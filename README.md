@@ -18,6 +18,111 @@ Todo sale de leer el código, que en ambos casos está minificado; no se captur�
 | 05 | [Librerías y APIs](docs/05-librerias-y-apis.md) | Arquitectura de haxball.js y node-haxball, API HBInit, ejemplos y glosario |
 | 06 | [Arquitectura de haxlite](docs/06-arquitectura-haxlite.md) | Host propio en TypeScript: módulos, reglas de código y oráculos de prueba (`npm test`) |
 
+## haxlite: uso
+
+**haxlite** es un host headless de HaxBall escrito desde cero en TypeScript para Node.js ≥ 22. Habla el protocolo 9 bit a bit con los clientes oficiales del navegador y expone la misma API `HBInit` que la página headless oficial (y que `haxball.js`), sin navegador ni script oficial. Solo depende de `node-datachannel` (WebRTC), `ws` y `json5`.
+
+### Instalación
+
+```sh
+npm install haxlite          # cuando esté publicado
+# o, desde este repositorio:
+npm install && npm run build # genera dist/ con los .d.ts
+```
+
+### Token
+
+Crear una sala exige un **headless token** de <https://www.haxball.com/headlesstoken>. Caduca a los pocos minutos, así que hay que crear la sala nada más copiarlo. Si es inválido o ha caducado, el servidor maestro pide un reCAPTCHA y `HBInit` se rechaza con `InvalidRoomTokenError` (igual que haxball.js), salvo que se pase `haxlite.onRecaptcha` (ver más abajo).
+
+### Ejemplo mínimo
+
+```js
+import { HBInit } from 'haxlite';
+
+const room = await HBInit({
+  roomName: 'Mi sala',
+  maxPlayers: 16,
+  public: true,
+  noPlayer: true,
+  token: process.env.HAXBALL_TOKEN,
+});
+room.onRoomLink = (link) => console.log(link);
+room.setDefaultStadium('Big');
+room.onPlayerJoin = (player) => room.sendAnnouncement(`Hola ${player.name}`, player.id);
+room.onPlayerChat = (player, msg) => msg !== '!secreto'; // false = el mensaje no llega a nadie
+
+process.once('SIGINT', () => room.haxlite.stop()); // el proceso termina solo
+```
+
+Ejemplos completos: [`examples/basic-room.mjs`](examples/basic-room.mjs) (admin al primer jugador, equipos automáticos, comandos `!bb`, `!afk`, `!swap`, `!rr`) y [`examples/moderation.mjs`](examples/moderation.mjs) (bans persistentes en JSON, re-ban al volver con otra IP, cuarentena de chat para `auth` nuevos, mute, bans por rango CIDR y rechazo de jugadores sin `auth`). Ambos se ejecutan en los tests (`test/api/examples.test.ts`).
+
+### Compatibilidad con el `HBInit` oficial
+
+* Todos los métodos (`sendChat`, `setPlayerAdmin`, `setPlayerTeam`, `kickPlayer`, `clearBan(s)`, `setScoreLimit`, `setTimeLimit`, `setCustomStadium`, `setDefaultStadium`, `setTeamsLock`, `setTeamColors`, `startGame`, `stopGame`, `pauseGame`, `getPlayer`, `getPlayerList`, `getScores`, `getBallPosition`, `startRecording`, `stopRecording`, `setPassword`, `setRequireRecaptcha`, `reorderPlayers`, `sendAnnouncement`, `setKickRateLimit`, `setPlayerAvatar`, `set/getDiscProperties`, `set/getPlayerDiscProperties`, `getDiscCount`, `CollisionFlags`, `InputFlags`) y todos los callbacks `on*` (incluidos `onPlayerActivity` y `onPlayerInput`) con las mismas formas de objeto, el mismo orden de claves, las mismas unidades (`scores.time` y `timeLimit` en segundos) y el mismo uso de `null` (`byPlayer` es `null` en las acciones del host sin jugador).
+* Mismo modelo de ejecución: los métodos que cambian el estado se aplican en un *microtask*, en orden de llamada (`setPlayerAdmin(id, true); getPlayer(id).admin` sigue siendo `false` en esa línea). Los errores de validación (`.hbs` inválido, `Stadium doesn't exist`, *casts*) se lanzan de forma síncrona.
+* `test/api/parity.test.ts` ejecuta **el mismo script y el mismo escenario** (clientes node-haxball que entran, chatean, cambian equipos, juegan, marcan, son expulsados…) contra el `HBInit` oficial real (el `headless-min.js` que trae haxball.js, conectado a un maestro falso) y contra haxlite, y exige la misma secuencia de callbacks con los mismos argumentos y los mismos resultados de los *getters*.
+
+Diferencias deliberadas:
+
+| | Oficial / haxball.js | haxlite |
+|---|---|---|
+| `HBInit` | síncrono (haxball.js: `await HaxballJS()` y luego `HBInit()`) | `await HBInit(config)`: consulta la geolocalización y resuelve cuando el maestro asigna el enlace; un `onRoomLink` asignado después lo recibe igual |
+| Token caducado | captcha en la página / `InvalidRoomTokenError` sin capturar | promesa rechazada con `InvalidRoomTokenError`, o flujo `haxlite.onRecaptcha` |
+| Excepciones en callbacks | rompen el bucle del motor | se notifican a `room.haxlite.onError` (por defecto `console.error`); `onPlayerChat` que lanza sigue expulsando al emisor ("Bad actor"), como el oficial |
+| `setScoreLimit/TimeLimit(3.5)` | aplica el valor sin convertir (los clientes leen un `i32`) | convierte a entero |
+| `clearBans()` | vacía la lista de bans | vacía los bans de `kickPlayer(…, true)`; los bans de `room.haxlite.bans` (IP, rango, auth) se quitan con `room.haxlite.bans.clear()` |
+| Varias salas | una por página (`Can't init twice`) | varias por proceso |
+| Cierre | no existe | `room.haxlite.stop()` / `close()` |
+| Temporizadores | `setInterval` de 50 ms siempre | un temporizador alineado al siguiente frame con trabajo; sala vacía sin partida = 0 % CPU |
+
+### Extensiones (`room.haxlite` y `config.haxlite`)
+
+Todas son opcionales; sin ellas el comportamiento es el oficial.
+
+```js
+const room = await HBInit({
+  roomName: 'Sala', token, noPlayer: true,
+  haxlite: {
+    inputDelayFrames: 2,          // Sb oficial
+    heartbeatFrames: 7,           // oficial
+    masterUrl: 'https://www.haxball.com/rs/',
+    agent: proxyAgent,            // http.Agent (https-proxy-agent, socks-proxy-agent…) para HTTP y WebSocket
+    iceServers: ['stun:stun.l.google.com:19302'],
+    allowNullAuth: false,         // rechaza a quien falla la verificación de identidad
+    joinRateLimit: { capacity: 3, msPerToken: 15_000 },   // intentos por IP
+    onJoinRequest: async (req) => (await esIpVetada(req.ip) ? false : true), // antes de WebRTC
+    onRecaptcha: (sitekey, useRecaptchaToken) => { /* resolver el captcha y llamar useRecaptchaToken(respuesta) */ },
+  },
+});
+room.haxlite.onBeforeOperation = (event, byPlayerId, frame) => true; // false descarta el evento del cliente
+room.haxlite.bans.addRange('203.0.113.0/24');
+room.haxlite.getPlayerConnection(id); // { auth, conn, ip, srflxIps, ping }
+```
+
+| Extensión | Qué hace |
+|---|---|
+| `haxlite.inputDelayFrames`, `haxlite.heartbeatFrames`, `haxlite.checksumIntervalFrames` | ajustes de netcode (ver abajo); modificables en caliente |
+| `haxlite.onJoinRequest(req)` | gancho previo a WebRTC con `ip`, `conn`, IPs *srflx*, versión y contraseña. Puede ser `async`. `undefined`/`true` acepta, `false` rechaza como baneado (4102), un número o `{reject: código}` cierra con ese código |
+| `haxlite.bans` | `addIp`, `addRange` (CIDR IPv4/IPv6), `addAuth`, `list`, `remove`, `clear`, `isIpBanned`, `isAuthBanned`. IP y rangos se comprueban en la señalización (sin coste de WebRTC); `auth` tras el *handshake*, antes de entrar. `config.haxlite.bans` permite compartir una lista entre salas |
+| `allowNullAuth`, `joinRateLimit` | sin jugadores anónimos; límite de intentos de entrada por IP |
+| `haxlite.onBeforeOperation(ev, byId, frame)` | ve cada evento de cliente (después del filtro de chat) antes de aplicarlo: `false` lo descarta, puede modificarlo, lanzar expulsa al emisor. Se llama también para cada input: debe ser barato |
+| `haxlite.onRecaptcha` / `useRecaptchaToken(r)` | el maestro pide captcha (token caducado al reconectar): se recibe la `sitekey` y se reintenta con la respuesta |
+| `haxlite.stop()` / `close()` | cierra temporizadores, señalización y conexiones; con la última sala del proceso libera node-datachannel para que Node termine solo (`shutdownWebRtcOnLastStop`) |
+| `haxlite.setMaxPlayers(n)`, `haxlite.roomLink`, `haxlite.frame`, `haxlite.onError` | utilidades |
+| `haxlite.host`, `haxlite.transport` | el motor (`HostRoom`) y el transporte (`HostTransport`) para usos avanzados |
+
+### Ajustes de netcode
+
+Los clientes oficiales se adaptan a ambos ajustes sin cambios, porque el host les comunica el retardo en cada *pong* y ellos avanzan según los *heartbeats* que reciben.
+
+* **`inputDelayFrames`** (por defecto 2, como el oficial): frames entre "ahora" y el frame en que se aplica el input de un cliente. Con más retardo llegan menos inputs tarde (que el host re-sella y provocan correcciones) en enlaces con *jitter*, a cambio de más latencia de control. Con menos, la respuesta es más inmediata.
+* **`heartbeatFrames`** (por defecto 7): cada cuántos frames el host envía el *heartbeat* (mensaje 3). Los clientes solo avanzan su estado confirmado al recibirlo y extrapolan desde él, así que bajar a 2–3 acorta la extrapolación y reduce las correcciones visibles de los demás jugadores. Cuesta unos 9 bytes por cliente y *heartbeat*.
+* **`checksumIntervalFrames`** (600): periodo del *CheckConsistency* que detecta desincronización.
+
+### Uso avanzado
+
+`import { HostRoom, HostTransport, readReplay, ReplayPlayer, parseHbs, defaultStadiums } from 'haxlite'` da acceso directo al motor, al transporte, a los replays `.hbr2` y a los estadios. Cada módulo también se exporta como espacio de nombres (`codec`, `sim`, `room`, `net`, `host`, `replay`). La arquitectura está en el [doc 06](docs/06-arquitectura-haxlite.md) y el contrato del motor en [`src/host/README.md`](src/host/README.md).
+
 ## HaxBall en una página
 
 ```

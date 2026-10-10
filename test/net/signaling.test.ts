@@ -18,7 +18,7 @@ afterEach(() => {
 });
 afterAll(async () => {
   await master.close();
-  shutdownWebRtc();
+  await shutdownWebRtc();
 });
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

@@ -14,7 +14,8 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist"
@@ -23,7 +24,14 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "bench:build": "tsc -p tsconfig.build.json --outDir node_modules/.cache/haxlite-bench/dist --declaration false --sourceMap false",
+    "bench:sim": "node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs bench/sim.bench.ts",
+    "bench:host": "npm run bench:build && node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs bench/net/run.ts",
+    "bench:startup": "npm run bench:host -- startup",
+    "bench:idle": "npm run bench:host -- idle",
+    "bench:game": "npm run bench:host -- game",
+    "bench:rooms": "npm run bench:host -- rooms"
   },
   "dependencies": {
     "json5": "^2.2.3",

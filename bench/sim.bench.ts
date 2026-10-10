@@ -11,7 +11,12 @@
  * nudge code runs on both sides. Reports ns/tick (best of several rounds)
  * and the heap growth during the timed rounds of our step (≈0 = no
  * per-tick allocation).
+ *
+ * `--out <file.json>` appends this run (one process = one repetition) to a
+ * JSON file: `{ info, runs: [...] }` (used by docs/07-benchmarks.md).
  */
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import { createWorld, defaultStadiums, Disc, stepWorld } from '../src/sim/index.js';
 import type { World } from '../src/sim/index.js';
 import { officialDefaults, officialDisc, officialWorld } from '../test/sim/official-sim.js';
@@ -101,12 +106,24 @@ const scenarios: [string, number, number][] = [
 ];
 
 console.log(`node ${process.version}; ${TICKS} ticks x ${ROUNDS} rounds (best), warm-up ${WARMUP}`);
+const rows: { label: string; haxliteNs: number; officialNs: number; speedup: number; haxliteHeapGrowthKiB: number }[] = [];
 for (const [label, idx, players] of scenarios) {
   const first = defaultStadiums()[idx]!.discs.length;
   const a = measure(ours(idx, players), first, tickOurs);
   const b = measure(official(idx, players), first, tickOfficial);
+  rows.push({ label, haxliteNs: a.ns, officialNs: b.ns, speedup: b.ns / a.ns, haxliteHeapGrowthKiB: a.heapDelta / 1024 });
   console.log(
     `${label.padEnd(32)} haxlite ${a.ns.toFixed(0).padStart(6)} ns/tick   official ${b.ns.toFixed(0).padStart(6)} ns/tick   ` +
       `speed-up x${(b.ns / a.ns).toFixed(2)}   haxlite heap growth ${(a.heapDelta / 1024).toFixed(0)} KiB / ${TICKS} ticks`,
   );
+}
+
+const outIdx = process.argv.indexOf('--out');
+if (outIdx >= 0 && process.argv[outIdx + 1]) {
+  const file = process.argv[outIdx + 1]!;
+  const doc = existsSync(file)
+    ? JSON.parse(readFileSync(file, 'utf8'))
+    : { info: { node: process.version, cpu: os.cpus()[0]?.model, nproc: os.cpus().length, TICKS, ROUNDS, WARMUP }, runs: [] };
+  doc.runs.push({ date: new Date().toISOString(), rows });
+  writeFileSync(file, JSON.stringify(doc, null, 1));
 }

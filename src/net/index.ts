@@ -60,6 +60,22 @@ export {
   type RoomInfo,
 } from './room-info.js';
 export { IpRange, bytesToConn, canonicalIp, connBytesToText, connToText, formatIp, parseIp } from './ip.js';
-export { candidateLine, parseCandidate, sdpMids, srflxAddress, type IceCandidateInit, type ParsedCandidate } from './ice.js';
+export {
+  candidateLine,
+  classifyAddress,
+  filterCandidate,
+  filterSdp,
+  parseCandidate,
+  sdpMids,
+  srflxAddress,
+  toNativeIceServers,
+  type AddressClass,
+  type BrowserIceServer,
+  type IceCandidateInit,
+  type IceCandidatePolicy,
+  type IceServerConfig,
+  type NativeIceServer,
+  type ParsedCandidate,
+} from './ice.js';
 export * from './constants.js';
-export { shutdownWebRtc } from './webrtc.js';
+export { shutdownWebRtc, webRtcStats, type WebRtcStats } from './webrtc.js';

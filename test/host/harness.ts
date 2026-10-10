@@ -213,7 +213,7 @@ export class E2E {
 }
 
 /** Call once per test file (afterAll). */
-export function shutdownAll(): void {
-  shutdownWebRtc();
+export async function shutdownAll(): Promise<void> {
+  await shutdownWebRtc();
   cleanupNodeHaxball();
 }

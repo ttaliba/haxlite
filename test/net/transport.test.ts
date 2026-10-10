@@ -22,6 +22,11 @@ const transports: HostTransport[] = [];
 const clients: RawClient[] = [];
 
 beforeAll(async () => {
+  if (process.env.NDC_LOG) {
+    const { createRequire } = await import('node:module');
+    const req = createRequire(import.meta.url);
+    req(`@node-datachannel/linux-x64-gnu/node_datachannel.node`).initLogger(process.env.NDC_LOG);
+  }
   master = await FakeMaster.start();
 });
 
@@ -33,7 +38,7 @@ afterEach(() => {
 
 afterAll(async () => {
   await master.close();
-  shutdownWebRtc();
+  await shutdownWebRtc();
 });
 
 function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {

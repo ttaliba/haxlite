@@ -25,17 +25,30 @@
  * t.start();
  * ```
  */
-import { PeerConnection, type DataChannel, type RtcConfig } from 'node-datachannel';
+import type { DataChannel, PeerConnection, RtcConfig } from 'node-datachannel';
 import { PROTOCOL_VERSION } from '../protocol.js';
 import { createChallenge, verifyAuthBlob } from './auth.js';
 import { BanList, type BanRecord } from './bans.js';
 import { CHANNELS, DEFAULT_ICE_SERVERS, DEFAULT_ROOM_LINK_BASE, NetDefaults, RejectCode } from './constants.js';
 import { encodeChallenge, encodeKick, parseHandshake, parseJoinInfo, type JoinPlayerInfo } from './handshake.js';
-import { candidateLine, parseCandidate, sdpMids, srflxAddress, type IceCandidateInit } from './ice.js';
+import {
+  candidateLine,
+  filterCandidate,
+  filterSdp,
+  parseCandidate,
+  sdpMids,
+  srflxAddress,
+  toNativeIceServers,
+  type IceCandidateInit,
+  type IceCandidatePolicy,
+  type IceServerConfig,
+  type NativeIceServer,
+} from './ice.js';
 import { KeyedRateLimiter, TokenBucket } from './rate-limit.js';
 import { defaultRoomInfo, encodeRoomInfo, type RoomInfo } from './room-info.js';
 import { HostSignaling, type HostSignalingOptions, type SignalingOffer } from './signaling.js';
 import { Writer } from '../codec/index.js';
+import { closeNative, createDataChannel, createPeerConnection } from './webrtc.js';
 
 /** Lifecycle of a {@link Peer}. */
 export type PeerState =
@@ -165,8 +178,26 @@ export interface JoinInfo extends JoinPlayerInfo {
 export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'> {
   /** Headless token from https://www.haxball.com/headlesstoken. */
   token: string;
-  /** STUN/TURN urls for node-datachannel (default Google STUN, like the official host). */
-  iceServers?: readonly string[];
+  /**
+   * STUN/TURN servers (default Google STUN, like the official host): libdatachannel
+   * URLs (`stun:host:port`, `turn:user:pass@host:port?transport=tcp`, `turns:…`),
+   * node-datachannel objects or browser `RTCIceServer`s (`{urls, username, credential}`).
+   * For relay-only operation add `rtc: { iceTransportPolicy: 'relay' }`.
+   */
+  iceServers?: readonly IceServerConfig[];
+  /**
+   * Which of the host's own ICE candidates (and SDP connection address) are
+   * sent to clients. Default `'public'`: LAN/link-local/loopback addresses of
+   * the server are never revealed (clients only need srflx/public
+   * candidates). `'private'` also sends LAN addresses, `'all'` everything
+   * (local tests over loopback). See {@link IceCandidatePolicy}.
+   */
+  iceCandidatePolicy?: IceCandidatePolicy;
+  /**
+   * Local UDP port range for ICE (firewall-friendly deployment), shorthand for
+   * `rtc.portRangeBegin/portRangeEnd`. Each connection uses one port.
+   */
+  portRange?: readonly [number, number] | null;
   /** List the room publicly (send RoomInfo, message 7). Default false (HBInit default). */
   public?: boolean;
   password?: string | null;
@@ -193,7 +224,11 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   reverseIceDelayMs?: number;
   /** Room link prefix (default `https://www.haxball.com/play?c=`). */
   roomLinkBase?: string;
-  /** Extra node-datachannel config (port range, bind address, UDP mux, MTU…). */
+  /**
+   * Extra node-datachannel config: `bindAddress`, `portRangeBegin/End`,
+   * `enableIceUdpMux` (all peers on one UDP port), `iceTransportPolicy`,
+   * `maxMessageSize`, `mtu`, `proxyServer`…
+   */
   rtc?: Partial<Omit<RtcConfig, 'iceServers'>>;
   /** Housekeeping period (timeouts, deferred closes). Default 1000 ms. */
   sweepIntervalMs?: number;
@@ -229,7 +264,18 @@ export class HostTransport {
   onError: ((err: Error) => void) | null = null;
 
   private readonly opts: HostTransportOptions;
-  private readonly iceServers: string[];
+  private readonly iceServers: (string | NativeIceServer)[];
+  private readonly icePolicy: IceCandidatePolicy;
+  private readonly reportError = (err: unknown): void => {
+    const e = err instanceof Error ? err : new Error(String(err));
+    const h = this.onError;
+    try {
+      if (h !== null) h(e);
+      else console.error('[haxlite/net]', e);
+    } catch {
+      /* never propagate */
+    }
+  };
   private readonly pending = new Map<number, Peer>();
   /** Peers with channel 0 open (official `Ha`), joined or not. */
   private connected: Peer[] = [];
@@ -248,7 +294,8 @@ export class HostTransport {
 
   constructor(opts: HostTransportOptions) {
     this.opts = opts;
-    this.iceServers = [...(opts.iceServers ?? DEFAULT_ICE_SERVERS)];
+    this.iceServers = toNativeIceServers(opts.iceServers ?? DEFAULT_ICE_SERVERS);
+    this.icePolicy = opts.iceCandidatePolicy ?? 'public';
     this.bans = opts.bans ?? new BanList();
     this.password = opts.password ?? null;
     this.maxPlayers = opts.maxPlayers ?? 12;
@@ -261,12 +308,12 @@ export class HostTransport {
     this.signaling = new HostSignaling(
       { ...opts },
       {
-        onRoomId: (id) => this.onRoomLink?.(this.roomLink ?? '', id),
-        onOffer: (offer) => this.handleOffer(offer),
-        onCandidate: (peerId, c) => this.handleRemoteCandidate(peerId, c),
-        onDisconnect: () => this.dropPending('shutdown'),
-        onRecaptcha: (sitekey) => this.onRecaptcha?.(sitekey),
-        onError: (err) => this.onError?.(err),
+        onRoomId: (id) => this.callUser(() => this.onRoomLink?.(this.roomLink ?? '', id)),
+        onOffer: (offer) => this.safely(() => this.handleOffer(offer)),
+        onCandidate: (peerId, c) => this.safely(() => this.handleRemoteCandidate(peerId, c)),
+        onDisconnect: () => this.safely(() => this.dropPending('shutdown')),
+        onRecaptcha: (sitekey) => this.callUser(() => this.onRecaptcha?.(sitekey)),
+        onError: (err) => this.reportError(err),
       },
     );
   }
@@ -278,7 +325,7 @@ export class HostTransport {
     this.running = true;
     this.publishRoomInfo();
     this.signaling.start();
-    this.sweepTimer = setInterval(() => this.sweep(), this.opts.sweepIntervalMs ?? 1000);
+    this.sweepTimer = setInterval(() => this.safely(() => this.sweep()), this.opts.sweepIntervalMs ?? 1000);
   }
 
   /** Closes signaling and every peer (joined peers get onPeerClose 'shutdown'). */
@@ -292,6 +339,29 @@ export class HostTransport {
     for (const p of [...this.connected]) this.closePeer(p, 'shutdown');
     for (const p of this.deferredDestroy) this.destroyNative(p);
     this.deferredDestroy.length = 0;
+  }
+
+  /** Runs internal code from a timer/socket/native callback: never throws. */
+  private safely(fn: () => void): void {
+    try {
+      fn();
+    } catch (err) {
+      this.reportError(err);
+    }
+  }
+
+  /** Calls a user callback: its exceptions are reported to onError, never propagated. */
+  private callUser(fn: () => void): void {
+    try {
+      fn();
+    } catch (err) {
+      this.reportError(err);
+    }
+  }
+
+  private log(msg: string): void {
+    const l = this.opts.log;
+    if (l !== undefined) this.callUser(() => l(msg));
   }
 
   get roomId(): string | null {
@@ -427,7 +497,8 @@ export class HostTransport {
 
   private reject(offer: { peerId: number; ip: string; conn: string }, code: number, why: string): void {
     this.signaling.sendReject(offer.peerId, code);
-    this.onJoinRejected?.({ peerId: offer.peerId, ip: offer.ip, conn: offer.conn }, code, why);
+    const cb = this.onJoinRejected;
+    if (cb !== null) this.callUser(() => cb({ peerId: offer.peerId, ip: offer.ip, conn: offer.conn }, code, why));
   }
 
   /** `Aa.$g` + `Wa.Xg` + hook. */
@@ -507,8 +578,8 @@ export class HostTransport {
     }
     if (result instanceof Promise) {
       result.then(
-        (d) => this.applyDecision(peer, offer, d),
-        (err) => this.hookFailed(peer, offer, err),
+        (d) => this.safely(() => this.applyDecision(peer, offer, d)),
+        (err) => this.safely(() => this.hookFailed(peer, offer, err)),
       );
     } else {
       this.applyDecision(peer, offer, result);
@@ -516,7 +587,7 @@ export class HostTransport {
   }
 
   private hookFailed(peer: Peer, offer: SignalingOffer, err: unknown): void {
-    this.onError?.(err instanceof Error ? err : new Error(String(err)));
+    this.reportError(err);
     this.applyDecision(peer, offer, RejectCode.TooManyPending);
   }
 
@@ -541,74 +612,102 @@ export class HostTransport {
   private negotiate(peer: Peer, offer: SignalingOffer): void {
     peer.state = 'negotiating';
     let pc: PeerConnection;
+    const range = this.opts.portRange;
     try {
-      pc = new PeerConnection(`haxlite-${peer.id}`, {
-        ...this.opts.rtc,
-        iceServers: this.iceServers,
-        disableAutoNegotiation: true,
-      });
+      pc = createPeerConnection(
+        `haxlite-${peer.id}`,
+        {
+          ...(range ? { portRangeBegin: range[0], portRangeEnd: range[1] } : null),
+          ...this.opts.rtc,
+          iceServers: this.iceServers,
+          disableAutoNegotiation: true,
+        },
+        {
+          onLocalCandidate: (cand, mid) => this.onLocalCandidate(peer, cand, mid),
+          onGatheringStateChange: (state) => {
+            if (state === 'complete') this.onGatheringComplete(peer);
+          },
+          onStateChange: (state) => {
+            if (state === 'failed' || state === 'closed') {
+              if (peer.state === 'negotiating') this.failNegotiation(peer, `pc ${state}`);
+              else if (peer.state !== 'closed') this.closePeer(peer, 'closed');
+            }
+          },
+          onError: this.reportError,
+        },
+      );
     } catch (err) {
-      this.onError?.(err as Error);
-      this.failNegotiation(peer);
+      this.reportError(err);
+      this.failNegotiation(peer, 'pc create error');
       return;
     }
     peer.pc = pc;
     peer.mids = sdpMids(offer.sdp);
-    pc.onLocalCandidate((cand, mid) => this.onLocalCandidate(peer, cand, mid));
-    pc.onGatheringStateChange((state) => {
-      if (state === 'complete') this.onGatheringComplete(peer);
-    });
-    pc.onStateChange((state) => {
-      if (state === 'failed' || state === 'closed') {
-        if (peer.state === 'negotiating') this.failNegotiation(peer);
-        else if (peer.state !== 'closed') this.closePeer(peer, 'closed');
-      }
-    });
     try {
       pc.setRemoteDescription(offer.sdp, 'offer');
       for (let i = 0; i < CHANNELS.length; i++) this.createChannel(peer, pc, i);
       pc.setLocalDescription('answer');
-      peer.localSdp = pc.localDescription()?.sdp ?? null;
-      if (peer.localSdp === null) throw new Error('no local description');
+      const sdp = pc.localDescription()?.sdp ?? null;
+      if (sdp === null) throw new Error('no local description');
+      peer.localSdp = filterSdp(sdp, this.icePolicy);
     } catch (err) {
-      this.onError?.(err as Error);
-      this.failNegotiation(peer);
+      this.reportError(err);
+      this.failNegotiation(peer, 'sdp error');
       return;
     }
     for (const c of offer.candidates) this.addRemoteCandidate(peer, c);
     for (const c of peer.queuedRemote) this.addRemoteCandidate(peer, c);
     peer.queuedRemote = [];
     if (peer.gatheringDone) this.sendAnswer(peer);
-    else peer.timer = setTimeout(() => this.sendAnswer(peer), this.opts.answerIceWaitMs ?? NetDefaults.answerIceWaitMs);
+    else {
+      peer.timer = setTimeout(
+        () => this.safely(() => this.sendAnswer(peer)),
+        this.opts.answerIceWaitMs ?? NetDefaults.answerIceWaitMs,
+      );
+    }
   }
 
   /** `la.Hg`: negotiated channel `id = index`, `maxRetransmits: 0` when unreliable. */
   private createChannel(peer: Peer, pc: PeerConnection, index: number): void {
     const cfg = CHANNELS[index]!;
-    const dc = pc.createDataChannel(cfg.label, {
-      negotiated: true,
-      id: index,
-      unordered: !cfg.ordered,
-      ...(cfg.reliable ? {} : { maxRetransmits: 0 }),
-    });
+    const dc = createDataChannel(
+      pc,
+      cfg.label,
+      {
+        negotiated: true,
+        id: index,
+        unordered: !cfg.ordered,
+        ...(cfg.reliable ? {} : { maxRetransmits: 0 }),
+      },
+      {
+        onOpen: () => {
+          if (peer.channels[index] !== dc) return; // stale (already destroyed)
+          peer.channelOpen[index] = true;
+          if (index === 0 && peer.state === 'negotiating') this.onChannelZeroOpen(peer);
+          if (peer.state === 'challenged' && peer.challengeDue && !peer.challengeSent) this.maybeSendChallenge(peer);
+        },
+        onClosed: () => {
+          if (peer.channels[index] !== dc) return;
+          peer.channelOpen[index] = false;
+          if (peer.state === 'negotiating') this.failNegotiation(peer, `channel ${index} closed`);
+          else if (peer.state !== 'closed') this.closePeer(peer, 'closed');
+        },
+        onMessage: (msg) => {
+          if (peer.channels[index] === dc) this.onChannelMessage(peer, index, msg);
+        },
+        onError: this.reportError,
+      },
+    );
     peer.channels[index] = dc;
-    dc.onOpen(() => {
-      peer.channelOpen[index] = true;
-      if (index === 0 && peer.state === 'negotiating') this.onChannelZeroOpen(peer);
-      if (peer.state === 'challenged' && peer.challengeDue && !peer.challengeSent) this.maybeSendChallenge(peer);
-    });
-    dc.onClosed(() => {
-      peer.channelOpen[index] = false;
-      if (peer.state === 'negotiating') this.failNegotiation(peer);
-      else if (peer.state !== 'closed') this.closePeer(peer, 'closed');
-    });
-    dc.onMessage((msg) => this.onChannelMessage(peer, index, msg));
   }
 
   private onLocalCandidate(peer: Peer, cand: string, mid: string): void {
     if (peer.state === 'closed') return;
-    const line = candidateLine(cand);
-    if (line.length === 0) return;
+    const line = filterCandidate(candidateLine(cand), this.icePolicy);
+    if (line === null || line.length === 0) {
+      if (line === null) this.log(`peer ${peer.id}: local candidate withheld by iceCandidatePolicy`);
+      return;
+    }
     const idx = peer.mids.indexOf(mid);
     const c: IceCandidateInit = { candidate: line, sdpMid: mid, sdpMLineIndex: idx >= 0 ? idx : 0 };
     if (!peer.answerSent) peer.localCandidates.push(c);
@@ -628,7 +727,7 @@ export class HostTransport {
     peer.timer = null;
     if (peer.answerSent || peer.state !== 'negotiating' || peer.localSdp === null) return;
     peer.answerSent = true;
-    this.opts.log?.(`peer ${peer.id}: answer sent with ${peer.localCandidates.length} candidates`);
+    this.log(`peer ${peer.id}: answer sent with ${peer.localCandidates.length} candidates`);
     this.signaling.sendAnswer(peer.id, peer.localSdp, peer.localCandidates);
     if (peer.gatheringDone) this.sendEnd(peer);
   }
@@ -666,14 +765,14 @@ export class HostTransport {
         // unresolvable (e.g. mDNS) or malformed: ignored like `.catch(function(){})`
       }
     };
-    if (peer.reverse) setTimeout(apply, this.opts.reverseIceDelayMs ?? NetDefaults.reverseIceDelayMs);
+    if (peer.reverse) setTimeout(() => this.safely(apply), this.opts.reverseIceDelayMs ?? NetDefaults.reverseIceDelayMs);
     else apply();
   }
 
   /** `la.Rd`: negotiation failed (timeout, channel closed/message before open, PC failed). */
-  private failNegotiation(peer: Peer): void {
+  private failNegotiation(peer: Peer, why: string): void {
     if (peer.state === 'closed') return;
-    this.opts.log?.(`peer ${peer.id}: negotiation failed`);
+    this.log(`peer ${peer.id}: negotiation failed (${why})`);
     if (this.pending.get(peer.id) === peer) {
       this.pending.delete(peer.id);
       this.sendEnd(peer);
@@ -695,7 +794,7 @@ export class HostTransport {
 
   /** `la.Qd` + `Wa.Ah`. */
   private onChannelZeroOpen(peer: Peer): void {
-    this.opts.log?.(`peer ${peer.id}: channel 0 open`);
+    this.log(`peer ${peer.id}: channel 0 open`);
     this.pending.delete(peer.id);
     this.sendEnd(peer);
     if (peer.timer !== null) clearTimeout(peer.timer);
@@ -725,7 +824,7 @@ export class HostTransport {
         peer.timer = null;
         if (peer.state !== 'challenged') return;
         peer.challengeDue = true;
-        this.maybeSendChallenge(peer);
+        this.safely(() => this.maybeSendChallenge(peer));
       }, delay);
     }
   }
@@ -747,7 +846,7 @@ export class HostTransport {
     for (let i = 0; i < open.length; i++) if (!open[i]) return;
     peer.challengeSent = true;
     this.send(peer, 0, encodeChallenge(peer.challenge!));
-    this.opts.log?.(`peer ${peer.id}: challenge sent`);
+    this.log(`peer ${peer.id}: challenge sent`);
   }
 
   // ================================================================== messages (`Ya` + `Wa.Jh`)
@@ -755,7 +854,7 @@ export class HostTransport {
   private onChannelMessage(peer: Peer, channel: number, msg: string | Buffer | ArrayBuffer): void {
     const state = peer.state;
     if (state === 'negotiating') {
-      this.failNegotiation(peer); // `la`: any message before channel 0 opens
+      this.failNegotiation(peer, `message on channel ${channel} before open`); // `la`: any message before channel 0 opens
       return;
     }
     if (state === 'closed' || state === 'validating') return;
@@ -771,11 +870,15 @@ export class HostTransport {
     }
     const data: Uint8Array = msg instanceof ArrayBuffer ? new Uint8Array(msg) : msg;
     if (state === 'joined') {
-      this.onPeerMessage?.(peer, data, channel);
+      const cb = this.onPeerMessage;
+      if (cb !== null) this.callUser(() => cb(peer, data, channel));
       return;
     }
     if (state === 'challenged' && data.length > 0 && data[0] === 0) {
-      void this.handleHandshake(peer, data);
+      this.handleHandshake(peer, data).catch((err: unknown) => {
+        this.reportError(err);
+        this.safely(() => this.closePeer(peer, 'protocol'));
+      });
       return;
     }
     this.closePeer(peer, 'protocol');
@@ -822,7 +925,9 @@ export class HostTransport {
     }
     peer.state = 'joined';
     this.joined.push(peer);
-    this.onPeerJoin?.(peer, {
+    const cb = this.onPeerJoin;
+    if (cb === null) return;
+    const joinInfo: JoinInfo = {
       name: info.name,
       flag: info.flag,
       avatar: info.avatar,
@@ -830,7 +935,8 @@ export class HostTransport {
       conn: peer.conn,
       ip: peer.ip,
       srflxIps: peer.srflxIps,
-    });
+    };
+    this.callUser(() => cb(peer, joinInfo));
   }
 
   // ================================================================== teardown
@@ -841,7 +947,7 @@ export class HostTransport {
    */
   private closePeer(peer: Peer, reason: PeerCloseReason, deferNative = false): void {
     const state = peer.state;
-    this.opts.log?.(`peer ${peer.id}: close (${reason}) from state ${state}`);
+    this.log(`peer ${peer.id}: close (${reason}) from state ${state}`);
     if (state === 'closed') return;
     if (state === 'validating' || state === 'negotiating') {
       if (this.pending.get(peer.id) === peer) {
@@ -863,33 +969,29 @@ export class HostTransport {
     }
     if (deferNative && this.running) this.deferredDestroy.push(peer);
     else this.destroyNative(peer);
-    if (state === 'joined') this.onPeerClose?.(peer, reason);
+    if (state === 'joined') {
+      const cb = this.onPeerClose;
+      if (cb !== null) this.callUser(() => cb(peer, reason));
+    }
   }
 
+  /**
+   * Detaches the native objects from the peer at once (late callbacks are
+   * ignored) and closes them on the next turn via {@link closeNative}, which
+   * keeps them referenced until libdatachannel confirms the close.
+   */
   private destroyNative(peer: Peer): void {
     if (peer.timer !== null) clearTimeout(peer.timer);
     peer.timer = null;
     for (let i = 0; i < peer.channels.length; i++) {
       const dc = peer.channels[i];
       peer.channelOpen[i] = false;
-      if (dc != null) {
-        try {
-          dc.close();
-        } catch {
-          /* already closed */
-        }
-      }
       peer.channels[i] = null;
+      if (dc != null) closeNative(dc);
     }
     const pc = peer.pc;
     peer.pc = null;
-    if (pc !== null) {
-      try {
-        pc.close();
-      } catch {
-        /* already closed */
-      }
-    }
+    if (pc !== null) closeNative(pc);
   }
 
   /** Housekeeping: negotiation timeouts (`la.gi`), idle peers (`Ya`), deferred closes. */
@@ -901,7 +1003,7 @@ export class HostTransport {
     }
     const openTimeout = this.opts.channelOpenTimeoutMs ?? NetDefaults.channelOpenTimeoutMs;
     for (const p of this.pending.values()) {
-      if (p.state === 'negotiating' && now - p.createdAt >= openTimeout) this.failNegotiation(p);
+      if (p.state === 'negotiating' && now - p.createdAt >= openTimeout) this.failNegotiation(p, 'channel open timeout');
     }
     const idle = this.opts.peerIdleTimeoutMs ?? NetDefaults.peerIdleTimeoutMs;
     const conns = this.connected;

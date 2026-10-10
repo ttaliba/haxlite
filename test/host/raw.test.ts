@@ -38,7 +38,7 @@ afterAll(async () => {
   for (const r of raws) r.close();
   for (const h of hosts) h.stop();
   await master.close();
-  shutdownWebRtc();
+  await shutdownWebRtc();
 });
 
 async function startHost(opts: Partial<HostRoomOptions> = {}): Promise<{ host: HostRoom; roomId: string }> {
