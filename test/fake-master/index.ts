@@ -68,6 +68,8 @@ export class FakeMaster {
   readonly rooms = new Map<string, FakeRoom>();
   /** Every host/client WS upgrade, for assertions (path, origin). */
   readonly upgrades: { path: string; origin: string | undefined }[] = [];
+  /** Every `[0][peer][code]` rejection received from hosts. */
+  readonly rejections: { peerId: number; code: number }[] = [];
   /** POST api/host bodies received. */
   readonly hostRequests: { token: string; rcr: string }[] = [];
   /** IP reported as `conn` for the next client connections (default: socket address). */
@@ -245,7 +247,9 @@ export class FakeMaster {
             client.rejectCode = code;
             this.log(`host rejected peer ${peerId} with ${code}`);
             room.peers.delete(peerId);
-            client.ws.close(code);
+            this.rejections.push({ peerId, code });
+            // WS close codes must be 1000/3000-4999: a parse error (0) can't be relayed as is.
+            client.ws.close(code >= 3000 && code <= 4999 ? code : 1008);
           } else {
             client.hostDone = true;
             this.maybeFinish(room, client);

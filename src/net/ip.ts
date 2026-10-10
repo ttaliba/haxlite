@@ -132,12 +132,12 @@ export class IpRange {
       const p = cidr.slice(slash + 1).trim();
       if (!/^\d{1,3}$/.test(p)) return null;
       prefix = Number(p);
-      if (prefix > bits) return null;
       // "::ffff:10.0.0.0/104" style prefixes on mapped addresses
       if (addr.length === 4 && cidr.indexOf(':') >= 0) {
         if (prefix < 96) return null;
         prefix -= 96;
       }
+      if (prefix > bits) return null;
     }
     const base = addr.slice();
     for (let i = 0; i < base.length; i++) {

@@ -3,12 +3,11 @@
  * node-haxball CLIENT, all offline through the fake master. The game
  * snapshot is not implemented yet, so assertions stop at the verified join.
  */
-import { createRequire } from 'node:module';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { FakeMaster } from '../fake-master/index.js';
+import { cleanupNodeHaxball, nodeHaxballFor } from '../fake-master/node-haxball.js';
 import { HostTransport, shutdownWebRtc, type JoinInfo, type Peer, type PeerCloseReason } from '../../src/net/index.js';
 
-const require = createRequire(import.meta.url);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Any = any;
 
@@ -19,7 +18,7 @@ const joins: { cancel(): void }[] = [];
 
 beforeAll(async () => {
   master = await FakeMaster.start();
-  nh = (require('node-haxball') as (w: unknown, c: unknown) => Any)(null, master.nodeHaxballConfig);
+  nh = nodeHaxballFor(master);
 });
 
 afterEach(() => {
@@ -36,11 +35,7 @@ afterEach(() => {
 afterAll(async () => {
   await master?.close();
   shutdownWebRtc();
-  try {
-    (require('node-haxball/node_modules/node-datachannel') as { cleanup(): void }).cleanup();
-  } catch {
-    /* not nested */
-  }
+  cleanupNodeHaxball();
 });
 
 function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
@@ -131,13 +126,14 @@ describe('HostTransport + node-haxball client', () => {
     const rejected: number[] = [];
     t.onJoinRejected = (_r, code) => rejected.push(code);
     t.bans.addIp('127.0.0.1');
-    await withTimeout(nhJoin(fakeRoom.id).closed, 10_000, 'close 1');
+    const r1 = await withTimeout(nhJoin(fakeRoom.id).closed, 10_000, 'close 1');
     t.bans.clear();
     master.clientIp = () => '2001:db8::42';
     t.bans.addRange('2001:db8::/32');
-    await withTimeout(nhJoin(fakeRoom.id).closed, 10_000, 'close 2');
+    const r2 = await withTimeout(nhJoin(fakeRoom.id).closed, 10_000, 'close 2');
     master.clientIp = null;
     expect(rejected).toEqual([4102, 4102]);
+    expect([r1?.code, r2?.code]).toEqual([nh.Errors.ErrorCodes.BannedBefore, nh.Errors.ErrorCodes.BannedBefore]);
   });
 
   it('rejects when full (4100) and an onJoinRequest hook decides before WebRTC', async () => {
@@ -146,8 +142,9 @@ describe('HostTransport + node-haxball client', () => {
     });
     const rejected: number[] = [];
     t.onJoinRejected = (_r, code) => rejected.push(code);
-    await withTimeout(nhJoin(fakeRoom.id).closed, 10_000, 'close full');
+    const r = await withTimeout(nhJoin(fakeRoom.id).closed, 10_000, 'close full');
     expect(rejected).toEqual([4100]);
+    expect(r?.code).toBe(nh.Errors.ErrorCodes.RoomFull);
 
     const seen: string[] = [];
     const { t: t2, fakeRoom: room2 } = await startHost({

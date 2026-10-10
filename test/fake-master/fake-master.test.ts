@@ -3,12 +3,11 @@
  * HOST and a node-haxball CLIENT meet through it, the client joins and sees
  * the room state (players, room name), and the room appears in api/list.
  */
-import { createRequire } from 'node:module';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { FakeMaster } from './index.js';
+import { cleanupNodeHaxball, nodeHaxballFor } from './node-haxball.js';
 import { fetchRoomList } from '../../src/net/master-http.js';
 
-const require = createRequire(import.meta.url);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Any = any;
 
@@ -17,18 +16,12 @@ let nh: Any;
 
 beforeAll(async () => {
   master = await FakeMaster.start();
-  // node-haxball keeps its config module-global: initialise it pointing at the fake master.
-  nh = (require('node-haxball') as (w: unknown, c: unknown) => Any)(null, master.nodeHaxballConfig);
+  nh = nodeHaxballFor(master, { sendDelayMs: 40 });
 });
 
 afterAll(async () => {
   await master?.close();
-  // node-haxball uses its own nested node-datachannel copy.
-  try {
-    (require('node-haxball/node_modules/node-datachannel') as { cleanup(): void }).cleanup();
-  } catch {
-    /* not nested */
-  }
+  cleanupNodeHaxball();
 });
 
 function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {

@@ -106,10 +106,12 @@ export class Peer {
   /** @internal */ readonly channelOpen: boolean[] = [false, false, false];
   /** @internal */ bucket: TokenBucket | null = null;
   /** @internal */ challenge: Uint8Array | null = null;
+  /** @internal */ challengeDue = false;
+  /** @internal */ challengeSent = false;
   /** @internal signaling `[0][peer]` already sent (`la.qf`). */ endSent = false;
   /** @internal */ answerSent = false;
   /** @internal */ gatheringDone = false;
-  /** @internal */ answerTimer: NodeJS.Timeout | null = null;
+  /** @internal one-shot timer: answer ICE wait, then challenge delay */ timer: NodeJS.Timeout | null = null;
   /** @internal */ localSdp: string | null = null;
   /** @internal */ readonly localCandidates: IceCandidateInit[] = [];
   /** @internal candidates received while 'validating' */ queuedRemote: IceCandidateInit[] = [];
@@ -195,9 +197,18 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   rtc?: Partial<Omit<RtcConfig, 'iceServers'>>;
   /** Housekeeping period (timeouts, deferred closes). Default 1000 ms. */
   sweepIntervalMs?: number;
+  /**
+   * Delay between channel-0 open and the challenge (official: 0). Default 40 ms
+   * so libdatachannel-based clients (node-haxball) don't drop it; see
+   * `maybeSendChallenge`.
+   */
+  challengeDelayMs?: number;
   /** Debug logger (peer lifecycle). */
   log?: (msg: string) => void;
 }
+
+/** See {@link HostTransportOptions.challengeDelayMs}. */
+const DEFAULT_CHALLENGE_DELAY_MS = 40;
 
 export class HostTransport {
   readonly bans: BanList;
@@ -568,7 +579,7 @@ export class HostTransport {
     for (const c of peer.queuedRemote) this.addRemoteCandidate(peer, c);
     peer.queuedRemote = [];
     if (peer.gatheringDone) this.sendAnswer(peer);
-    else peer.answerTimer = setTimeout(() => this.sendAnswer(peer), this.opts.answerIceWaitMs ?? NetDefaults.answerIceWaitMs);
+    else peer.timer = setTimeout(() => this.sendAnswer(peer), this.opts.answerIceWaitMs ?? NetDefaults.answerIceWaitMs);
   }
 
   /** `la.Hg`: negotiated channel `id = index`, `maxRetransmits: 0` when unreliable. */
@@ -584,6 +595,7 @@ export class HostTransport {
     dc.onOpen(() => {
       peer.channelOpen[index] = true;
       if (index === 0 && peer.state === 'negotiating') this.onChannelZeroOpen(peer);
+      if (peer.state === 'challenged' && peer.challengeDue && !peer.challengeSent) this.maybeSendChallenge(peer);
     });
     dc.onClosed(() => {
       peer.channelOpen[index] = false;
@@ -606,14 +618,14 @@ export class HostTransport {
   private onGatheringComplete(peer: Peer): void {
     peer.gatheringDone = true;
     if (peer.state !== 'negotiating') return;
-    if (peer.answerTimer !== null && peer.localSdp !== null) this.sendAnswer(peer);
+    if (peer.timer !== null && peer.localSdp !== null) this.sendAnswer(peer);
     else if (peer.answerSent) this.sendEnd(peer);
   }
 
   /** `Aa.Zh` (after `ub.li`: gathering complete or 500 ms). */
   private sendAnswer(peer: Peer): void {
-    if (peer.answerTimer !== null) clearTimeout(peer.answerTimer);
-    peer.answerTimer = null;
+    if (peer.timer !== null) clearTimeout(peer.timer);
+    peer.timer = null;
     if (peer.answerSent || peer.state !== 'negotiating' || peer.localSdp === null) return;
     peer.answerSent = true;
     this.opts.log?.(`peer ${peer.id}: answer sent with ${peer.localCandidates.length} candidates`);
@@ -686,8 +698,8 @@ export class HostTransport {
     this.opts.log?.(`peer ${peer.id}: channel 0 open`);
     this.pending.delete(peer.id);
     this.sendEnd(peer);
-    if (peer.answerTimer !== null) clearTimeout(peer.answerTimer);
-    peer.answerTimer = null;
+    if (peer.timer !== null) clearTimeout(peer.timer);
+    peer.timer = null;
     if (this.connected.length >= this.maxPlayers) {
       peer.state = 'closed';
       peer.closeReason = 'full';
@@ -704,15 +716,44 @@ export class HostTransport {
     );
     this.connected.push(peer);
     peer.challenge = createChallenge();
-    const sent = this.send(peer, 0, encodeChallenge(peer.challenge));
-    this.opts.log?.(`peer ${peer.id}: challenge sent=${sent} open=${peer.channelOpen.join(",")}`);
+    const delay = this.opts.challengeDelayMs ?? DEFAULT_CHALLENGE_DELAY_MS;
+    if (delay <= 0) {
+      peer.challengeDue = true;
+      this.maybeSendChallenge(peer);
+    } else {
+      peer.timer = setTimeout(() => {
+        peer.timer = null;
+        if (peer.state !== 'challenged') return;
+        peer.challengeDue = true;
+        this.maybeSendChallenge(peer);
+      }, delay);
+    }
+  }
+
+  /**
+   * Sends the challenge once it is due and all three channels are open.
+   *
+   * The official host sends it as soon as channel 0 opens; browsers open all
+   * negotiated channels in the same task and never deliver a message before
+   * `open`, so that is safe for browser clients. Clients built on
+   * libdatachannel (node-haxball) dispatch `open`/`message` callbacks through
+   * separate queues and silently drop a message that arrives before all
+   * their channels report open, which happens when the challenge is sent the
+   * instant the SCTP association comes up. haxlite therefore waits until its
+   * three channels are open and `challengeDelayMs` (default 40 ms) elapsed.
+   */
+  private maybeSendChallenge(peer: Peer): void {
+    const open = peer.channelOpen;
+    for (let i = 0; i < open.length; i++) if (!open[i]) return;
+    peer.challengeSent = true;
+    this.send(peer, 0, encodeChallenge(peer.challenge!));
+    this.opts.log?.(`peer ${peer.id}: challenge sent`);
   }
 
   // ================================================================== messages (`Ya` + `Wa.Jh`)
 
   private onChannelMessage(peer: Peer, channel: number, msg: string | Buffer | ArrayBuffer): void {
     const state = peer.state;
-    this.opts.log?.(`peer ${peer.id}: message on ${channel} in state ${state} (${typeof msg === 'string' ? 'text' : msg.byteLength} bytes)`);
     if (state === 'negotiating') {
       this.failNegotiation(peer); // `la`: any message before channel 0 opens
       return;
@@ -826,8 +867,8 @@ export class HostTransport {
   }
 
   private destroyNative(peer: Peer): void {
-    if (peer.answerTimer !== null) clearTimeout(peer.answerTimer);
-    peer.answerTimer = null;
+    if (peer.timer !== null) clearTimeout(peer.timer);
+    peer.timer = null;
     for (let i = 0; i < peer.channels.length; i++) {
       const dc = peer.channels[i];
       peer.channelOpen[i] = false;

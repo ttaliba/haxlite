@@ -107,6 +107,7 @@ export class HostSignaling {
 
   /** Starts (`Aa.be`). `rcr` = captcha response, normally empty. */
   start(rcr = ''): void {
+    if (!this.stopped) return;
     this.stopped = false;
     void this.connect(rcr);
   }
@@ -122,6 +123,10 @@ export class HostSignaling {
     this.stopped = true;
     this.generation++;
     this.clearTimers();
+    this.dropSocket();
+  }
+
+  private dropSocket(): void {
     const ws = this.ws;
     this.ws = null;
     if (ws !== null) {
@@ -213,10 +218,12 @@ export class HostSignaling {
 
   private async connect(rcr: string): Promise<void> {
     const gen = ++this.generation;
-    if (this.reconnectTimer !== null) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
+    if (this.ws !== null) {
+      // explicit retry while connected (useRecaptchaToken): replace the session
+      this.dropSocket();
+      this.lost(1000, false);
     }
+    this.clearTimers();
     let session;
     try {
       session = await requestHostSession(this.token, rcr, this.opts);
