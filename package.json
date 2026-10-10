@@ -1,0 +1,42 @@
+{
+  "name": "haxlite",
+  "version": "0.0.1",
+  "description": "Clean-room, ultra-lightweight TypeScript reimplementation of a HaxBall headless host (protocol v9) with an HBInit-compatible API.",
+  "type": "module",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "json5": "^2.2.3",
+    "node-datachannel": "^0.33.4",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/ws": "^8.18.2",
+    "haxball.js": "5.1.0",
+    "node-haxball": "2.3.1",
+    "pako": "^2.2.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  }
+}

@@ -16,6 +16,7 @@ Todo sale de leer el código, que en ambos casos está minificado; no se captur�
 | 03 | [Física y estadios](docs/03-fisica-y-estadios.md) | Bucle de juego, colisiones, jugador y chute, reglas, formato `.hbs` y mapas por defecto |
 | 04 | [Netcode](docs/04-netcode-y-sincronizacion.md) | Lockstep, asignación de frames, predicción, ping, checksums y autoridad del host |
 | 05 | [Librerías y APIs](docs/05-librerias-y-apis.md) | Arquitectura de haxball.js y node-haxball, API HBInit, ejemplos y glosario |
+| 06 | [Arquitectura de haxlite](docs/06-arquitectura-haxlite.md) | Host propio en TypeScript: módulos, reglas de código y oráculos de prueba (`npm test`) |
 
 ## HaxBall en una página
 
