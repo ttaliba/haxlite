@@ -16,6 +16,7 @@ export interface TestKey {
   id: string;
   secret: string;
   readonly key: string;
+  maxSessions?: number;
 }
 
 export function makeKey(id: string): TestKey {
@@ -27,7 +28,7 @@ export async function startEdge(keys: TestKey[], opts: Partial<EdgeServerOptions
   return EdgeServer.start({
     host: EDGE_IP,
     port: 0,
-    keys: keys.map((k) => ({ id: k.id, secret: k.secret })),
+    keys: keys.map((k) => ({ id: k.id, secret: k.secret, maxSessions: k.maxSessions })),
     webrtc: {
       bindAddress: EDGE_IP,
       iceServers: [],

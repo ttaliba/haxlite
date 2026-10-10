@@ -71,6 +71,52 @@ describe('haxlite Edge tunnel', () => {
     ).rejects.toThrow(/rejected the key/);
   });
 
+  it('HBInit with haxlite.edge: room works through the edge, edgeStats()', async () => {
+    const room = await HBInit({
+      roomName: 'edge room',
+      noPlayer: true,
+      token: 'thr1.test',
+      geo: { code: 'ar', lat: 0, lon: 0 },
+      haxlite: { masterUrl: master.httpBase, shutdownWebRtcOnLastStop: false, edge: edgeConfig(edge, keyB) },
+    });
+    try {
+      const joined: Any[] = [];
+      room.onPlayerJoin = (p) => joined.push(p);
+      const roomId = room.haxlite.roomLink!.split('c=')[1]!;
+      const [, authObj] = (await nh.Utils.generateAuth()) as [string, Any];
+      let open: Any = null;
+      nh.Room.join(
+        { id: roomId, password: null, authObj },
+        { storage: { player_name: 'viaHBInit', avatar: null, geo: { lat: 0, lon: 0, flag: 'uy' } }, onOpen: (r: Any) => (open = r) },
+      );
+      await waitFor(() => open !== null && joined.length === 1, 15_000, 'HBInit join');
+      expect(joined[0].name).toBe('viaHBInit');
+      const info = room.haxlite.getPlayerConnection(joined[0].id)!;
+      expect(info.remoteAddress).toMatch(/^127\./);
+      const st = room.haxlite.edgeStats()!;
+      expect(st.state).toBe('ready');
+      expect(st.dataPlane).toBe('webrtc');
+      expect(st.peers).toBe(1);
+      expect(st.rttMs === null || st.rttMs >= 0).toBe(true);
+      open.leave();
+    } finally {
+      await room.haxlite.stop();
+    }
+  }, 60_000);
+
+  it('falls back to the WebSocket data plane when the UDP tunnel does not come up', async () => {
+    const e = await E2E.start({ shared: { master, nh }, transport: { edge: edgeConfig(edge, keyA, { dataPlaneTimeoutMs: 1 }) } });
+    try {
+      expect(backendOf(e).stats().dataPlane).toBe('ws');
+      const c = await e.join('fallback');
+      await waitFor(() => e.host.state.players.length === 2, 5000, 'joined');
+      expect(c.closeError).toBeNull();
+      expect(e.errors).toEqual([]);
+    } finally {
+      await e.close();
+    }
+  }, 60_000);
+
   it('WebSocket data plane: join, play, chat, leave', async () => {
     const e = await E2E.start({ shared: { master, nh }, transport: { edge: edgeConfig(edge, keyA, { dataPlane: 'ws' }) } });
     try {
