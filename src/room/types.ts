@@ -129,6 +129,64 @@ export class GameState {
 }
 
 /**
+ * Callback slots fired from inside event `apply` and the game tick (official
+ * RoomState callback fields; the headless wires them to HBInit `on*`).
+ * Every slot is `null` by default and is tested with a single null check, so
+ * an unset hook costs nothing. Hooks must not mutate the room synchronously
+ * (the official host schedules every change as an event).
+ */
+export class RoomHooks {
+  /** Start of every unpaused game tick. off `Og`. */
+  onGameTick: (() => void) | null = null;
+  /** A player kicked at least one `kick` disc this tick. off `wf`. */
+  onPlayerBallKick: ((player: Player) => void) | null = null;
+  /** Goal scored; `team` = SCORING team. off `Mf` (called with `goalOwner.rival`). */
+  onTeamGoal: ((team: TeamId) => void) | null = null;
+  /** Goal scored; `goalOwner` = team that owns the goal crossed (replay goal marker). off `zf`. */
+  onGoalMarker: ((goalOwner: TeamId) => void) | null = null;
+  /** Time limit reached with untied score (right before the game ends). off `ji`. */
+  onTimeLimitReached: (() => void) | null = null;
+  /** Positions reset after a goal (kick-off). off `xf`. */
+  onPositionsReset: (() => void) | null = null;
+  /** Game entered the 300-tick Ending phase. off `Nf`. */
+  onTeamVictory: ((winner: TeamId) => void) | null = null;
+  /** off `Kf`. `byPlayer` null when issued by the host (id 0). */
+  onGameStart: ((byPlayer: Player | null) => void) | null = null;
+  /** off `md`. `byPlayer` null when issued by the host or when the Ending phase finished. */
+  onGameStop: ((byPlayer: Player | null) => void) | null = null;
+  /** off `Ch`: (by, paused, wasPausedOrResuming = pauseGameTickCounter > 0 before). */
+  onGamePauseChange: ((byPlayer: Player | null, paused: boolean, wasPaused: boolean) => void) | null = null;
+  /** off `Eh`. */
+  onPlayerJoin: ((player: Player) => void) | null = null;
+  /** Player removed (leave if `reason === null`, else kick/ban). off `Fh`. */
+  onPlayerLeave: ((player: Player, reason: string | null, ban: boolean, byPlayer: Player | null) => void) | null = null;
+  /** Chat message applied. off `Li`. */
+  onPlayerChat: ((player: Player, message: string) => void) | null = null;
+  /** Host-side validation before accepting a SendChat (false = drop). off `uf` (via event `fg`). */
+  onPlayerChatFilter: ((player: Player, message: string) => boolean) | null = null;
+  /** off `Ni`. */
+  onChatIndicator: ((player: Player, value: number) => void) | null = null;
+  /** SendInput applied to a player that has a disc. off `vf`. */
+  onPlayerInput: ((player: Player, previousInput: number) => void) | null = null;
+  /** off `Gh`. */
+  onPlayerTeamChange: ((byPlayer: Player | null, player: Player, team: TeamId) => void) | null = null;
+  /** off `tf`. */
+  onPlayerAdminChange: ((byPlayer: Player | null, player: Player) => void) | null = null;
+  /** SetPlayerSync changed a player's desync flag. off `Mi`. */
+  onPlayerDesyncChange: ((player: Player) => void) | null = null;
+  /** CheckConsistency applied: `desynced` = local checksum differs. off `Ki`. */
+  onConsistencyResult: ((desynced: boolean) => void) | null = null;
+  /** off `Oi`. */
+  onAnnouncement: ((message: string, color: number, style: number, sound: number) => void) | null = null;
+  /** off `If`. */
+  onStadiumChange: ((byPlayer: Player | null, stadium: Stadium) => void) | null = null;
+  /** off `hh`: (by, min, rate, burst-after-clamp). */
+  onKickRateLimitSet: ((byPlayer: Player | null, min: number, rate: number, burst: number) => void) | null = null;
+  /** off `ii`. */
+  onTeamsLockChange: ((byPlayer: Player | null, locked: boolean) => void) | null = null;
+}
+
+/**
  * Whole room state. off `Ta` · nh `RoomState` / `pE`.
  * Wire (official `Ta.G`): see field order. The consistency checksum is
  * xorInt32Words(serialize(roomState)).
@@ -158,6 +216,10 @@ export class RoomState {
   redColors = new TeamColors();
   /** off `tc[2]` · nh `teamColors[2]` / `aW[2]` · bin TeamColors (default colours [0x5689E5]) */
   blueColors = new TeamColors();
+
+  // ---- not serialized ----
+  /** Callback slots (see {@link RoomHooks}). */
+  hooks = new RoomHooks();
 
   constructor() {
     this.redColors.colors.push(TEAMS[1].color);
