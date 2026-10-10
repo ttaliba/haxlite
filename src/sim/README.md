@@ -7,8 +7,8 @@
 | Stadium binary `writeStadium` / `readStadium` (+ `writeStadiumBody` / `readStadiumBody`) | **READY** | official `w.G`/`w.qa` and node-haxball, byte-exact |
 | Disc / World binary `writeDisc` / `readDisc` / `writeWorld` / `readWorld` | **READY** | official `Ba.G` layout (92 bytes, color u32) |
 | 10 default stadiums `defaultStadiums()` / `buildDefaultStadium(id)` | **READY** | official `w.Fd()` forced to the 255 form, byte-exact |
-| `.hbs` parser `parseHbs` | READY | official `w.kh` + node-haxball, byte-exact on the corpus in `test/sim/hbs-corpus.ts` |
-| World step `stepWorld(world, dt)` | READY | official `Oa.Da` bit-exact (Object.is on every disc field, every tick) |
+| `.hbs` parser `parseHbs` | **READY** | official `w.kh` byte-exact on 103 stadiums (hand-written edge cases, 10 exported built-ins, 80 random) + 30 rejected inputs; node-haxball agrees wherever it accepts the input |
+| World step `stepWorld(world, dt)` | **READY** | official `Oa.Da` bit-exact: 172,600 ticks, every field of every disc compared with `Object.is` after each tick (10 built-ins + 24 custom stadiums) |
 
 ## API for the room (engineer B)
 
@@ -52,3 +52,34 @@ so replacing those arrays between ticks is fine.
   `bgGoalLine = NaN` (node-haxball says 0 — the official one is NaN), hockey ones `bgColor = 0`.
 * `.hbs` values without an official type check (disc pos/speed/gravity, goal points) are
   converted with `Number()`, i.e. what clients decode from the bytes.
+
+## Tests and benchmark
+
+* `test/sim/default-stadiums.test.ts`: built-ins vs official `w.Fd()` (255 form), 1-byte form, round trip.
+* `test/sim/hbs.test.ts` + `test/sim/hbs-corpus.ts`: parser vs official `w.kh` (and node-haxball), error cases.
+* `test/sim/physics.test.ts`: differential world step vs official `Oa.Da` (reached through
+  `test/sim/official-sim.ts`), 5000 ticks per stadium, player-like chase/kick nudges, mask flips,
+  fractional dt.
+* `test/sim/world.test.ts`: world/disc bytes vs official `Oa.G`, `goalCrossed` vs official `w.Ag`,
+  cached step vs literal reference step, cache invalidation.
+* Benchmark: `node --experimental-strip-types --no-warnings --import ./bench/ts-resolve.mjs bench/sim.bench.ts`
+  (Node 22.22, this container): Classic + 8 players ≈ 1.1 µs/tick vs official ≈ 2.1 µs/tick;
+  Huge with 30 discs ≈ 3.5 µs/tick vs ≈ 6.4 µs/tick. No GC during 2M ticks (`--trace-gc`).
+
+## Performance notes
+
+`stepWorld` keeps the official algorithm and float expressions, but iterates only the static
+objects whose masks can match the disc (a per-world, per-(cMask, cGroup) ordered index list;
+skipped objects have no side effects, so results are identical — `stepWorldReference` is the
+literal full scan and the tests check they agree). The cache notices replaced geometry arrays;
+call `invalidateGeometryCache(world)` only if you mutate a plane/segment/vertex mask in place
+(the official game never does).
+
+## Known host-vs-client corners of the official parser (we follow the clients)
+
+The official HOST keeps some `.hbs` values uncast while clients get the serialized numbers; we
+always produce the client's view (the bytes are identical either way):
+* string / missing disc `pos`/`speed`/`gravity` items (`"5"`, `[1]`) → `Number()` (5, NaN);
+* a joint without `d0`/`d1` → the official host skips it (undefined index), clients apply it to
+  disc 0 (u8 0 on the wire); we store 0.
+* an unparsable colour (`"zzz"`) → stored as NaN: serializes as 0 and keeps the segment colour flag set.
