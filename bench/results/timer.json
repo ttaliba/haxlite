@@ -1,0 +1,80 @@
+{
+ "command": "node bench/timer.bench.mjs 20 <rooms>",
+ "date": "2026-10-10T21:59:33.597Z",
+ "runs": [
+  {
+   "node": "v22.22.0",
+   "seconds": 20,
+   "rooms": 1,
+   "results": [
+    {
+     "name": "baseline (no timers)",
+     "rooms": 1,
+     "cpuPct": 0.002,
+     "wakeupsPerS": 0
+    },
+    {
+     "name": "frame (setTimeout per frame)",
+     "rooms": 1,
+     "cpuPct": 0.838,
+     "wakeupsPerS": 61.2
+    },
+    {
+     "name": "refresh (Timeout.refresh)",
+     "rooms": 1,
+     "cpuPct": 0.933,
+     "wakeupsPerS": 61.2
+    },
+    {
+     "name": "shared (one timer, all rooms)",
+     "rooms": 1,
+     "cpuPct": 1.113,
+     "wakeupsPerS": 61.2
+    },
+    {
+     "name": "interval50 (official)",
+     "rooms": 1,
+     "cpuPct": 0.329,
+     "wakeupsPerS": 19.9
+    }
+   ]
+  },
+  {
+   "node": "v22.22.0",
+   "seconds": 20,
+   "rooms": 10,
+   "results": [
+    {
+     "name": "baseline (no timers)",
+     "rooms": 10,
+     "cpuPct": 0.003,
+     "wakeupsPerS": 0
+    },
+    {
+     "name": "frame (setTimeout per frame)",
+     "rooms": 10,
+     "cpuPct": 1.469,
+     "wakeupsPerS": 614.9
+    },
+    {
+     "name": "refresh (Timeout.refresh)",
+     "rooms": 10,
+     "cpuPct": 1.219,
+     "wakeupsPerS": 610.2
+    },
+    {
+     "name": "shared (one timer, all rooms)",
+     "rooms": 10,
+     "cpuPct": 1.088,
+     "wakeupsPerS": 613.5
+    },
+    {
+     "name": "interval50 (official)",
+     "rooms": 10,
+     "cpuPct": 0.342,
+     "wakeupsPerS": 199
+    }
+   ]
+  }
+ ]
+}

@@ -78,4 +78,17 @@ export {
   type ParsedCandidate,
 } from './ice.js';
 export * from './constants.js';
+export { LocalPeerBackend, LocalPeerLink, type PeerBackend, type PeerLink, type PeerLinkEvents } from './peer-backend.js';
+export { EdgeError, EdgePeerBackend, type EdgeBackendStats, type EdgeErrorKind, type EdgeOptions, type EdgeState } from './edge-client.js';
+export {
+  AuthFlag as EdgeAuthFlag,
+  EDGE_DEFAULT_PATH,
+  EDGE_PROTOCOL_VERSION,
+  EdgeCloseCode,
+  EdgeLimits,
+  EdgeMsg,
+  EdgePeerClose,
+  edgeAuthMac,
+  parseEdgeKey,
+} from './edge-protocol.js';
 export { liveWebRtcObjects, shutdownWebRtc, webRtcStats, type WebRtcStats } from './webrtc.js';

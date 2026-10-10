@@ -32,8 +32,12 @@ export interface PeerLinkEvents {
   onMessage(index: number, data: string | Uint8Array): void;
   /** Connection-level `failed`/`closed`. */
   onConnectionState(state: 'failed' | 'closed'): void;
-  /** The backend dropped this peer for flooding (edge-side limiter). */
-  onFlood(): void;
+  /**
+   * The backend already dropped this peer for abuse (edge-side flood limiter
+   * or a text message): the host treats it like its own `flood`/`protocol`
+   * close ("Bad actor").
+   */
+  onAbuse(kind: 'flood' | 'protocol'): void;
   onError(err: Error): void;
 }
 

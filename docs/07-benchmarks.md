@@ -1,0 +1,391 @@
+# 07 — Benchmarks de recursos: haxlite vs host oficial vs node-haxball
+
+> Medición reproducible del consumo de recursos de un **host** de HaxBall en Node.js:
+> haxlite (este repo), el **script oficial del headless** ejecutado por `haxball.js` 5.1.0 y
+> **node-haxball** 2.3.1 actuando como host. Todo offline contra la `FakeMaster` de
+> `test/fake-master`, con clientes reales (node-haxball) en procesos aparte.
+> Datos crudos: `bench/results/*.json`. Tablas regenerables con `node bench/net/report.mjs`.
+
+## 0. Resumen
+
+Valores = mediana de 3 repeticiones (60 s de ventana tras 15 s de calentamiento; ociosa 3 × 200 s).
+CPU en % de **un** núcleo (100 % = un núcleo entero), medido con `process.cpuUsage()` sobre el
+proceso host completo (hilo JS + hilos nativos de WebRTC).
+
+| escenario | métrica | haxlite | oficial (haxball.js) | node-haxball |
+|---|---|---:|---:|---:|
+| sala pública ociosa, 0 jugadores | CPU % | **0,031** | 0,403 | 1,293 |
+| | RSS / heap usado (MB) | 69,7 / 9,1 | 75,7 / 9,7 | 71,5 / 11,6 |
+| partida, 4 clientes | CPU % | 4,74 – 5,71 ¹ | 4,76 – 5,17 ¹ | 5,88 |
+| partida, 10 clientes | CPU % | 9,79 | 10,13 | 11,76 |
+| partida, 20 clientes | CPU % | **21,76** | 23,52 | 25,71 |
+| | RSS / heap usado (MB) | 85,5 / **10,7** | 89,8 / 12,4 | 92,8 / 16,0 |
+| | GC por minuto / ms de GC por minuto | **17 / 7,6** | 98 / 76,8 | 98 / 61,2 |
+| | lag del event loop p50 / p99 (ms) | 0,17 / 1,44 | 0,16 / 1,71 | 0,20 / 1,67 |
+| 10 salas × 4 clientes, 1 proceso | CPU % | **28,1** | 31,6 | 33,2 |
+| | RSS / heap usado (MB) | **92,4 / 11,8** | 105,4 / 17,9 | 103,3 / 18,5 |
+| arranque → link de sala | ms desde el inicio del proceso | 202 | 211 | 215 |
+| física (`stepWorld`, Classic 13 discos) | ns/tick | **1044** | 1902 | — |
+
+¹ Rango de medianas de las tres tandas que midieron N = 4 (§4.3): con 1 sala y pocos clientes
+haxlite queda **igual o hasta ~10 % por encima** del oficial (coste fijo de su reloj de 60 Hz, §5.1).
+
+Conclusiones cortas (detalle en §5):
+
+* **Ociosa**, haxlite es ~13× más barato que el oficial y ~40× que node-haxball, pero en valores
+  absolutos todos son despreciables (0,03 % vs 0,4 % de un núcleo).
+* **Con jugadores**, el coste lo domina WebRTC: ~la mitad de la CPU está en hilos nativos de
+  libdatachannel (iguales en los tres) y buena parte del hilo JS son las llamadas nativas de
+  envío/recepción. haxlite ahorra un **~7 % de CPU con 20 clientes** y un **~11 % con 10 salas**,
+  sobre todo en el hilo JS; con 1 sala y 4 clientes no gana (≈ +0,3–0,5 puntos).
+* Donde haxlite sí se separa claramente es en **memoria del heap y GC**: heap plano (~10,7 MB con
+  1 sala, +0,2 MB por sala extra frente a +0,8 MB del oficial) y **5–6× menos GC** (10× menos
+  tiempo de GC). El RSS (70–105 MB) lo domina el runtime de Node + TLS + libdatachannel.
+* **Lag del event loop**: sin diferencias relevantes (p50 ≈ 0,15–0,2 ms, p99 ≈ 1–1,7 ms en los
+  tres). Ninguna implementación bloquea el loop lo bastante como para afectar al netcode.
+* **Física**: ×1,85–×1,97 más rápida que la oficial, pero 1 µs por tick son 0,006 % de un núcleo
+  a 60 Hz: irrelevante para el consumo total del host.
+
+## 1. Qué se compara
+
+| | haxlite | oficial | node-haxball |
+|---|---|---|---|
+| código | `src/` compilado con `tsc` (`npm run bench:build` → `node_modules/.cache/haxlite-bench/dist`) | `haxball.js` 5.1.0 (script `headless-min.js` oficial evaluado en Node) | `node-haxball` 2.3.1 `Room.create` |
+| API usada | `HostRoom` + `HostTransport` (como hará la fachada `HBInit`) | `HBInit` | `Room.create` + `room.setPlayerTeam/startGame…` |
+| WebRTC | `node-datachannel` 0.33.4 (libdatachannel) | `@webrtc-node/webrtc` 0.2.1 (también libdatachannel, con capa JS W3C) | `node-datachannel` 0.25 (polyfill W3C) |
+| reloj | `setTimeout` por frame (60 Hz) con partida; sin timers ociosa | `setInterval(…, 50)` siempre | timers propios |
+
+Misma configuración de sala en las tres: pública, `noPlayer`, `maxPlayers` 30, misma geo, estadio
+Classic por defecto, límites de goles/tiempo a 0 (la partida no termina), servidores STUN por
+defecto (inalcanzables offline: solo candidatos `host`).
+
+### 1.1 Cómo se ejecuta cada host offline (solo en el arnés, sin tocar las librerías)
+
+* **haxlite**: `HostTransport({ masterUrl: 'http://127.0.0.1:PUERTO/rs/' })`.
+* **oficial (haxball.js)**: `haxball.js` no permite cambiar el backend, pero carga `xhr2` y `ws`
+  como módulos normales. El arnés parchea `XMLHttpRequest.prototype.open` de `xhr2` (el mismo
+  módulo que importa `haxball.js`) para reescribir `https://www.haxball.com/rs/` → FakeMaster; la
+  URL del WebSocket del host ya viene en la respuesta de `api/host` (`ws://…/host`). WebRTC se
+  inyecta con la opción pública `webrtc` de `HaxballJS()` (ver shims).
+* **node-haxball**: `require('node-haxball')(window, { backend: { hostname, hostnameWs, secure: false } })`.
+
+Shims de compatibilidad (clientes node-haxball, no afectan al comportamiento del host):
+
+1. **Retraso del primer envío por canal (40 ms)** en los hosts oficial y node-haxball. Los clientes
+   node-haxball (libdatachannel) descartan mensajes que llegan antes de ver abiertos todos sus
+   canales; esos hosts envían el *challenge* en cuanto abre el canal 0 y ~20 % de las uniones por
+   loopback se cuelgan. haxlite hace lo mismo de serie (`challengeDelayMs = 40`). El envoltorio
+   solo difiere los envíos de los primeros 40 ms de cada canal; después `send()` se llama directo
+   (coste en régimen: una llamada y una comparación por mensaje).
+2. **Candidatos `a=candidate:`** (solo host oficial): node-haxball manda sus candidatos ICE con el
+   prefijo SDP `a=`; los navegadores no. `@webrtc-node/webrtc` los rechaza y la unión falla
+   siempre; el envoltorio de `addIceCandidate` quita el prefijo.
+
+## 2. Metodología
+
+### 2.1 Procesos
+
+Cada repetición arranca procesos nuevos:
+
+```
+bench/net/run.ts (orquestador, TS) ── FakeMaster (HTTP + WS de señalización en 127.0.0.1)
+  ├─ bench/net/host-proc.mjs     host bajo prueba (JS plano: sin cargador de TypeScript en el
+  │                              proceso medido); se mide a sí mismo y responde por IPC
+  └─ bench/net/clients-proc.mjs  × ⌈clientes/10⌉  clientes node-haxball (nunca se cuentan)
+```
+
+* **Clientes**: node-haxball (`Room.join`) con identidad ECDSA, en procesos separados (≤ 10 por
+  proceso). Se unen secuencialmente; el host reparte equipos alternos rojo/azul y arranca la partida.
+* **Carga de juego (idéntica para los tres hosts, PRNG con semilla)**: cada cliente cambia su
+  estado de teclas cada 60–250 ms (uniforme, ≈ 6,5 cambios/s: un jugador muy activo), una de 9
+  direcciones y tiro el 25 % de las veces; chat con probabilidad 1/200 por cambio (≈ 1 mensaje cada
+  30 s por cliente). Los contadores confirman la misma carga: p. ej. N = 20 → 9654–9806 inputs y
+  46–52 chats por repetición en los tres hosts.
+* **Validez**: antes de medir el host debe ver los N jugadores; al final, los N siguen conectados
+  y ningún cliente se desconectó (`valid` en el JSON). Todas las repeticiones publicadas son válidas.
+
+### 2.2 Métricas (en el proceso host)
+
+* **CPU**: `process.cpuUsage()` (usuario + sistema, todos los hilos del proceso) / tiempo de pared
+  de la ventana. Además, reparto **por hilo** leyendo `/proc/self/task/*/stat` al inicio y al final
+  (solo Linux; `main (JS)` = hilo principal; `RTC worker`, `juice poll`, `SCTP timer` = hilos de
+  libdatachannel; `node` = hilos de la plataforma V8: GC concurrente, compilación).
+* **Memoria**: `process.memoryUsage()` cada 1 s (5 s en ociosa): RSS y heap usado medios/máximos.
+* **GC**: `PerformanceObserver` de entradas `gc` (número y duración).
+* **Lag del event loop**: `monitorEventLoopDelay({ resolution: 10 })`. El histograma guarda el
+  intervalo entre disparos de su timer de 10 ms; se publica `lag = valor − 10 ms` (p50/p99/máx).
+  No se usa en ociosa (su propio timer de 100 Hz dominaría la CPU medida).
+* **Arranque**: `performance.now()` del proceso host (ms desde que Node arranca) al recibir el
+  link; `creación → link` = desde la llamada que crea la sala; CPU consumida hasta el link.
+
+### 2.3 Repeticiones, ruido y equidad
+
+* 3 repeticiones por configuración (10 en arranque), **intercaladas** (rep 1 de todas las
+  configuraciones, luego rep 2…) para que la deriva de la máquina afecte a todos por igual.
+  Se publica **mediana (mín–máx)**.
+* La máquina era compartida con otros procesos (tests de otros ingenieros). El orquestador mide la
+  CPU de todo el sistema (`/proc/stat`) durante la ventana y resta la de sus propios procesos:
+  columna **«ajeno %»**. Si supera el 100 % de un núcleo, se repite (máx. 2 intentos; si sigue
+  ruidoso se conserva el menos ruidoso y se marca `noisy`, `*` en las tablas). Las tandas
+  «ociosa», «K salas» y la de confirmación se midieron con la máquina tranquila (ajeno ≤ 4–9 %);
+  la tanda «partida» tuvo ruido ajeno en N = 4 y N = 10 (mediana 47–82 %).
+* Mismo escenario, mismos clientes, mismo estadio, mismas duraciones y mismo PRNG para los tres.
+
+### 2.4 Máquina y versiones
+
+Intel Xeon @ 2,80 GHz, **4 vCPU** (VM Firecracker), 16 GB, Linux 6.18, **Node v22.22.0**
+(V8 12.4). haxball.js 5.1.0, node-haxball 2.3.1, node-datachannel 0.33.4, @webrtc-node/webrtc 0.2.1.
+haxlite medido: build `88aef57bf1d4` (commit `aef9533` + árbol de trabajo del 10-10-2026 18:57
+UTC) para las tandas principales; build `ff0326f10e5e` (commit `25af3d4`, con el blindaje de red
+de `2f25b6b`) para la tanda de confirmación §4.3 y los diagnósticos. El hash del build medido va
+en `info.haxliteBuildSha` de cada JSON.
+
+### 2.5 Comandos exactos
+
+```sh
+npm ci
+npm run bench:build                       # compila src/ → node_modules/.cache/haxlite-bench/dist
+R="node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs bench/net/run.ts"
+$R startup                                # 10 reps × 3 hosts            → bench/results/startup.json
+$R game                                   # N = 4,10,20 × 3 hosts × 3    → bench/results/game.json
+$R rooms --impl haxlite,official,nodehaxball   # K = 1,5,10 × 4 clientes → bench/results/rooms.json
+$R idle                                   # 3 × 200 s × 3 hosts          → bench/results/idle.json
+for i in 1 2 3; do npm run -s bench:sim -- --out bench/results/sim.json; done
+node bench/net/report.mjs                 # tablas markdown de este documento
+# confirmación con el build actual y diagnósticos
+$R game --impl haxlite,official --n 4,20 --out bench/results/game-head.json
+$R game --impl haxlite,official --n 4 --eld 0 --out bench/results/diag-noeld.json
+HAXLITE_HOST_OPTS='{"heartbeatFrames":9}' $R game --impl haxlite --n 4,20 --out bench/results/diag-heartbeat9.json
+node bench/timer.bench.mjs 20 1; node bench/timer.bench.mjs 20 10   # → bench/results/timer.json
+```
+
+Atajos: `npm run bench:startup|bench:idle|bench:game|bench:rooms` (compilan antes) y
+`npm run bench:sim`. Flags: `--reps`, `--warmup`, `--window`, `--n`, `--k`, `--impl`,
+`--max-foreign`, `--attempts`, `--eld 0`, `--host-node-args "--cpu-prof …"`; variables de
+diagnóstico `HOST_CPU_PROFILE=<archivo>` (perfil V8 del hilo JS solo durante la ventana) y
+`HAXLITE_HOST_OPTS` (opciones extra de `HostRoom`; nunca usadas en las tablas principales).
+Duración total aproximada: 3–4 h (cada repetición con clientes ≈ 100 s).
+
+## 3. Escenarios
+
+| | descripción | ventana |
+|---|---|---|
+| (a) ociosa | sala pública, 0 jugadores, sin partida | 10 s calentamiento + 200 s × 3 reps = **10 min** por host |
+| (b) partida | 1 sala, N = 4, 10, 20 clientes jugando una partida en curso | 15 s + 60 s × 3 |
+| (c) K salas | K = 1, 5, 10 salas en **un** proceso, 4 clientes por sala (los tres hosts; el oficial evalúa una copia del script por sala) | 15 s + 60 s × 3 |
+| (d) arranque | proceso nuevo → link de sala (`onRoomLink`) | 10 reps |
+
+## 4. Resultados
+
+Formato: mediana (mín–máx). «clientes CPU %» = CPU de los procesos de clientes (no contada en el
+host; sirve para ver que la carga generada es la misma).
+
+### 4.1 Arranque (d)
+
+| host | reps | inicio proceso → link (ms) | creación → link (ms) | carga módulos (ms) | CPU hasta link (ms) | RSS al link (MB) | heap al link (MB) |
+|---|---|---|---|---|---|---|---|
+| haxlite | 10 | 202 (178–309) | 20.2 (16.6–28.6) | 134 (116–188) | 270 (239–402) | 76.2 (74.5–76.8) | 10.4 (10.4–10.5) |
+| oficial (haxball.js) | 10 | 211 (189–283) | 28.4 (25.9–41.3) | 133 (118–191) | 312 (275–378) | 74.9 (70.6–76.9) | 10.4 (10.4–10.4) |
+| node-haxball | 10 | 215 (187–280) | 25.5 (22.3–34.4) | 141 (114–178) | 241 (214–305) | 72.9 (72.2–73.5) | 12.4 (12.4–12.5) |
+
+Prácticamente igual: ~200 ms, dominados por el arranque de Node (~40 ms) y la carga de módulos
+(~130 ms: `ws`/TLS y la librería nativa de WebRTC). La FakeMaster es local, así que `creación →
+link` (20–28 ms) no incluye latencia real de haxball.com.
+
+### 4.2 Sala pública ociosa (a)
+
+| host | reps × ventana | CPU % | CPU ms/min | RSS medio (MB) | Δ RSS en ventana (MB) | heap usado medio (MB) | GC/min | ajeno % |
+|---|---|---|---|---|---|---|---|---|
+| haxlite | 3 × 200 s | 0.031 (0.030–0.031) | 18 (18–19) | 69.7 (69.2–72.4) | 0.25 (0.25–0.25) | 9.1 (9.1–9.2) | 0.0 (0.0–0.0) | 3 (3–3) |
+| oficial (haxball.js) | 3 × 200 s | 0.403 (0.399–0.421) | 242 (239–253) | 75.7 (73.4–78.8) | 1.63 (1.50–1.76) | 9.7 (9.7–9.7) | 0.6 (0.6–0.6) | 3 (3–3) |
+| node-haxball | 3 × 200 s | 1.293 (1.243–1.295) | 776 (746–777) | 71.5 (70.2–71.6) | -2.33 (-2.58–3.14) | 11.6 (11.5–11.6) | 3.9 (2.7–3.9) | 3 (3–3) |
+
+* haxlite no arma ningún timer de juego sin clientes ni partida: lo que queda (18 ms de CPU por
+  minuto) son el barrido de 1 Hz de `HostTransport`, el keep-alive de señalización y el propio
+  muestreo de memoria del arnés (cada 5 s). Ningún GC en 10 minutos.
+* El oficial ejecuta `setInterval(…, 50)` siempre (20 despertares/s): 0,40 %. Es coherente con el
+  micro-benchmark de timers (§5.1: un `setInterval` de 50 ms vacío cuesta 0,33 % en esta VM).
+* Ninguno muestra fuga: Δ RSS ≤ 1,8 MB en 200 s, heap estable.
+
+### 4.3 Partida en curso, 1 sala con N clientes (b)
+
+| config | reps | CPU % | RSS medio (MB) | heap usado medio (MB) | lag p50 (ms) | lag p99 (ms) | lag máx (ms) | GC/min | GC ms/min | clientes CPU % | ajeno % |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| haxlite N=4 | 3* | 4.74 (4.13–5.60) | 80.1 (79.6–81.9) | 10.2 (10.1–10.6) | 0.19 (0.19–0.20) | 1.13 (0.97–1.71) | 21.7 (5.2–26.5) | 10.0 (7.0–12.0) | 4.5 (2.8–14.2) | 6 (6–7) | 82 (4–142) |
+| oficial (haxball.js) N=4 | 3 | 4.76 (4.59–5.05) | 80.0 (78.0–84.2) | 10.8 (10.8–10.9) | 0.15 (0.15–0.17) | 1.02 (1.02–1.35) | 37.2 (35.1–63.8) | 18.0 (18.0–19.0) | 7.7 (6.6–7.7) | 6 (6–7) | 52 (4–88) |
+| node-haxball N=4 | 3 | 5.88 (5.58–6.22) | 84.4 (84.3–85.5) | 14.1 (14.0–14.1) | 0.22 (0.22–0.22) | 1.14 (1.01–1.35) | 44.7 (10.3–49.4) | 35.0 (34.0–36.0) | 14.1 (11.7–14.6) | 7 (6–7) | 78 (4–92) |
+| haxlite N=10 | 3 | 9.79 (9.57–10.00) | 84.1 (84.0–88.3) | 10.6 (10.6–10.6) | 0.18 (0.17–0.18) | 1.32 (1.05–1.36) | 51.7 (51.3–155.4) | 12.0 (11.0–14.0) | 4.5 (4.4–5.9) | 14 (14–15) | 74 (4–94) |
+| oficial (haxball.js) N=10 | 3 | 10.13 (9.63–10.50) | 82.8 (82.5–85.8) | 11.6 (11.6–11.6) | 0.15 (0.14–0.15) | 1.27 (1.01–1.29) | 31.1 (13.8–44.6) | 58.0 (57.0–59.0) | 25.9 (23.5–27.5) | 14 (13–14) | 47 (4–73) |
+| node-haxball N=10 | 3 | 11.76 (11.48–11.91) | 86.5 (86.2–86.7) | 15.2 (15.1–15.2) | 0.19 (0.18–0.20) | 1.18 (1.05–1.18) | 4.9 (4.7–24.1) | 68.0 (65.0–71.0) | 28.2 (25.1–29.9) | 14 (14–14) | 48 (3–55) |
+| haxlite N=20 | 3 | 21.76 (20.79–21.83) | 85.5 (84.8–87.0) | 10.7 (10.7–10.7) | 0.17 (0.17–0.17) | 1.44 (1.37–1.71) | 22.5 (13.3–62.6) | 17.0 (15.0–18.0) | 7.6 (7.6–8.4) | 42 (40–42) | 28 (2–42) |
+| oficial (haxball.js) N=20 | 3 | 23.52 (22.52–23.63) | 89.8 (87.2–91.0) | 12.4 (12.4–12.5) | 0.16 (0.16–0.17) | 1.71 (1.49–3.16) | 55.2 (52.6–115.2) | 98.0 (95.0–99.0) | 76.8 (72.1–80.0) | 42 (40–42) | 42 (3–81) |
+| node-haxball N=20 | 3 | 25.71 (25.29–27.28) | 92.8 (91.8–94.1) | 16.0 (16.0–16.0) | 0.20 (0.19–0.21) | 1.67 (1.61–2.08) | 132.5 (6.4–145.1) | 98.0 (97.0–102.0) | 61.2 (60.7–68.6) | 43 (41–45) | 4 (2–41) |
+
+Reparto por hilo (mediana, % de un núcleo):
+
+| config | main (JS) | RTC worker | juice poll | SCTP timer | node (V8) |
+|---|---|---|---|---|---|
+| haxlite N=4 | 2.53 | 1.52 | 0.64 | 0.30 | 0.15 |
+| oficial (haxball.js) N=4 | 2.20 | 1.55 | 0.61 | 0.32 | 0.15 |
+| node-haxball N=4 | 3.08 | 1.62 | 0.65 | 0.32 | 0.20 |
+| haxlite N=10 | 4.11 | 3.70 | 1.58 | 0.32 | 0.20 |
+| oficial (haxball.js) N=10 | 4.31 | 3.84 | 1.60 | 0.32 | 0.23 |
+| node-haxball N=10 | 5.33 | 4.13 | 1.70 | 0.32 | 0.36 |
+| haxlite N=20 | 8.48 | 8.83 | 3.90 | 0.33 | 0.17 |
+| oficial (haxball.js) N=20 | 9.85 | 8.78 | 3.92 | 0.33 | 0.37 |
+| node-haxball N=20 | 11.46 | 9.35 | 4.05 | 0.35 | 0.47 |
+
+**Tanda de confirmación** (máquina tranquila, build actual `ff0326f10e5e` con el blindaje de red,
+`bench/results/game-head.json`, haxlite y oficial intercalados):
+
+| config | CPU % | main (JS) | heap usado (MB) | GC/min | lag p50 / p99 (ms) | ajeno % |
+|---|---|---|---|---|---|---|
+| haxlite N=4 | 5.71 (5.38–5.74) | 2.80 | 10.2 | 8 | 0.21 / 0.98 | 6 |
+| oficial N=4 | 5.17 (5.16–5.19) | 2.35 | 10.8 | 18 | 0.17 / 0.96 | 9 |
+| haxlite N=20 | 22.23 (21.52–23.06) | 8.63 | 10.8 | 16 | 0.18 / 1.42 | 6 |
+| oficial N=20 | 23.96 (23.56–24.19) | 10.17 | 12.4 | 97 | 0.17 / 1.58 | 7 |
+
+Confirma la tanda principal: con 20 clientes haxlite −7 % de CPU (−15 % en el hilo JS); con 4
+clientes y la máquina tranquila haxlite queda **+10 %** sobre el oficial (+0,45 puntos en el hilo
+JS; causa en §5.1). La tanda principal de N = 4 (paridad) tuvo mucho ruido ajeno.
+
+### 4.4 K salas en un proceso, 4 clientes por sala (c)
+
+| config | reps | CPU % | RSS medio (MB) | heap usado medio (MB) | lag p50 (ms) | lag p99 (ms) | lag máx (ms) | GC/min | GC ms/min | clientes CPU % | ajeno % |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| haxlite K=1 | 3 | 5.39 (5.31–5.49) | 79.9 (78.6–84.3) | 10.1 (10.1–10.2) | 0.20 (0.20–0.21) | 0.96 (0.94–0.98) | 34.2 (21.9–45.6) | 9.0 (8.0–9.0) | 3.7 (3.4–3.7) | 7 (7–7) | 4 (3–4) |
+| oficial (haxball.js) K=1 | 3 | 5.11 (4.77–5.28) | 80.9 (79.3–88.4) | 10.9 (10.9–10.9) | 0.17 (0.16–0.17) | 0.94 (0.94–0.96) | 54.5 (11.7–58.2) | 18.0 (18.0–19.0) | 7.0 (6.7–7.8) | 7 (6–7) | 4 (3–4) |
+| node-haxball K=1 | 3 | 6.33 (6.31–6.46) | 84.4 (84.3–84.9) | 14.1 (14.0–14.1) | 0.22 (0.21–0.22) | 0.99 (0.98–1.00) | 31.0 (27.2–41.3) | 36.0 (34.0–36.0) | 13.3 (12.8–13.6) | 7 (7–7) | 4 (3–4) |
+| haxlite K=5 | 3 | 16.05 (15.01–17.24) | 87.0 (86.8–88.1) | 11.1 (11.1–11.2) | 0.15 (0.14–0.17) | 1.03 (1.01–1.04) | 12.0 (5.9–22.3) | 27.0 (27.0–28.0) | 11.6 (10.7–13.4) | 25 (23–26) | 3 (2–3) |
+| oficial (haxball.js) K=5 | 3 | 17.81 (17.37–19.12) | 92.4 (87.5–95.7) | 15.0 (14.9–15.0) | 0.16 (0.14–0.16) | 1.09 (1.06–1.19) | 4.9 (4.8–57.3) | 163.0 (163.0–163.0) | 79.0 (76.5–84.8) | 24 (23–26) | 3 (2–4) |
+| node-haxball K=5 | 3 | 19.53 (18.03–20.99) | 93.4 (92.8–94.3) | 16.7 (16.6–16.8) | 0.16 (0.14–0.17) | 1.08 (1.07–1.10) | 26.9 (7.5–60.9) | 85.0 (85.0–86.0) | 41.3 (38.3–41.4) | 25 (23–27) | 3 (3–4) |
+| haxlite K=10 | 3 | 28.08 (26.92–32.13) | 92.4 (92.2–94.4) | 11.8 (11.8–11.8) | 0.11 (0.11–0.13) | 1.06 (1.05–1.11) | 35.1 (18.9–43.6) | 45.0 (45.0–46.0) | 17.7 (17.2–20.6) | 47 (44–54) | 0 (0–2) |
+| oficial (haxball.js) K=10 | 3 | 31.62 (30.85–33.74) | 105.4 (102.2–109.7) | 17.9 (17.9–18.0) | 0.14 (0.13–0.15) | 1.17 (1.11–1.19) | 10.5 (4.5–35.5) | 239.0 (236.0–239.0) | 148.3 (139.8–159.7) | 45 (43–48) | 0 (0–4) |
+| node-haxball K=10 | 3 | 33.21 (31.01–33.89) | 103.3 (102.4–103.6) | 18.5 (18.4–18.6) | 0.13 (0.12–0.13) | 1.18 (1.07–1.28) | 53.7 (5.9–63.3) | 152.0 (152.0–156.0) | 75.4 (74.7–78.6) | 46 (43–47) | 0 (0–0) |
+
+| config | main (JS) | RTC worker | juice poll | SCTP timer | node (V8) |
+|---|---|---|---|---|---|
+| haxlite K=1 | 2.60 | 1.62 | 0.65 | 0.35 | 0.15 |
+| oficial (haxball.js) K=1 | 2.27 | 1.67 | 0.63 | 0.33 | 0.15 |
+| node-haxball K=1 | 3.28 | 1.80 | 0.70 | 0.37 | 0.23 |
+| haxlite K=5 | 6.27 | 6.38 | 2.90 | 0.35 | 0.18 |
+| oficial (haxball.js) K=5 | 7.78 | 6.38 | 2.87 | 0.35 | 0.45 |
+| node-haxball K=5 | 8.73 | 6.95 | 3.13 | 0.38 | 0.37 |
+| haxlite K=10 | 10.53 | 11.17 | 5.75 | 0.47 | 0.13 |
+| oficial (haxball.js) K=10 | 13.58 | 11.33 | 5.73 | 0.42 | 0.57 |
+| node-haxball K=10 | 14.53 | 11.95 | 5.93 | 0.50 | 0.35 |
+
+Coste marginal por sala extra (K = 1 → 10, 4 clientes cada una):
+
+| | CPU (puntos/sala) | RSS (MB/sala) | heap usado (MB/sala) |
+|---|---|---|---|
+| haxlite | +2,5 | **+1,4** | **+0,19** |
+| oficial | +2,9 | +2,7 | +0,78 |
+| node-haxball | +3,0 | +2,1 | +0,49 |
+
+40 clientes repartidos en 10 salas cuestan bastante menos que lo que sugeriría escalar la sala de
+20 (la retransmisión de inputs es O(N²) por sala: cada input se reenvía a los N clientes).
+
+### 4.5 Física (`bench/sim.bench.ts`, `stepWorld` vs `Oa.Da` oficial)
+
+| escenario | reps | haxlite ns/tick | oficial ns/tick | aceleración | crecimiento heap haxlite (KiB / 200k ticks) |
+|---|---|---|---|---|---|
+| Classic, 8 players (13 discs) | 3 | 1044 (1031–1083) | 1902 (1832–1964) | ×1.85 (1.69–1.88) | 18 (18–18) |
+| Huge, 25 players (30 discs) | 3 | 3433 (3377–3777) | 6746 (6364–6844) | ×1.97 (1.68–2.03) | 0 (0–0) |
+
+(Mejor de 5 rondas de 200 000 ticks, 3 procesos; `bench/results/sim.json`.) A 60 Hz, 1–3,5 µs por
+tick son 0,006–0,02 % de un núcleo: la física **no** es el cuello de botella del host.
+
+## 5. Análisis y hallazgos de rendimiento en haxlite
+
+### 5.1 Coste fijo del reloj por frame (hallazgo, sin cambiar `src/`)
+
+Con 1 sala y 4 clientes el hilo JS de haxlite gasta +0,3–0,45 puntos más que el oficial
+(2,60 vs 2,27 en K = 1; 2,80 vs 2,35 en la tanda de confirmación), aunque procesa los mismos
+mensajes con menos trabajo JS. Evidencia:
+
+1. **Perfil V8 del hilo JS durante la ventana** (`HOST_CPU_PROFILE`, N = 4, 30 s): en haxlite el
+   código de timers de Node (`processTimers`, `listOnTimeout`, constructor `Timeout`, `insert`) y
+   los hooks async suman ~100 ms/30 s (≈ 0,33 % de un núcleo) frente a ~25 ms en el oficial; el
+   código propio de haxlite (host, sequencer, room, sim, codec) es < 0,5 % en total.
+2. **Micro-benchmark** `bench/timer.bench.mjs` (`bench/results/timer.json`), sin red ni juego:
+
+   | estrategia | 1 sala: CPU % (despertares/s) | 10 salas: CPU % (despertares/s) |
+   |---|---|---|
+   | `setTimeout` re-armado por frame (haxlite) | 0,84 (61) | 1,47 (615) |
+   | mismo, reutilizando el `Timeout` con `refresh()` | 0,93 (61) | 1,22 (610) |
+   | un timer de 60 Hz compartido por todas las salas | 1,11 (61) | 1,09 (614 llamadas) |
+   | `setInterval(…, 50)` (oficial) | 0,33 (20) | 0,34 (199) |
+
+   En esta VM cada despertar del proceso cuesta ~140–165 µs (sobre todo kernel/epoll, no JS),
+   así que lo que pesa es la **frecuencia** de despertares (60/s vs 20/s), no la asignación del
+   `Timeout`. Con varias salas los timers coinciden en el mismo ciclo del loop y el coste crece
+   poco.
+3. **No son los heartbeats**: con `heartbeatFrames: 9` (cadencia ≈ oficial) la CPU no baja
+   (`diag-heartbeat9.json`: N = 4 5,68 %, N = 20 22,5 %).
+
+Impacto: ~0,3–0,5 % de un núcleo por proceso (no por cliente). Es el precio de enviar heartbeats y
+eventos en el frame exacto en lugar de cuantizados a 50 ms (menos jitter para los clientes).
+**Sugerencias** (para el dueño de `src/host`):
+* opción `clockIntervalMs`/`tickBatchFrames` (p. ej. despertar cada 2–3 frames y simular el
+  atraso, como el oficial) para quien prefiera CPU a precisión;
+* para muchos procesos/salas, un reloj **compartido por proceso** (un timer para todas las
+  `HostRoom`); `refresh()` no aporta nada medible.
+
+### 5.2 El hilo JS lo dominan las llamadas nativas de WebRTC (no es un problema de haxlite)
+
+Perfil N = 20: ~5,8 % de un núcleo en funciones nativas sin nombre (`sendMessageBinary` de
+node-datachannel y las callbacks N-API de mensajes entrantes), frente a ~1,6 % del JS de haxlite
+(host, sequencer, codec, física). En el oficial lo equivalente es ~7 % + ~1 % de su capa JS
+W3C (`@webrtc-node/webrtc`) + 1 % de su script. Con N clientes, cada input se reenvía a N
+destinatarios: ≈ 20 × 6,5 × 20 ≈ 2 600 envíos/s más ~170 heartbeats/s: unos 20 µs
+de hilo JS por envío (más el trabajo en los hilos de libdatachannel: `RTC worker` + `juice poll`
+≈ 13 % con 20 clientes, igual en los tres hosts). Los perfiles se tomaron con el profiler activo
+(que encarece todo ~2×): solo valen las proporciones. No es reducible sin cambiar el protocolo (no hay envío por
+lotes en HaxBall 9). Posible mejora menor a evaluar en `src/net`: evitar el envoltorio JS por
+mensaje (`net/webrtc.js`) en el camino de recepción si el blindaje lo permite.
+
+### 5.3 Memoria y GC
+
+* El camino caliente casi no asigna: 15–17 GC/min con 20 clientes (frente a 98) y heap plano
+  (~10,7 MB). Esto corrobora las reglas de §4.1 de docs/06.
+* El RSS (70–105 MB) lo fija el runtime: Node vacío 42 MB; + `node-datachannel` 60 MB; + `ws`/TLS
+  e imports de haxlite 74 MB (medido con imports aislados). No hay margen grande en haxlite ahí.
+* Sin fugas en 10 min ociosos ni en las ventanas de 60 s (heap estable, Δ RSS < 2 MB).
+
+### 5.4 Lag del event loop
+
+p50 0,11–0,22 ms y p99 0,9–1,8 ms en los tres hosts y en todos los escenarios. Los máximos
+(5–155 ms) aparecen en los tres sin patrón y coinciden con ruido ajeno; no son atribuibles a
+ninguna implementación con 3 repeticiones. haxlite muestra p50 ~0,03 ms más alto que el oficial
+(más timers por segundo compitiendo con el del monitor), sin efecto práctico. Ninguno se acerca a
+un frame (16,7 ms) en p99.
+
+### 5.5 Incidencias observadas
+
+* 1 de las ~80 repeticiones con clientes (haxlite N = 20, build actual) falló: 16/20 clientes
+  unidos tras 4 intentos cada uno; en el reintento, el link de sala tardó 41,7 s (compatible con
+  el reintento de señalización de 10–60 s tras un primer fallo de conexión al master). No se
+  reprodujo en 20 arranques aislados ni en el resto de tandas; la máquina tenía tests de estrés
+  de otros ingenieros en ese momento. Queda registrado en `game-head.json` (`discarded`).
+* En la tanda principal de N = 4 haxlite tuvo una repetición marcada `noisy` (ajeno 142 %).
+
+## 6. Advertencias (caveats)
+
+* **Máquina compartida**: 4 vCPU de una VM con otros procesos. La CPU del host (`cpuUsage`) es
+  robusta al ruido; el lag del event loop y los máximos no tanto. Ver columna «ajeno %».
+* **Loopback**: sin pérdida, latencia ni jitter reales; DTLS/SCTP sí se ejecutan. Con red real el
+  coste por mensaje (retransmisiones SCTP, ICE) puede ser mayor y los timers de 50 ms del oficial
+  añadirían jitter que aquí no se mide.
+* Los clientes son node-haxball, no navegadores; los dos shims de §1.1 son necesarios para ellos.
+* El monitor de lag (timer de 10 ms) y el muestreo de 1 s también consumen CPU dentro del proceso
+  medido, igual para los tres (orden de 0,5–1 punto según §5.1); los valores absolutos de CPU en
+  partida lo incluyen. Ver `diag-noeld.json` para la medida sin monitor.
+* El host oficial corre en `haxball.js` (Node, `@webrtc-node/webrtc`, pako sustituido por zlib),
+  no en el navegador headless de haxball.com; node-haxball usa su propio `node-datachannel` 0.25.
+* En K salas el oficial y node-haxball evalúan/crean una instancia por sala en el mismo proceso;
+  no es su forma de despliegue habitual (normalmente un proceso/navegador por sala, lo que
+  multiplicaría el RSS base de ~70 MB por sala).
+* 3 repeticiones de 60 s: diferencias menores de ~5 % en CPU están dentro del ruido (ver rangos).
+* haxlite evoluciona en paralelo (`src/net` se endureció durante las mediciones); la tanda de
+  confirmación con el build actual reproduce las conclusiones.

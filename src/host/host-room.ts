@@ -240,10 +240,8 @@ export class HostRoom {
     this.checksumIntervalFrames = opts.checksumIntervalFrames ?? HostDefaults.checksumIntervalFrames;
     this.pingIntervalMs = opts.pingIntervalMs ?? HostDefaults.pingIntervalMs;
     const sink: SequencerSink = {
-      broadcast: (data, channel) => {
-        const list = this.ready;
-        for (let i = 0; i < list.length; i++) this.transport.send(list[i]!.peer, channel, data);
-      },
+      // one tunnel message for everyone when the players are behind a haxlite Edge
+      broadcast: (data, channel) => this.transport.broadcastTo(this.ready, channel, data),
       hasConnections: () => this.transport.connectionCount > 0,
     };
     this.sequencer = new Sequencer(this.state, sink, {
