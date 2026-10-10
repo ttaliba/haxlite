@@ -1,0 +1,104 @@
+#!/usr/sbin/nft -f
+# haxguard: allowlist UDP para salas haxlite (WebRTC) en el hook ingress (antes de conntrack/IP stack).
+# Cargar:  nft -f haxguard.nft      Validar: nft -c -f haxguard.nft
+# Requisitos: salas con enableIceUdpMux (1 puerto UDP por sala) en ROOM_PORTS, fuera de
+# net.ipv4.ip_local_port_range (32768-60999 por defecto) para no tirar respuestas de sockets salientes.
+
+define WAN = "eth0"
+define ROOM_PORTS = 20000-20999
+
+destroy table netdev haxguard
+table netdev haxguard {
+	# --- estado que mantiene haxlite (vía sidecar privilegiado) ---
+	# jugadores unidos: (IP origen . puerto de la sala). Timeout de seguridad: el sidecar refresca cada 60 s.
+	set active4 { type ipv4_addr . inet_service; flags timeout; timeout 5m; size 65536; }
+	set active6 { type ipv6_addr . inet_service; flags timeout; timeout 5m; size 65536; }
+	# uniéndose: IPs de la oferta (IP vista por el master + srflx + relay) . puerto de la sala; 20 s.
+	set pending4 { type ipv4_addr . inet_service; flags timeout; timeout 20s; size 65536; }
+	set pending6 { type ipv6_addr . inet_service; flags timeout; timeout 20s; size 65536; }
+	# bans / kicks "Bad actor": se descartan antes que nada.
+	set deny4 { type ipv4_addr; flags interval, timeout; size 65536; }
+	set deny6 { type ipv6_addr; flags interval, timeout; size 65536; }
+	# servidores STUN propios (respuestas a las consultas srflx del host). Vacío si iceServers: [].
+	set stun_servers4 { type ipv4_addr . inet_service; }
+	# medidores dinámicos por origen para STUN de IPs desconocidas
+	set stunrate4 { type ipv4_addr; flags dynamic, timeout; timeout 30s; size 65536; }
+	set stunrate6 { type ipv6_addr; flags dynamic, timeout; timeout 30s; size 65536; }
+	# tope por jugador unido (un jugador malicioso inundando desde su IP real)
+	set actrate4 { type ipv4_addr; flags dynamic, timeout; timeout 30s; size 65536; }
+	set actrate6 { type ipv6_addr; flags dynamic, timeout; timeout 30s; size 65536; }
+	# puertos origen de reflectores UDP > 1023 (los < 1024 se tiran todos)
+	set amp_sports { type inet_service; elements = { 1900, 3283, 3478, 3702, 5353, 5683, 10001, 11211, 32414, 37810 } }
+
+	counter c_frag {}
+	counter c_lowport {}
+	counter c_deny {}
+	counter c_active {}
+	counter c_pending {}
+	counter c_amp {}
+	counter c_stun_ok {}
+	counter c_stun_over {}
+	counter c_drop {}
+
+	chain ingress {
+		type filter hook ingress device $WAN priority -500; policy accept;
+
+		# 1) fragmentos UDP (WebRTC nunca fragmenta: DTLS/SCTP < MTU) y tráfico ajeno a las salas
+		ip frag-off & 0x3fff != 0 meta l4proto udp counter name c_frag drop
+		ip6 nexthdr ipv6-frag counter name c_frag drop
+		udp dport != $ROOM_PORTS accept
+
+		# 2) baneados
+		ip saddr @deny4 counter name c_deny drop
+		ip6 saddr @deny6 counter name c_deny drop
+
+		# 3) reflexión clásica: DNS 53, NTP 123, SSDP-ish < 1024, chargen 19, CLDAP 389, SNMP 161...
+		udp sport < 1024 counter name c_lowport drop
+
+		# 4) jugadores conocidos (HaxBall: ~60-200 pps por cliente; tope 1000 pps por IP)
+		ip saddr . udp dport @active4 jump active_rate
+		ip6 saddr . udp dport @active6 jump active_rate
+
+		# 4b) respuestas de los servidores STUN propios (solo si iceServers no está vacío)
+		ip saddr . udp sport @stun_servers4 accept
+
+		# 5) reflectores > 1023 (después de active por si un NAT mapea justo ahí)
+		udp sport @amp_sports counter name c_amp drop
+
+		# 6) uniéndose (IPs anunciadas en la oferta)
+		ip saddr . udp dport @pending4 counter name c_pending accept
+		ip6 saddr . udp dport @pending6 counter name c_pending accept
+
+		# 7) desconocidos: solo mensajes STUN (2 bits altos = 00, cookie 0x2112A442, >= 20 B): Binding
+		#    Request del cliente y Binding Success Response a los checks del host (el host es el agente
+		#    controlled y necesita sus propias respuestas para nominar el par). Límite por origen y global.
+		#    libjuice descarta los que no llevan un ufrag/MESSAGE-INTEGRITY válidos.
+		udp length >= 28 @th,64,2 0 @th,96,32 0x2112a442 jump stun_unknown
+
+		# 8) todo lo demás hacia los puertos de sala
+		counter name c_drop drop
+	}
+
+	chain active_rate {
+		meta protocol ip add @actrate4 { ip saddr limit rate over 1000/second burst 200 packets } counter name c_drop drop
+		meta protocol ip6 add @actrate6 { ip6 saddr limit rate over 1000/second burst 200 packets } counter name c_drop drop
+		counter name c_active accept
+	}
+
+	chain stun_unknown {
+		meta protocol ip add @stunrate4 { ip saddr limit rate over 5/second burst 10 packets } counter name c_stun_over drop
+		meta protocol ip6 add @stunrate6 { ip6 saddr limit rate over 5/second burst 10 packets } counter name c_stun_over drop
+		limit rate 2000/second burst 500 packets counter name c_stun_ok accept
+		counter name c_stun_over drop
+	}
+}
+
+# Opcional (otra tabla, con conntrack): el host no necesita TCP entrante salvo SSH de administración.
+# table inet haxguard_tcp {
+# 	chain in { type filter hook input priority -150; policy accept;
+# 		ct state established,related accept
+# 		tcp dport 22 ip saddr { 203.0.113.0/24 } accept   # IPs de administración
+# 		tcp flags & (syn|ack) == syn counter drop
+# 	}
+# }
+# + sysctl net.ipv4.tcp_syncookies=1

@@ -1,0 +1,20 @@
+# Fuerza relay-only real en haxlite (bug libjuice: checks directos desde la IP real).
+# Uso: haxlite con portRange [40000, 40999] y rtc.iceTransportPolicy = "relay".
+# Mantener los sets turn4/turn6 al día con los A/AAAA de tu servidor TURN.
+
+table inet haxhost {
+  set turn4 { type ipv4_addr; elements = { 141.101.90.1, 162.159.207.0/24 } }   # o la IP de tu relay
+  set turn6 { type ipv6_addr; elements = { 2a06:98c1:3200::1, 2606:4700:48::1 } }
+  chain out {
+    type filter hook output priority 0; policy accept;
+    udp sport 40000-40999 ip  daddr @turn4 accept
+    udp sport 40000-40999 ip6 daddr @turn6 accept
+    udp sport 40000-40999 drop          # checks directos de libjuice → nunca salen
+  }
+  chain in {
+    type filter hook input priority 0; policy accept;
+    udp dport 40000-40999 ip  saddr @turn4 accept
+    udp dport 40000-40999 ip6 saddr @turn6 accept
+    udp dport 40000-40999 drop
+  }
+}

@@ -1,0 +1,24 @@
+# Per-(destination address, destination UDP port) packet/byte counters for the
+# canary range. Counting only: policy accept, no drops. Real deployment: put the
+# same set in a `netdev` table on the `ingress` hook of the public interface.
+table inet ipresearch_test {
+  set canary4 {
+    type ipv4_addr . inet_service
+    flags dynamic, timeout
+    timeout 10m
+    counter
+    size 65536
+  }
+  set canary6 {
+    type ipv6_addr . inet_service
+    flags dynamic, timeout
+    timeout 10m
+    counter
+    size 65536
+  }
+  chain pre {
+    type filter hook prerouting priority -300; policy accept;
+    udp dport 41000-41999 update @canary4 { ip daddr . udp dport }
+    meta nfproto ipv6 udp dport 41000-41999 update @canary6 { ip6 daddr . udp dport }
+  }
+}

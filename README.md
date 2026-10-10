@@ -17,6 +17,7 @@ Todo sale de leer el código, que en ambos casos está minificado; no se captur�
 | 04 | [Netcode](docs/04-netcode-y-sincronizacion.md) | Lockstep, asignación de frames, predicción, ping, checksums y autoridad del host |
 | 05 | [Librerías y APIs](docs/05-librerias-y-apis.md) | Arquitectura de haxball.js y node-haxball, API HBInit, ejemplos y glosario |
 | 06 | [Arquitectura de haxlite](docs/06-arquitectura-haxlite.md) | Host propio en TypeScript: módulos, reglas de código y oráculos de prueba (`npm test`) |
+| 08 | [Ocultar y proteger la IP](docs/08-ocultar-ip.md) | Por qué se ve la IP, fuga de relay-only en libjuice, Cloudflare TURN, anti-DDoS, firewall `haxguard`, IP por jugador |
 
 ## haxlite: uso
 
