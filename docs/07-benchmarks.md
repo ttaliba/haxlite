@@ -39,7 +39,7 @@ Conclusiones cortas (detalle en §5):
   envío/recepción. haxlite ahorra un **~7 % de CPU con 20 clientes** y un **~11 % con 10 salas**,
   sobre todo en el hilo JS; con 1 sala y 4 clientes no gana (≈ +0,3–0,5 puntos).
 * Donde haxlite sí se separa claramente es en **memoria del heap y GC**: heap plano (~10,7 MB con
-  1 sala, +0,2 MB por sala extra frente a +0,8 MB del oficial) y **5–6× menos GC** (10× menos
+  1 sala, +0,2 MB por sala extra frente a +0,8 MB del oficial) y **5–6× menos GC** (8–10× menos
   tiempo de GC). El RSS (70–105 MB) lo domina el runtime de Node + TLS + libdatachannel.
 * **Lag del event loop**: sin diferencias relevantes (p50 ≈ 0,15–0,2 ms, p99 ≈ 1–1,7 ms en los
   tres). Ninguna implementación bloquea el loop lo bastante como para afectar al netcode.
