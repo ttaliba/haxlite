@@ -16,7 +16,8 @@
 // IPC in : {cmd:'game'} | {cmd:'measure-start', eld, sampleMs} | {cmd:'measure-stop'} | {cmd:'players'}
 // IPC out: {type:'link', room, id, tCreate, tLink} | {type:'game', players} |
 //          {type:'stats', …} | {type:'players', counts} | {type:'error', message}
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { Session } from 'node:inspector';
 import { createRequire } from 'node:module';
 import { monitorEventLoopDelay, performance, PerformanceObserver } from 'node:perf_hooks';
 import path from 'node:path';
@@ -199,6 +200,26 @@ async function nodeHaxballFactory() {
 
 let meas = null;
 
+// HOST_CPU_PROFILE=<file.cpuprofile> (diagnostics only): V8 CPU profile of the
+// main thread restricted to the measurement window.
+const PROFILE = process.env.HOST_CPU_PROFILE ?? null;
+let profSession = null;
+function profileStart() {
+  if (!PROFILE) return;
+  profSession = new Session();
+  profSession.connect();
+  profSession.post('Profiler.enable', () => profSession.post('Profiler.start'));
+}
+function profileStop() {
+  if (!profSession) return;
+  const s = profSession;
+  profSession = null;
+  s.post('Profiler.stop', (err, res) => {
+    if (!err) writeFileSync(PROFILE, JSON.stringify(res.profile));
+    s.disconnect();
+  });
+}
+
 /**
  * Per-thread CPU ticks (Linux /proc/self/task/<tid>/stat, utime+stime, 1/100 s):
  * tells the JS main thread apart from libuv/V8 workers and the native WebRTC
@@ -357,11 +378,13 @@ process.on('message', (msg) => {
         break;
       }
       case 'measure-start':
+        profileStart();
         startMeasure(msg);
         send({ type: 'measuring' });
         break;
       case 'measure-stop':
         send({ type: 'stats', stats: stopMeasure(), players: rooms.map((r) => r.players().length) });
+        profileStop();
         break;
       case 'exit':
         process.exit(0);
