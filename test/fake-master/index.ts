@@ -76,6 +76,12 @@ export class FakeMaster {
   clientIp: ((req: http.IncomingMessage) => string) | null = null;
   /** Fixed room id for the next host connection (default random 11 chars). */
   nextRoomId: string | null = null;
+  /**
+   * Every host → client signaling message relayed (`[1]` answer / `[4]`
+   * candidate, payload still deflated) when set to an array: lets tests check
+   * exactly what clients receive (e.g. that no host address leaks).
+   */
+  clientMessages: { peerId: number; type: number; payload: Uint8Array }[] | null = null;
 
   private readonly server: http.Server;
   private readonly wss: WebSocketServer;
@@ -265,6 +271,7 @@ export class FakeMaster {
           const out = new Uint8Array(1 + r.remaining);
           out[0] = type;
           out.set(r.bytes(), 1);
+          this.clientMessages?.push({ peerId, type, payload: out.slice(1) });
           client.ws.send(out);
           return;
         }

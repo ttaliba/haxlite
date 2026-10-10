@@ -10,7 +10,16 @@
  * namespaced haxlite extensions.
  */
 import type http from 'node:http';
-import type { BanList, BanRecord, HostTransport, HostTransportOptions, JoinDecision, JoinRequest } from '../net/index.js';
+import type {
+  BanList,
+  BanRecord,
+  EdgeBackendStats,
+  EdgeOptions,
+  HostTransport,
+  HostTransportOptions,
+  JoinDecision,
+  JoinRequest,
+} from '../net/index.js';
 import type { HostRoom } from '../host/index.js';
 import type { RoomEvent } from '../room/index.js';
 
@@ -268,6 +277,14 @@ export interface HaxliteConfig {
   shutdownWebRtcOnLastStop?: boolean;
   /** Escape hatch: extra {@link HostTransportOptions} (timeouts, RTC port range, logging…). */
   transport?: Partial<HostTransportOptions>;
+  /**
+   * haxlite Edge: players connect to the edge, never to this machine (its IP
+   * stays hidden). `{ url: 'wss://edge.example.com:8443/tunnel', key: 'id:secret' }`;
+   * `fallbackWs` (default true) carries player traffic over the WebSocket when
+   * UDP to the edge is blocked. `iceServers`/`transport.iceCandidatePolicy`/
+   * `transport.portRange` are then ignored (the edge has its own). See docs/09.
+   */
+  edge?: EdgeOptions | null;
 }
 
 /** Pre-join decision: `undefined`/`true` accept, `false` reject (banned, 4102), a number = close code. */
@@ -283,6 +300,8 @@ export interface PlayerConnectionInfo {
   srflxIps: readonly string[];
   /** Ping declared by the client (ms). */
   ping: number;
+  /** Remote address of the selected ICE pair (as seen by this host, or by the edge). */
+  remoteAddress: string | null;
 }
 
 /** Ban list operations exposed as `room.haxlite.bans`. */
@@ -336,6 +355,13 @@ export interface HaxliteRoomExtensions {
   getPlayerConnection(playerId: number): PlayerConnectionInfo | null;
   /** Changes the capacity at runtime (not possible officially). */
   setMaxPlayers(n: number): void;
+  /** Edge tunnel statistics (state, data plane, RTT, peers, bytes), null without `haxlite.edge`. */
+  edgeStats(): EdgeBackendStats | null;
+  /**
+   * Edge tunnel availability: `'down'` = tunnel lost (every player was
+   * disconnected; joins refused until it reconnects), `'ready'` = (re)connected.
+   */
+  onBackendState: ((state: 'ready' | 'down', err: Error | null) => void) | null;
 
   /** Stops the room: timers, signaling, every peer. Idempotent. */
   stop(): Promise<void>;

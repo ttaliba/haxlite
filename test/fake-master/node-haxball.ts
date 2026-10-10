@@ -26,16 +26,24 @@ export interface NodeHaxballTestOptions {
    * own host does the equivalent with `challengeDelayMs`).
    */
   sendDelayMs?: number;
+  /** Called with every RTCPeerConnection the clients create (e.g. to read the selected ICE pair). */
+  onPeerConnection?: (pc: Any) => void;
 }
 
 /** Initialises node-haxball pointing at `master` (HTTP + WS on 127.0.0.1). */
 export function nodeHaxballFor(master: FakeMaster, opts: NodeHaxballTestOptions = {}): Any {
   let window: Any = null;
   const delay = opts.sendDelayMs ?? 0;
-  if (delay > 0) {
+  const onPc = opts.onPeerConnection;
+  if (delay > 0 || onPc !== undefined) {
     const poly = nestedDataChannel('/polyfill');
     class DelayedSendPeerConnection extends poly.RTCPeerConnection {
+      constructor(...args: Any[]) {
+        super(...args);
+        onPc?.(this);
+      }
       createDataChannel(label: string, init: Any): Any {
+        if (delay <= 0) return super.createDataChannel(label, init);
         const dc = super.createDataChannel(label, init);
         const send = dc.send.bind(dc);
         dc.send = (data: Any) => {

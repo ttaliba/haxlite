@@ -18,7 +18,8 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "dist"
+    "dist",
+    "bin"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -31,7 +32,8 @@
     "bench:startup": "npm run bench:host -- startup",
     "bench:idle": "npm run bench:host -- idle",
     "bench:game": "npm run bench:host -- game",
-    "bench:rooms": "npm run bench:host -- rooms"
+    "bench:rooms": "npm run bench:host -- rooms",
+    "edge": "node --experimental-strip-types --no-warnings --import ./scripts/ts-resolve.mjs scripts/edge.ts"
   },
   "dependencies": {
     "json5": "^2.2.3",
@@ -46,5 +48,8 @@
     "pako": "^2.2.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.3"
+  },
+  "bin": {
+    "haxlite-edge": "./bin/haxlite-edge.js"
   }
 }

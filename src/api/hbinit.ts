@@ -19,6 +19,8 @@
  * by default, resolves once the master has assigned the room link.
  */
 import {
+  EdgeError,
+  EdgePeerBackend,
   HostTransport,
   MasterError,
   fetchGeo,
@@ -213,6 +215,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
   if (hx.allowNullAuth !== undefined) transportOpts.allowNullAuth = hx.allowNullAuth;
   if (hx.joinRateLimit !== undefined) transportOpts.joinRateLimit = hx.joinRateLimit;
   if (hx.bans !== undefined) transportOpts.bans = hx.bans;
+  if (hx.edge != null) transportOpts.edge = hx.edge;
   const transport = new HostTransport(transportOpts);
   const host = new HostRoom({
     transport,
@@ -268,6 +271,8 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
   host.onError = reportError;
   transport.onError = (err) => {
     if (err instanceof MasterError && err.kind === 'recaptcha') return; // handled by onRecaptcha
+    // edge tunnel: keep retrying until initTimeoutMs unless the error is fatal (bad key/version)
+    if (!initialized && err instanceof EdgeError && !err.fatal) return;
     if (!initialized) finishInit(err);
     else reportError(err);
   };
@@ -388,7 +393,24 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     getPlayerConnection(playerId: number): PlayerConnectionInfo | null {
       const c = host.getConnection(playerId);
       if (c === null || c.closed) return null;
-      return { auth: c.auth, conn: c.conn, ip: c.peer.ip, srflxIps: c.peer.srflxIps, ping: c.ping };
+      return {
+        auth: c.auth,
+        conn: c.conn,
+        ip: c.peer.ip,
+        srflxIps: c.peer.srflxIps,
+        ping: c.ping,
+        remoteAddress: c.peer.remoteAddress,
+      };
+    },
+    edgeStats() {
+      const b = transport.backend;
+      return b instanceof EdgePeerBackend ? b.stats() : null;
+    },
+    get onBackendState() {
+      return transport.onBackendState;
+    },
+    set onBackendState(h) {
+      transport.onBackendState = h ?? null;
     },
     setMaxPlayers(n: number) {
       const v = castInt(n, 12);

@@ -98,13 +98,14 @@ export interface EdgeBackendStats {
   messagesIn: number;
 }
 
-const enum Phase {
-  Hello,
-  Auth,
-  DataPlane,
-  Ready,
-  Closed,
-}
+const Phase = {
+  Hello: 0,
+  Auth: 1,
+  DataPlane: 2,
+  Ready: 3,
+  Closed: 4,
+} as const;
+type Phase = (typeof Phase)[keyof typeof Phase];
 
 function readStr(r: Reader, max: number): string {
   const n = r.varUint();
@@ -348,7 +349,7 @@ export class EdgePeerBackend implements PeerBackend {
 
 /** One tunnel connection attempt / session (WS + optional data-plane PeerConnection). */
 class TunnelSession {
-  phase = Phase.Hello;
+  phase: Phase = Phase.Hello;
   readonly mode: 'webrtc' | 'ws';
   sessionId: number | null = null;
   rttMs: number | null = null;

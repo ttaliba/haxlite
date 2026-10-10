@@ -478,12 +478,13 @@ function stripUndefined<T extends object>(o: T): Partial<T> {
   return out;
 }
 
-const enum SPhase {
-  Hello,
-  DataPlane,
-  Ready,
-  Closed,
-}
+const SPhase = {
+  Hello: 0,
+  DataPlane: 1,
+  Ready: 2,
+  Closed: 3,
+} as const;
+type SPhase = (typeof SPhase)[keyof typeof SPhase];
 
 /** A player connection on the edge. */
 class EdgePeer {
@@ -502,7 +503,7 @@ class EdgePeer {
 /** One host tunnel (one room). */
 class EdgeSession {
   readonly id: number;
-  phase = SPhase.Hello;
+  phase: SPhase = SPhase.Hello;
   private readonly edge: EdgeServer;
   private readonly ws: WebSocket;
   private readonly remote: string;
