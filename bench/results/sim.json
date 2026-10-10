@@ -45,6 +45,25 @@
      "haxliteHeapGrowthKiB": 0.15625
     }
    ]
+  },
+  {
+   "date": "2026-10-10T21:18:35.764Z",
+   "rows": [
+    {
+     "label": "Classic, 8 players (13 discs)",
+     "haxliteNs": 1044.059305,
+     "officialNs": 1964.392265,
+     "speedup": 1.8814949070349982,
+     "haxliteHeapGrowthKiB": 18.0546875
+    },
+    {
+     "label": "Huge, 25 players (30 discs)",
+     "haxliteNs": 3776.768415,
+     "officialNs": 6363.65475,
+     "speedup": 1.684947036923364,
+     "haxliteHeapGrowthKiB": 0.15625
+    }
+   ]
   }
  ]
 }
