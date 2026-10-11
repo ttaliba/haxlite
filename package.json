@@ -26,7 +26,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "bench:build": "tsc -p tsconfig.build.json --outDir node_modules/.cache/haxlite-bench/dist --declaration false --sourceMap false",
+    "bench:build": "tsc -p tsconfig.build.json --outDir node_modules/.cache/haxlite-bench/dist --declaration false --sourceMap false && node scripts/build.mjs --out node_modules/.cache/haxlite-bench/bundle",
     "bench:sim": "node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs bench/sim.bench.ts",
     "bench:host": "npm run bench:build && node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs bench/net/run.ts",
     "bench:startup": "npm run bench:host -- startup",

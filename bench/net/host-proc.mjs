@@ -16,7 +16,7 @@
 // IPC in : {cmd:'game'} | {cmd:'measure-start', eld, sampleMs} | {cmd:'measure-stop'} | {cmd:'players'}
 // IPC out: {type:'link', room, id, tCreate, tLink} | {type:'game', players} |
 //          {type:'stats', …} | {type:'players', counts} | {type:'error', message}
-import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { Session } from 'node:inspector';
 import { createRequire } from 'node:module';
 import { monitorEventLoopDelay, performance, PerformanceObserver } from 'node:perf_hooks';
@@ -118,8 +118,16 @@ async function haxliteFactory() {
     if (variant.logger) ndc.initLogger(variant.logger, () => {});
     if (variant.sctp) ndc.setSctpSettings(variant.sctp);
   }
-  const { HostRoom, createHostRoomState } = await import(pathToFileURL(path.join(dist, 'host/index.js')).href);
-  const { HostTransport } = await import(pathToFileURL(path.join(dist, 'net/index.js')).href);
+  // Default: the shipped package bundle (minified, `npm run bench:build`), i.e. what users run.
+  // A variant with an explicit `dist` (per-module tsc build) is loaded module by module.
+  const bundle = path.resolve(ROOT, 'node_modules/.cache/haxlite-bench/bundle/index.js');
+  const { HostRoom, createHostRoomState, HostTransport } =
+    !variant.dist && existsSync(bundle)
+      ? await import(pathToFileURL(bundle).href)
+      : {
+          ...(await import(pathToFileURL(path.join(dist, 'host/index.js')).href)),
+          ...(await import(pathToFileURL(path.join(dist, 'net/index.js')).href)),
+        };
   return (i, onLink) => {
     const transport = new HostTransport({
       token: `thr1.bench${i}`,
