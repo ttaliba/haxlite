@@ -24,12 +24,14 @@ import {
   AuthFlag,
   EDGE_NONCE_LENGTH,
   EDGE_PROTOCOL_VERSION,
+  EDGE_RO_LANES,
   EdgeCloseCode,
   EdgeLimits,
   EdgeMsg,
   EdgePeerClose,
   edgeAuthMac,
   parseEdgeKey,
+  roLaneChannel,
 } from './edge-protocol.js';
 
 export interface EdgeOptions {
@@ -45,6 +47,13 @@ export interface EdgeOptions {
   fallbackWs?: boolean;
   /** Start directly with `'ws'` (UDP known to be blocked). Default `'webrtc'`. */
   dataPlane?: 'webrtc' | 'ws';
+  /**
+   * Ask the edge for `ro` lanes ({@link AuthFlag.RoLanes}): player `ro`
+   * traffic spread over several ordered tunnel channels so a loss on the
+   * host↔edge path does not stall every player's `ro` messages. Default true
+   * (ignored by edges that don't support it).
+   */
+  roLanes?: boolean;
   /** Local address for the outbound WebSocket and the tunnel PeerConnection. */
   bindAddress?: string;
   /** STUN/TURN for the tunnel PeerConnection (default none: the edge is public). */
@@ -86,6 +95,8 @@ export class EdgeError extends Error {
 export interface EdgeBackendStats {
   state: EdgeState;
   dataPlane: 'webrtc' | 'ws' | null;
+  /** Ordered tunnel channels carrying player `ro` traffic (1 = single channel; null when not ready). */
+  roLanes: number | null;
   sessionId: number | null;
   /** Last tunnel round-trip time (application ping), ms. */
   rttMs: number | null;
@@ -187,6 +198,7 @@ export class EdgePeerBackend implements PeerBackend {
     return {
       state: this.state,
       dataPlane: s !== null && s.phase === Phase.Ready ? s.mode : null,
+      roLanes: s !== null && s.phase === Phase.Ready ? s.roLanes : null,
       sessionId: s?.sessionId ?? null,
       rttMs: s?.rttMs ?? null,
       peers: this.links.size,
@@ -356,8 +368,15 @@ class TunnelSession {
   private readonly backend: EdgePeerBackend;
   private readonly ws: WebSocket;
   private pc: PeerConnection | null = null;
-  private readonly dcs: (DataChannel | null)[] = [null, null, null];
-  private readonly dcOpen = [false, false, false];
+  /** Tunnel channels: ro, ru, uu, then the extra `ro` lanes. */
+  private dcs: (DataChannel | null)[] = [null, null, null];
+  private dcOpen = [false, false, false];
+  /** `ro` lanes granted by the edge (1 = the single `ro` channel). */
+  private lanes = 1;
+
+  get roLanes(): number {
+    return this.lanes;
+  }
   private answerApplied = false;
   private readonly heldCandidates: [string, string][] = [];
   private readonly heldRemote: [string, string][] = [];
@@ -433,7 +452,7 @@ class TunnelSession {
     buf[2] = EdgeMsg.PeerClose;
     buf.writeUInt16BE(slot, 3);
     if (this.mode === 'ws') this.sendWs(buf.subarray(2));
-    else this.sendDc(0, buf);
+    else this.sendDc(roLaneChannel(slot, this.lanes), buf);
   }
 
   private sendDc(ch: number, frame: Uint8Array): boolean {
@@ -474,36 +493,53 @@ class TunnelSession {
     buf[0] = slot >>> 8;
     buf[1] = slot & 0xff;
     buf.set(data, 2);
-    return this.sendDc(ch, buf.subarray(0, n));
+    return this.sendDc(ch === 0 ? roLaneChannel(slot, this.lanes) : ch, buf.subarray(0, n));
   }
 
-  /** One tunnel message for many players (`Multicast`), in chunks of 255 slots. */
+  /**
+   * One tunnel message for many players (`Multicast`), in chunks of 255
+   * slots. On `ro` with lanes, one message per lane in use (each slot's `ro`
+   * order lives on its lane).
+   */
   sendMulticast(ch: number, links: readonly EdgeLink[], data: Uint8Array): void {
-    for (let start = 0; start < links.length; start += 255) {
-      const count = Math.min(255, links.length - start);
-      const head = (this.mode === 'ws' ? 0 : 2) + 3 + 2 * count;
-      const n = head + data.length;
-      const buf = this.mode === 'ws' ? Buffer.allocUnsafe(n) : this.ensureScratch(n);
-      let p = 0;
-      if (this.mode !== 'ws') {
-        buf[p++] = 0;
-        buf[p++] = 0;
+    const lanes = ch === 0 && this.mode !== 'ws' ? this.lanes : 1;
+    for (let lane = 0; lane < lanes; lane++) {
+      let start = 0;
+      for (;;) {
+        // next ≤ 255 slots of this lane, written straight into the frame
+        const ws = this.mode === 'ws';
+        const room = lanes === 1 ? Math.min(255, links.length - start) : 255; // slots this frame can take
+        const size = (ws ? 0 : 2) + 3 + 2 * room + data.length;
+        const buf = ws ? Buffer.allocUnsafe(size) : this.ensureScratch(size);
+        let p = ws ? 0 : 2;
+        if (!ws) {
+          buf[0] = 0;
+          buf[1] = 0;
+        }
+        buf[p++] = EdgeMsg.Multicast;
+        buf[p++] = ch;
+        const countAt = p++;
+        let count = 0;
+        while (start < links.length && count < 255) {
+          const slot = links[start++]!.slot;
+          if (lanes > 1 && slot % lanes !== lane) continue;
+          buf[p++] = slot >>> 8;
+          buf[p++] = slot & 0xff;
+          count++;
+        }
+        if (count > 0) {
+          buf[countAt] = count;
+          buf.set(data, p);
+          const n = p + data.length;
+          if (ws) {
+            const c = this.backend.counters;
+            c.messagesOut++;
+            c.bytesOut += n;
+            this.sendWs(buf.subarray(0, n));
+          } else this.sendDc(lane === 0 ? ch : 2 + lane, buf.subarray(0, n));
+        }
+        if (start >= links.length) break;
       }
-      buf[p++] = EdgeMsg.Multicast;
-      buf[p++] = ch;
-      buf[p++] = count;
-      for (let i = 0; i < count; i++) {
-        const slot = links[start + i]!.slot;
-        buf[p++] = slot >>> 8;
-        buf[p++] = slot & 0xff;
-      }
-      buf.set(data, p);
-      if (this.mode === 'ws') {
-        const c = this.backend.counters;
-        c.messagesOut++;
-        c.bytesOut += n;
-        this.sendWs(buf);
-      } else this.sendDc(ch, buf.subarray(0, n));
     }
   }
 
@@ -540,7 +576,7 @@ class TunnelSession {
         w.u8(EDGE_PROTOCOL_VERSION);
         w.string(this.backend.keyId);
         w.bytes(edgeAuthMac(this.backend.secret, nonce));
-        w.u8(this.mode === 'webrtc' ? AuthFlag.WebRtc : 0);
+        w.u8(this.mode === 'webrtc' ? AuthFlag.WebRtc | (this.backend.opts.roLanes !== false ? AuthFlag.RoLanes : 0) : 0);
         this.phase = Phase.Auth;
         this.sendWs(w.copyBytes());
         return;
@@ -549,6 +585,8 @@ class TunnelSession {
         if (this.phase !== Phase.Auth) throw new Error('unexpected auth ok');
         this.sessionId = r.u32();
         r.u16(); // maxPeers (informational)
+        const granted = r.remaining > 0 ? r.u8() : 0;
+        if (this.mode === 'webrtc' && (granted & AuthFlag.RoLanes) !== 0 && this.backend.opts.roLanes !== false) this.lanes = EDGE_RO_LANES;
         this.startPing();
         if (this.mode === 'ws') this.becomeReady();
         else this.startDataPlane();
@@ -650,8 +688,11 @@ class TunnelSession {
         },
       );
       this.pc = pc;
-      for (let i = 0; i < CHANNELS.length; i++) {
-        const cfg = CHANNELS[i]!;
+      const total = CHANNELS.length + this.lanes - 1;
+      this.dcs = new Array<DataChannel | null>(total).fill(null);
+      this.dcOpen = new Array<boolean>(total).fill(false);
+      for (let i = 0; i < total; i++) {
+        const cfg = CHANNELS[i] ?? { label: `ro${i - 2}`, ordered: true, reliable: true };
         const dc = createDataChannel(
           pc,
           `tunnel-${cfg.label}`,
@@ -709,7 +750,7 @@ class TunnelSession {
     c.bytesIn += msg.length;
     const slot = (msg[0]! << 8) | msg[1]!;
     if (slot !== 0) {
-      this.backend.onPeerData(ch, slot, msg.subarray(2));
+      this.backend.onPeerData(ch < 3 ? ch : 0, slot, msg.subarray(2)); // channels ≥ 3: `ro` lanes
       return;
     }
     try {

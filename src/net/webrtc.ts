@@ -51,6 +51,12 @@ const closeQueue: (PeerConnection | DataChannel)[] = [];
 let closeScheduled = false;
 let createdCount = 0;
 let drainWaiters: (() => void)[] = [];
+/** See {@link setWebRtcIdleRelease}. */
+let idleReleaseMs: number | null = 1;
+let idleTimer: NodeJS.Timeout | null = null;
+/** `createdCount` right after the last `cleanup()`: nothing new to release while unchanged. */
+let cleanedAt = 0;
+let releaseCount = 0;
 
 export interface WebRtcStats {
   /** PeerConnections created and not yet confirmed closed. */
@@ -69,6 +75,8 @@ export interface WebRtcStats {
   pendingCloses: number;
   /** Total natives created since load (PCs + DCs). */
   created: number;
+  /** Native teardowns so far (`cleanup()`: {@link shutdownWebRtc} or the idle release). */
+  releases: number;
 }
 
 /** Names of the natives not yet confirmed closed (diagnostics: `pc-name` / `pc-name/label [state]`). */
@@ -99,6 +107,7 @@ export function webRtcStats(): WebRtcStats {
     orphanedDataChannels: orphans,
     pendingCloses: closeQueue.length,
     created: createdCount,
+    releases: releaseCount,
   };
 }
 
@@ -142,11 +151,40 @@ export function guard1<T>(fn: (arg: T) => void, onError: ErrorSink): (arg: T) =>
 
 /** Every PeerConnection confirmed closed (remaining DataChannels are orphans). */
 function released(): void {
-  if (livePcs.size === 0 && closeQueue.length === 0 && drainWaiters.length > 0) {
-    const w = drainWaiters;
-    drainWaiters = [];
-    for (const f of w) f();
+  if (livePcs.size === 0 && closeQueue.length === 0) {
+    if (drainWaiters.length > 0) {
+      const w = drainWaiters;
+      drainWaiters = [];
+      for (const f of w) f();
+    }
+    armIdleRelease();
   }
+}
+
+/**
+ * Idle release of libdatachannel's native threads. Once WebRTC has been used,
+ * its worker/usrsctp/ICE threads stay alive and usrsctp's timer thread wakes
+ * every 10 ms even with no connection at all (≈ 0.6 % of a core on the
+ * benchmark VM, 20× an idle haxlite room). After the last PeerConnection is
+ * confirmed closed and `ms` pass with nothing new, haxlite runs the same safe
+ * teardown as {@link shutdownWebRtc}; the next PeerConnection re-initialises
+ * the library (a few ms). `null` disables it. Default 15 s.
+ */
+export function setWebRtcIdleRelease(ms: number | null): void {
+  idleReleaseMs = ms;
+  if (idleTimer !== null) clearTimeout(idleTimer);
+  idleTimer = null;
+  armIdleRelease();
+}
+
+function armIdleRelease(): void {
+  if (idleReleaseMs === null || idleTimer !== null || createdCount === cleanedAt) return;
+  if (livePcs.size > 0 || closeQueue.length > 0 || shutdownPromise !== null) return;
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    if (livePcs.size === 0 && closeQueue.length === 0 && shutdownPromise === null) void shutdownWebRtc();
+  }, idleReleaseMs);
+  idleTimer.unref?.();
 }
 
 /**
@@ -169,6 +207,10 @@ export interface PeerConnectionHandlers {
 
 /** `new PeerConnection` + guarded callbacks + lifetime tracking. Throws like the constructor. */
 export function createPeerConnection(name: string, config: RtcConfig, h: PeerConnectionHandlers): PeerConnection {
+  if (idleTimer !== null) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
   const pc = new PeerConnection(name, config);
   createdCount++;
   livePcs.set(pc, name);
@@ -287,11 +329,17 @@ async function doShutdown(timeoutMs: number): Promise<void> {
     });
   }
   if (createdCount !== generation) return; // WebRTC in use again
+  const t0 = performance.now();
+  const dbg = liveWebRtcObjects().join(', ');
   try {
     cleanup();
+    console.log(`[dbg] cleanup ${(performance.now() - t0).toFixed(1)} ms live=[${dbg}]`);
   } catch (err) {
+    console.log(`[dbg] cleanup FAILED ${(performance.now() - t0).toFixed(1)} ms live=[${dbg}]`);
     report(null, err);
   }
+  cleanedAt = createdCount;
+  releaseCount++;
   // After cleanup() the binding no longer references any wrapper: safe to let them go.
   livePcs.clear();
   liveDcs.clear();

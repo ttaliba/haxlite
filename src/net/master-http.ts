@@ -6,8 +6,13 @@
  * be plugged in; the base URL is configurable for tests, proxies and custom
  * backends.
  */
-import http from 'node:http';
-import https from 'node:https';
+import type { Agent } from 'node:http';
+import { createRequire } from 'node:module';
+// CJS require on purpose: the ESM facade of node:http(s) evaluates the lazy
+// `WebSocket`/`CloseEvent`/`MessageEvent` getters, loading undici (~35 ms of startup).
+const require = createRequire(import.meta.url);
+const http = require('node:http') as typeof import('node:http');
+const https = require('node:https') as typeof import('node:https');
 import { DEFAULT_MASTER_URL } from './constants.js';
 import { parseRoomList, type ListedRoom } from './room-info.js';
 
@@ -15,7 +20,7 @@ export interface MasterHttpOptions {
   /** Base URL ending in `/` (default `https://www.haxball.com/rs/`). */
   masterUrl?: string;
   /** Agent for proxies (`https-proxy-agent`, `socks-proxy-agent`…). */
-  agent?: http.Agent;
+  agent?: Agent;
   /** Extra request headers. */
   headers?: Record<string, string>;
   /** Request timeout (default 15 s). */

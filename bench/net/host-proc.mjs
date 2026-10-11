@@ -106,7 +106,7 @@ async function haxliteFactory() {
   const dist = path.resolve(ROOT, variant.dist ?? 'node_modules/.cache/haxlite-bench/dist');
   if (variant.sctp || variant.logger) {
     const ndc = createRequire(path.join(dist, 'x.js'))('node-datachannel');
-    if (variant.logger) ndc.initLogger(variant.logger);
+    if (variant.logger) ndc.initLogger(variant.logger, () => {});
     if (variant.sctp) ndc.setSctpSettings(variant.sctp);
   }
   const { HostRoom, createHostRoomState } = await import(pathToFileURL(path.join(dist, 'host/index.js')).href);

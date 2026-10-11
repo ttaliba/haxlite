@@ -22,7 +22,7 @@
     "bin"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -46,6 +46,7 @@
     "haxball.js": "5.1.0",
     "node-haxball": "2.3.1",
     "pako": "^2.2.0",
+    "rolldown": "1.2.13",
     "typescript": "^7.0.2",
     "vitest": "^5.0.3"
   },

@@ -211,8 +211,8 @@ export class HostRoom {
   readonly transport: HostTransport;
   readonly sequencer: Sequencer;
   readonly pingIntervalMs: number;
-  /** `.hbr2` recorder (one per room, reused): see {@link startRecording}. */
-  readonly recorder = new ReplayRecorder();
+  /** Created on first use (its buffers are ~17 KB): see {@link recorder}. */
+  private rec: ReplayRecorder | null = null;
 
   // ---------------------------------------------------------------- callbacks
   /** A player joined (after the JoinRoom event applied; `auth`/`conn` set). Official `onPlayerJoin`. */
@@ -277,7 +277,8 @@ export class HostRoom {
     this.sequencer.onError = (err) => this.reportError(err);
     this.sequencer.onEventApplied = (ev) => {
       // official `Ab`: the recorder serializes the event right after `apply`
-      if (this.recorder.isRecording) this.recorder.onEvent(ev, this.sequencer.frame);
+      const rec = this.rec;
+      if (rec !== null && rec.isRecording) rec.onEvent(ev, this.sequencer.frame);
       const cb = this.onEventApplied;
       if (cb !== null) cb(ev);
     };
@@ -314,7 +315,12 @@ export class HostRoom {
     this.nextPingAt = Infinity;
     this.transport.stop();
     this.deferred.length = 0;
-    this.recorder.cancel();
+    this.rec?.cancel();
+  }
+
+  /** `.hbr2` recorder (one per room, reused; created on first use): see {@link startRecording}. */
+  get recorder(): ReplayRecorder {
+    return (this.rec ??= new ReplayRecorder());
   }
 
   get isRunning(): boolean {
@@ -398,7 +404,7 @@ export class HostRoom {
 
   /** Stops the recording and returns the `.hbr2` bytes, or null if not recording. */
   stopRecording(): Uint8Array | null {
-    if (!this.recorder.isRecording) return null;
+    if (this.rec === null || !this.rec.isRecording) return null;
     if (!this.sequencer.busy) this.catchUp();
     return this.recorder.stop(this.sequencer.frame);
   }

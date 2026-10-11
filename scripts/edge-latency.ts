@@ -26,7 +26,9 @@
 //   --edge-webrtc <json>  extra EdgeServer `webrtc` options (e.g. '{"enableIceUdpMux":true}')
 //   --edge-opts <json>    extra host `edge` options
 import { execFileSync, fork, type ChildProcess } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -329,7 +331,10 @@ function setLoss(pct: number): void {
     `add rule inet ${NFT_TABLE} in ip saddr ${HOST_IP} ip daddr ${EDGE_IP} meta l4proto udp numgen random mod 10000 < ${per10k} drop`,
     `add rule inet ${NFT_TABLE} in ip saddr ${EDGE_IP} ip daddr ${HOST_IP} meta l4proto udp numgen random mod 10000 < ${per10k} drop`,
   ];
-  execFileSync('nft', ['-f', '-'], { input: rules.join('\n') });
+  const file = path.join(mkdtempSync(path.join(tmpdir(), 'haxlite-loss-')), 'rules.nft');
+  writeFileSync(file, rules.join('\n') + '\n');
+  execFileSync('nft', ['-f', file]);
+  rmSync(path.dirname(file), { recursive: true, force: true });
   lossInstalled = true;
 }
 process.on('exit', () => setLoss(0));

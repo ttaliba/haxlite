@@ -137,7 +137,7 @@ async function host() {
   const require = createRequire(path.join(dist, 'x.js'));
   const ndc = require('node-datachannel');
   const logger = flag('logger', '');
-  if (logger) ndc.initLogger(logger);
+  if (logger) ndc.initLogger(logger, () => {});
   const sctp = flag('sctp', '');
   if (sctp) ndc.setSctpSettings(JSON.parse(sctp));
   const { LocalPeerLink } = await import(pathToFileURL(path.join(dist, 'net/peer-backend.js')).href);

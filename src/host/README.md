@@ -37,17 +37,27 @@ host.start();
 ## Clock and scheduling
 
 * `frame = ((performance.now() - start) * 0.06) | 0` exactly as official; each wake-up simulates
-  **every** pending frame (catch-up, official `Wa.Da`), then sends the heartbeat if
+  **every** pending frame one by one (catch-up, official `Wa.Da`), then sends the heartbeat if
   `frame - lastHeartbeat >= heartbeatFrames` and heartbeat + CheckConsistency every
   `checksumIntervalFrames`.
-* Instead of the official 50 ms `setInterval`, one `setTimeout` is armed for the next frame
-  boundary that has work: every frame while a game exists; otherwise the next heartbeat,
-  checksum or queued event (only while clients are connected). **No clients and no game → no
-  timer at all** (0 CPU); the frame counter is virtual and is caught up (O(1) for game-less
-  frames) on the next message/action/`update()`. The Ping event timer runs only while clients
-  are connected.
+* Instead of the official 50 ms `setInterval`, every `HostRoom` registers in **one
+  process-wide clock** (`src/host/clock.ts`, `hostClock`): a single `setTimeout` armed for the
+  earliest room that has work, re-armed only when that time changes. A room asks to be woken at:
+  * with ready clients: the exact frame of the next heartbeat and of the next CheckConsistency
+    (and, without a game, of the next queued event);
+  * the Ping event (`pingIntervalMs`, only while clients are connected);
+  * while a game runs: at least every `maxWakeFrames` (default 4 = 66.7 ms; official ≈ 3),
+    spread evenly inside each heartbeat period (default: frames +4 and +7 → ~17 wake-ups/s per
+    room in a game, official 20/s; `maxWakeFrames: Infinity` → one per heartbeat, ~8.6/s).
+  It bounds how late per-frame hooks (`onGameTick`, `onTeamGoal`, …) fire and how stale getters
+  are between messages; every frame is still simulated (and `onGameTick` called) exactly once.
+* **No clients and no game → no wake-ups at all** (0 CPU); the frame counter is virtual and is
+  caught up (O(1) for game-less frames) on the next message/action/`update()`.
 * Every incoming client message first catches the clock up (official `Jh` → `Da`), and so do
   host actions (the official `oc` stamps with a possibly 50 ms-stale frame; ours is exact).
+* The clock adds 1 ms of slack to each timer (Node's millisecond timer clock can fire up to
+  ~1 ms early, which would cost a second wake-up): heartbeats leave ~1–2 ms after their frame
+  boundary.
 
 ## Netcode knobs (host-only, compatible with official clients)
 
@@ -57,6 +67,7 @@ host.start();
 | `heartbeatFrames` | 7 | Clients only advance their *confirmed* state when a heartbeat (msg 3) arrives, and extrapolate from it for rendering. Lower values (e.g. 2) shorten that extrapolation window → fewer visible corrections of remote players, at ~9 bytes × clients per heartbeat on `uu`. E2E-tested with 2 and 7. |
 | `checksumIntervalFrames` | 600 | CheckConsistency period. |
 | `pingIntervalMs` | 3000 | Ping event period. |
+| `maxWakeFrames` | 4 | While a game runs, simulate at least every N frames without messages (hook latency / getter staleness vs wake-ups; see above). `Infinity` = only at heartbeats/messages. |
 
 ## Facade-facing API
 
@@ -110,7 +121,8 @@ error), `setDefaultStadium(name)` (throws `Stadium doesn't exist`), `setTeamsLoc
 `startGame`, `stopGame`, `pauseGame(paused)`, `setDiscProperties(index, props)`,
 `setPlayerDiscProperties(id, props)` (`props` use HBInit names incl. `bCoeff`), `reorderPlayers(ids, moveToTop)`,
 `setPassword`, `setRequireRecaptcha`, `setMaxPlayers` (extension), `startRecording()`,
-`stopRecording()` → `.hbr2` bytes | null, `update()` (catch up now).
+`stopRecording()` → `.hbr2` bytes | null, `update()` (catch up now). `recorder` is created on
+first use.
 
 **Timing / parity.** Actions run synchronously (the state reflects them on return), except when
 called from inside a room hook / HostRoom callback that fires while events are applied: then
@@ -152,8 +164,9 @@ multicast tunnel message (the local backend loops `send`).
 
 ## Deviations from the official host
 
-* Precise frame-aligned timers instead of `setInterval(Da, 50)` (frame math identical;
-  heartbeats leave at exactly `heartbeatFrames` instead of the 50 ms-quantized ~9 frames).
+* One shared, frame-aligned timer for all rooms instead of `setInterval(Da, 50)` per room
+  (frame math identical; heartbeats leave at exactly `heartbeatFrames` instead of the 50
+  ms-quantized ~9 frames; during a game catch-ups every ≤ `maxWakeFrames`).
 * Idle rooms run no timers; the 3 s Ping event is only emitted while clients are connected
   (it changes no serialized state). Host actions stamp with the caught-up frame.
 * Exceptions in room hooks are reported via `onError` and never abort the frame loop (the

@@ -21,7 +21,7 @@
  *  - Limits: more than 255 vertexes/segments/planes/goals/discs -> "Error";
  *    then derived geometry; then the validity test -> "Invalid stadium".
  */
-import JSON5 from 'json5';
+import { createRequire } from 'node:module';
 import { createDefaultBall } from './defaults.js';
 import { applySegmentCurve, isValidStadium, prepareStadium } from './geometry.js';
 import { Disc, Goal, Joint, Plane, PlayerPhysics, Segment, Stadium, Vertex } from './types.js';
@@ -37,6 +37,13 @@ export class HbsParseError extends Error {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Json = any;
+
+/** `json5` is loaded on the first parse (most rooms never parse a .hbs). */
+let json5Parse: ((text: string) => Json) | null = null;
+function parseJson5(text: string): Json {
+  if (json5Parse === null) json5Parse = (createRequire(import.meta.url)('json5') as typeof import('json5')).parse;
+  return json5Parse(text);
+}
 
 const castError = (v: unknown, type: string): HbsParseError =>
   new HbsParseError(`Cannot cast ${describe(v)} to ${type}`);
@@ -300,7 +307,7 @@ function parseSpawnPoint(o: Json): Point {
  * parser.
  */
 export function parseHbs(text: string): Stadium {
-  const root: Json = JSON5.parse(text);
+  const root: Json = parseJson5(text);
   const s = new Stadium();
   s.defaultStadiumId = 255;
   s.name = str(root.name) ?? null;

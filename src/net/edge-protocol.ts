@@ -18,6 +18,9 @@
  * WebSocket itself (fallback, UDP blocked). Data frames on a tunnel data
  * channel are `[u16 slot][payload]` (the tunnel channel is the player
  * channel); slot 0 carries an in-band control message `[u16 0][u8 type] …`.
+ * With {@link AuthFlag.RoLanes}, `ro` frames of slot `s` (and in-band
+ * control about `s`) travel on tunnel channel {@link roLaneChannel}`(s)`;
+ * tunnel channels ≥ 3 are `ro` lanes.
  * On the WebSocket data plane, data frames are `[u8 Data0+ch][u16 slot][payload]`
  * and in-band control messages are ordinary WS messages.
  *
@@ -76,11 +79,33 @@ export const EdgeMsg = {
   Data2: 0x72,
 } as const;
 
-/** Auth flags. */
+/** Auth flags (`Auth` from the host = requested; `AuthOk` from the edge = granted). */
 export const AuthFlag = {
   /** Data plane over a host↔edge PeerConnection (else over this WebSocket). */
   WebRtc: 1,
+  /**
+   * `ro` lanes: player `ro` traffic is spread over {@link EDGE_RO_LANES}
+   * ordered tunnel channels by slot (`slot % lanes`) instead of one, so a
+   * packet lost on the host↔edge path only delays the `ro` messages of the
+   * players sharing its lane (head-of-line blocking), not everybody's.
+   * Per-player order is kept: all of a slot's `ro` frames and its in-band
+   * control use the same lane. Only granted with {@link WebRtc}; an edge
+   * that does not echo it keeps the single `ro` channel (interoperable both ways).
+   */
+  RoLanes: 2,
 } as const;
+
+/** Ordered tunnel channels carrying player `ro` traffic when {@link AuthFlag.RoLanes} is granted. */
+export const EDGE_RO_LANES = 16;
+
+/**
+ * Tunnel data-channel id of a slot's `ro` traffic: lane 0 is channel 0,
+ * lane `k > 0` is channel `2 + k` (after `ru` = 1 and `uu` = 2).
+ */
+export function roLaneChannel(slot: number, lanes: number): number {
+  const lane = slot % lanes;
+  return lane === 0 ? 0 : 2 + lane;
+}
 
 /** Why the edge closed a player connection (`PeerClosed`). */
 export const EdgePeerClose = {

@@ -12,8 +12,14 @@
  * One {@link EdgeSession} per tunnel WebSocket (one room). Many hosts (API
  * keys) and many rooms per key, each bounded by per-key quotas.
  */
-import http from 'node:http';
-import https from 'node:https';
+import type { IncomingMessage, Server as HttpServer, ServerResponse } from 'node:http';
+import type { Server as HttpsServer } from 'node:https';
+import { createRequire } from 'node:module';
+// CJS require on purpose: the ESM facade of node:http(s) evaluates the lazy
+// `WebSocket`/`CloseEvent`/`MessageEvent` getters, loading undici (~35 ms of startup).
+const require = createRequire(import.meta.url);
+const http = require('node:http') as typeof import('node:http');
+const https = require('node:https') as typeof import('node:https');
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
@@ -41,12 +47,14 @@ import {
   EDGE_MAC_LENGTH,
   EDGE_NONCE_LENGTH,
   EDGE_PROTOCOL_VERSION,
+  EDGE_RO_LANES,
   EdgeCloseCode,
   EdgeLimits,
   EdgeMsg,
   EdgePeerClose,
   edgeAuthMac,
   edgeMacEqual,
+  roLaneChannel,
 } from '../net/edge-protocol.js';
 
 /** One API key (tenant). */
@@ -126,7 +134,7 @@ export interface EdgeServerOptions {
   /** TLS (`wss://`): PEM file paths. Reloaded on {@link EdgeServer.reloadTls} (SIGHUP in the CLI). */
   tls?: { certFile: string; keyFile: string } | null;
   /** Use an existing HTTP(S) server instead of creating one (`host`/`port`/`tls` ignored). */
-  server?: http.Server | https.Server;
+  server?: HttpServer | HttpsServer;
   keys: readonly EdgeKeyConfig[];
   webrtc?: EdgeWebRtcOptions;
   limits?: EdgeLimitsOptions;
@@ -218,7 +226,7 @@ function remoteCandidateOk(policy: 'public' | 'private' | 'all', line: string): 
 
 export class EdgeServer {
   readonly opts: EdgeServerOptions;
-  private readonly server: http.Server | https.Server;
+  private readonly server: HttpServer | HttpsServer;
   private readonly ownsServer: boolean;
   private readonly wss: WebSocketServer;
   private readonly keys = new Map<string, KeyState>();
@@ -404,7 +412,7 @@ export class EdgeServer {
 
   // ------------------------------------------------------------------ HTTP
 
-  private readonly onRequest = (req: http.IncomingMessage, res: http.ServerResponse): void => {
+  private readonly onRequest = (req: IncomingMessage, res: ServerResponse): void => {
     const statsPath = this.opts.statsPath === undefined ? '/stats' : this.opts.statsPath;
     const path = (req.url ?? '/').split('?')[0];
     if (statsPath !== null && req.method === 'GET' && path === statsPath) {
@@ -424,7 +432,7 @@ export class EdgeServer {
     res.writeHead(404).end();
   };
 
-  private readonly onUpgrade = (req: http.IncomingMessage, socket: Duplex, head: Buffer): void => {
+  private readonly onUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer): void => {
     const path = (req.url ?? '/').split('?')[0];
     if (this.closed || path !== (this.opts.path ?? EDGE_DEFAULT_PATH)) {
       socket.destroy();
@@ -517,8 +525,11 @@ class EdgeSession {
   private key: KeyState | null = null;
   private wsData = false;
   private pc: PeerConnection | null = null;
-  private readonly dcs: (DataChannel | null)[] = [null, null, null];
-  private readonly dcOpen = [false, false, false];
+  /** Tunnel channels: ro, ru, uu, then the extra `ro` lanes. */
+  private dcs: (DataChannel | null)[] = [null, null, null];
+  private dcOpen = [false, false, false];
+  /** `ro` lanes granted to this host ({@link AuthFlag.RoLanes}; 1 = single `ro` channel). */
+  private lanes = 1;
   private tunnelRemoteCandidates = 0;
   private readonly peers = new Map<number, EdgePeer>();
   private pendingCount = 0;
@@ -582,16 +593,17 @@ class EdgeSession {
     if (this.ws.readyState === WebSocket.OPEN) this.ws.send(bytes);
   }
 
-  /** In-band control (ordered with data on `ro`): the data-plane `ro` channel, or the WS. */
-  private sendInBand(bytes: Uint8Array): void {
-    if (!this.wsData && this.dcOpen[0]) {
+  /** In-band control about `slot` (ordered with its `ro` data): the slot's `ro` lane, or the WS. */
+  private sendInBand(slot: number, bytes: Uint8Array): void {
+    const ch = roLaneChannel(slot, this.lanes);
+    if (!this.wsData && this.dcOpen[ch]) {
       const n = bytes.length + 2;
       const buf = this.ensureScratch(n);
       buf[0] = 0;
       buf[1] = 0;
       buf.set(bytes, 2);
       try {
-        this.dcs[0]!.sendMessageBinary(buf.subarray(0, n));
+        this.dcs[ch]!.sendMessageBinary(buf.subarray(0, n));
       } catch {
         /* closing */
       }
@@ -617,8 +629,9 @@ class EdgeSession {
       this.sendWs(buf);
       return;
     }
-    const dc = this.dcs[ch];
-    if (dc == null || !this.dcOpen[ch]) return;
+    const tch = ch === 0 ? roLaneChannel(slot, this.lanes) : ch;
+    const dc = this.dcs[tch];
+    if (dc == null || !this.dcOpen[tch]) return;
     const n = 2 + data.length;
     const buf = this.ensureScratch(n);
     buf[0] = slot >>> 8;
@@ -766,10 +779,11 @@ class EdgeSession {
     const lim = this.edge.limits;
     this.openBucket = new TokenBucket(lim.peerOpenCapacity, lim.peerOpenMsPerToken);
     this.wsData = !webrtc;
+    if (webrtc && (flags & AuthFlag.RoLanes) !== 0) this.lanes = EDGE_RO_LANES;
     const w = this.control(EdgeMsg.AuthOk);
     w.u32(this.id);
     w.u16(Math.min(lim.maxPeersPerSession, 0xffff));
-    w.u8(flags & AuthFlag.WebRtc);
+    w.u8(webrtc ? flags & (AuthFlag.WebRtc | AuthFlag.RoLanes) : 0);
     this.sendWs(w.copyBytes());
     this.edge.log(`session ${this.id}: key "${k.cfg.id}" from ${this.remote} (data plane ${webrtc ? 'webrtc' : 'ws'})`);
     if (this.deadline !== null) clearTimeout(this.deadline);
@@ -801,8 +815,11 @@ class EdgeSession {
       onError,
     });
     this.pc = pc;
-    for (let i = 0; i < CHANNELS.length; i++) {
-      const cfg = CHANNELS[i]!;
+    const total = CHANNELS.length + this.lanes - 1;
+    this.dcs = new Array<DataChannel | null>(total).fill(null);
+    this.dcOpen = new Array<boolean>(total).fill(false);
+    for (let i = 0; i < total; i++) {
+      const cfg = CHANNELS[i] ?? { label: `ro${i - 2}`, ordered: true, reliable: true };
       const dc = createDataChannel(
         pc,
         `tunnel-${cfg.label}`,
@@ -907,7 +924,7 @@ class EdgeSession {
         w.u16(slot);
         w.u8(index);
         w.string(remoteAddress ?? '');
-        this.sendInBand(w.copyBytes());
+        this.sendInBand(slot, w.copyBytes());
       },
       onChannelClosed: () => this.closePeer(slot, EdgePeerClose.Closed),
       onConnectionState: (state) => this.closePeer(slot, state === 'failed' ? EdgePeerClose.Failed : EdgePeerClose.Closed),
@@ -963,7 +980,7 @@ class EdgeSession {
       if (lingerMs > 0) setTimeout(() => link.close(), lingerMs);
       else link.close();
     }
-    if (reason !== null && this.phase !== SPhase.Closed) this.sendInBand(this.peerClosedMsg(slot, reason));
+    if (reason !== null && this.phase !== SPhase.Closed) this.sendInBand(slot, this.peerClosedMsg(slot, reason));
   }
 
   private sweep(): void {

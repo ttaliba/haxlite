@@ -20,8 +20,8 @@
                    └───────────────┬───────────────────────────────▲──────────────┘
                                    │ acciones del host             │ eventos de juego
                    ┌───────────────▼────────── src/host ───────────┴──────────────┐
-                   │  reloj 60 Hz, cola de eventos (frame, orden), difusión,      │  fase 2
-                   │  snapshot de unión, CheckConsistency, Ping                   │
+                   │  reloj de frames (timer único por proceso), cola de eventos, │  fase 2
+                   │  difusión, snapshot de unión, CheckConsistency, Ping         │
                    └──────┬──────────────────────────────▲─────────────────────────┘
         aplicar evento /  │ tick                          │ mensajes decodificados
                    ┌──────▼────────── src/room ──┐  ┌─────┴─────────── src/net ──────────┐

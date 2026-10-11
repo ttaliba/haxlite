@@ -84,11 +84,13 @@ export {
   AuthFlag as EdgeAuthFlag,
   EDGE_DEFAULT_PATH,
   EDGE_PROTOCOL_VERSION,
+  EDGE_RO_LANES,
   EdgeCloseCode,
   EdgeLimits,
   EdgeMsg,
   EdgePeerClose,
   edgeAuthMac,
   parseEdgeKey,
+  roLaneChannel,
 } from './edge-protocol.js';
-export { liveWebRtcObjects, shutdownWebRtc, webRtcStats, type WebRtcStats } from './webrtc.js';
+export { liveWebRtcObjects, setWebRtcIdleRelease, shutdownWebRtc, webRtcStats, type WebRtcStats } from './webrtc.js';

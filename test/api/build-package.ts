@@ -1,5 +1,5 @@
 /**
- * TEST ONLY: builds the package (tsc -p tsconfig.build.json) into a private
+ * TEST ONLY: builds the package (scripts/build.mjs: tsc + bundle) into a private
  * directory under node_modules/.cache (so node-datachannel/ws/json5 resolve
  * from the repo's node_modules) with a package.json carrying the same
  * `exports` as the real one, and links it as `node_modules/haxlite` there, so
@@ -15,9 +15,8 @@ export function buildPackage(name: string): string {
   const out = path.join(ROOT, 'node_modules', '.cache', name);
   rmSync(out, { recursive: true, force: true });
   mkdirSync(path.join(out, 'node_modules'), { recursive: true });
-  execFileSync(process.execPath, [path.join(ROOT, 'node_modules/typescript/bin/tsc'), '-p', path.join(ROOT, 'tsconfig.build.json'), '--outDir', path.join(out, 'dist')], {
-    stdio: 'inherit',
-  });
+  // the real package build (tsc + rolldown bundle), see scripts/build.mjs
+  execFileSync(process.execPath, [path.join(ROOT, 'scripts/build.mjs'), '--out', path.join(out, 'dist')], { stdio: 'inherit' });
   const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as Record<string, unknown>;
   writeFileSync(
     path.join(out, 'package.json'),
