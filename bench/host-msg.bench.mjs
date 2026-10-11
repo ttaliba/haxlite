@@ -13,10 +13,10 @@
 // whole run (PerformanceObserver 'gc').
 import path from 'node:path';
 import { performance, PerformanceObserver } from 'node:perf_hooks';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import v8 from 'node:v8';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = path.resolve(ROOT, process.argv[2] ?? 'node_modules/.cache/haxlite-bench/dist');
 const N = Number(process.argv[3] ?? 20);
 const MESSAGES = Number(process.argv[4] ?? 2e6);
