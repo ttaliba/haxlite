@@ -8,7 +8,7 @@
  */
 import { Disc } from '../sim/types.js';
 import type { Stadium } from '../sim/types.js';
-import { copyDiscProps, createWorld, defaultStadiums, goalCrossed, stepWorld } from '../sim/index.js';
+import { copyDiscProps, createWorld, defaultStadium, goalCrossed, stepWorld } from '../sim/index.js';
 import { GamePhase, TeamId } from '../protocol.js';
 import { GameState, Player, RoomState, TEAMS } from './types.js';
 
@@ -52,7 +52,7 @@ const spawnCounts = new Int32Array(3);
  */
 export function createRoomState(stadium?: Stadium): RoomState {
   const rs = new RoomState();
-  rs.stadium = stadium ?? defaultStadiums()[0]!;
+  rs.stadium = stadium ?? defaultStadium(0);
   return rs;
 }
 

@@ -14,6 +14,7 @@
  *   writeWorld/readWorld            `u8 n` + discs (writeWorld assigns disc.index)
  *   parseHbs(text)                  `w.kh` (JSON5 .hbs)
  *   defaultStadiums()               `w.Fd()` (index = defaultStadiumId; shared, do not mutate)
+ *   defaultStadium(id)              one shared built-in stadium (built lazily, same instance)
  *   buildDefaultStadium(id)         a private copy of built-in stadium `id`
  * See src/sim/README.md.
  */
@@ -32,7 +33,7 @@ export {
   InvalidStadiumError,
 } from './binary.js';
 export { parseHbs, parseColor, parseCollisionFlags, HbsParseError } from './hbs.js';
-export { defaultStadiums, buildDefaultStadium, createDefaultBall, DEFAULT_STADIUM_COUNT } from './defaults.js';
+export { defaultStadiums, defaultStadium, buildDefaultStadium, createDefaultBall, DEFAULT_STADIUM_COUNT } from './defaults.js';
 export {
   applySegmentCurve,
   computeSegmentGeometry,

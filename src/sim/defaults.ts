@@ -302,7 +302,23 @@ function buildHockey(
   return s;
 }
 
-let cache: Stadium[] | null = null;
+/** Shared instances, built one by one on first use (a room only needs Classic: ~110 KB of heap saved). */
+const shared: (Stadium | null)[] = [];
+let all: Stadium[] | null = null;
+
+/**
+ * Shared built-in stadium `id` (0..9), the same instance as
+ * `defaultStadiums()[id]`, building only that one if needed. Never mutate it.
+ */
+export function defaultStadium(id: number): Stadium {
+  let s = shared[id] ?? null;
+  if (s === null) {
+    s = buildDefaultStadium(id); // throws for an unknown id
+    while (shared.length <= id) shared.push(null);
+    shared[id] = s;
+  }
+  return s;
+}
 
 /**
  * Built-in stadiums, index = defaultStadiumId (off `w.Fd()`):
@@ -312,12 +328,12 @@ let cache: Stadium[] | null = null;
  * private copy.
  */
 export function defaultStadiums(): readonly Stadium[] {
-  if (cache === null) {
+  if (all === null) {
     const list: Stadium[] = [];
-    for (let i = 0; i < DEFAULT_STADIUM_COUNT; i++) list.push(buildDefaultStadium(i));
-    cache = list;
+    for (let i = 0; i < DEFAULT_STADIUM_COUNT; i++) list.push(defaultStadium(i));
+    all = list;
   }
-  return cache;
+  return all;
 }
 
 export const DEFAULT_STADIUM_COUNT = 10;

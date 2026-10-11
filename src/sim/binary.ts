@@ -7,7 +7,7 @@
  * PlayerPhysics `Qa.G`, World `Oa.G`. See docs/02 §5.3 and §4.4.
  */
 import type { Reader, Writer } from '../codec/index.js';
-import { defaultStadiums } from './defaults.js';
+import { DEFAULT_STADIUM_COUNT, defaultStadium } from './defaults.js';
 import { isValidStadium, prepareStadium } from './geometry.js';
 import { Disc, Goal, Joint, Plane, PlayerPhysics, Segment, Stadium, Vertex, World } from './types.js';
 import type { Point } from './types.js';
@@ -356,12 +356,11 @@ export function readStadiumBody(r: Reader): Stadium {
 
 /**
  * Reads a stadium (off static `w.qa`): `u8 id`; 255 -> body; otherwise the
- * SHARED built-in instance `defaultStadiums()[id]` (do not mutate it).
+ * SHARED built-in instance `defaultStadium(id)` (do not mutate it).
  */
 export function readStadium(r: Reader): Stadium {
   const id = r.u8();
   if (id === 255) return readStadiumBody(r);
-  const s = defaultStadiums()[id];
-  if (s === undefined) throw new InvalidStadiumError(`Invalid stadium: unknown default stadium id ${id}`);
-  return s;
+  if (id >= DEFAULT_STADIUM_COUNT) throw new InvalidStadiumError(`Invalid stadium: unknown default stadium id ${id}`);
+  return defaultStadium(id);
 }
