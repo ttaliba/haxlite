@@ -53,8 +53,12 @@ export interface SctpAssociationOptions {
 }
 
 export interface SctpAssociationLike {
-  /** One decrypted DTLS application-data record (a view of the received datagram, not reused; may be kept). */
-  input(packet: Uint8Array): void;
+  /**
+   * One decrypted DTLS application-data record: `packet[off, off+len)`
+   * (defaults: the whole array). `packet` is the received datagram (decrypted
+   * in place, never reused), so views into it may be kept.
+   */
+  input(packet: Uint8Array, off?: number, len?: number): void;
   /** Queues a user message; false when not open or over the buffer limit. */
   send(channelId: number, data: Uint8Array): boolean;
   /** Tears down (best-effort ABORT/SHUTDOWN). No callback afterwards. Idempotent. */

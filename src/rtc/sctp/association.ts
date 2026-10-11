@@ -21,8 +21,11 @@
  *   are bundled (RFC 9260 §6.10: DATA chunks of any streams, plus the SACK
  *   and control chunks) into as few MTU-sized packets as possible; while
  *   corked even the end-of-input flush (SACK) waits for the outermost uncork.
- * - A single timer per association (injectable `setTimer`/`clearTimer`) is
- *   re-armed lazily: a timer that fires early just re-arms.
+ * - A single deadline per association. With the default clock and timers it
+ *   lives in one process-wide heap with one Node timer (./timers.ts: moving a
+ *   deadline allocates nothing); injected `setTimer`/`clearTimer` get one
+ *   timer per association, re-armed lazily (a timer that fires early just
+ *   re-arms).
  * - `input` never throws on malformed packets (everything is bounds-checked
  *   and a last-resort try/catch counts the error).
  *
@@ -31,6 +34,7 @@
  */
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readChecksum, sctpChecksum, writeChecksum } from './crc32c.js';
+import { sharedTimers, TimerSlot } from './timers.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -348,6 +352,8 @@ export class SctpAssociation {
   private readonly rxMask: number;
   private readonly cookieKey: Buffer;
   private readonly onTimerBound: () => void;
+  /** Slot in the shared timer heap (default clock and timers), else null. */
+  private readonly slot: TimerSlot | null;
 
   // --- association state
   private state = S_CLOSED;
@@ -533,6 +539,7 @@ export class SctpAssociation {
     this.cookieKey = randomBytes(32);
     this.rto = this.rtoInitial;
     this.onTimerBound = () => this.onTimer();
+    this.slot = opts.setTimer === undefined && opts.clearTimer === undefined && opts.now === undefined ? new TimerSlot(this.onTimerBound) : null;
     ensureShared(this.mtu);
     for (const ch of opts.channels) {
       if (!Number.isInteger(ch.id) || ch.id < 0 || ch.id > 65534) throw new RangeError(`bad channel id ${ch.id}`);
@@ -2603,6 +2610,12 @@ export class SctpAssociation {
     if (this.t3At !== 0 && (d === 0 || this.t3At < d)) d = this.t3At;
     if (this.sackAt !== 0 && (d === 0 || this.sackAt < d)) d = this.sackAt;
     if (this.reconfAt !== 0 && (d === 0 || this.reconfAt < d)) d = this.reconfAt;
+    const slot = this.slot;
+    if (slot !== null) {
+      if (d === 0) sharedTimers.clear(slot);
+      else if (slot.index < 0 || slot.at !== d) sharedTimers.set(slot, d);
+      return;
+    }
     if (d === 0) return; // a stale armed timer just finds nothing to do
     if (this.timerHandle !== null) {
       if (this.timerAt <= d) return;
@@ -2616,6 +2629,10 @@ export class SctpAssociation {
     this.timerHandle = null;
     if (this.dead) return;
     if (this.inInput || this.flushing) {
+      if (this.slot !== null) {
+        sharedTimers.set(this.slot, this.nowFn() + 1);
+        return;
+      }
       this.timerAt = 0;
       this.timerHandle = this.setTimerFn(this.onTimerBound, 1);
       return;
@@ -2717,6 +2734,7 @@ export class SctpAssociation {
       this.clearTimerFn(this.timerHandle);
       this.timerHandle = null;
     }
+    if (this.slot !== null) sharedTimers.clear(this.slot);
     this.t1At = this.t2At = this.t3At = this.sackAt = this.reconfAt = 0;
     this.buffered = 0;
     if (!notify) return;

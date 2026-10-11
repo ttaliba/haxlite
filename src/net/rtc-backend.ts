@@ -137,8 +137,9 @@ export function resolvePublicAddresses(o: RtcBackendOptions): string[] {
  *   sends issued outside any scope (transport handshake, user code…).
  */
 class SendBundler {
-  private list: RtcPeerLink[] = [];
-  private spare: RtcPeerLink[] = [];
+  /** Corked links (`n` used; slots are cleared, never shrunk: no allocation in steady state). */
+  private list: (RtcPeerLink | null)[] = [];
+  private n = 0;
   private depth = 0;
   private scheduled = false;
   private flushing = false;
@@ -148,7 +149,7 @@ class SendBundler {
   };
 
   add(link: RtcPeerLink): void {
-    this.list.push(link);
+    this.list[this.n++] = link;
     if (this.depth === 0 && !this.scheduled && !this.flushing) {
       this.scheduled = true;
       setImmediate(this.immediateFn);
@@ -166,21 +167,18 @@ class SendBundler {
   private flush(): void {
     if (this.flushing) return;
     this.flushing = true;
+    const l = this.list;
     try {
-      // a flush can deliver deferred input → host sends → new corks: take them in the same pass
-      while (this.list.length > 0) {
-        const l = this.list;
-        this.list = this.spare;
-        for (let i = 0; i < l.length; i++) l[i]!.flushBundle();
-        l.length = 0;
-        this.spare = l;
+      // a flush can deliver deferred input → host sends → new corks appended: same pass
+      for (let i = 0; i < this.n; i++) {
+        const link = l[i]!;
+        l[i] = null;
+        link.flushBundle();
       }
     } finally {
+      for (let i = 0; i < this.n; i++) l[i] = null;
+      this.n = 0;
       this.flushing = false;
-      if (this.list.length > 0 && this.depth === 0 && !this.scheduled) {
-        this.scheduled = true;
-        setImmediate(this.immediateFn);
-      }
     }
   }
 }
@@ -475,7 +473,11 @@ class RtcPeerLink implements PeerLink {
     try {
       this.s.uncork();
     } catch (err) {
-      this.ev?.onError(err instanceof Error ? err : new Error(String(err)));
+      try {
+        this.ev?.onError(err instanceof Error ? err : new Error(String(err)));
+      } catch {
+        /* never propagate: the bundler must reach every link */
+      }
     }
   }
 

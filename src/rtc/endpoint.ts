@@ -82,6 +82,9 @@ function randomIceString(n: number): string {
   return s;
 }
 
+/** Largest datagram whose exact-length scratch view is cached (≥ the 1200-byte SCTP MTU + DTLS overhead). */
+const VIEW_CACHE_MAX = 1536;
+
 /** Default data-channel layer: R2's SCTP association (src/rtc/sctp). */
 const defaultDataLayer: SctpFactory = (o) => new SctpAssociation(o);
 
@@ -131,6 +134,11 @@ export class RtcEndpoint {
   private readonly stunScratch = new StunMessage();
   /** Shared seal buffer for outgoing records (replaced if the kernel ever queues a send that still references it). */
   private sendScratch: Buffer = Buffer.allocUnsafeSlow(2048);
+  /**
+   * Exact-length views of {@link sendScratch} by datagram length (≤ {@link VIEW_CACHE_MAX}):
+   * dgram would otherwise build a new view for every offset/length send.
+   */
+  private sendViews: (Buffer | undefined)[] = [];
   private readonly host: SessionHost;
   private sweepTimer: NodeJS.Timeout | null = null;
   private closed = false;
@@ -175,18 +183,24 @@ export class RtcEndpoint {
         counters.packetsOut++;
         counters.bytesOut += length;
         const sock = dest.sock;
+        const scratch = buf === this.sendScratch;
+        let out = buf;
+        if (length !== buf.length) {
+          if (scratch && length <= VIEW_CACHE_MAX) out = this.sendViews[length] ??= buf.subarray(0, length);
+          else out = buf.subarray(0, length);
+        }
         try {
           // synchronous (literalLookup): dgram tries the send right away
-          sock.send(buf, 0, length, dest.port, dest.address);
+          sock.send(out, dest.port, dest.address);
         } catch {
           /* socket closed */
           return;
         }
         // EAGAIN: libuv queued the datagram and still references `buf`: never reuse it
-        if (buf === this.sendScratch && sock.getSendQueueCount() !== 0) this.sendScratch = Buffer.allocUnsafeSlow(buf.length);
+        if (scratch && sock.getSendQueueCount() !== 0) this.replaceScratch(buf.length);
       },
       sendBuffer: (size) => {
-        if (this.sendScratch.length < size) this.sendScratch = Buffer.allocUnsafeSlow(Math.min(Math.max(size, 2 * this.sendScratch.length), DtlsServer.MAX_RECORD));
+        if (this.sendScratch.length < size) this.replaceScratch(Math.min(Math.max(size, 2 * this.sendScratch.length), DtlsServer.MAX_RECORD));
         return this.sendScratch;
       },
       bindAddress: (v) => this.bindAddress(v),
@@ -260,6 +274,11 @@ export class RtcEndpoint {
       throw err;
     }
     return new RtcEndpoint(opts, sockets, port, certificate, dataLayer);
+  }
+
+  private replaceScratch(size: number): void {
+    this.sendScratch = Buffer.allocUnsafeSlow(size);
+    this.sendViews = [];
   }
 
   /** Our candidate lines (no `a=`), identical for every session. */

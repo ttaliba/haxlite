@@ -256,6 +256,8 @@ function profileStart() {
   }
 }
 function profileStop() {
+  // HOST_HEAP_SNAPSHOT=<file.heapsnapshot> (diagnostics only): heap at the end of the window
+  if (process.env.HOST_HEAP_SNAPSHOT) require('node:v8').writeHeapSnapshot(process.env.HOST_HEAP_SNAPSHOT);
   if (!profSession) return;
   const s = profSession;
   profSession = null;
