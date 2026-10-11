@@ -107,7 +107,10 @@ export class ServerPeer {
 
   markClosed(first: string): void {
     if (this.closed === null) this.closed = { first, t: now() };
-    this.proxy?.close();
+    // keep the proxy a little longer: the close itself (SCTP ABORT/SHUTDOWN, DTLS
+    // close_notify, retransmissions) must still reach the browser through it
+    const px = this.proxy;
+    if (px !== null) setTimeout(() => px.close(), 5_000).unref();
     const w = this.closeWaiters;
     this.closeWaiters = [];
     for (const f of w) f();
@@ -447,7 +450,10 @@ export class InteropServer {
 
   async close(): Promise<void> {
     if (this.tick !== null) clearInterval(this.tick);
-    for (const p of this.peers.values()) if (p.closed === null) p.close();
+    for (const p of this.peers.values()) {
+      if (p.closed === null) p.close();
+      p.proxy?.close();
+    }
     for (const c of this.wss.clients) c.terminate();
     await new Promise<void>((r) => this.wss.close(() => r()));
     await new Promise<void>((r) => this.http.close(() => r()));

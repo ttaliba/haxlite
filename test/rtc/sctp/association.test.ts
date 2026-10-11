@@ -159,7 +159,36 @@ describe('channel semantics over a lossy, reordering, duplicating link', () => {
   });
 });
 
+function held(p: Peer): number {
+  return (p.sctp as unknown as { heldBytes: number }).heldBytes;
+}
+
 describe('fragmentation', () => {
+  for (const seed of [1, 2, 3]) {
+    it(`seed ${seed}: fragmented uu (maxRetransmits 0) messages under loss: intact or dropped, no leak`, () => {
+      const p = makePair({ seed, link: { loss: 0.08, dup: 0.03, delay: 15, jitter: 25 } });
+      expect(connectPair(p)).toBe(true);
+      const N = 200;
+      for (let i = 0; i < N; i++) {
+        p.sim.at(i * 8, () => {
+          p.a.sctp.send(2, msg(2, i, 1000 + ((i * 997) % 6000)));
+          p.a.sctp.send(0, msg(0, i, 50));
+        });
+      }
+      p.sim.run(30_000);
+      const uu = byCh(p.b, 2);
+      const ids = uu.map(msgId);
+      expect(new Set(ids).size).toBe(ids.length);
+      expect(uu.every((m) => checkMsg(2, m))).toBe(true);
+      expect(ids.length).toBeGreaterThan(N * 0.4);
+      expect(ids.length).toBeLessThan(N);
+      expect(byCh(p.b, 0).map(msgId)).toEqual([...Array(N).keys()]);
+      expect(p.a.sctp.bufferedAmount).toBe(0);
+      expect(held(p.b)).toBe(0); // no partial fragments left behind
+      noErrors(p.a, p.b);
+    });
+  }
+
   for (const [ch, size] of [
     [0, 20_000],
     [1, 20_000],

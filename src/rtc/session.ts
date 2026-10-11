@@ -51,6 +51,8 @@ export class RtcSessionImpl implements RtcSession {
   readonly remoteUfrag: string;
   /** Our ICE password as bytes (STUN MESSAGE-INTEGRITY key). */
   readonly integrityKey: Buffer;
+  /** USERNAME every Binding request must carry: "ourUfrag:theirUfrag". */
+  private readonly expectedUsername: Buffer;
   readonly createdAt: number;
 
   onOpen?: () => void;
@@ -85,6 +87,7 @@ export class RtcSessionImpl implements RtcSession {
     this.localUfrag = localUfrag;
     this.remoteUfrag = offer.iceUfrag;
     this.integrityKey = Buffer.from(localPwd, 'latin1');
+    this.expectedUsername = Buffer.from(`${localUfrag}:${offer.iceUfrag}`, 'latin1');
     this.answerSdp = answerSdp;
     this.localCandidates = localCandidates;
     this.mid = offer.mid;
@@ -143,8 +146,11 @@ export class RtcSessionImpl implements RtcSession {
   handleBinding(m: StunMessage, sock: Socket, address: string, port: number): boolean {
     if (this.state === 'closed') return false;
     // USERNAME = "ourUfrag:theirUfrag" exactly
-    const user = m.username();
-    if (user === null || user !== `${this.localUfrag}:${this.remoteUfrag}`) return false;
+    const want = this.expectedUsername;
+    if (m.usernameLength !== want.length) return false;
+    const buf = m.buf;
+    const off = m.usernameOffset;
+    for (let i = 0; i < want.length; i++) if (buf[off + i] !== want[i]) return false;
     if (!checkFingerprint(m) || !checkIntegrity(m, this.integrityKey)) return false;
     if (m.unknownRequired >= 0) {
       // Authenticated but with comprehension-required attributes we do not know: 420.

@@ -49,45 +49,42 @@ await ep.close();       // closes every session ('endpoint-closed') and the sock
 ep.stats();             // counters (see RtcEndpointStats in index.ts)
 ```
 
-`onClose` reasons: `'closed'` (local, not reported), `'remote-close'` (close_notify /
-SCTP shutdown), `'timeout'` (ICE consent), `'handshake-timeout'`, `'dtls-alert:<n>'`
+`onClose` reasons: `'remote-close'` (DTLS close_notify), `'timeout'` (ICE consent), `'handshake-timeout'`, `'dtls-alert:<n>'`
 (fatal alert received), `'dtls-error:<what>'` (we aborted the handshake: e.g.
-`'dtls-error:fingerprint-mismatch'`), `'sctp:<reason>'`, `'endpoint-closed'`.
+`'dtls-error:fingerprint-mismatch'`, `'dtls-error:no-client-certificate'`), `'sctp:<reason>'`
+(R2: `shutdown`, `abort`, `timeout`, `init-timeout`…), `'endpoint-closed'`. A local `close()` is
+never reported.
 
 ## Contract with R2 — `SctpAssociation` (`src/rtc/sctp/index.ts`)
 
-Types are in `src/rtc/types.ts` (`SctpAssociationOptions`, `SctpAssociationLike`); R2's class
-must satisfy them structurally:
+`RtcEndpoint` uses R2's `SctpAssociation` by default (static import). The subset the session
+relies on is `SctpAssociationOptions` / `SctpAssociationLike` in `src/rtc/types.ts`; R2's class
+satisfies it structurally (R2's own options type is a superset):
 
 ```ts
-export class SctpAssociation implements SctpAssociationLike {
-  constructor(opts: {
-    send(packet: Uint8Array): void;     // one SCTP packet → one DTLS record. Synchronous: the
-                                        // bytes are encrypted before return, R2 may reuse the buffer.
-    channels: { id: number; ordered: boolean; maxRetransmits?: number }[];
-       // always [{id:0,ordered:true},{id:1,ordered:false},{id:2,ordered:false,maxRetransmits:0}]
-    maxMessageSize: number;             // min(offer a=max-message-size, ours = 262144)
-    localPort?: number;                 // our sctp-port (5000)
-    remotePort?: number;                // offer a=sctp-port (default 5000)
-    onMessage(channelId: number, data: Uint8Array): void; // receiver may keep `data`
-    onOpen(): void;                     // association established (channels usable)
-    onClose(reason: string): void;      // ABORT / SHUTDOWN / timeout (once)
-  });
-  input(packet: Uint8Array): void;      // one decrypted DTLS application-data record; R2 may
-                                        // keep views into it (it is freshly allocated per record)
-  send(channelId: number, data: Uint8Array): boolean; // false when not open / buffer full
-  close(): void;                        // graceful/abort, no onClose callback afterwards
-}
+new SctpAssociation({
+  send(packet: Uint8Array): void,   // one SCTP packet → one DTLS record, encrypted synchronously
+                                    // (R2 may reuse the buffer after the call)
+  channels: [{id:0,ordered:true},{id:1,ordered:false},{id:2,ordered:false,maxRetransmits:0}],
+  maxMessageSize,                   // peer's a=max-message-size (sends above it are refused)
+  maxReceiveMessageSize: 262144,    // ours
+  localPort: 5000, remotePort,      // a=sctp-port of answer / offer
+  onMessage(channelId, data),       // receiver may keep `data`
+  onOpen(), onClose(reason),        // reason → session onClose('sctp:<reason>')
+  onError(err),                     // exceptions from the callbacks above
+});
+assoc.input(record)   // one decrypted DTLS application-data record (fresh buffer, may be kept)
+assoc.send(channelId, data): boolean
+assoc.close()         // no onClose afterwards
 ```
 
-* The association is constructed **when the DTLS handshake completes** (the browser, as DTLS
-  client, normally sends INIT right away; R2 may also send its own INIT at construction).
-* Path MTU: assume 1200 bytes of SCTP packet (DTLS adds ≤ 29 bytes, IP/UDP ≤ 48).
-* All callbacks run on the main thread from within `input()`/timers; exceptions thrown by
-  `onMessage` are caught by RtcSession.
-* Until R2's module exists, `RtcEndpoint.listen({ dataLayer })` accepts any factory
-  `(opts) => SctpAssociationLike` (tests use a raw echo layer: one DTLS record = one message on
-  channel 0).
+* The association is constructed **when the DTLS handshake completes** (the browser sends INIT
+  right away; R2 may also send its own).
+* Path MTU: SCTP packets ≤ 1200 bytes (DTLS adds 29 bytes with AES-GCM, IP/UDP ≤ 48).
+* All callbacks run synchronously from `input()`/timers on the main thread.
+* `RtcEndpoint.listen({ dataLayer })` accepts any other factory `(opts) => SctpAssociationLike`;
+  `rawDataLayer` (one DTLS record = one message, `[u8 channel][payload]`) is used by the DTLS
+  tests against `openssl s_client`.
 
 ## Design notes
 
@@ -98,11 +95,21 @@ export class SctpAssociation implements SctpAssociationLike {
   nominates (= `remoteAddress`). NAT rebinding: only through a new authenticated binding.
   Consent: the browser keeps sending bindings (~every 2.5–5 s); none for `idleTimeoutMs` →
   close.
-* **DTLS 1.2 server** (RFC 6347): stateless HMAC cookie (HelloVerifyRequest) before any
-  allocation, `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (+ AES_256_GCM_SHA384,
-  CHACHA20_POLY1305), x25519/secp256r1, extended_master_secret required (RFC 7627),
-  renegotiation_info, mandatory client certificate whose hash must equal the SDP
-  `a=fingerprint` (else fatal `bad_certificate`), CertificateVerify checked, 64-entry
-  anti-replay window per epoch, retransmission with exponential backoff, fragmentation and
-  reassembly. A DTLS 1.3-capable browser (supported_versions) is answered with 1.2.
+* **DTLS 1.2 server** (RFC 6347, `dtls/server.ts`): HMAC cookie (HelloVerifyRequest, bound to
+  the remote address and the ClientHello parameters) before any handshake state;
+  `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` preferred (+ AES_256_GCM_SHA384,
+  CHACHA20_POLY1305 — all three exercised against OpenSSL), x25519 preferred / secp256r1;
+  extended_master_secret **required** (RFC 7627, fatal handshake_failure otherwise);
+  renegotiation_info (initial handshake only, renegotiation refused); mandatory client
+  certificate whose hash must equal the SDP `a=fingerprint` (constant-time compare; fatal
+  `bad_certificate` → `onClose('dtls-error:fingerprint-mismatch')`), its CertificateVerify
+  checked (ECDSA or RSA-PKCS#1, SHA-256/384/512); epochs 0/1, 48-bit sequence numbers,
+  64-entry anti-replay window, records that fail AEAD are silently dropped; flight
+  retransmission (1 s doubling to 8 s, and on peer retransmissions, rate-limited);
+  fragmentation of our flights to the MTU and reassembly of the client's (fragmented
+  ClientHello included, bounded sizes); alerts; close_notify both ways. No resumption, no
+  compression, no DTLS 1.0.
+* **DTLS 1.3**: Chromium 141 with `WebRTC-ForceDtls13` offers 1.3 via `supported_versions`;
+  we answer a plain DTLS 1.2 ServerHello (no downgrade sentinel: we are not 1.3-capable) after
+  a HelloVerifyRequest, and Chromium connects with 1.2 (test/rtc/chromium-dtls.test.ts).
 * Self-signed ECDSA P-256 certificate built with a minimal DER encoder (`cert.ts`).

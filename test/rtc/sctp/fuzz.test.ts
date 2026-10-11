@@ -62,7 +62,7 @@ function mutate(src: Uint8Array, rnd: () => number, other: Uint8Array): Uint8Arr
     } else if (r < 0.78) {
       // splice chunks of another packet
       const tail = other.subarray(12 + Math.floor(rnd() * Math.max(1, other.length - 12)));
-      const ext = new Uint8Array(Math.min(1500, pkt.length + tail.length));
+      const ext = new Uint8Array(Math.max(pkt.length, Math.min(1500, pkt.length + tail.length)));
       ext.set(pkt);
       ext.set(tail.subarray(0, ext.length - pkt.length), pkt.length);
       pkt = ext;

@@ -62,6 +62,15 @@ function nextMessage(s: Socket, ms = 500): Promise<Buffer | null> {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+const ipv6Available = await new Promise<boolean>((resolve) => {
+  const s = dgram.createSocket({ type: 'udp6', ipv6Only: true });
+  s.on('error', () => resolve(false));
+  s.bind(0, '::1', () => {
+    s.close();
+    resolve(true);
+  });
+});
+
 describe('RtcEndpoint ICE-lite', () => {
   let ep: RtcEndpoint | null = null;
   const sockets: Socket[] = [];
@@ -189,6 +198,29 @@ describe('RtcEndpoint ICE-lite', () => {
     expect(s.localCandidates).toEqual([`candidate:1 1 udp 2130706431 203.0.113.9 ${ep.port} typ host generation 0`]);
     expect(s.answerSdp).toContain('a=ice-lite');
     expect(s.answerSdp).toContain(`a=fingerprint:sha-256 ${formatFingerprint(ep.certificate.fingerprint)}`);
+  });
+
+  it('binds the wildcard of the public family when no address is given', async () => {
+    ep = await RtcEndpoint.listen({ publicAddresses: ['127.0.0.1'], dataLayer: rawDataLayer });
+    const session = ep.createSession(offerSdp(cert.sha256));
+    const c = await client();
+    c.send(binding(answerCreds(session.answerSdp)), ep.port, '127.0.0.1');
+    expect(await nextMessage(c)).not.toBeNull();
+  });
+
+  it.skipIf(!ipv6Available)('IPv6 + IPv4 on the same port', async () => {
+    ep = await RtcEndpoint.listen({ publicAddresses: ['::1', '127.0.0.1'], dataLayer: rawDataLayer });
+    const session = ep.createSession(offerSdp(cert.sha256));
+    expect(session.answerSdp).toContain(`a=candidate:1 1 udp 2130706431 ::1 ${ep.port} typ host`);
+    const c6 = dgram.createSocket({ type: 'udp6', ipv6Only: true });
+    await new Promise<void>((r) => c6.bind(0, '::1', () => r()));
+    sockets.push(c6);
+    c6.send(binding(answerCreds(session.answerSdp), { useCandidate: true }), ep.port, '::1');
+    const res = await nextMessage(c6);
+    const m = new StunMessage();
+    expect(parseStun(res!, m)).toBe(true);
+    expect(readXorAddress(res!, findAttr(m, StunAttr.XorMappedAddress), m.transactionId()).port).toBe(c6.address().port);
+    expect(session.remoteAddress?.address).toBe('::1');
   });
 
   it('validates options', async () => {
