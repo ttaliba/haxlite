@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>haxlite-rtc self-test</title>
+<style>
+  :root { --bg: #fff; --fg: #111; --ok: #0a7d32; --bad: #b3261e; --mut: #666; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #111; --fg: #eee; --ok: #5fd38a; --bad: #ff8a80; --mut: #aaa; } }
+  body { background: var(--bg); color: var(--fg); font: 15px/1.4 system-ui, sans-serif; margin: 0 16px 32px; }
+  h1 { font-size: 20px; }
+  button { font-size: 16px; padding: 8px 16px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+  td, th { border-bottom: 1px solid #8884; padding: 4px 6px; text-align: left; vertical-align: top; word-break: break-word; }
+  .ok { color: var(--ok); font-weight: 600; } .bad { color: var(--bad); font-weight: 600; } .mut { color: var(--mut); }
+  pre { white-space: pre-wrap; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>haxlite-rtc — prueba de interoperabilidad</h1>
+<p class="mut">Esta página abre conexiones WebRTC exactamente como el cliente oficial de HaxBall (3 canales negociados ro/ru/uu) contra el servidor que la sirve y verifica la entrega en ambos sentidos. Pulsa «Probar» y copia el resultado.</p>
+<p><button id="go">Probar</button></p>
+<table id="t"><thead><tr><th>Prueba</th><th>Resultado</th><th>Detalle</th></tr></thead><tbody></tbody></table>
+<pre id="raw"></pre>
+<script type="module">
+import { Harness } from './client.js';
+const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const base = proto + '//' + location.host;
+const hx = new Harness(base);
+const tbody = document.querySelector('#t tbody');
+const raw = document.getElementById('raw');
+const report = { userAgent: navigator.userAgent, results: [] };
+function row(name, ok, detail) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${name}</td><td class="${ok ? 'ok' : 'bad'}">${ok ? 'OK' : 'FALLO'}</td><td>${detail}</td>`;
+  tbody.appendChild(tr);
+  report.results.push({ name, ok, detail });
+  raw.textContent = JSON.stringify(report, null, 1);
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let ctl, nextId = 1; const pending = new Map();
+function control() {
+  return new Promise((resolve, reject) => {
+    ctl = new WebSocket(base + '/control');
+    ctl.onopen = () => resolve();
+    ctl.onerror = () => reject(new Error('control ws'));
+    ctl.onmessage = (e) => { const m = JSON.parse(e.data); pending.get(m.id)?.(m); pending.delete(m.id); };
+  });
+}
+function cmd(c) { return new Promise((r) => { const id = nextId++; pending.set(id, r); ctl.send(JSON.stringify({ id, ...c })); }); }
+async function until(fn, ms) { const end = Date.now() + ms; while (Date.now() < end) { if (await fn()) return true; await sleep(100); } return false; }
+
+async function run() {
+  document.getElementById('go').disabled = true;
+  tbody.textContent = '';
+  try {
+    await control();
+    report.server = (await cmd({ cmd: 'info', tag: '' })).result;
+    // 1. connect
+    const [j] = await hx.connect(1);
+    row('Conexión (3 canales)', !!j, j ? `${Math.round(j.joinMs)} ms; maxMessageSize ${hx.stats(j.index).state.maxMessageSize}` : hx.errors.join('; '));
+    if (!j) return;
+    const i = j.index, tag = j.tag;
+    // 2. 200 messages each way per channel, 64 B; then 5 × 20 KB on ro/ru
+    for (const [n, size, chans] of [[200, 64, [0, 1, 2]], [5, 20000, [0, 1]]]) {
+      const s0 = hx.stats(i).rx.ch.map((c) => c.data);
+      const r0 = (await cmd({ cmd: 'stats', tag })).result.rx.ch.map((c) => c.data);
+      for (const ch of chans) { await cmd({ cmd: 'burst', tag, ch, n, size }); hx.burst(i, ch, n, size); }
+      await until(async () => {
+        const s = hx.stats(i).rx.ch, r = (await cmd({ cmd: 'stats', tag })).result.rx.ch;
+        return [0, 1].every((ch) => s[ch].data - s0[ch] >= n && r[ch].data - r0[ch] >= n);
+      }, 20000);
+      await sleep(500);
+      const s = hx.stats(i).rx.ch, r = (await cmd({ cmd: 'stats', tag })).result.rx.ch;
+      for (const ch of chans) {
+        const a = s[ch], b = r[ch], got = a.data - s0[ch], got2 = b.data - r0[ch];
+        const name = ['ro', 'ru', 'uu'][ch];
+        const reliable = ch < 2;
+        const ok = a.corrupt === 0 && b.corrupt === 0 && a.dups === 0 && b.dups === 0 && a.strings === 0 &&
+          (reliable ? got === n && got2 === n : got > 0 && got2 > 0) && (ch !== 0 || (a.reordered === 0 && b.reordered === 0));
+        row(`${name}: ${n} × ${size} B`, ok, `servidor→navegador ${got}/${n}, navegador→servidor ${got2}/${n}, desordenados ${a.reordered}/${b.reordered}, duplicados ${a.dups}/${b.dups}, corruptos ${a.corrupt}/${b.corrupt}`);
+      }
+    }
+    // 3. idle 40 s (ICE consent freshness)
+    hx.conns[i].inactivityMs = Infinity; clearTimeout(hx.conns[i].idleTimer);
+    row('Inactividad 40 s (esperando…)', true, 'sin datos de aplicación');
+    await sleep(40000);
+    const st = hx.stats(i).state;
+    row('Inactividad 40 s', st.open && st.conn === 'connected', JSON.stringify(st));
+    // 4. server close is noticed
+    const t0 = performance.now();
+    await cmd({ cmd: 'close', tag });
+    const noticed = await until(async () => !hx.stats(i).state.open, 20000);
+    row('Cierre desde el servidor', noticed, `${Math.round(performance.now() - t0)} ms (${hx.stats(i).state.closeReason})`);
+    // 5. reconnect, then browser close
+    const [j2] = await hx.connect(1);
+    row('Reconexión', !!j2, j2 ? `${Math.round(j2.joinMs)} ms` : hx.errors.join('; '));
+    if (j2) {
+      const t1 = performance.now();
+      hx.close(j2.index);
+      const ok = await until(async () => (await cmd({ cmd: 'stats', tag: j2.tag })).result.closed !== null, 20000);
+      row('Cierre desde el navegador', ok, `${Math.round(performance.now() - t1)} ms`);
+    }
+  } catch (e) {
+    row('Error', false, String(e && e.stack || e));
+  } finally {
+    document.getElementById('go').disabled = false;
+  }
+}
+document.getElementById('go').onclick = run;
+</script>
+</body>
+</html>

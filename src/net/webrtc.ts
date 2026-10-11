@@ -52,7 +52,7 @@ let closeScheduled = false;
 let createdCount = 0;
 let drainWaiters: (() => void)[] = [];
 /** See {@link setWebRtcIdleRelease}. */
-let idleReleaseMs: number | null = 1;
+let idleReleaseMs: number | null = 15_000;
 let idleTimer: NodeJS.Timeout | null = null;
 /** `createdCount` right after the last `cleanup()`: nothing new to release while unchanged. */
 let cleanedAt = 0;
@@ -329,14 +329,16 @@ async function doShutdown(timeoutMs: number): Promise<void> {
     });
   }
   if (createdCount !== generation) return; // WebRTC in use again
-  const t0 = performance.now();
-  const dbg = liveWebRtcObjects().join(', ');
   try {
     cleanup();
-    console.log(`[dbg] cleanup ${(performance.now() - t0).toFixed(1)} ms live=[${dbg}]`);
   } catch (err) {
-    console.log(`[dbg] cleanup FAILED ${(performance.now() - t0).toFixed(1)} ms live=[${dbg}]`);
+    // libdatachannel gave up waiting for its own teardown ("cleanup timeout
+    // (possible deadlock)", seen only when called right after closes, never
+    // after an idle delay): keep every wrapper referenced (letting them be
+    // collected is what crashes) and stop releasing automatically.
     report(null, err);
+    idleReleaseMs = null;
+    return;
   }
   cleanedAt = createdCount;
   releaseCount++;

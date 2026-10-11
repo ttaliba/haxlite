@@ -53,7 +53,7 @@ Un **dominio no sirve.** La RFC 8839 manda a los navegadores ignorar los candida
 
    Se probó en loopback: la entrada sigue funcionando y las IPs baneadas no conectan. **Protege la CPU y aguanta floods que no saturan el enlace.** Si el ataque llena el enlace, no sirve: ahí solo ayuda el proveedor.
    - Le falta a haxlite: eventos `onPeerPending` / `onPeerAddress` / `onPeerGone` (node-datachannel ya expone `getSelectedCandidatePair()`) y un *sidecar* con privilegios que actualice los sets.
-3. **Una dirección distinta por jugador ("canary").** Con `bindAddress` y el puerto por PeerConnection (sin `enableIceUdpMux`), cada jugador recibe su propia dirección:puerto. Se probó con 8 sesiones simultáneas en 8 direcciones.
+3. **Una dirección distinta por jugador ("canary").** Con `bindAddress` y el puerto por PeerConnection (`rtc: { enableIceUdpMux: false }`: desde la pasada de ligereza haxlite usa el mux UDP por defecto, un puerto para todos), cada jugador recibe su propia dirección:puerto. Se probó con 8 sesiones simultáneas en 8 direcciones.
    - Con un **/64 de IPv6**, cada jugador tiene una /128 propia. Si atacan esa dirección, se sabe **quién la filtró**: se banea su auth/IP y se descarta la dirección sin afectar al resto.
    - IPv6 disponible por país (APNIC): UY 61 %, BR 59 %, MX 58 %, PE 35 %, AR 34 %, CL 23 %, CO 22 %. Los jugadores que solo tienen IPv4 comparten la IPv4.
    - Los booters suelen atacar la IP entera, así que **la atribución por puerto solo atrapa a los ingenuos**; por dirección IPv6 es robusta. Un ataque contra todo el /64 sigue saturando el enlace.

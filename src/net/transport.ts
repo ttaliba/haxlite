@@ -207,7 +207,9 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   iceCandidatePolicy?: IceCandidatePolicy;
   /**
    * Local UDP port range for ICE (firewall-friendly deployment), shorthand for
-   * `rtc.portRangeBegin/portRangeEnd`. Each connection uses one port.
+   * `rtc.portRangeBegin/portRangeEnd`. With the default UDP mux every
+   * connection shares `portRange[0]`; with `rtc.enableIceUdpMux: false`
+   * each connection uses its own port of the range.
    */
   portRange?: readonly [number, number] | null;
   /** List the room publicly (send RoomInfo, message 7). Default false (HBInit default). */
@@ -238,7 +240,10 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   roomLinkBase?: string;
   /**
    * Extra node-datachannel config: `bindAddress`, `portRangeBegin/End`,
-   * `enableIceUdpMux` (all peers on one UDP port), `iceTransportPolicy`,
+   * `enableIceUdpMux` (default **true** in haxlite: all peers share one UDP
+   * socket — 1 fd instead of 1 per player and ≈ −6 % host CPU with 20
+   * players, docs/07 «Pasada de ligereza — red»; set it to false to give
+   * each connection its own port, e.g. per-player `bindAddress`), `iceTransportPolicy`,
    * `maxMessageSize`, `mtu`, `proxyServer`…
    */
   rtc?: Partial<Omit<RtcConfig, 'iceServers'>>;
@@ -330,6 +335,7 @@ export class HostTransport {
       const iceServers: (string | NativeIceServer)[] = toNativeIceServers(opts.iceServers ?? DEFAULT_ICE_SERVERS);
       const range = opts.portRange;
       const rtc: RtcConfig = {
+        enableIceUdpMux: true,
         ...(range ? { portRangeBegin: range[0], portRangeEnd: range[1] } : null),
         ...opts.rtc,
         iceServers,

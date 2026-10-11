@@ -79,6 +79,14 @@ codificación del códec (`varuint` + UTF-8).
   fiabilidad de `ro`/`ru`/`uu` (el canal del túnel **es** el canal del jugador). Trama:
   `[u16 slot][payload]` — 2 bytes de overhead. `slot = 0` lleva un mensaje de control en banda.
   Sin el flag (o como *fallback*), todo va por el WebSocket: `[0x70+canal][u16 slot][payload]`.
+* **Carriles `ro` (`flags & 2`, `AuthFlag.RoLanes`):** el host lo pide en `Auth` y el edge lo
+  confirma en `AuthOk`. Entonces el tráfico `ro` de los jugadores (¡los clientes mandan **todos**
+  sus eventos/inputs por `ro`!) se reparte en 16 canales ordenados del túnel según `slot % 16`
+  (carril 0 = canal 0, carril k = canal 2 + k): una pérdida en el tramo host↔edge solo retrasa el
+  `ro` de los jugadores de ese carril, no el de todos. El orden por jugador se mantiene: todo el
+  `ro` de un slot y su control en banda (`PeerChannelOpen`/`PeerClosed`/`PeerClose`) van por su
+  carril; un multicast `ro` sale como un mensaje por carril en uso. Un host o un edge que no
+  conocen el flag siguen con el canal `ro` único (interoperan en ambos sentidos).
 * **Multicast:** las difusiones del host (eventos, heartbeats, CheckConsistency) salen como **un**
   mensaje `[0][0][0x40][canal][n][slot × n][payload]` en vez de uno por jugador: la subida del
   host no crece con el número de jugadores.
@@ -119,6 +127,7 @@ Con `HostTransport` directamente: `new HostTransport({ token, edge: { url, key }
 |---|---|---|
 | `url` | — | `wss://host:puerto/tunnel` (`ws://` solo para pruebas/LAN) |
 | `key` | — | `"<keyId>:<secret>"` |
+| `roLanes` | `true` | pedir los carriles `ro` (§1.2); `false` = un solo canal `ro` en el túnel |
 | `fallbackWs` | `true` | si la PeerConnection de datos no sube en `dataPlaneTimeoutMs`, reconecta con todo por el WebSocket (queda en WS hasta reiniciar la sala) |
 | `dataPlane` | `'webrtc'` | `'ws'` para forzar el WebSocket |
 | `bindAddress` | — | dirección local para el WS y la PeerConnection del túnel |
@@ -306,7 +315,7 @@ JSON (`--config` o `HAXLITE_EDGE_CONFIG`) + variables de entorno (ganan): `HAXLI
 | `keysFile` | — | JSON (array) o `id:secret` por línea |
 | `webrtc.bindAddress` | todas | dirección local (y anunciada) de las PeerConnections |
 | `webrtc.portRange` | efímeros | rango UDP de jugadores y túneles |
-| `webrtc.enableIceUdpMux` | false | todas las conexiones en un puerto |
+| `webrtc.enableIceUdpMux` | false | todas las conexiones en un puerto (en el edge **no** ahorra CPU: +6 % medido, §7.1; el host sí lo usa por defecto) |
 | `webrtc.iceServers` | STUN de Google | para descubrir la IP pública detrás de NAT 1:1 (nubes con IP privada) |
 | `webrtc.iceCandidatePolicy` | `'public'` | candidatos propios anunciados (`'all'` solo para pruebas en loopback) |
 | `webrtc.remoteCandidatePolicy` | `'public'` | candidatos remotos aceptados (`'private'`/`'all'` para LAN/pruebas) |
@@ -331,10 +340,13 @@ In/Out}`.
 
 ## 6. Límites y decisiones
 
-* El túnel `ro` es **un** stream SCTP ordenado para todos los jugadores: una pérdida en el tramo
-  host↔edge retrasa el `ro` de todos (snapshot, CheckConsistency, mensajes dirigidos). Inputs,
-  eventos (`ru`) y heartbeats (`uu`) no sufren *head-of-line*. Con el *fallback* WebSocket todo es
-  TCP (HOL total): usarlo solo si el UDP está bloqueado.
+* *Head-of-line* en el túnel: los clientes oficiales mandan **todos** sus eventos (inputs, chat)
+  por `ro`, así que con un único canal `ro` en el túnel una pérdida en el tramo host↔edge frenaba
+  los inputs de **todos** los jugadores hasta la retransmisión. Con los carriles `ro` (§1.2, por
+  defecto) solo se frena el carril del paquete perdido (≈ 1/16 de los jugadores): con 2–5 % de
+  pérdida en el túnel el RTT medio por `ro` baja a la mitad del exceso (§7.1). Eventos del host
+  (`ru`) y heartbeats (`uu`) nunca sufren HOL. Con el *fallback* WebSocket todo es TCP (HOL
+  total): usarlo solo si el UDP está bloqueado.
 * Sin *batching* de mensajes chicos: cada mensaje de jugador es un mensaje de túnel (+2 bytes).
   Agruparlos añadiría latencia y las mediciones (§7) no lo justifican; el multicast ya elimina el
   caso caro (difusiones).
@@ -345,7 +357,15 @@ In/Out}`.
   jugador); las estadísticas por clave permiten detectar abusos.
 * Cero asignaciones por mensaje en los caminos calientes salvo las inevitables (el `Buffer` que
   entrega node-datachannel por mensaje recibido y la vista `subarray`): los encabezados se
-  escriben en un buffer *scratch* reutilizado (node-datachannel copia de forma síncrona).
+  escriben en un buffer *scratch* reutilizado (node-datachannel copia de forma síncrona). Quitar
+  el encabezado es una vista (`subarray`), el multicast entrega **la misma** vista del payload a
+  cada jugador y se parsea en el sitio (sin `Reader`). Anteponer el slot en el sentido
+  jugador→host cuesta una copia del payload al *scratch* (no hay espacio previo en el `Buffer` que
+  entrega node-datachannel); son decenas de bytes.
+* Sin temporizadores en vacío: el ping de keep-alive a los hosts (10 s) solo corre mientras hay
+  sesiones; el barrido de negociaciones colgadas (1 s) solo mientras hay alguna negociación
+  pendiente. Un edge sin sesiones no despierta nunca (y libera los hilos nativos de libdatachannel
+  15 s después de cerrar su última PeerConnection, ver `setWebRtcIdleRelease`).
 
 ## 7. Overhead medido (loopback)
 

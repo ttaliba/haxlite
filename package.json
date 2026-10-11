@@ -33,7 +33,8 @@
     "bench:idle": "npm run bench:host -- idle",
     "bench:game": "npm run bench:host -- game",
     "bench:rooms": "npm run bench:host -- rooms",
-    "edge": "node --experimental-strip-types --no-warnings --import ./scripts/ts-resolve.mjs scripts/edge.ts"
+    "edge": "node --experimental-strip-types --no-warnings --import ./scripts/ts-resolve.mjs scripts/edge.ts",
+    "test:interop": "vitest run -c test/rtc-interop/vitest.config.ts"
   },
   "dependencies": {
     "json5": "^2.2.3",
@@ -46,6 +47,7 @@
     "haxball.js": "5.1.0",
     "node-haxball": "2.3.1",
     "pako": "^2.2.0",
+    "playwright-core": "1.56.1",
     "rolldown": "1.2.13",
     "typescript": "^7.0.2",
     "vitest": "^5.0.3"

@@ -45,6 +45,10 @@ Conclusiones cortas (detalle en §5):
   tres). Ninguna implementación bloquea el loop lo bastante como para afectar al netcode.
 * **Física**: ×1,85–×1,97 más rápida que la oficial, pero 1 µs por tick son 0,006 % de un núcleo
   a 60 Hz: irrelevante para el consumo total del host.
+* **Pasada de ligereza (§7)**: reloj único por proceso (17 despertares/s por sala en partida en
+  vez de 60; hilo JS −28 % con 4 clientes, GC a la mitad), camino de mensajes casi sin
+  asignaciones (665 → 123 B/mensaje), arranque 192 → 139 ms, paquete instalado 1,4 → 0,77 MB, y
+  flags recomendados (−7 MB de RSS).
 
 ## 1. Qué se compara
 
@@ -392,3 +396,164 @@ un frame (16,7 ms) en p99.
 * 3 repeticiones de 60 s: diferencias menores de ~5 % en CPU están dentro del ruido (ver rangos).
 * haxlite evoluciona en paralelo (`src/net` se endureció durante las mediciones); la tanda de
   confirmación con el build actual reproduce las conclusiones.
+
+## 7. Pasada de ligereza (src/host, room, sim, codec, replay, api, build)
+
+Objetivo: menos CPU, despertares, memoria, GC, arranque y tamaño de instalación **sin cambiar el
+comportamiento** (los tests oráculo siguen bit-exactos; suite completa en verde). A/B con el
+mismo arnés: `base` = build anterior (snapshot del árbol antes de la pasada), `new` = esta pasada
+con el **mismo** `src/net` congelado, para aislar los cambios de L1. Las corridas de red usan
+`--eld 0` (sin el monitor de lag, cuyo timer de 100 Hz taparía los despertares que se quieren
+medir). Todas las mediciones se hicieron con `flock /tmp/haxlite-bench.lock` (sin solaparse con
+las de otros ingenieros).
+
+### 7.1 Reloj compartido por proceso (§5.1 resuelto)
+
+`src/host/clock.ts` (`hostClock`): **un único `setTimeout`** para todas las `HostRoom` del
+proceso, armado para la sala con trabajo más próximo y re-armado solo cuando ese instante
+cambia. Cada sala pide despertar en: el frame exacto del próximo heartbeat y del próximo
+CheckConsistency (con clientes), el próximo evento encolado (sin partida), el Ping de 3 s, y con
+partida como mucho cada `maxWakeFrames` (nuevo, por defecto 4 = 66,7 ms; el oficial ≈ 3 frames /
+50 ms), repartidos dentro de cada periodo de heartbeat (frames +4 y +7). La aritmética de frames
+no cambia: cada frame se simula una vez, en lotes como el bucle de 50 ms oficial; los heartbeats
+salen en el mismo frame que antes (+~1 ms de holgura del timer, que evita los disparos
+adelantados del reloj de milisegundos de libuv: sin ella ~13 % de despertares extra). Sala sin
+clientes ni partida: **cero** despertares. `maxWakeFrames: Infinity` → solo heartbeats/mensajes.
+
+Despertares del proceso, sin red (`bench/wakeups.bench.mjs`, 1 cliente falso por sala, partida
+en curso, 10 s):
+
+| | haxlite antes | haxlite ahora | ahora, `maxWakeFrames: Infinity` | oficial |
+|---|---:|---:|---:|---:|
+| 1 sala, despertares/s | 61,5 | **17,3** | 8,7 | 20 |
+| 10 salas, despertares/s | 637,9 | **137,8** | 87,0 | 200 |
+| sala ociosa (sin clientes ni partida) | 0 | 0 | 0 | 20 |
+
+Con red real (`bench/results/lite-game.json`, `lite-rooms.json`; mediana (mín–máx)):
+
+| config | CPU % antes | CPU % ahora | hilo JS antes → ahora | GC/min antes → ahora | GC ms/min |
+|---|---:|---:|---|---|---|
+| 1 sala, N = 4 (3 reps) | 4,87 (4,74–5,30) | **4,31** (4,13–4,36) | 2,18 → **1,57** (−28 %) | 8 → 5 | 3,3 → 1,9 |
+| 1 sala, N = 20 (3 reps) | 20,90 (20,30–21,98) | 21,17 (20,02–21,37) | 8,08 → 7,93 | 14 → **7** | 7,0 → 5,1 |
+| 10 salas × 4 (2 reps) | 28,67 (28,30–28,67) | 28,24 (27,26–28,24) | 10,78 → **9,93** (−8 %) | 44 → **23** | 19,4 → 11,7 |
+
+Con 4 clientes haxlite pasa de +10 % sobre el oficial (§4.3) a ~−10 %. Con 20 clientes los
+mensajes ya provocan los catch-ups y el coste lo domina WebRTC: la CPU total queda en el ruido,
+pero el GC se reduce a la mitad.
+
+### 7.2 Camino de mensajes sin asignaciones
+
+`bench/host-msg.bench.mjs`: `HostRoom` + transporte falso, N clientes enviando SendInput que se
+secuencia y difunde a los N (más heartbeats); mide CPU y bytes de *new space* por mensaje
+(lotes sin GC de 1000 mensajes) y atribuye con el perfilador de heap (`HEAP_PROF=`).
+
+| | ns/mensaje antes → ahora | bytes asignados/mensaje antes → ahora | scavenges / 1000 msgs |
+|---|---|---|---|
+| N = 20 (21,5 envíos por mensaje) | 3 390 → **2 650** (−22 %) | 665 → **123** | 0,25 → 0,06 |
+| N = 4 | 2 570 → **1 600** (−38 %) | 889 → **181** | 0,36 → 0,09 |
+
+Qué se quitó: el cierre por mensaje de `run(() => …)` (160 B), `new Reader` + `DataView` por
+mensaje (80 B: `Reader` ahora lee con aritmética de bytes y se reutiliza con `reset()`), la vista
+`subarray` de cada difusión/heartbeat/pong (96 B: `Writer.finishShared()` cachea una vista por
+longitud ≤ 256 B), los `splice` de la cola de eventos (2 × 32 B de arrays de resultado) y el
+`setTimeout` re-armado (≈ 180 B por frame). Queda, a propósito: el objeto `RoomEvent` del
+mensaje (64 B; es el objeto que reciben `onBeforeOperation`/`onEventApplied`, reutilizarlo
+cambiaría la API) y, en el bench, el re-armado del reloj porque el tiempo virtual avanza un frame
+cada 1–2 mensajes (en tiempo real ocurre ~17 veces/s, no por mensaje). El `Buffer` de cada
+mensaje entrante lo crea node-datachannel (`src/net`, fuera de este alcance); en la frontera
+host↔net no hay copias (`Uint8Array` en ambos sentidos).
+
+### 7.3 Arranque, carga perezosa y bundle
+
+`bench/startup/run.ts` (proceso nuevo → `import` del paquete → `HBInit` público → link de la
+FakeMaster; 20 reps intercaladas, mediana):
+
+| variante | proceso → link (ms) | import (ms) | CPU hasta link (ms) | RSS (MB) | heap (MB) | módulos ESM / CJS |
+|---|---:|---:|---:|---:|---:|---|
+| antes (tsc, ~50 archivos) | 192 | 127 | 248 | 75,5 | 11,6 | 67 / 23 |
+| + json5 perezoso, grabador perezoso | 194 | 127 | 250 | 76,1 | 12,3 | 67 / 18 |
+| + bundle (rolldown) | 185 ¹ | 115 ¹ | 247 ¹ | 76,4 ¹ | 10,9 ¹ | 17 / 18 |
+| + `node:http` vía `require` (src/net, L2) | 167 ¹ | 101 ¹ | 233 ¹ | 72,0 ¹ | 9,5 ¹ | |
+| **build actual** (todo junto) | **139** | **76** | **197** | **71,1** | **9,0** | 17 / 18 |
+
+¹ Otra tanda de 20 reps (misma máquina, mismo método). Total: **−28 % de arranque, −51 ms de
+CPU, −4,4 MB de RSS**.
+
+* **Bundle**: `npm run build` (`scripts/build.mjs`) compila con `tsc` (tipos `.d.ts` intactos) y
+  agrupa el JS con rolldown en `dist/index.js` + `dist/edge/cli.js` + un chunk compartido:
+  `import 'haxlite'` carga 2 archivos propios en lugar de ~50 (−20 ms). Dependencias de runtime
+  externas.
+* **Hallazgo `node:http`**: `import http from 'node:http'` en ESM crea la fachada del módulo
+  leyendo todos sus exports, lo que dispara los getters perezosos `http.WebSocket` /
+  `CloseEvent` / `MessageEvent` y carga **undici** entero (~35 ms y ~4 MB de RSS) aunque nadie lo
+  use. Con `createRequire(import.meta.url)('node:http')` no ocurre (aplicado por L2 en
+  `net/master-http.ts` y `edge/server.ts`).
+* **Perezosos**: `json5` se carga en el primer `parseHbs` (−5 módulos CJS, ~2 ms; la mayoría de
+  salas no parsean `.hbs`); el `ReplayRecorder` (17 KB de buffers) se crea en el primer uso.
+  Replay, `.hbs` y Edge se siguen exportando desde la raíz (no se rompe la API); con el bundle su
+  coste de carga es marginal (2–3 ms en total), así que no se separaron en subpaths.
+
+### 7.4 Dependencias y tamaño de instalación
+
+`npm pack` + `npm install --omit=dev` del tarball en un directorio vacío:
+
+| | antes | ahora |
+|---|---:|---:|
+| tarball | 248 KB | **177 KB** |
+| paquete `haxlite` instalado | 1 444 KB, 162 archivos | **768 KB**, 60 archivos |
+| `node_modules` total (6 paquetes) | 12 024 KB, 383 archivos | **11 348 KB**, 281 archivos |
+
+Se dejan de publicar los `.map` (apuntaban a `src/*.ts`, que no se publica) y el JS va agrupado.
+El resto es node-datachannel (+ binario `@node-datachannel/linux-x64-gnu`, 9,9 MB de los 11,3).
+
+Rechazado:
+* **Sustituir `json5`** (296 KB, 1 paquete): para ser exactos hay que replicar su máquina de
+  estados (mensajes de error `JSON5: invalid character … at l:c`, columnas, `console.warn` de
+  U+2028) **y sus tablas Unicode 10** de identificadores: frente a `\p{ID_Start}`/`\p{ID_Continue}`
+  de V8 (Unicode 15) difieren ~16 000 code points en 156 + 202 rangos. Ganancia pequeña, riesgo
+  real de aceptar `.hbs` que el oficial rechaza → se mantiene, cargado de forma perezosa.
+* **`ws` → `WebSocket` nativo de Node 22 (undici)**: acepta `headers` (Origin) pero no un
+  `http.Agent` (la opción `haxlite.agent` para proxies HTTP(S)/SOCKS); haría falta el paquete
+  `undici` (`ProxyAgent`), más grande que `ws`, y cargar undici cuesta ~35 ms. Se mantiene `ws`.
+
+### 7.5 Memoria (RSS) y flags de Node
+
+RSS medio con el build nuevo: sala pública ociosa **73 MB** (heap 9,2 MB; `lite-idle.json`, 0
+GC/min salvo arranque), 1 sala con 20 clientes **87–88 MB** (heap 11,0), 10 salas × 4 clientes
+**95 MB** (heap 12,1). El heap de haxlite es ~10 % del RSS: el resto es Node + libdatachannel.
+
+Flags evaluados con N = 20 (`bench/results/lite-flags-*.json`, 2 reps cada uno; CPU con ruido
+ajeno de hasta 36–55 % en algunas tandas, el RSS es robusto):
+
+| flags | RSS (MB) | CPU % | veredicto |
+|---|---:|---:|---|
+| ninguno | 86,9 – 87,8 | 19,7 – 21,2 | referencia |
+| `--max-semi-space-size=1` | 87,4 | 20,5 | neutro (el heap ya es pequeño) |
+| `--single-threaded-gc` | 88,0 | 20,5 | neutro |
+| `--optimize-for-size` | 86,4 | **22,3** | rechazado: +1–2,5 puntos de CPU |
+| `--v8-pool-size=1` | 84,5 | 20,6 | −3 MB (menos hilos de plataforma V8) |
+| `MALLOC_ARENA_MAX=2` (variable de entorno) | 82,6 | 19,6 | −5 MB (arenas de glibc de los hilos de libdatachannel) |
+| `MALLOC_ARENA_MAX=2` + `--v8-pool-size=1` + `--max-semi-space-size=1` | **80,3** | 19,3 | **−7 MB (−8 %), sin coste de CPU medible** |
+
+**Recomendado** para hosts de larga duración:
+
+```sh
+MALLOC_ARENA_MAX=2 node --v8-pool-size=1 --max-semi-space-size=1 mi-sala.js
+```
+
+`--jitless`/`--lite-mode` no se consideran (CPU). `--max-old-space-size` no reduce el RSS (el
+heap viejo es de ~11 MB). `--v8-pool-size=1` puede alargar algo el arranque (compilación en
+segundo plano con un solo hilo); no medido como significativo.
+
+### 7.6 Comandos
+
+```sh
+npm run build                                           # tsc + bundle → dist/
+node bench/host-msg.bench.mjs <dist> 20 2000000         # §7.2 (HEAP_PROF=f.heapprofile para atribuir)
+node bench/wakeups.bench.mjs <dist> 10 10 [Infinity]    # §7.1 despertares (K salas, s, maxWakeFrames)
+node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+  bench/startup/run.ts 20 antes=<dist-a>/index.js ahora=dist/index.js        # §7.3
+HAXLITE_BENCH_VARIANTS='{"base":{"dist":"…"},"new":{"dist":"…"}}' \
+  node … bench/net/run.ts game --impl haxlite:base,haxlite:new --n 4,20 --eld 0 --out bench/results/lite-game.json
+node … bench/net/run.ts game --impl haxlite:new --n 20 --reps 2 --eld 0 --host-node-args "--v8-pool-size=1"
+```
