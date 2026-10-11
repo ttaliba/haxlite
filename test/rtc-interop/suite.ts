@@ -337,14 +337,8 @@ export function defineInteropSuite(kind: BackendKind): void {
         const t0 = Date.now();
         const pageClosed = await until(async () => !(await pc.stats(j.index)).state.open, lossy ? 40_000 : T);
         observe({ backend: kind, cond: cond.name, what: 'browser dc.close(ru) → browser onclose', ms: Date.now() - t0, completed: pageClosed });
-        if (lossy && !pageClosed) {
-          // Known: under loss the SCTP stream reset can stall (seen with node-datachannel); the
-          // official client would then drop the connection by inactivity. Not a hard failure here.
-          await pc.close(j.index);
-        } else {
-          expect(pageClosed).toBe(true);
-          expect((await pc.stats(j.index)).state.closeReason).toMatch(/^channel-closed:1$/);
-        }
+        expect(pageClosed, 'stream reset completed (dc.onclose)').toBe(true);
+        expect((await pc.stats(j.index)).state.closeReason).toMatch(/^channel-closed:1$/);
         await p.whenClosed(lossy ? 40_000 : 15_000);
       }, 60_000);
 
@@ -352,7 +346,7 @@ export function defineInteropSuite(kind: BackendKind): void {
         const { j, p } = await join1();
         const t0 = Date.now();
         p.close();
-        const ok = await until(async () => !(await pc.stats(j.index)).state.open, lossy ? 40_000 : 15_000, 100);
+        const ok = await until(async () => !(await pc.stats(j.index)).state.open, lossy ? 40_000 : 15_000, 5);
         const st = await pc.stats(j.index);
         observe({ backend: kind, cond: cond.name, what: 'server close → browser close', ms: Date.now() - t0, reason: st.state.closeReason, ice: st.state.ice });
         expect(ok, JSON.stringify(st.state)).toBe(true);

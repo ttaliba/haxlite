@@ -24,9 +24,9 @@ dependen de nosotros (ver la cabecera de `src/net/webrtc.ts`):
   riesgo es estructural.
 - **Hilos nativos**: libdatachannel + usrsctp + libjuice mantienen varios hilos por proceso, y
   el temporizador de usrsctp despierta cada 10 ms aunque no haya conexiones.
-- **`cleanup()` puede colgarse**: durante este trabajo el banco registró varias veces
-  `libdatachannel error# cleanup timeout (possible deadlock)` al cerrar el servidor tras las
-  pruebas con pérdida (§5.3).
+- **`cleanup()` puede colgarse**: durante este trabajo el banco registró
+  `libdatachannel error# cleanup timeout (possible deadlock)` al apagar un servidor cuyos peers
+  habían perdido el camino UDP a mitad de un cierre (§5.3).
 - Un puerto UDP por PeerConnection (salvo `enableIceUdpMux`), binario nativo por plataforma.
 
 haxlite-rtc corre entero en el hilo de JS: un único socket UDP por familia para todas las
@@ -144,22 +144,21 @@ RTC_INTEROP_REPORT=/tmp/obs.json …                     # vuelca tiempos medido
 
 | Backend | loopback4 | eth4 | lossy (5 % / 30 ms) | dtls13 | loopback6 |
 |---|---|---|---|---|---|
-| node-datachannel 0.33 (libdatachannel 0.24) | ✅ 10/10 | ✅ 9/9 ¹ | ✅ 10/10 ² | ✅ 9/9 ¹ | sin IPv6 en la VM |
+| node-datachannel 0.33 (libdatachannel 0.24) | ✅ 10/10 | ✅ 9/9 ¹ | ✅ 10/10 | ✅ 9/9 ¹ | sin IPv6 en la VM |
 | **haxlite-rtc** | ✅ 10/10 | ✅ 9/9 ¹ | ✅ 10/10 | ✅ 9/9 ¹ | sin IPv6 en la VM |
 
 ¹ Sin la prueba de 40 s (solo se corre en `loopback4` y `lossy`).
-² El cierre de un canal desde el navegador no se completa con pérdida (§5.3); la prueba lo
-registra y sigue.
 
-Tiempos medidos (`RTC_INTEROP_REPORT`):
+Tiempos medidos (`RTC_INTEROP_REPORT`, rangos de 2–3 corridas; «limpio» = loopback4, eth4 y
+dtls13):
 
 | Medida | node-datachannel | haxlite-rtc |
 |---|---:|---:|
-| entrada (oferta → canal 0 abierto) loopback / pérdida | 1 080 / 1 340 ms | 1 047 / 1 316 ms |
-| el navegador cierra la PC → el servidor lo nota (loopback / pérdida) | 3 / 23 ms | 3 / 22 ms |
-| `dc.close()` de `ru` → `onclose` en el navegador (loopback / pérdida) | 3 ms / **no termina en 40 s** | 2 / 55 ms |
-| el servidor cierra → el navegador lo nota (loopback / pérdida) | ≈ 15 / ≈ 115 ms | ≈ 14 / ≈ 120 ms |
-| ráfaga de 10 × 20 KB por `uu` servidor → navegador (loopback / eth0) | 6–8 / 10 | 10 / 10 |
+| entrada (oferta → canal 0 abierto), limpio / pérdida | 1 072–1 083 / 1 336–1 340 ms | 1 021–1 049 / 1 316–1 332 ms |
+| el navegador cierra la PC → el servidor lo nota, limpio / pérdida | 2–4 / 21–23 ms | 2–3 / 20–22 ms |
+| `dc.close()` de `ru` → `onclose` en el navegador, limpio / pérdida | 3–6 / 55–60 ms | 2–10 / 54–59 ms |
+| el servidor cierra → el navegador lo nota, limpio / pérdida | 8–19 / 24–28 ms | 8–17 / 29–38 ms |
+| ráfaga de 10 × 20 KB por `uu` servidor → navegador (limpio) | 6–10 / 10 | 10 / 10 siempre |
 | mensajes enviados por el servidor al abrirse el canal 0, por canal `ro/ru/uu` | 3 / 0 / 0 | 1 / 1 / 1 |
 
 La entrada ronda 1 s porque Chromium no da por terminada la recolección ICE en este entorno y
@@ -187,21 +186,21 @@ channels (no se piden cámara ni micrófono).
 
 ### 5.3 Observaciones
 
-- **node-datachannel × pérdida, cierre de canal**: con 5 % de pérdida, el `dc.close()` de
-  Chromium (reset de stream SCTP, RFC 6525) contra usrsctp **no se completa en 40 s** (en
-  loopback limpio tarda 3 ms). Con haxlite-rtc tarda 55 ms. El cliente oficial nunca cierra un
-  solo canal, así que no afecta a HaxBall, pero indica un fallo de retransmisión del RE‑CONFIG en
-  esa combinación.
+- **Cierres con pérdida**: el reset de stream (RFC 6525) de un `dc.close()` y el ABORT de un
+  cierre del servidor llegan en decenas de ms con 5 % de pérdida en ambos backends. (Una versión
+  anterior del banco cerraba el proxy en cuanto el servidor veía el cierre y cortaba así la
+  respuesta del reset; parecía un fallo de node-datachannel y no lo era.)
 - **node-datachannel abre `ru`/`uu` después de `ro`**: en el servidor, el evento *open* de los
   canales 1 y 2 llega después del del canal 0, también en loopback. Lo que el host envía
   justo al abrirse el canal 0 por `ru`/`uu` cae al canal 0 (comportamiento oficial de `Za.pb`).
   haxlite-rtc abre los tres a la vez (la asociación SCTP es una sola).
-- **`uu` con ráfagas grandes**: 10 × 20 KB seguidos por `uu` (sin retransmisión) pierden 2–4
-  mensajes con node-datachannel en loopback (en eth0 llegaron todos); haxlite-rtc los entrega
-  todos. HaxBall solo manda mensajes pequeños por `uu`.
-- **`cleanup()` de node-datachannel**: al apagar el servidor tras las pruebas con pérdida se
-  registró `cleanup timeout (possible deadlock)` (no rompe la prueba, pero es el riesgo descrito
-  en §1).
+- **`uu` con ráfagas grandes**: de 10 × 20 KB seguidos por `uu` (sin retransmisión),
+  node-datachannel pierde a veces 1–4 mensajes incluso sin pérdida de red; haxlite-rtc los
+  entregó todos en todas las corridas. HaxBall solo manda mensajes pequeños por `uu`.
+- **`cleanup()` de node-datachannel**: cuando el camino UDP desaparecía a mitad de un cierre
+  (el proxy cortado, como un jugador que pierde la conexión mientras se desconecta), al apagar
+  el servidor se registró `cleanup timeout (possible deadlock)` (riesgo descrito en §1). No
+  rompe nada, pero `cleanup()` tarda su timeout entero.
 - **Inactividad del cliente oficial**: el cliente cierra a los 10 s sin recibir nada. Un host real
   nunca calla tanto (heartbeats cada ~117 ms), pero una prueba que conecta 30 clientes con
   pérdida y no manda nada hasta tenerlos todos sí lo dispara; esas pruebas la desactivan.
