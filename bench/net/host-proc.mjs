@@ -233,21 +233,46 @@ let meas = null;
 // HOST_CPU_PROFILE=<file.cpuprofile> (diagnostics only): V8 CPU profile of the
 // main thread restricted to the measurement window.
 const PROFILE = process.env.HOST_CPU_PROFILE ?? null;
+// HOST_ALLOC_PROFILE=<file.heapprofile> (diagnostics only): sampling allocation
+// profile of the window INCLUDING garbage (objects already collected), i.e. where
+// the young-generation churn that drives the GC count comes from.
+const ALLOC_PROFILE = process.env.HOST_ALLOC_PROFILE ?? null;
 let profSession = null;
 function profileStart() {
-  if (!PROFILE) return;
+  if (!PROFILE && !ALLOC_PROFILE) return;
   profSession = new Session();
   profSession.connect();
-  profSession.post('Profiler.enable', () => profSession.post('Profiler.start'));
+  if (PROFILE) profSession.post('Profiler.enable', () => profSession.post('Profiler.start'));
+  if (ALLOC_PROFILE) {
+    profSession.post('HeapProfiler.enable', () =>
+      profSession.post('HeapProfiler.startSampling', {
+        samplingInterval: 4096,
+        includeObjectsCollectedByMajorGC: true,
+        includeObjectsCollectedByMinorGC: true,
+      }),
+    );
+  }
 }
 function profileStop() {
   if (!profSession) return;
   const s = profSession;
   profSession = null;
-  s.post('Profiler.stop', (err, res) => {
-    if (!err) writeFileSync(PROFILE, JSON.stringify(res.profile));
-    s.disconnect();
-  });
+  let pending = (PROFILE ? 1 : 0) + (ALLOC_PROFILE ? 1 : 0);
+  const done = () => {
+    if (--pending === 0) s.disconnect();
+  };
+  if (PROFILE) {
+    s.post('Profiler.stop', (err, res) => {
+      if (!err) writeFileSync(PROFILE, JSON.stringify(res.profile));
+      done();
+    });
+  }
+  if (ALLOC_PROFILE) {
+    s.post('HeapProfiler.stopSampling', (err, res) => {
+      if (!err) writeFileSync(ALLOC_PROFILE, JSON.stringify(res.profile));
+      done();
+    });
+  }
 }
 
 /**
