@@ -31,18 +31,17 @@
  *   `publicAddresses` are announced as given;
  * * the selected-pair address given with channel 0 is the source address of
  *   the browser's authenticated STUN checks (its NAT's public address);
- * * **bundling**: the first `send` to a peer corks its SCTP association;
- *   corked peers are flushed when the outermost {@link RtcPeerBackend.cork}
- *   scope ends (HostRoom wraps every wake-up, client message and top-level
- *   action: the flush happens before control returns to the event loop) or,
- *   for sends outside any scope, from one `setImmediate` (check phase of the
- *   same iteration). All the messages a peer gets in that scope (event on
- *   `ru`, heartbeat on `uu`, pong, CheckConsistency…, plus the SACK it is
- *   owed) leave as one SCTP packet (RFC 9260 bundling, up to the MTU and the
- *   congestion window) → one DTLS record, one cipher operation, one
- *   datagram. Each message is still delivered separately to the data
- *   channel; no latency is added. Closing a link flushes first, so a kick
- *   message still precedes the ABORT;
+ * * **bundling**: the first `send` to a peer in an event-loop iteration
+ *   corks its SCTP association; corked peers are flushed together from one
+ *   `setImmediate` (check phase of the same iteration, right after the poll
+ *   phase: no timer, no added wait). All the messages a peer gets in that
+ *   iteration — from every HostRoom wake-up / client message / action that
+ *   ran in it (event on `ru`, heartbeat on `uu`, pong, CheckConsistency…,
+ *   plus the SACK it is owed) — leave as one SCTP packet (RFC 9260 bundling,
+ *   up to the MTU and the congestion window) → one DTLS record, one cipher
+ *   operation, one datagram. Each message is still delivered separately to
+ *   the data channel. Closing a link flushes first, so a kick message still
+ *   precedes the ABORT;
  * * received messages may be transient views (only valid during
  *   `onMessage`, see `transientDelivery` in src/rtc/sctp): the transport and
  *   the host consume them synchronously and copy what they keep.
@@ -95,7 +94,7 @@ export interface RtcBackendOptions {
   gatherRefreshMs?: number;
   /** Advertised port when a 1:1 NAT maps a different one (default: the bound port). */
   publicPort?: number;
-  /** DTLS certificate (default: {@link certificateFile}, else one ECDSA P-256 key per process, generated off-thread). */
+  /** DTLS certificate (default: {@link certificateFile}, else one ECDSA P-256 key per process, generated synchronously once). */
   certificate?: RtcCertificate;
   /** Keep the DTLS identity in this PEM file (created 0600 on first use): stable fingerprint, no key generation at start. */
   certificateFile?: string;
@@ -161,13 +160,22 @@ export function resolvePublicAddresses(o: RtcBackendOptions): string[] {
 /**
  * Per-iteration bundling of every RtcPeerLink in the process. A link corks
  * its session on its first send and registers here; everything registered
- * is flushed (uncorked) either
+ * is flushed (uncorked) from one shared `setImmediate`, i.e. in the check
+ * phase of the same event-loop iteration, right after the poll phase.
  *
- * * when the outermost explicit scope ends ({@link RtcPeerBackend.cork} /
- *   `uncork`, used by HostRoom around each wake-up / message / action: the
- *   flush happens before control returns to the event loop, no allocation), or
- * * from one shared `setImmediate` (check phase of the same iteration) for
- *   sends issued outside any scope (transport handshake, user code…).
+ * Flushing once per iteration rather than at the end of each
+ * {@link RtcPeerBackend.cork} scope (HostRoom wraps every wake-up, client
+ * message and action in one) merges what several scopes of one iteration
+ * send to the same peer into one SCTP packet: e.g. the event broadcasts of
+ * every client input libuv delivered in one poll phase, or a frame's
+ * heartbeat with the events processed right after it. On the bench (20
+ * players) that is ≈ 23 % fewer datagrams out — and as many fewer SACK-only
+ * datagrams back from the browsers (they acknowledge every second packet), each
+ * of which costs a Buffer + rinfo allocation in dgram. The added delay is the
+ * rest of that iteration's I/O processing (no timer, no wait: the poll phase
+ * does not block while an immediate is pending), so no game latency.
+ * Scopes still nest (cork/uncork are kept for the PeerBackend contract) but
+ * do not flush by themselves; no allocation in steady state.
  */
 class SendBundler {
   /** Corked links (`n` used; slots are cleared, never shrunk: no allocation in steady state). */
@@ -183,7 +191,8 @@ class SendBundler {
 
   add(link: RtcPeerLink): void {
     this.list[this.n++] = link;
-    if (this.depth === 0 && !this.scheduled && !this.flushing) {
+    // links corked while flushing are flushed by the same pass
+    if (!this.scheduled && !this.flushing) {
       this.scheduled = true;
       setImmediate(this.immediateFn);
     }
@@ -194,7 +203,12 @@ class SendBundler {
   }
 
   leave(): void {
-    if (this.depth > 0 && --this.depth === 0) this.flush();
+    if (this.depth > 0) this.depth--;
+  }
+
+  /** {@link flushRtcBundles}. */
+  flushNow(): void {
+    if (!this.flushing) this.flush();
   }
 
   private flush(): void {
@@ -219,6 +233,14 @@ class SendBundler {
 }
 
 const bundler = new SendBundler();
+
+/**
+ * Flushes every bundled peer now instead of at the end of the iteration.
+ * For synchronous harnesses (simulated time, benches) only.
+ */
+export function flushRtcBundles(): void {
+  bundler.flushNow();
+}
 
 /** Fallback delay after start() before the endpoint is brought up without an offer / whenListening() call. */
 const LISTEN_DELAY_MS = 50;
@@ -375,14 +397,15 @@ export class RtcPeerBackend implements PeerBackend {
   }
 
   /**
-   * Opens a bundling scope (nestable, process-wide): sends to any peer until
-   * the outermost {@link uncork} are bundled per peer and flushed by it.
+   * Opens a bundling scope (nestable, process-wide). Sends are bundled per
+   * peer for the whole event-loop iteration anyway (see SendBundler): scopes
+   * are accepted for the PeerBackend contract and do not flush by themselves.
    */
   cork(): void {
     bundler.enter();
   }
 
-  /** Ends one {@link cork} scope; the outermost one flushes every bundled peer. */
+  /** Ends one {@link cork} scope (the flush happens once per iteration, see SendBundler). */
   uncork(): void {
     bundler.leave();
   }

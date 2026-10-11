@@ -38,7 +38,7 @@ import { SctpAssociation } from '../../src/rtc/sctp/index.js';
 // The simulated browsers use a SEPARATE instance of the association module
 // (distinct URL), so allocation sites in it are told apart from the host's.
 const { SctpAssociation: ClientAssociation } = (await import('../../src/rtc/sctp/association.ts?client' as string)) as typeof import('../../src/rtc/sctp/association.js');
-import { RtcPeerBackend } from '../../src/net/rtc-backend.js';
+import { RtcPeerBackend, flushRtcBundles } from '../../src/net/rtc-backend.js';
 import type { PeerLink, PeerLinkEvents } from '../../src/net/peer-backend.js';
 
 const argv = process.argv.slice(2);
@@ -129,6 +129,7 @@ function hostSend(k: number, ch: number, msg: Uint8Array): void {
   backend.cork!();
   peers[k]!.link!.send(ch, msg);
   backend.uncork!();
+  flushRtcBundles();
 }
 
 function hostOnMessage(i: number, ch: number, data: Uint8Array): void {
@@ -144,6 +145,8 @@ function hostOnMessage(i: number, ch: number, data: Uint8Array): void {
   } finally {
     if (BUNDLE) backend.uncork!();
   }
+  // the backend flushes once per event-loop iteration (setImmediate): here, synchronously per scope
+  flushRtcBundles();
 }
 
 for (let i = 0; i < PEERS; i++) {
@@ -230,6 +233,8 @@ function hostFrame(frame: number): void {
   } finally {
     if (BUNDLE) backend.uncork!();
   }
+  // the backend flushes once per event-loop iteration (setImmediate): here, synchronously per scope
+  flushRtcBundles();
 }
 
 // ------------------------------------------------------------------ run
