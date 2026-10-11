@@ -1,0 +1,1990 @@
+{
+ "scenario": "idle",
+ "info": {
+  "date": "2026-10-11T16:04:53.168Z",
+  "node": "v22.22.0",
+  "v8": "12.4.254.21-node.33",
+  "platform": "Linux 6.18.44-fc-v114 x64",
+  "cpu": "Intel(R) Xeon(R) Processor @ 2.30GHz",
+  "nproc": 4,
+  "totalMemMB": 16093,
+  "commit": "5b25d44effec746f76436532afd88690d5a20586",
+  "srcDiffSha": null,
+  "haxliteBuildSha": "92150438392c",
+  "versions": {
+   "haxball.js": "5.1.0",
+   "node-haxball": "2.3.1",
+   "node-datachannel": "0.33.4",
+   "node-haxball/node-datachannel": "0.25.0",
+   "@webrtc-node/webrtc": "0.2.1"
+  },
+  "cpuMHz": 0,
+  "command": "node --experimental-transform-types --import ./bench/ts-resolve.mjs bench/net/run.ts idle --impl official,nodehaxball,haxlite:ndc,haxlite:rtc --reps 3 --warmup 10 --window 60 --max-foreign 50 --attempts 3 --out bench/results/quick-idle.json",
+  "params": {
+   "ELD": true,
+   "IMPLS": [
+    "official",
+    "nodehaxball",
+    "haxlite:ndc",
+    "haxlite:rtc"
+   ],
+   "REPS": 3,
+   "WARMUP_S": 10,
+   "WINDOW_S": 60,
+   "NS": [
+    4,
+    10,
+    20
+   ],
+   "KS": [
+    1,
+    5,
+    10
+   ],
+   "MAX_FOREIGN": 50,
+   "ATTEMPTS": 3,
+   "CLIENTS_PER_PROC": 10,
+   "HOST_NODE_ARGS": []
+  }
+ },
+ "configs": [
+  {
+   "label": "official",
+   "spec": {
+    "impl": "official",
+    "rooms": 1,
+    "clientsPerRoom": 0,
+    "warmupS": 10,
+    "windowS": 60,
+    "eld": false,
+    "sampleMs": 5000
+   },
+   "runs": [
+    {
+     "impl": "official",
+     "rooms": 1,
+     "clientsPerRoom": 0,
+     "warmupS": 10,
+     "windowS": 60,
+     "eld": false,
+     "sampleMs": 5000,
+     "seed": 1,
+     "startup": {
+      "forkToLinkMs": 173.396659,
+      "links": [
+       {
+        "room": 0,
+        "tStart": 50.815066,
+        "tLoad": 90.67984199999998,
+        "tCreate": 142.106271,
+        "tLink": 166.524811,
+        "createToLinkMs": 24.418540000000007,
+        "cpuMs": 254.758,
+        "rss": 79679488,
+        "heapUsed": 11017360
+       }
+      ],
+      "foreignPct": 0
+     },
+     "host": {
+      "wallMs": 60012.22199400001,
+      "cpuUserMs": 107.077,
+      "cpuSystemMs": 29.34,
+      "cpuPct": 0.22731536255004675,
+      "rssStart": 76156928,
+      "rssEnd": 76681216,
+      "rssMean": 76439236.92307693,
+      "rssMax": 76681216,
+      "heapUsedStart": 9860568,
+      "heapUsedEnd": 10627776,
+      "heapUsedMean": 10285612.923076924,
+      "heapUsedMax": 10627776,
+      "heapTotalEnd": 11997184,
+      "externalEnd": 3856957,
+      "arrayBuffersEnd": 135841,
+      "gcCount": 0,
+      "gcMs": 0,
+      "eld": null,
+      "threadsPct": {
+       "main (JS)": 0.23
+      },
+      "cpuSplit": {
+       "mainPct": 0.233,
+       "otherPct": 0
+      },
+      "wakeups": {
+       "voluntaryPerS": 20.53,
+       "involuntaryPerS": 0,
+       "mainVoluntaryPerS": 20.4
+      },
+      "threadCount": 7,
+      "fdCount": 24,
+      "cpuPctSeries": [
+       0.206,
+       0.214,
+       0.217,
+       0.201,
+       0.191,
+       0.252,
+       0.227,
+       0.26,
+       0.228,
+       0.264,
+       0.231,
+       0.208
+      ]
+     },
+     "hostPlayersAtEnd": [
+      0
+     ],
+     "clients": [],
+     "machine": {
+      "loadavgStart": [
+       0.84,
+       0.85,
+       0.71
+      ],
+      "loadavgEnd": [
+       0.36,
+       0.71,
+       0.66
+      ],
+      "sysBusyPct": 2.0666666666666664,
+      "foreignPct": 1.7717713041166196
+     },
+     "valid": true,
+     "errors": [],
+     "discarded": []
+    },
+    {
+     "impl": "official",
+     "rooms": 1,
+     "clientsPerRoom": 0,
+     "warmupS": 10,
+     "windowS": 60,
+     "eld": false,
+     "sampleMs": 5000,
+     "seed": 2,
+     "startup": {
+      "forkToLinkMs": 457.5211249999702,
+      "links": [
+       {
+        "room": 0,
+        "tStart": 214.751598,
+        "tLoad": 206.62587599999998,
+        "tCreate": 421.88245,
+        "tLink": 450.034683,
+        "createToLinkMs": 28.152232999999967,
+        "cpuMs": 531.685,
+        "rss": 72380416,
+        "heapUsed": 10900096
+       }
+      ],
+      "foreignPct": 13.187929581519143
+     },
+     "host": {
+      "wallMs": 60012.298896,
+      "cpuUserMs": 108.952,
+      "cpuSystemMs": 11.448,
+      "cpuPct": 0.20062554212204164,
+      "rssStart": 69070848,
+      "rssEnd": 69726208,
+      "rssMean": 69464064,
+      "rssMax": 69726208,
+      "heapUsedStart": 9869320,
+      "heapUsedEnd": 10637872,
+      "heapUsedMean": 10295849.23076923,
+      "heapUsedMax": 10637872,
+      "heapTotalEnd": 11997184,
+      "externalEnd": 3856957,
+      "arrayBuffersEnd": 135841,
+      "gcCount": 0,
+      "gcMs": 0,
+      "eld": null,
+      "threadsPct": {
+       "main (JS)": 0.2
+      },
+      "cpuSplit": {
+       "mainPct": 0.2,
+       "otherPct": 0
+      },
+      "wakeups": {
+       "voluntaryPerS": 20.55,
+       "involuntaryPerS": 0,
+       "mainVoluntaryPerS": 20.41
+      },
+      "threadCount": 7,
+      "fdCount": 24,
+      "cpuPctSeries": [
+       0.201,
+       0.215,
+       0.216,
+       0.167,
+       0.154,
+       0.184,
+       0.213,
+       0.235,
+       0.193,
+       0.239,
+       0.2,
+       0.168
+      ]
+     },
+     "hostPlayersAtEnd": [
+      0
+     ],
+     "clients": [],
+     "machine": {
+      "loadavgStart": [
+       0.02,
+       0.35,
+       0.52
+      ],
+      "loadavgEnd": [
+       0.01,
+       0.28,
+       0.49
+      ],
+      "sysBusyPct": 1.5000000000000002,
+      "foreignPct": 1.296442791211292
+     },
+     "valid": true,
+     "errors": [],
+     "discarded": []
+    },
+    {
+     "impl": "official",
+     "rooms": 1,
+     "clientsPerRoom": 0,
+     "warmupS": 10,
+     "windowS": 60,
+     "eld": false,
+     "sampleMs": 5000,
+     "seed": 3,
+     "startup": {
+      "forkToLinkMs": 154.76988400006667,
+      "links": [
+       {
+        "room": 0,
+        "tStart": 37.02637,
+        "tLoad": 85.396838,
+        "tCreate": 122.772766,
+        "tLink": 147.923167,
+        "createToLinkMs": 25.150401000000002,
+        "cpuMs": 296.394,
+        "rss": 83337216,
+        "heapUsed": 11051624
+       }
+      ],
+      "foreignPct": 4.682064455185094
+     },
+     "host": {
+      "wallMs": 60012.917950999996,
+      "cpuUserMs": 134.826,
+      "cpuSystemMs": 11.762,
+      "cpuPct": 0.24426074419458788,
+      "rssStart": 80855040,
+      "rssEnd": 80011264,
+      "rssMean": 80575251.6923077,
+      "rssMax": 80855040,
+      "heapUsedStart": 9802832,
+      "heapUsedEnd": 9997912,
+      "heapUsedMean": 10050833.23076923,
+      "heapUsedMax": 10351704,
+      "heapTotalEnd": 11735040,
+      "externalEnd": 3856904,
+      "arrayBuffersEnd": 135788,
+      "gcCount": 2,
+      "gcMs": 2.5915610007941723,
+      "eld": null,
+      "threadsPct": {
+       "main (JS)": 0.22,
+       "node": 0.03
+      },
+      "cpuSplit": {
+       "mainPct": 0.217,
+       "otherPct": 0.033
+      },
+      "wakeups": {
+       "voluntaryPerS": 21.03,
+       "involuntaryPerS": 0,
+       "mainVoluntaryPerS": 20.53
+      },
+      "threadCount": 7,
+      "fdCount": 24,
+      "cpuPctSeries": [
+       0.214,
+       0.175,
+       0.24,
+       0.197,
+       0.238,
+       0.216,
+       0.189,
+       0.204,
+       0.226,
+       0.633,
+       0.173,
+       0.198
+      ]
+     },
+     "hostPlayersAtEnd": [
+      0
+     ],
+     "clients": [],
+     "machine": {
+      "loadavgStart": [
+       0,
+       0.12,
+       0.37
+      ],
+      "loadavgEnd": [
+       0,
+       0.1,
+       0.34
+      ],
+      "sysBusyPct": 1.9333333333333331,
+      "foreignPct": 1.6849259224720785
+     },
+     "valid": true,
+     "errors": [],
+     "discarded": []
+    }
+   ],
+   "summary": {
+    "reps": 3,
+    "failed": 0,
+    "cpuPct": {
+     "median": 0.22731536255004675,
+     "min": 0.20062554212204164,
+     "max": 0.24426074419458788,
+     "n": 3
+    },
+    "rssMeanMB": {
+     "median": 72.89813701923077,
+     "min": 66.24609375,
+     "max": 76.84254807692308,
+     "n": 3
+    },
+    "rssMaxMB": {
+     "median": 73.12890625,
+     "min": 66.49609375,
+     "max": 77.109375,
+     "n": 3
+    },
+    "rssGrowthMB": {
+     "median": 0.5,
+     "min": -0.8046875,
+     "max": 0.625,
+     "n": 3
+    },
+    "heapUsedMeanMB": {
+     "median": 9.809124873234676,
+     "min": 9.585221510667067,
+     "max": 9.81888697697566,
+     "n": 3
+    },
+    "heapUsedMaxMB": {
+     "median": 10.13543701171875,
+     "min": 9.872154235839844,
+     "max": 10.145065307617188,
+     "n": 3
+    },
+    "gcPerMin": {
+     "median": 0,
+     "min": 0,
+     "max": 1.9995694943208548,
+     "n": 3
+    },
+    "gcMsPerMin": {
+     "median": 0,
+     "min": 0,
+     "max": 2.5910031599298256,
+     "n": 3
+    },
+    "eldP50": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "eldP99": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "eldMax": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "createToLinkMs": {
+     "median": 25.150401000000002,
+     "min": 24.418540000000007,
+     "max": 28.152232999999967,
+     "n": 3
+    },
+    "processStartToLinkMs": {
+     "median": 166.524811,
+     "min": 147.923167,
+     "max": 450.034683,
+     "n": 3
+    },
+    "forkToLinkMs": {
+     "median": 173.396659,
+     "min": 154.76988400006667,
+     "max": 457.5211249999702,
+     "n": 3
+    },
+    "loadMs": {
+     "median": 90.67984199999998,
+     "min": 85.396838,
+     "max": 206.62587599999998,
+     "n": 3
+    },
+    "cpuToLinkMs": {
+     "median": 296.394,
+     "min": 254.758,
+     "max": 531.685,
+     "n": 3
+    },
+    "rssAtLinkMB": {
+     "median": 75.98828125,
+     "min": 69.02734375,
+     "max": 79.4765625,
+     "n": 3
+    },
+    "heapAtLinkMB": {
+     "median": 10.506973266601562,
+     "min": 10.3951416015625,
+     "max": 10.539649963378906,
+     "n": 3
+    },
+    "clientsCpuPct": {
+     "median": 0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "mainThreadCpuPct": {
+     "median": 0.217,
+     "min": 0.2,
+     "max": 0.233,
+     "n": 3
+    },
+    "otherThreadsCpuPct": {
+     "median": 0,
+     "min": 0,
+     "max": 0.033,
+     "n": 3
+    },
+    "threadCount": {
+     "median": 7,
+     "min": 7,
+     "max": 7,
+     "n": 3
+    },
+    "fdCount": {
+     "median": 24,
+     "min": 24,
+     "max": 24,
+     "n": 3
+    },
+    "wakeupsPerS": {
+     "median": 20.55,
+     "min": 20.53,
+     "max": 21.03,
+     "n": 3
+    },
+    "mainWakeupsPerS": {
+     "median": 20.41,
+     "min": 20.4,
+     "max": 20.53,
+     "n": 3
+    },
+    "joinP50Ms": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "joinP90Ms": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "joinFailures": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "foreignPct": {
+     "median": 1.6849259224720785,
+     "min": 1.296442791211292,
+     "max": 1.7717713041166196,
+     "n": 3
+    },
+    "noisyReps": 0,
+    "allValid": true
+   }
+  },
+  {
+   "label": "nodehaxball",
+   "spec": {
+    "impl": "nodehaxball",
+    "rooms": 1,
+    "clientsPerRoom": 0,
+    "warmupS": 10,
+    "windowS": 60,
+    "eld": false,
+    "sampleMs": 5000
+   },
+   "runs": [
+    {
+     "impl": "nodehaxball",
+     "rooms": 1,
+     "clientsPerRoom": 0,
+     "warmupS": 10,
+     "windowS": 60,
+     "eld": false,
+     "sampleMs": 5000,
+     "seed": 1,
+     "startup": {
+      "forkToLinkMs": 150.72235899999214,
+      "links": [
+       {
+        "room": 0,
+        "tStart": 35.951124,
+        "tLoad": 87.264676,
+        "tCreate": 123.60018,
+        "tLink": 144.478354,
+        "createToLinkMs": 20.878174,
+        "cpuMs": 158.865,
+        "rss": 77209600,
+        "heapUsed": 13337856
+       }
+      ],
+      "foreignPct": 0
+     },
+     "host": {
+      "wallMs": 60015.428283,
+      "cpuUserMs": 339.93,
+      "cpuSystemMs": 64.556,
+      "cpuPct": 0.6739700299940622,
+      "rssStart": 77733888,
+      "rssEnd": 75231232,
+      "rssMean": 74381154.46153846,
+      "rssMax": 78258176,
+      "heapUsedStart": 14144224,
+      "heapUsedEnd": 11922208,
+      "heapUsedMean": 12221763.692307692,
+      "heapUsedMax": 14488384,
+      "heapTotalEnd": 13897728,
+      "externalEnd": 2497033,
+      "arrayBuffersEnd": 28798,
+      "gcCount": 7,
+      "gcMs": 14.086957002058625,
+      "eld": null,
+      "threadsPct": {
+       "main (JS)": 0.57,
+       "node": 0.12
+      },
+      "cpuSplit": {
+       "mainPct": 0.567,
+       "otherPct": 0.117
+      },
+      "wakeups": {
+       "voluntaryPerS": 81.61,
+       "involuntaryPerS": 0.03,
+       "mainVoluntaryPerS": 80.05
+      },
+      "threadCount": 7,
+      "fdCount": 24,
+      "cpuPctSeries": [
+       0.641,
+       1.776,
+       0.726,
+       0.632,
+       0.783,
+       0.624,
+       0.451,
+       0.849,
+       0.434,
+       0.382,
+       0.425,
+       0.341
+      ]
+     },
+     "hostPlayersAtEnd": [
+      0
+     ],
+     "clients": [],
+     "machine": {
+      "loadavgStart": [
+       0.3,
+       0.69,
+       0.66
+      ],
+      "loadavgEnd": [
+       0.14,
+       0.57,
+       0.62
+      ],
+      "sysBusyPct": 1.883333333333333,
+      "foreignPct": 1.2058666366726043
+     },
+     "valid": true,
+     "errors": [],
+     "discarded": []
+    },
+    {
+     "impl": "nodehaxball",
+     "rooms": 1,
+     "clientsPerRoom": 0,
+     "warmupS": 10,
+     "windowS": 60,
+     "eld": false,
+     "sampleMs": 5000,
+     "seed": 2,
+     "startup": {
+      "forkToLinkMs": 483.74004800000694,
+      "links": [
+       {
+        "room": 0,
+        "tStart": 36.406568,
+        "tLoad": 393.624088,
+        "tCreate": 430.393377,
+        "tLink": 476.066421,
+        "createToLinkMs": 45.673044000000004,
+        "cpuMs": 484.08,
+        "rss": 76685312,
+        "heapUsed": 13333328
+       }
+      ],
+      "foreignPct": 0
+     },
+     "host": {
+      "wallMs": 60011.681513,
+      "cpuUserMs": 253.683,
+      "cpuSystemMs": 99.692,
+      "cpuPct": 0.5888436902462904,
+      "rssStart": 71081984,
+      "rssEnd": 74219520,
+      "rssMean": 73417019.07692307,
+      "rssMax": 74219520,
+      "heapUsedStart": 11722048,
+      "heapUsedEnd": 12547256,
+      "heapUsedMean": 12128052.923076924,
+      "heapUsedMax": 12547256,
+      "heapTotalEnd": 13635584,
+      "externalEnd": 2497033,
+      "arrayBuffersEnd": 28798,
+      "gcCount": 3,
+      "gcMs": 1.0649500004947186,
+      "eld": null,
+      "threadsPct": {
+       "main (JS)": 0.5,
+       "node": 0.1
+      },
+      "cpuSplit": {
+       "mainPct": 0.5,
+       "otherPct": 0.1
+      },
+      "wakeups": {
+       "voluntaryPerS": 80.52,
+       "involuntaryPerS": 0.02,
+       "mainVoluntaryPerS": 79.92
+      },
+      "threadCount": 7,
+      "fdCount": 24,
+      "cpuPctSeries": [
+       0.628,
+       0.624,
+       0.644,
+       0.566,
+       0.789,
+       0.802,
+       0.484,
+       0.861,
+       0.409,
+       0.457,
+       0.418,
+       0.361
+      ]
+     },
+     "hostPlayersAtEnd": [
+      0
+     ],
+     "clients": [],
+     "machine": {
+      "loadavgStart": [
+       0,
+       0.27,
+       0.48
+      ],
+      "loadavgEnd": [
+       0,
+       0.22,
+       0.44
+      ],
+      "sysBusyPct": 2.1166666666666667,
+      "foreignPct": 1.5250113097537097
+     },
+     "valid": true,
+     "errors": [],
+     "discarded": []
+    },
+    {
+     "impl": "nodehaxball",
+     "rooms": 1,
+     "clientsPerRoom": 0,
+     "warmupS": 10,
+     "windowS": 60,
+     "eld": false,
+     "sampleMs": 5000,
+     "seed": 3,
+     "startup": {
+      "forkToLinkMs": 274.70237299997825,
+      "links": [
+       {
+        "room": 0,
+        "tStart": 112.230029,
+        "tLoad": 134.522953,
+        "tCreate": 247.48495,
+        "tLink": 267.171426,
+        "createToLinkMs": 19.686476,
+        "cpuMs": 280.325,
+        "rss": 76705792,
+        "heapUsed": 13292432
+       }
+      ],
+      "foreignPct": 8.52125136284386
+     },
+     "host": {
+      "wallMs": 60005.543123,
+      "cpuUserMs": 300.016,
+      "cpuSystemMs": 65.49,
+      "cpuPct": 0.6091203928456774,
+      "rssStart": 77361152,
+      "rssEnd": 74854400,
+      "rssMean": 74311207.38461539,
+      "rssMax": 77623296,
+      "heapUsedStart": 14092744,
+      "heapUsedEnd": 11958720,
+      "heapUsedMean": 12231585.23076923,
+      "heapUsedMax": 14434848,
+      "heapTotalEnd": 14159872,
+      "externalEnd": 2497033,
+      "arrayBuffersEnd": 28798,
+      "gcCount": 7,
+      "gcMs": 8.671927001327276,
+      "eld": null,
+      "threadsPct": {
+       "main (JS)": 0.48,
+       "node": 0.12
+      },
+      "cpuSplit": {
+       "mainPct": 0.483,
+       "otherPct": 0.117
+      },
+      "wakeups": {
+       "voluntaryPerS": 82.08,
+       "involuntaryPerS": 0.05,
+       "mainVoluntaryPerS": 80.26
+      },
+      "threadCount": 7,
+      "fdCount": 24,
+      "cpuPctSeries": [
+       0.576,
+       1.633,
+       0.657,
+       0.533,
+       0.618,
+       0.612,
+       0.429,
+       0.743,
+       0.375,
+       0.343,
+       0.34,
+       0.429
+      ]
+     },
+     "hostPlayersAtEnd": [
+      0
+     ],
+     "clients": [],
+     "machine": {
+      "loadavgStart": [
+       0,
+       0.09,
+       0.34
+      ],
+      "loadavgEnd": [
+       0,
+       0.07,
+       0.31
+      ],
+      "sysBusyPct": 1.8000000000000003,
+      "foreignPct": 1.188419607154323
+     },
+     "valid": true,
+     "errors": [],
+     "discarded": []
+    }
+   ],
+   "summary": {
+    "reps": 3,
+    "failed": 0,
+    "cpuPct": {
+     "median": 0.6091203928456774,
+     "min": 0.5888436902462904,
+     "max": 0.6739700299940622,
+     "n": 3
+    },
+    "rssMeanMB": {
+     "median": 70.86868990384616,
+     "min": 70.01592548076923,
+     "max": 70.93539663461539,
+     "n": 3
+    },
+    "rssMaxMB": {
+     "median": 74.02734375,
+     "min": 70.78125,
+     "max": 74.6328125,
+     "n": 3
+    },
+    "rssGrowthMB": {
+     "median": -2.38671875,
+     "min": -2.390625,
+     "max": 2.9921875,
+     "n": 3
+    },
+    "heapUsedMeanMB": {
+     "median": 11.655582134540264,
+     "min": 11.566212580754208,
+     "max": 11.66494868351863,
+     "n": 3
+    },
+    "heapUsedMaxMB": {
+     "median": 13.766143798828125,
+     "min": 11.965995788574219,
+     "max": 13.81719970703125,
+     "n": 3
+    },
+    "gcPerMin": {
+     "median": 6.9982004963708535,
+     "min": 2.999416038042653,
+     "max": 6.999353362056561,
+     "n": 3
+    },
+    "gcMsPerMin": {
+     "median": 8.67112591603559,
+     "min": 1.0647427037324635,
+     "max": 14.083335640594507,
+     "n": 3
+    },
+    "eldP50": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "eldP99": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "eldMax": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "createToLinkMs": {
+     "median": 20.878174,
+     "min": 19.686476,
+     "max": 45.673044000000004,
+     "n": 3
+    },
+    "processStartToLinkMs": {
+     "median": 267.171426,
+     "min": 144.478354,
+     "max": 476.066421,
+     "n": 3
+    },
+    "forkToLinkMs": {
+     "median": 274.70237299997825,
+     "min": 150.72235899999214,
+     "max": 483.74004800000694,
+     "n": 3
+    },
+    "loadMs": {
+     "median": 134.522953,
+     "min": 87.264676,
+     "max": 393.624088,
+     "n": 3
+    },
+    "cpuToLinkMs": {
+     "median": 280.325,
+     "min": 158.865,
+     "max": 484.08,
+     "n": 3
+    },
+    "rssAtLinkMB": {
+     "median": 73.15234375,
+     "min": 73.1328125,
+     "max": 73.6328125,
+     "n": 3
+    },
+    "heapAtLinkMB": {
+     "median": 12.715652465820312,
+     "min": 12.676651000976562,
+     "max": 12.719970703125,
+     "n": 3
+    },
+    "clientsCpuPct": {
+     "median": 0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "mainThreadCpuPct": {
+     "median": 0.5,
+     "min": 0.483,
+     "max": 0.567,
+     "n": 3
+    },
+    "otherThreadsCpuPct": {
+     "median": 0.117,
+     "min": 0.1,
+     "max": 0.117,
+     "n": 3
+    },
+    "threadCount": {
+     "median": 7,
+     "min": 7,
+     "max": 7,
+     "n": 3
+    },
+    "fdCount": {
+     "median": 24,
+     "min": 24,
+     "max": 24,
+     "n": 3
+    },
+    "wakeupsPerS": {
+     "median": 81.61,
+     "min": 80.52,
+     "max": 82.08,
+     "n": 3
+    },
+    "mainWakeupsPerS": {
+     "median": 80.05,
+     "min": 79.92,
+     "max": 80.26,
+     "n": 3
+    },
+    "joinP50Ms": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "joinP90Ms": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "joinFailures": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "foreignPct": {
+     "median": 1.2058666366726043,
+     "min": 1.188419607154323,
+     "max": 1.5250113097537097,
+     "n": 3
+    },
+    "noisyReps": 0,
+    "allValid": true
+   }
+  },
+  {
+   "label": "haxlite:ndc",
+   "spec": {
+    "impl": "haxlite:ndc",
+    "rooms": 1,
+    "clientsPerRoom": 0,
+    "warmupS": 10,
+    "windowS": 60,
+    "eld": false,
+    "sampleMs": 5000
+   },
+   "runs": [
+    {
+     "impl": "haxlite:ndc",
+     "rooms": 1,
+     "clientsPerRoom": 0,
+     "warmupS": 10,
+     "windowS": 60,
+     "eld": false,
+     "sampleMs": 5000,
+     "seed": 1,
+     "startup": {
+      "forkToLinkMs": 96.38405399999465,
+      "links": [
+       {
+        "room": 0,
+        "tStart": 34.975713,
+        "tLoad": 41.543121,
+        "tCreate": 76.854285,
+        "tLink": 90.206352,
+        "createToLinkMs": 13.352066999999991,
+        "cpuMs": 132.825,
+        "rss": 71786496,
+        "heapUsed": 8738976
+       }
+      ],
+      "foreignPct": 2.2338801015377516
+     },
+     "host": {
+      "wallMs": 60010.999692,
+      "cpuUserMs": 3.675,
+      "cpuSystemMs": 3.599,
+      "cpuPct": 0.012121111191836535,
+      "rssStart": 68943872,
+      "rssEnd": 69074944,
+      "rssMean": 68954794.66666667,
+      "rssMax": 69074944,
+      "heapUsedStart": 7782008,
+      "heapUsedEnd": 7878104,
+      "heapUsedMean": 7823241.333333333,
+      "heapUsedMax": 7878104,
+      "heapTotalEnd": 9609216,
+      "externalEnd": 2617590,
+      "arrayBuffersEnd": 47402,
+      "gcCount": 0,
+      "gcMs": 0,
+      "eld": null,
+      "threadsPct": {},
+      "cpuSplit": {
+       "mainPct": 0,
+       "otherPct": 0
+      },
+      "wakeups": {
+       "voluntaryPerS": 0.23,
+       "involuntaryPerS": 0,
+       "mainVoluntaryPerS": 0.23
+      },
+      "threadCount": 7,
+      "fdCount": 24,
+      "cpuPctSeries": [
+       0.014,
+       0.008,
+       0.008,
+       0.01,
+       0.009,
+       0.02,
+       0.006,
+       0.006,
+       0.009,
+       0.014,
+       0.008
+      ]
+     },
+     "hostPlayersAtEnd": [
+      0
+     ],
+     "clients": [],
+     "machine": {
+      "loadavgStart": [
+       0.11,
+       0.54,
+       0.61
+      ],
+      "loadavgEnd": [
+       0.09,
+       0.46,
+       0.57
+      ],
+      "sysBusyPct": 2.1166666666666667,
+      "foreignPct": 2.1002722221414967
+     },
+     "valid": true,
+     "errors": [],
+     "discarded": []
+    },
+    {
+     "impl": "haxlite:ndc",
+     "rooms": 1,
+     "clientsPerRoom": 0,
+     "warmupS": 10,
+     "windowS": 60,
+     "eld": false,
+     "sampleMs": 5000,
+     "seed": 2,
+     "startup": {
+      "forkToLinkMs": 178.2430910000112,
+      "links": [
+       {
+        "room": 0,
+        "tStart": 39.659509,
+        "tLoad": 103.26354799999999,
+        "tCreate": 143.382472,
+        "tLink": 170.514187,
+        "createToLinkMs": 27.131714999999986,
+        "cpuMs": 251.342,
+        "rss": 72503296,
+        "heapUsed": 8749864
+       }
+      ],
+      "foreignPct": 0
+     },
+     "host": {
+      "wallMs": 60012.059187,
+      "cpuUserMs": 2.151,
+      "cpuSystemMs": 3.723,
+      "cpuPct": 0.009788032738047497,
+      "rssStart": 69652480,
+      "rssEnd": 69783552,
+      "rssMean": 69739861.33333333,
+      "rssMax": 69783552,
+      "heapUsedStart": 7785704,
+      "heapUsedEnd": 7881800,
+      "heapUsedMean": 7826937.333333333,
+      "heapUsedMax": 7881800,
+      "heapTotalEnd": 9609216,
+      "externalEnd": 2617590,
+      "arrayBuffersEnd": 47402,
+      "gcCount": 0,
+      "gcMs": 0,
+      "eld": null,
+      "threadsPct": {
+       "main (JS)": 0.02
+      },
+      "cpuSplit": {
+       "mainPct": 0.017,
+       "otherPct": 0
+      },
+      "wakeups": {
+       "voluntaryPerS": 0.23,
+       "involuntaryPerS": 0,
+       "mainVoluntaryPerS": 0.23
+      },
+      "threadCount": 7,
+      "fdCount": 24,
+      "cpuPctSeries": [
+       0.011,
+       0.007,
+       0.006,
+       0.009,
+       0.009,
+       0.015,
+       0.005,
+       0.007,
+       0.006,
+       0.009,
+       0.006
+      ]
+     },
+     "hostPlayersAtEnd": [
+      0
+     ],
+     "clients": [],
+     "machine": {
+      "loadavgStart": [
+       0,
+       0.21,
+       0.44
+      ],
+      "loadavgEnd": [
+       0,
+       0.17,
+       0.41
+      ],
+      "sysBusyPct": 1.2666666666666666,
+      "foreignPct": 1.2538969672619524
+     },
+     "valid": true,
+     "errors": [],
+     "discarded": []
+    },
+    {
+     "impl": "haxlite:ndc",
+     "rooms": 1,
+     "clientsPerRoom": 0,
+     "warmupS": 10,
+     "windowS": 60,
+     "eld": false,
+     "sampleMs": 5000,
+     "seed": 3,
+     "startup": {
+      "forkToLinkMs": 104.27467900002375,
+      "links": [
+       {
+        "room": 0,
+        "tStart": 38.973815,
+        "tLoad": 42.529174000000005,
+        "tCreate": 81.883662,
+        "tLink": 97.007536,
+        "createToLinkMs": 15.123874,
+        "cpuMs": 134.441,
+        "rss": 71143424,
+        "heapUsed": 8746464
+       }
+      ],
+      "foreignPct": 0
+     },
+     "host": {
+      "wallMs": 60012.471805,
+      "cpuUserMs": 6.41,
+      "cpuSystemMs": 0.628,
+      "cpuPct": 0.01172756226883763,
+      "rssStart": 68403200,
+      "rssEnd": 68534272,
+      "rssMean": 68435968,
+      "rssMax": 68534272,
+      "heapUsedStart": 7784624,
+      "heapUsedEnd": 7880720,
+      "heapUsedMean": 7825857.333333333,
+      "heapUsedMax": 7880720,
+      "heapTotalEnd": 9609216,
+      "externalEnd": 2617590,
+      "arrayBuffersEnd": 47402,
+      "gcCount": 0,
+      "gcMs": 0,
+      "eld": null,
+      "threadsPct": {
+       "main (JS)": 0.02
+      },
+      "cpuSplit": {
+       "mainPct": 0.017,
+       "otherPct": 0
+      },
+      "wakeups": {
+       "voluntaryPerS": 0.23,
+       "involuntaryPerS": 0,
+       "mainVoluntaryPerS": 0.23
+      },
+      "threadCount": 7,
+      "fdCount": 24,
+      "cpuPctSeries": [
+       0.013,
+       0.008,
+       0.007,
+       0.009,
+       0.01,
+       0.017,
+       0.006,
+       0.007,
+       0.008,
+       0.013,
+       0.007
+      ]
+     },
+     "hostPlayersAtEnd": [
+      0
+     ],
+     "clients": [],
+     "machine": {
+      "loadavgStart": [
+       0,
+       0.07,
+       0.31
+      ],
+      "loadavgEnd": [
+       0.03,
+       0.07,
+       0.29
+      ],
+      "sysBusyPct": 1.3833333333333333,
+      "foreignPct": 1.3684957710644956
+     },
+     "valid": true,
+     "errors": [],
+     "discarded": []
+    }
+   ],
+   "summary": {
+    "reps": 3,
+    "failed": 0,
+    "cpuPct": {
+     "median": 0.01172756226883763,
+     "min": 0.009788032738047497,
+     "max": 0.012121111191836535,
+     "n": 3
+    },
+    "rssMeanMB": {
+     "median": 65.76041666666667,
+     "min": 65.265625,
+     "max": 66.50911458333333,
+     "n": 3
+    },
+    "rssMaxMB": {
+     "median": 65.875,
+     "min": 65.359375,
+     "max": 66.55078125,
+     "n": 3
+    },
+    "rssGrowthMB": {
+     "median": 0.125,
+     "min": 0.125,
+     "max": 0.125,
+     "n": 3
+    },
+    "heapUsedMeanMB": {
+     "median": 7.463319142659505,
+     "min": 7.460824330647786,
+     "max": 7.464349110921224,
+     "n": 3
+    },
+    "heapUsedMaxMB": {
+     "median": 7.5156402587890625,
+     "min": 7.513145446777344,
+     "max": 7.516670227050781,
+     "n": 3
+    },
+    "gcPerMin": {
+     "median": 0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "gcMsPerMin": {
+     "median": 0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "eldP50": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "eldP99": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "eldMax": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "createToLinkMs": {
+     "median": 15.123874,
+     "min": 13.352066999999991,
+     "max": 27.131714999999986,
+     "n": 3
+    },
+    "processStartToLinkMs": {
+     "median": 97.007536,
+     "min": 90.206352,
+     "max": 170.514187,
+     "n": 3
+    },
+    "forkToLinkMs": {
+     "median": 104.27467900002375,
+     "min": 96.38405399999465,
+     "max": 178.2430910000112,
+     "n": 3
+    },
+    "loadMs": {
+     "median": 42.529174000000005,
+     "min": 41.543121,
+     "max": 103.26354799999999,
+     "n": 3
+    },
+    "cpuToLinkMs": {
+     "median": 134.441,
+     "min": 132.825,
+     "max": 251.342,
+     "n": 3
+    },
+    "rssAtLinkMB": {
+     "median": 68.4609375,
+     "min": 67.84765625,
+     "max": 69.14453125,
+     "n": 3
+    },
+    "heapAtLinkMB": {
+     "median": 8.341278076171875,
+     "min": 8.334136962890625,
+     "max": 8.344520568847656,
+     "n": 3
+    },
+    "clientsCpuPct": {
+     "median": 0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "mainThreadCpuPct": {
+     "median": 0.017,
+     "min": 0,
+     "max": 0.017,
+     "n": 3
+    },
+    "otherThreadsCpuPct": {
+     "median": 0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "threadCount": {
+     "median": 7,
+     "min": 7,
+     "max": 7,
+     "n": 3
+    },
+    "fdCount": {
+     "median": 24,
+     "min": 24,
+     "max": 24,
+     "n": 3
+    },
+    "wakeupsPerS": {
+     "median": 0.23,
+     "min": 0.23,
+     "max": 0.23,
+     "n": 3
+    },
+    "mainWakeupsPerS": {
+     "median": 0.23,
+     "min": 0.23,
+     "max": 0.23,
+     "n": 3
+    },
+    "joinP50Ms": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "joinP90Ms": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "joinFailures": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "foreignPct": {
+     "median": 1.3684957710644956,
+     "min": 1.2538969672619524,
+     "max": 2.1002722221414967,
+     "n": 3
+    },
+    "noisyReps": 0,
+    "allValid": true
+   }
+  },
+  {
+   "label": "haxlite:rtc",
+   "spec": {
+    "impl": "haxlite:rtc",
+    "rooms": 1,
+    "clientsPerRoom": 0,
+    "warmupS": 10,
+    "windowS": 60,
+    "eld": false,
+    "sampleMs": 5000
+   },
+   "runs": [
+    {
+     "impl": "haxlite:rtc",
+     "rooms": 1,
+     "clientsPerRoom": 0,
+     "warmupS": 10,
+     "windowS": 60,
+     "eld": false,
+     "sampleMs": 5000,
+     "seed": 1,
+     "startup": {
+      "forkToLinkMs": 108.39208600000711,
+      "links": [
+       {
+        "room": 0,
+        "tStart": 38.642417,
+        "tLoad": 47.992118,
+        "tCreate": 87.008611,
+        "tLink": 101.296121,
+        "createToLinkMs": 14.287509999999997,
+        "cpuMs": 149.282,
+        "rss": 72667136,
+        "heapUsed": 8726536
+       }
+      ],
+      "foreignPct": 3.9610644172299647
+     },
+     "host": {
+      "wallMs": 60013.86814099999,
+      "cpuUserMs": 22.889,
+      "cpuSystemMs": 1.918,
+      "cpuPct": 0.04133544590346522,
+      "rssStart": 71778304,
+      "rssEnd": 70942720,
+      "rssMean": 70983680,
+      "rssMax": 71778304,
+      "heapUsedStart": 8035048,
+      "heapUsedEnd": 8135136,
+      "heapUsedMean": 8064704.666666667,
+      "heapUsedMax": 8135136,
+      "heapTotalEnd": 9871360,
+      "externalEnd": 2638174,
+      "arrayBuffersEnd": 49542,
+      "gcCount": 2,
+      "gcMs": 2.024947000667453,
+      "eld": null,
+      "threadsPct": {
+       "main (JS)": 0.03,
+       "node": 0.03
+      },
+      "cpuSplit": {
+       "mainPct": 0.033,
+       "otherPct": 0.033
+      },
+      "wakeups": {
+       "voluntaryPerS": 0.72,
+       "involuntaryPerS": 0,
+       "mainVoluntaryPerS": 0.33
+      },
+      "threadCount": 11,
+      "fdCount": 25,
+      "cpuPctSeries": [
+       0.017,
+       0.009,
+       0.368,
+       0.009,
+       0.006,
+       0.017,
+       0.007,
+       0.008,
+       0.007,
+       0.009,
+       0.006
+      ],
+      "rtc": {
+       "packetsInPerS": 0,
+       "packetsOutPerS": 0,
+       "bytesOutPerS": 0
+      }
+     },
+     "hostPlayersAtEnd": [
+      0
+     ],
+     "clients": [],
+     "machine": {
+      "loadavgStart": [
+       0.08,
+       0.44,
+       0.57
+      ],
+      "loadavgEnd": [
+       0.03,
+       0.36,
+       0.53
+      ],
+      "sysBusyPct": 1.2333333333333334,
+      "foreignPct": 1.1854345540965348
+     },
+     "valid": true,
+     "errors": [],
+     "discarded": []
+    },
+    {
+     "impl": "haxlite:rtc",
+     "rooms": 1,
+     "clientsPerRoom": 0,
+     "warmupS": 10,
+     "windowS": 60,
+     "eld": false,
+     "sampleMs": 5000,
+     "seed": 2,
+     "startup": {
+      "forkToLinkMs": 150.01659800001653,
+      "links": [
+       {
+        "room": 0,
+        "tStart": 70.624575,
+        "tLoad": 49.01753599999999,
+        "tCreate": 119.95868,
+        "tLink": 142.803974,
+        "createToLinkMs": 22.84529400000001,
+        "cpuMs": 199.654,
+        "rss": 71020544,
+        "heapUsed": 8743368
+       }
+      ],
+      "foreignPct": 0
+     },
+     "host": {
+      "wallMs": 60012.126345000004,
+      "cpuUserMs": 3.209,
+      "cpuSystemMs": 3.49,
+      "cpuPct": 0.011162743945262883,
+      "rssStart": 69210112,
+      "rssEnd": 69472256,
+      "rssMean": 69352106.66666667,
+      "rssMax": 69472256,
+      "heapUsedStart": 8069808,
+      "heapUsedEnd": 8178888,
+      "heapUsedMean": 8111154,
+      "heapUsedMax": 8178888,
+      "heapTotalEnd": 10133504,
+      "externalEnd": 2638226,
+      "arrayBuffersEnd": 49594,
+      "gcCount": 0,
+      "gcMs": 0,
+      "eld": null,
+      "threadsPct": {},
+      "cpuSplit": {
+       "mainPct": 0,
+       "otherPct": 0
+      },
+      "wakeups": {
+       "voluntaryPerS": 0.23,
+       "involuntaryPerS": 0,
+       "mainVoluntaryPerS": 0.23
+      },
+      "threadCount": 11,
+      "fdCount": 25,
+      "cpuPctSeries": [
+       0.014,
+       0.007,
+       0.007,
+       0.01,
+       0.007,
+       0.019,
+       0.007,
+       0.007,
+       0.006,
+       0.01,
+       0.006
+      ],
+      "rtc": {
+       "packetsInPerS": 0,
+       "packetsOutPerS": 0,
+       "bytesOutPerS": 0
+      }
+     },
+     "hostPlayersAtEnd": [
+      0
+     ],
+     "clients": [],
+     "machine": {
+      "loadavgStart": [
+       0,
+       0.16,
+       0.4
+      ],
+      "loadavgEnd": [
+       0,
+       0.13,
+       0.37
+      ],
+      "sysBusyPct": 1.35,
+      "foreignPct": 1.3354922560547373
+     },
+     "valid": true,
+     "errors": [],
+     "discarded": []
+    },
+    {
+     "impl": "haxlite:rtc",
+     "rooms": 1,
+     "clientsPerRoom": 0,
+     "warmupS": 10,
+     "windowS": 60,
+     "eld": false,
+     "sampleMs": 5000,
+     "seed": 3,
+     "startup": {
+      "forkToLinkMs": 118.96001400006935,
+      "links": [
+       {
+        "room": 0,
+        "tStart": 50.043889,
+        "tLoad": 45.81984299999999,
+        "tCreate": 96.193166,
+        "tLink": 110.957374,
+        "createToLinkMs": 14.764207999999996,
+        "cpuMs": 152.045,
+        "rss": 71540736,
+        "heapUsed": 8748224
+       }
+      ],
+      "foreignPct": 2.367729703004826
+     },
+     "host": {
+      "wallMs": 60012.209171999995,
+      "cpuUserMs": 4.478,
+      "cpuSystemMs": 1.851,
+      "cpuPct": 0.010546187329749115,
+      "rssStart": 69775360,
+      "rssEnd": 69906432,
+      "rssMean": 69895509.33333333,
+      "rssMax": 69906432,
+      "heapUsedStart": 8078496,
+      "heapUsedEnd": 8187624,
+      "heapUsedMean": 8119846,
+      "heapUsedMax": 8187624,
+      "heapTotalEnd": 9871360,
+      "externalEnd": 2638226,
+      "arrayBuffersEnd": 49594,
+      "gcCount": 0,
+      "gcMs": 0,
+      "eld": null,
+      "threadsPct": {
+       "main (JS)": 0.03
+      },
+      "cpuSplit": {
+       "mainPct": 0.033,
+       "otherPct": 0
+      },
+      "wakeups": {
+       "voluntaryPerS": 0.23,
+       "involuntaryPerS": 0,
+       "mainVoluntaryPerS": 0.23
+      },
+      "threadCount": 11,
+      "fdCount": 25,
+      "cpuPctSeries": [
+       0.013,
+       0.008,
+       0.007,
+       0.009,
+       0.006,
+       0.015,
+       0.005,
+       0.006,
+       0.006,
+       0.009,
+       0.008
+      ],
+      "rtc": {
+       "packetsInPerS": 0,
+       "packetsOutPerS": 0,
+       "bytesOutPerS": 0
+      }
+     },
+     "hostPlayersAtEnd": [
+      0
+     ],
+     "clients": [],
+     "machine": {
+      "loadavgStart": [
+       0.02,
+       0.07,
+       0.29
+      ],
+      "loadavgEnd": [
+       0.01,
+       0.05,
+       0.27
+      ],
+      "sysBusyPct": 4.666666666666666,
+      "foreignPct": 4.65262381267025
+     },
+     "valid": true,
+     "errors": [],
+     "discarded": []
+    }
+   ],
+   "summary": {
+    "reps": 3,
+    "failed": 0,
+    "cpuPct": {
+     "median": 0.011162743945262883,
+     "min": 0.010546187329749115,
+     "max": 0.04133544590346522,
+     "n": 3
+    },
+    "rssMeanMB": {
+     "median": 66.65755208333333,
+     "min": 66.13932291666667,
+     "max": 67.6953125,
+     "n": 3
+    },
+    "rssMaxMB": {
+     "median": 66.66796875,
+     "min": 66.25390625,
+     "max": 68.453125,
+     "n": 3
+    },
+    "rssGrowthMB": {
+     "median": 0.125,
+     "min": -0.796875,
+     "max": 0.25,
+     "n": 3
+    },
+    "heapUsedMeanMB": {
+     "median": 7.73539924621582,
+     "min": 7.691101710001628,
+     "max": 7.743688583374023,
+     "n": 3
+    },
+    "heapUsedMaxMB": {
+     "median": 7.799995422363281,
+     "min": 7.758270263671875,
+     "max": 7.808326721191406,
+     "n": 3
+    },
+    "gcPerMin": {
+     "median": 0,
+     "min": 0,
+     "max": 1.9995378354560513,
+     "n": 3
+    },
+    "gcMsPerMin": {
+     "median": 0,
+     "min": 0,
+     "max": 2.0244790713139107,
+     "n": 3
+    },
+    "eldP50": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "eldP99": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "eldMax": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "createToLinkMs": {
+     "median": 14.764207999999996,
+     "min": 14.287509999999997,
+     "max": 22.84529400000001,
+     "n": 3
+    },
+    "processStartToLinkMs": {
+     "median": 110.957374,
+     "min": 101.296121,
+     "max": 142.803974,
+     "n": 3
+    },
+    "forkToLinkMs": {
+     "median": 118.96001400006935,
+     "min": 108.39208600000711,
+     "max": 150.01659800001653,
+     "n": 3
+    },
+    "loadMs": {
+     "median": 47.992118,
+     "min": 45.81984299999999,
+     "max": 49.01753599999999,
+     "n": 3
+    },
+    "cpuToLinkMs": {
+     "median": 152.045,
+     "min": 149.282,
+     "max": 199.654,
+     "n": 3
+    },
+    "rssAtLinkMB": {
+     "median": 68.2265625,
+     "min": 67.73046875,
+     "max": 69.30078125,
+     "n": 3
+    },
+    "heapAtLinkMB": {
+     "median": 8.338325500488281,
+     "min": 8.322273254394531,
+     "max": 8.34295654296875,
+     "n": 3
+    },
+    "clientsCpuPct": {
+     "median": 0,
+     "min": 0,
+     "max": 0,
+     "n": 3
+    },
+    "mainThreadCpuPct": {
+     "median": 0.033,
+     "min": 0,
+     "max": 0.033,
+     "n": 3
+    },
+    "otherThreadsCpuPct": {
+     "median": 0,
+     "min": 0,
+     "max": 0.033,
+     "n": 3
+    },
+    "threadCount": {
+     "median": 11,
+     "min": 11,
+     "max": 11,
+     "n": 3
+    },
+    "fdCount": {
+     "median": 25,
+     "min": 25,
+     "max": 25,
+     "n": 3
+    },
+    "wakeupsPerS": {
+     "median": 0.23,
+     "min": 0.23,
+     "max": 0.72,
+     "n": 3
+    },
+    "mainWakeupsPerS": {
+     "median": 0.23,
+     "min": 0.23,
+     "max": 0.33,
+     "n": 3
+    },
+    "joinP50Ms": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "joinP90Ms": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "joinFailures": {
+     "median": null,
+     "min": null,
+     "max": null,
+     "n": 0
+    },
+    "foreignPct": {
+     "median": 1.3354922560547373,
+     "min": 1.1854345540965348,
+     "max": 4.65262381267025,
+     "n": 3
+    },
+    "noisyReps": 0,
+    "allValid": true
+   }
+  }
+ ]
+}

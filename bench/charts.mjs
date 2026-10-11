@@ -1,5 +1,5 @@
 // Generates benchmark chart cards (HTML/SVG) and screenshots each one as a PNG.
-// Usage: node bench/charts.mjs docs/img/benchmark   (needs the Playwright Chromium in /opt/pw-browsers)
+// Usage: node bench/charts.mjs docs/img/benchmark [bench/results/quick]   (needs the Playwright Chromium in /opt/pw-browsers)
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 const require = createRequire('/home/user/rev-eng-haxball/package.json');
@@ -91,36 +91,62 @@ function hpanel({ title, sub, values, decimals, unit = '', width = 530, best = '
 }
 
 function card({ id, title, sub, body, note }) {
-  return `<section class="card" id="${id}"><header><h1>${esc(title)}</h1><p>${sub}</p></header>${legend()}${body}${note ? `<footer>${note}</footer>` : ''}<div class="src">Benchmark haxlite · 11-10-2026 · misma máquina y sesión (4 vCPU, Node 22) · mediana de 3 repeticiones · clientes reales en procesos aparte</div></section>`;
+  return `<section class="card" id="${id}"><header><h1>${esc(title)}</h1><p>${sub}</p></header>${legend()}${body}${note ? `<footer>${note}</footer>` : ''}<div class="src">Benchmark haxlite · 11-10-2026 · misma máquina y sesión (4 vCPU, Node 22) · mediana de 3 repeticiones intercaladas · clientes reales en procesos aparte · paquete minificado</div></section>`;
 }
+
+
+// ---- data: read the quick/unified result files -------------------------------------------
+const { readFileSync } = await import('node:fs');
+const RES = process.argv[3] ?? 'bench/results/quick';
+const IMPL = { 'haxlite:rtc': 'rtc', 'haxlite:ndc': 'ndc', official: 'off', nodehaxball: 'nh' };
+function load(name) {
+  const j = JSON.parse(readFileSync(`${RES}-${name}.json`, 'utf8'));
+  const out = {};
+  for (const c of j.configs) out[IMPL[c.label.split(' ')[0]]] = c.summary;
+  return (metric, scale = 1) => Object.fromEntries(Object.entries(out).map(([k, s]) => [k, s[metric].median * scale]));
+}
+const game = load('game'), rooms = load('rooms'), idle = load('idle'), startup = load('startup');
+const pct = (a, b) => Math.round((1 - a / b) * 100);
+const cg = game('cpuPct'), cr = rooms('cpuPct');
 
 const cpu = groups => grouped({ groups, unit: '%', decimals: 1 });
 const cards = [];
 
 cards.push(card({
   id: 'cpu',
-  title: 'CPU del host con jugadores',
+  title: 'CPU del host',
   sub: '% de un núcleo de CPU que usa el proceso del host · <b>menos es mejor</b>',
   body: cpu([
-    { label: '4 jugadores', values: { rtc: 2.0, ndc: 2.59, off: 2.85, nh: 3.42 } },
-    { label: '10 jugadores', values: { rtc: 3.56, ndc: 5.13, off: 5.81, nh: 6.41 } },
-    { label: '20 jugadores', values: { rtc: 7.79, ndc: 11.95, off: 13.52, nh: 15.1 } },
-    { label: '10 salas × 4 jugadores', values: { rtc: 9.13, ndc: 15.79, off: 19.89, nh: 20.37 } },
+    { label: 'Una sala con 20 jugadores', values: cg },
+    { label: '10 salas × 4 jugadores (un proceso)', values: cr },
   ]),
-  note: 'Con 20 jugadores, haxlite con WebRTC propio usa <b>42 % menos CPU</b> que el host oficial y <b>48 % menos</b> que node-haxball. Con 10 salas, <b>54 % menos</b> que el oficial.',
+  note: `Con 20 jugadores, haxlite con WebRTC propio usa <b>${pct(cg.rtc, cg.off)} % menos CPU</b> que el host oficial (haxball.js) y <b>${pct(cg.rtc, cg.nh)} % menos</b> que node-haxball. Con 10 salas, <b>${pct(cr.rtc, cr.off)} % menos</b> que el oficial.`,
 }));
 
 cards.push(card({
   id: 'p20',
   title: 'Una sala con 20 jugadores',
-  sub: 'Cuatro métricas por separado (cada una con su propia escala) · <b>menos es mejor</b>',
+  sub: 'Cada métrica con su propia escala · <b>menos es mejor</b> · en negrita el mejor',
   body: `<div class="grid">${[
-    hpanel({ title: 'Despertares por segundo', sub: 'veces que el proceso se despierta', values: { rtc: 509, ndc: 4138, off: 4331, nh: 4375 }, decimals: 0 }),
-    hpanel({ title: 'Tiempo para entrar a la sala', sub: 'mediana, segundos', values: { rtc: 1.059, ndc: 2.055, off: 2.057, nh: 2.06 }, decimals: 2, unit: ' s' }),
-    hpanel({ title: 'Hilos del proceso', sub: 'incluye los de Node.js', values: { rtc: 11, ndc: 19, off: 18, nh: 15 }, decimals: 0 }),
-    hpanel({ title: 'Memoria RAM (RSS)', sub: 'MB', values: { rtc: 88.7, ndc: 83.3, off: 85.3, nh: 92.4 }, decimals: 1, unit: ' MB' }),
+    hpanel({ title: 'Memoria RAM (RSS)', sub: 'MB', values: game('rssMeanMB'), decimals: 1, unit: ' MB' }),
+    hpanel({ title: 'Tiempo para entrar a la sala', sub: 'mediana, segundos', values: game('joinP50Ms', 1 / 1000), decimals: 2, unit: ' s' }),
+    hpanel({ title: 'Hilos del proceso', sub: 'incluye los de Node.js', values: game('threadCount'), decimals: 0 }),
+    hpanel({ title: 'Despertares por segundo', sub: 'veces que el proceso se despierta', values: game('wakeupsPerS'), decimals: 0 }),
   ].join('')}</div>`,
-  note: 'El WebRTC propio corre entero en JavaScript, sin hilos nativos: se despierta ~8× menos y los jugadores entran en la mitad de tiempo. La RAM es parecida en los cuatro (la domina Node.js).',
+  note: 'El WebRTC propio corre entero en JavaScript, sin hilos nativos: menos RAM, ~8× menos despertares y los jugadores entran en la mitad de tiempo.',
+}));
+
+cards.push(card({
+  id: 'gc',
+  title: 'Recolector de basura y lag (20 jugadores)',
+  sub: 'Pausas de JavaScript para liberar memoria y retraso del event loop · <b>menos es mejor</b>',
+  body: `<div class="grid">${[
+    hpanel({ title: 'Tiempo en GC', sub: 'ms por minuto', values: game('gcMsPerMin'), decimals: 1, unit: ' ms' }),
+    hpanel({ title: 'Memoria JS (heap)', sub: 'MB', values: game('heapUsedMeanMB'), decimals: 1, unit: ' MB' }),
+    hpanel({ title: 'Lag del event loop p99', sub: 'ms (un frame del juego = 16,7 ms)', values: game('eldP99'), decimals: 2, unit: ' ms' }),
+    hpanel({ title: 'Pausas de GC', sub: 'por minuto', values: game('gcPerMin'), decimals: 0 }),
+  ].join('')}</div>`,
+  note: 'El WebRTC propio gasta menos tiempo en GC que haxball.js y node-haxball, pero más que haxlite + node-datachannel: el resto de la basura la crea el propio módulo UDP de Node por cada paquete. El lag p99 queda entre 1,2 y 1,7 ms en los cuatro: muy por debajo de un frame.',
 }));
 
 cards.push(card({
@@ -128,29 +154,30 @@ cards.push(card({
   title: '10 salas en un mismo proceso (4 jugadores c/u)',
   sub: 'Cuánto cuesta escalar a muchas salas · <b>menos es mejor</b>',
   body: `<div class="grid three">${[
-    hpanel({ title: 'CPU', sub: '% de un núcleo', values: { rtc: 9.13, ndc: 15.79, off: 19.89, nh: 20.37 }, decimals: 1, unit: ' %', width: 340 }),
-    hpanel({ title: 'Memoria RAM (RSS)', sub: 'MB', values: { rtc: 79.3, ndc: 90.9, off: 104.8, nh: 103.0 }, decimals: 0, unit: ' MB', width: 340 }),
-    hpanel({ title: 'Pausas del GC', sub: 'por minuto', values: { rtc: 103, ndc: 22, off: 237, nh: 154 }, decimals: 0, width: 340 }),
+    hpanel({ title: 'Memoria RAM (RSS)', sub: 'MB', values: rooms('rssMeanMB'), decimals: 0, unit: ' MB', width: 340 }),
+    hpanel({ title: 'Tiempo en GC', sub: 'ms por minuto', values: rooms('gcMsPerMin'), decimals: 0, unit: ' ms', width: 340 }),
+    hpanel({ title: 'Sockets y archivos (fds)', sub: 'descriptores abiertos', values: rooms('fdCount'), decimals: 0, width: 340 }),
   ].join('')}</div>`,
-  note: 'Las dos variantes de haxlite usan 12–25 MB menos de RAM y bastante menos recolección de basura que haxball.js y node-haxball.',
+  note: 'Con el WebRTC propio todas las salas comparten un solo socket UDP.',
 }));
 
 cards.push(card({
   id: 'idle',
-  title: 'Sala pública vacía (0 jugadores)',
-  sub: 'Lo que cuesta tener la sala abierta esperando gente · <b>menos es mejor</b>',
-  body: `<div class="grid">${[
-    hpanel({ title: 'CPU', sub: '% de un núcleo', values: { rtc: 0.009, ndc: 0.01, off: 0.337, nh: 0.632 }, decimals: 3, unit: ' %' }),
-    hpanel({ title: 'Despertares por segundo', sub: 'haxlite: 0,2 = solo el medidor del benchmark', values: { rtc: 0.2, ndc: 0.2, off: 20.5, nh: 81 }, decimals: 1 }),
+  title: 'Sala vacía y arranque',
+  sub: 'Costo de tener la sala abierta esperando gente, y tiempo hasta tener el link · <b>menos es mejor</b>',
+  body: `<div class="grid three">${[
+    hpanel({ title: 'CPU con la sala vacía', sub: '% de un núcleo', values: idle('cpuPct'), decimals: 2, unit: ' %', width: 340 }),
+    hpanel({ title: 'Despertares/s con la sala vacía', sub: 'haxlite: 0,2 = solo el medidor', values: idle('wakeupsPerS'), decimals: 1, width: 340 }),
+    hpanel({ title: 'Arranque hasta el link', sub: 'ms desde que inicia el proceso', values: startup('processStartToLinkMs'), decimals: 0, unit: ' ms', width: 340 }),
   ].join('')}</div>`,
-  note: 'haxlite no tiene timers cuando la sala está vacía: ~35× menos CPU que el oficial y ~65× menos que node-haxball. Las dos variantes de haxlite empatan.',
+  note: 'haxlite no tiene timers con la sala vacía. Las dos variantes de haxlite empatan en reposo y arrancan ~40 ms antes que las otras.',
 }));
 
 const stack = [
   ['haxball.js 5.1.0', '@webrtc-node/webrtc 0.2.1', 'libdatachannel (master, ~0.24.5) · libjuice 1.7.2 · OpenSSL 1.1.1w · usrsctp', '18 hilos con jugadores · 1 socket UDP por jugador', 'Cualquier red, también detrás de NAT'],
   ['node-haxball 2.3.1', 'node-datachannel 0.25.0 (copia propia)', 'libdatachannel 0.22.2 · libjuice 1.5.7 · OpenSSL 1.1.1w · usrsctp', '15 hilos · 1 socket UDP por jugador', 'Cualquier red'],
   ['haxlite + node-datachannel', 'node-datachannel 0.33.4', 'libdatachannel 0.24.5 · libjuice 1.7.2 · OpenSSL 1.1.1w · usrsctp', '19 hilos (se liberan con la sala vacía) · 1 socket UDP para todos', 'Cualquier red'],
-  ['haxlite + WebRTC propio', 'ninguno: haxlite-rtc (TypeScript)', 'ICE-lite, DTLS 1.2 y SCTP propios · cifrado con node:crypto (OpenSSL 3.5)', '0 hilos nativos · 1 socket UDP para todos', 'Servidor con IP pública (dedicado, VPS) o detrás del edge'],
+  ['haxlite + WebRTC propio', 'ninguno: haxlite-rtc (TypeScript)', 'ICE-lite, DTLS 1.2 (ChaCha20-Poly1305 en JS) y SCTP propios', '0 hilos nativos · 1 socket UDP para todas las salas', 'Servidor con IP pública (dedicado, VPS) o detrás del edge'],
 ];
 cards.push(`<section class="card wide" id="stack"><header><h1>Qué WebRTC usa cada librería</h1><p>Los tres primeros usan por dentro <b>la misma librería nativa</b> (libdatachannel) en distintas versiones; haxlite puede usar la suya propia</p></header>
 <table><thead><tr><th>Librería</th><th>Paquete WebRTC</th><th>Por dentro (ICE · DTLS · SCTP)</th><th>Hilos y sockets</th><th>Dónde funciona</th></tr></thead><tbody>
@@ -182,7 +209,7 @@ const browser = await chromium.launch({ executablePath: '/opt/pw-browsers/chromi
 const page = await browser.newPage({ viewport: { width: 1500, height: 1000 }, deviceScaleFactor: 2 });
 await page.setContent(html);
 await page.evaluate(() => document.fonts.ready);
-const names = { cpu: '1-cpu-con-jugadores', p20: '2-sala-20-jugadores', rooms: '3-diez-salas', idle: '4-sala-vacia', stack: '5-webrtc-por-libreria' };
+const names = { cpu: '1-cpu', p20: '2-sala-20-jugadores', gc: '3-gc-y-lag', rooms: '4-diez-salas', idle: '5-sala-vacia-y-arranque', stack: '6-webrtc-por-libreria' };
 for (const [id, name] of Object.entries(names)) await page.locator(`#${id}`).screenshot({ path: `${OUT}/${name}.png` });
 await browser.close();
 console.log('ok');

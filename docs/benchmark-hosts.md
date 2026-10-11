@@ -1,5 +1,33 @@
 # Benchmark: hosts de HaxBall en Node.js
 
+## Resultado actual (benchmark rápido, tras la pasada de GC y memoria)
+
+Misma sesión, las 4 opciones intercaladas, 3 repeticiones, ventanas de 30 s (sala vacía: 60 s), arranque con 10 repeticiones; haxlite medido con el **paquete minificado** publicado. Mediana [mín–máx]. Datos: `bench/results/quick-*.json` · `sh bench/net/quick.sh` · imágenes en `docs/img/benchmark/`.
+
+| métrica | haxball.js (oficial) | node-haxball | haxlite + ndc | **haxlite + rtc** |
+|---|---:|---:|---:|---:|
+| **20 jugadores** · CPU % | 13,72 [13,31–13,81] | 14,98 [14,23–15,31] | 11,85 [11,36–11,96] | **5,41** [5,24–5,46] |
+| RSS MB | 89,3 | 92,4 | 84,1 | **73,0** |
+| heap MB | 12,2 | 15,8 | **9,3** | 11,1 |
+| GC ms/min · pausas/min | 46,2 · 110 | 41,8 · 116 | **3,9 · 12** | 25,2 · 94 |
+| lag p99 ms | 1,43 [1,16–2,10] | **1,24** [1,06–5,16] | 1,30 [1,12–1,49] | 1,72 [1,39–2,57] |
+| hilos · fds | 18 · 46 | 15 · 48 | 19 · 27 | **11 · 25** |
+| despertares/s | 4 274 | 4 379 | 4 150 | **486** |
+| entrada p50 ms | 2 054 | 2 060 | 2 054 | **1 056** |
+| **10 salas × 4** · CPU % | 19,19 | 20,03 | 15,58 | **6,25** |
+| RSS MB · heap MB | 104,3 · 17,8 | 103,0 · 18,1 | 90,7 · **10,5** | **76,2** · 12,4 |
+| GC ms/min | 115,0 | 54,5 | **8,2** | 13,5 |
+| fds | 75 | 77 | 36 | **34** |
+| **Sala vacía** · CPU % | 0,23 | 0,61 | **0,01** | **0,01** |
+| despertares/s | 20,6 | 81,6 | **0,2** | **0,2** |
+| **Arranque** proceso → link ms | 141 | 135 | 96 | **94** |
+
+**Lectura:** haxlite + rtc gana a haxball.js y a node-haxball en todo salvo el **lag p99** (+0,3–0,5 ms, rangos solapados; todos muy por debajo de un frame de 16,7 ms). Frente a haxlite + ndc gana en CPU (−54 %), RAM, hilos, despertares, entrada y escala; pierde en GC/heap porque el módulo UDP de Node crea objetos por paquete (ndc hace la red en código nativo, fuera del GC).
+
+---
+
+## Comparativa unificada anterior (antes de la pasada de GC; histórica)
+
 haxball.js (script oficial) vs node-haxball vs haxlite + node-datachannel vs haxlite + WebRTC propio.
 Extraído de [`docs/07-benchmarks.md`](07-benchmarks.md); datos crudos en `bench/results/unified-*.json`.
 
