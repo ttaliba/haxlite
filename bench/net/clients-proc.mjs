@@ -44,7 +44,9 @@ let failures = 0;
 function joinOnce(roomId, name, timeoutMs) {
   return new Promise(async (resolve) => {
     const [, authObj] = await nh.Utils.generateAuth();
-    const c = { name, room: null, closed: false, inputs: 0, chats: 0 };
+    const c = { name, room: null, closed: false, inputs: 0, chats: 0, joinMs: NaN };
+    const tJoin = performance.now(); // Room.join → onOpen: signaling + offer/answer + ICE/DTLS/SCTP + challenge
+
     let done = false;
     let j = null;
     const timer = setTimeout(() => {
@@ -61,6 +63,7 @@ function joinOnce(roomId, name, timeoutMs) {
         storage: { player_name: name, avatar: null, geo: { lat: 0, lon: 0, flag: 'uy' } },
         onOpen: (room) => {
           c.room = room;
+          c.joinMs = performance.now() - tJoin;
           if (done) return;
           done = true;
           clearTimeout(timer);
@@ -95,7 +98,7 @@ for (const t of targets) {
     clients.push(c);
   }
 }
-send({ type: 'joined', joined: clients.length, failures, ms: performance.now() - t0 });
+send({ type: 'joined', joined: clients.length, failures, ms: performance.now() - t0, joinMs: clients.map((c) => +c.joinMs.toFixed(1)) });
 
 const DIRS = [0, 1, 2, 4, 8, 1 | 4, 1 | 8, 2 | 4, 2 | 8]; // none, up, down, left, right, diagonals
 let running = false;

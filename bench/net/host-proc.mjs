@@ -263,7 +263,15 @@ function threadTicks() {
         const st = readFileSync(`/proc/self/task/${tid}/stat`, 'utf8');
         const name = st.slice(st.indexOf('(') + 1, st.lastIndexOf(')'));
         const f = st.slice(st.lastIndexOf(')') + 2).split(' ');
-        out.set(tid, { name, ticks: Number(f[11]) + Number(f[12]) });
+        // context switches = wake-ups of this thread (voluntary: it blocked and was woken)
+        let vcs = 0;
+        let nvcs = 0;
+        try {
+          const status = readFileSync(`/proc/self/task/${tid}/status`, 'utf8');
+          vcs = Number(/voluntary_ctxt_switches:\s+(\d+)/.exec(status)?.[1] ?? 0);
+          nvcs = Number(/nonvoluntary_ctxt_switches:\s+(\d+)/.exec(status)?.[1] ?? 0);
+        } catch {}
+        out.set(tid, { name, ticks: Number(f[11]) + Number(f[12]), utime: Number(f[11]), stime: Number(f[12]), vcs, nvcs });
       } catch {}
     }
   } catch {}
@@ -276,6 +284,39 @@ function countFds() {
   } catch {
     return null;
   }
+}
+
+/**
+ * Wake-ups per second over the window: voluntary context switches of every
+ * thread (a thread that blocked in poll/epoll/futex/nanosleep and was woken),
+ * plus involuntary ones, total and for the JS main thread.
+ */
+function wakeups(before, after, wallMs) {
+  let vcs = 0;
+  let nvcs = 0;
+  let mainVcs = 0;
+  for (const [tid, t] of after) {
+    const b = before.get(tid);
+    const dv = t.vcs - (b?.vcs ?? 0);
+    vcs += dv;
+    nvcs += t.nvcs - (b?.nvcs ?? 0);
+    if (tid === String(process.pid)) mainVcs = dv;
+  }
+  const perS = (x) => +((x / wallMs) * 1000).toFixed(2);
+  return { voluntaryPerS: perS(vcs), involuntaryPerS: perS(nvcs), mainVoluntaryPerS: perS(mainVcs) };
+}
+
+/** CPU % of the JS main thread vs every other thread (libuv/V8 workers + native WebRTC threads). */
+function cpuSplit(before, after, wallMs) {
+  let main = 0;
+  let other = 0;
+  for (const [tid, t] of after) {
+    const d = t.ticks - (before.get(tid)?.ticks ?? 0);
+    if (tid === String(process.pid)) main += d;
+    else other += d;
+  }
+  // ticks are 1/100 s (CLK_TCK); a thread that exited during the window is lost (rare)
+  return { mainPct: +(((main * 10) / wallMs) * 100).toFixed(3), otherPct: +(((other * 10) / wallMs) * 100).toFixed(3) };
 }
 
 function threadBreakdown(before, after, wallMs) {
@@ -372,6 +413,8 @@ function stopMeasure() {
     gcMs: m.gc.ms,
     eld,
     threadsPct: threadBreakdown(m.threads0, threads1, wallMs),
+    cpuSplit: cpuSplit(m.threads0, threads1, wallMs),
+    wakeups: wakeups(m.threads0, threads1, wallMs),
     threadCount: threads1.size,
     fdCount: countFds(),
     cpuPctSeries: m.samples.map((s) => +s.cpuPct.toFixed(3)),

@@ -282,6 +282,16 @@ function stat(xs: number[]): { median: number; min: number; max: number; n: numb
   return { median, min: s[0] ?? NaN, max: s[n - 1] ?? NaN, n };
 }
 const MB = 1024 * 1024;
+function joinTimes(r: Any): number[] {
+  return (r.join ?? []).flatMap((j: Any) => j.joinMs ?? []);
+}
+function quantile(xs: number[], q: number): number {
+  const s = xs.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+  if (s.length === 0) return NaN;
+  const i = (s.length - 1) * q;
+  const lo = Math.floor(i);
+  return s[lo]! + (s[Math.min(lo + 1, s.length - 1)]! - s[lo]!) * (i - lo);
+}
 function summarize(runs: Any[]): Any {
   const ok = runs.filter((r) => !r.failed);
   const pick = (f: (r: Any) => number) => stat(ok.map(f));
@@ -307,6 +317,16 @@ function summarize(runs: Any[]): Any {
     rssAtLinkMB: pick((r) => r.startup.links[0].rss / MB),
     heapAtLinkMB: pick((r) => r.startup.links[0].heapUsed / MB),
     clientsCpuPct: pick((r) => r.clients?.reduce((a: number, c: Any) => a + c.cpuPct, 0) ?? NaN),
+    mainThreadCpuPct: pick((r) => r.host.cpuSplit?.mainPct ?? NaN),
+    otherThreadsCpuPct: pick((r) => r.host.cpuSplit?.otherPct ?? NaN),
+    threadCount: pick((r) => r.host.threadCount ?? NaN),
+    fdCount: pick((r) => r.host.fdCount ?? NaN),
+    wakeupsPerS: pick((r) => r.host.wakeups?.voluntaryPerS ?? NaN),
+    mainWakeupsPerS: pick((r) => r.host.wakeups?.mainVoluntaryPerS ?? NaN),
+    // per-client Room.join → onOpen (successful attempt), median / p90 over the clients of a rep
+    joinP50Ms: pick((r) => quantile(joinTimes(r), 0.5)),
+    joinP90Ms: pick((r) => quantile(joinTimes(r), 0.9)),
+    joinFailures: pick((r) => r.join?.reduce((a: number, j: Any) => a + j.failures, 0) ?? NaN),
     foreignPct: pick((r) => r.machine.foreignPct),
     noisyReps: ok.filter((r) => r.noisy).length,
     allValid: ok.every((r) => r.valid),
@@ -352,7 +372,14 @@ function info(): Any {
     commit,
     srcDiffSha: srcDirty || null,
     haxliteBuildSha: buildSha,
-    versions: { 'haxball.js': pkg('haxball.js'), 'node-haxball': pkg('node-haxball'), 'node-datachannel': pkg('node-datachannel'), '@webrtc-node/webrtc': pkg('@webrtc-node/webrtc') },
+    versions: {
+      'haxball.js': pkg('haxball.js'),
+      'node-haxball': pkg('node-haxball'),
+      'node-datachannel': pkg('node-datachannel'),
+      'node-haxball/node-datachannel': pkg('node-haxball/node_modules/node-datachannel'),
+      '@webrtc-node/webrtc': pkg('@webrtc-node/webrtc'),
+    },
+    cpuMHz: os.cpus()[0]?.speed,
     command: `node --experimental-transform-types --import ./bench/ts-resolve.mjs bench/net/run.ts ${argv.join(' ')}`,
     params: { ELD, IMPLS, REPS, WARMUP_S, WINDOW_S, NS, KS, MAX_FOREIGN, ATTEMPTS, CLIENTS_PER_PROC, HOST_NODE_ARGS },
   };
@@ -392,6 +419,7 @@ async function main(): Promise<void> {
         console.log(
           `    cpu ${h.cpuPct.toFixed(2)} %  rss ${(h.rssMean / MB).toFixed(1)} MB  heap ${(h.heapUsedMean / MB).toFixed(1)} MB  ` +
             (h.eld ? `lag p50 ${h.eld.p50.toFixed(2)} p99 ${h.eld.p99.toFixed(2)} max ${h.eld.max.toFixed(1)} ms  ` : '') +
+            (h.cpuSplit ? `js ${h.cpuSplit.mainPct.toFixed(2)} other ${h.cpuSplit.otherPct.toFixed(2)}  thr ${h.threadCount} fd ${h.fdCount}  wake ${h.wakeups?.voluntaryPerS}/s  ` : '') +
             `link ${run.startup.links[0].createToLinkMs.toFixed(0)} ms  foreign ${run.machine.foreignPct.toFixed(0)} %  valid ${run.valid}`,
         );
       }
