@@ -3,8 +3,13 @@
  * the AEAD record protection of the supported cipher suites (AES-GCM per
  * RFC 5288/6347, ChaCha20-Poly1305 per RFC 7905) and the anti-replay
  * window (RFC 6347 §4.1.2.6).
+ *
+ * ChaCha20-Poly1305 records are protected by the allocation-free JS AEAD of
+ * ./chacha.ts (in place); AES-GCM uses node:crypto (one native cipher object
+ * and fresh buffers per record — AES is never done in JS: not constant time).
  */
 import { createCipheriv, createDecipheriv, createHmac } from 'node:crypto';
+import { ChaCha20Poly1305 } from './chacha.js';
 
 // ---------------------------------------------------------------- PRF
 
@@ -40,7 +45,21 @@ export interface CipherSuite {
   explicitNonce: number;
 }
 
+/**
+ * Supported suites, in our default preference order: ChaCha20-Poly1305 first
+ * (allocation-free JS AEAD, faster than node:crypto for the small records of
+ * a game: docs/10 §6.3), then AES-128-GCM (every browser), then AES-256-GCM.
+ */
 export const SUITES: readonly CipherSuite[] = [
+  {
+    id: 0xcca9,
+    name: 'TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256',
+    cipher: 'chacha20-poly1305',
+    hash: 'sha256',
+    keyLength: 32,
+    ivLength: 12,
+    explicitNonce: 0,
+  },
   {
     id: 0xc02b,
     name: 'TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256',
@@ -59,19 +78,34 @@ export const SUITES: readonly CipherSuite[] = [
     ivLength: 4,
     explicitNonce: 8,
   },
-  {
-    id: 0xcca9,
-    name: 'TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256',
-    cipher: 'chacha20-poly1305',
-    hash: 'sha256',
-    keyLength: 32,
-    ivLength: 12,
-    explicitNonce: 0,
-  },
 ];
+
+/** Suite ids or IANA names (`TLS_ECDHE_ECDSA_WITH_…`, or the short OpenSSL-style `chacha20` / `aes128gcm` / `aes256gcm`) → ids. Throws on unknown entries. */
+export function resolveSuites(list: readonly (number | string)[]): number[] {
+  const out: number[] = [];
+  for (const x of list) {
+    let suite: CipherSuite | undefined;
+    if (typeof x === 'number') suite = SUITES.find((s) => s.id === x);
+    else {
+      const k = x.toLowerCase().replace(/[^a-z0-9]/g, '');
+      suite = SUITES.find(
+        (s) =>
+          s.name.toLowerCase().replace(/[^a-z0-9]/g, '') === k ||
+          (k === 'chacha20' || k === 'chacha20poly1305' ? s.id === 0xcca9 : k === 'aes128gcm' ? s.id === 0xc02b : k === 'aes256gcm' ? s.id === 0xc02c : false),
+      );
+    }
+    if (suite === undefined) throw new Error(`unknown DTLS cipher suite ${JSON.stringify(x)}`);
+    if (!out.includes(suite.id)) out.push(suite.id);
+  }
+  if (out.length === 0) throw new Error('no DTLS cipher suite configured');
+  return out;
+}
 
 export const TAG_LENGTH = 16;
 export const RECORD_HEADER = 13;
+
+/** How ChaCha20-Poly1305 records are protected: the JS AEAD (default) or node:crypto (diagnostics / A-B). */
+export type ChaChaImpl = 'js' | 'node';
 
 /**
  * One direction of record protection for one epoch. `seal`/`open` take the
@@ -83,11 +117,14 @@ export class RecordCipher {
   private readonly iv: Buffer;
   private readonly nonce = Buffer.alloc(12);
   private readonly aad = Buffer.alloc(13);
+  /** Allocation-free AEAD for ChaCha20-Poly1305 (null: node:crypto). */
+  private readonly js: ChaCha20Poly1305 | null;
 
-  constructor(suite: CipherSuite, key: Buffer, iv: Buffer) {
+  constructor(suite: CipherSuite, key: Buffer, iv: Buffer, chacha: ChaChaImpl = 'js') {
     this.suite = suite;
     this.key = key;
     this.iv = iv;
+    this.js = suite.cipher === 'chacha20-poly1305' && chacha === 'js' ? new ChaCha20Poly1305(key) : null;
   }
 
   /** Bytes added to a plaintext by {@link seal}. */
@@ -130,7 +167,8 @@ export class RecordCipher {
   /**
    * Writes the protected fragment of `plaintext` into `out` at `off`
    * (explicit nonce, ciphertext, tag); returns the fragment length.
-   * `out` must have room for `plaintext.length + overhead`.
+   * `out` must have room for `plaintext.length + overhead`. `plaintext` may
+   * already sit at out[off…] (no copy then).
    */
   seal(
     type: number,
@@ -143,7 +181,14 @@ export class RecordCipher {
     off: number,
   ): number {
     this.setNonce(epoch, seqHi, seqLo);
-    this.setAad(type, version, epoch, seqHi, seqLo, plaintext.length);
+    const len = plaintext.length;
+    this.setAad(type, version, epoch, seqHi, seqLo, len);
+    const js = this.js;
+    if (js !== null) {
+      if (plaintext.buffer !== out.buffer || plaintext.byteOffset !== out.byteOffset + off) out.set(plaintext, off);
+      js.seal(this.nonce, this.aad, 0, 13, out, off, len, out, off + len);
+      return len + TAG_LENGTH;
+    }
     let p = off;
     if (this.suite.explicitNonce === 8) {
       this.nonce.copy(out, p, 4, 12);
@@ -152,42 +197,59 @@ export class RecordCipher {
     // (typed as GCM: the ChaCha20-Poly1305 AEAD API is identical)
     const c = createCipheriv(this.suite.cipher as 'aes-128-gcm', this.key, this.nonce, { authTagLength: TAG_LENGTH });
     c.setAAD(this.aad);
-    const ct = c.update(plaintext);
-    ct.copy(out, p);
-    p += ct.length;
+    p += c.update(plaintext).copy(out, p);
     const fin = c.final();
-    if (fin.length > 0) {
-      fin.copy(out, p);
-      p += fin.length;
-    }
-    c.getAuthTag().copy(out, p);
-    p += TAG_LENGTH;
+    if (fin.length > 0) p += fin.copy(out, p);
+    p += c.getAuthTag().copy(out, p);
     return p - off;
   }
 
-  /** Decrypts a protected fragment; null when it does not authenticate. */
+  /** Decrypts a protected fragment; null when it does not authenticate. See {@link openAt}. */
   open(type: number, version: number, epoch: number, seqHi: number, seqLo: number, fragment: Uint8Array): Buffer | null {
+    return this.openAt(type, version, epoch, seqHi, seqLo, fragment, 0, fragment.length);
+  }
+
+  /**
+   * Decrypts the protected fragment buf[off, off+len); null when it does not
+   * authenticate. ChaCha20-Poly1305 (JS) decrypts IN PLACE after the tag
+   * verified and returns a view of `buf`; AES-GCM returns a fresh buffer and
+   * leaves `buf` untouched.
+   */
+  openAt(type: number, version: number, epoch: number, seqHi: number, seqLo: number, buf: Uint8Array, off: number, len: number): Buffer | null {
     const explicit = this.suite.explicitNonce;
-    const ptLen = fragment.length - explicit - TAG_LENGTH;
+    const ptLen = len - explicit - TAG_LENGTH;
     if (ptLen < 0) return null;
+    const js = this.js;
+    if (js !== null) {
+      this.setNonce(epoch, seqHi, seqLo);
+      this.setAad(type, version, epoch, seqHi, seqLo, ptLen);
+      if (!js.open(this.nonce, this.aad, 0, 13, buf, off, ptLen, buf, off + ptLen)) return null;
+      return Buffer.from(buf.buffer, buf.byteOffset + off, ptLen);
+    }
     if (explicit === 8) {
       const n = this.nonce;
       this.iv.copy(n, 0, 0, 4);
-      for (let i = 0; i < 8; i++) n[4 + i] = fragment[i]!;
+      for (let i = 0; i < 8; i++) n[4 + i] = buf[off + i]!;
     } else {
       this.setNonce(epoch, seqHi, seqLo);
     }
     this.setAad(type, version, epoch, seqHi, seqLo, ptLen);
     try {
       const d = createDecipheriv(this.suite.cipher as 'aes-128-gcm', this.key, this.nonce, { authTagLength: TAG_LENGTH });
-      d.setAuthTag(fragment.subarray(explicit + ptLen));
+      d.setAuthTag(buf.subarray(off + explicit + ptLen, off + len));
       d.setAAD(this.aad);
-      const pt = d.update(fragment.subarray(explicit, explicit + ptLen));
+      const pt = d.update(buf.subarray(off + explicit, off + explicit + ptLen));
       const fin = d.final(); // throws when the tag does not match
       return fin.length === 0 ? pt : Buffer.concat([pt, fin]);
     } catch {
       return null;
     }
+  }
+
+  /** Best-effort key hygiene when the session ends. */
+  wipe(): void {
+    this.key.fill(0);
+    this.js?.wipe();
   }
 }
 

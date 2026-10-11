@@ -42,7 +42,7 @@ import {
   type KeyObject,
 } from 'node:crypto';
 import type { RtcCertificate } from '../cert.js';
-import { RECORD_HEADER, RecordCipher, ReplayWindow, SUITES, prf, type CipherSuite } from './crypto.js';
+import { RECORD_HEADER, RecordCipher, ReplayWindow, SUITES, TAG_LENGTH, prf, type ChaChaImpl, type CipherSuite } from './crypto.js';
 
 export const ContentType = { ChangeCipherSpec: 20, Alert: 21, Handshake: 22, ApplicationData: 23 } as const;
 
@@ -124,10 +124,24 @@ export interface DtlsServerOptions {
   certificate: RtcCertificate;
   /** From the offer's a=fingerprint. */
   remoteFingerprint: { algorithm: string; digest: Uint8Array };
-  /** Sends one datagram to the peer. */
-  send(datagram: Buffer): void;
+  /**
+   * Sends one datagram (`datagram[0, length)`, default the whole buffer) to
+   * the peer, synchronously: the buffer may be reused once this returns
+   * (unless {@link sendBuffer} says otherwise).
+   */
+  send(datagram: Buffer, length?: number): void;
+  /**
+   * Scratch buffer of at least `size` bytes that application-data records are
+   * sealed into before {@link send} (shared by every session of an endpoint).
+   * Absent: a fresh exact-size buffer per record.
+   */
+  sendBuffer?(size: number): Buffer;
   onConnected(): void;
-  /** One application-data record (freshly allocated). */
+  /**
+   * One application-data record. With ChaCha20-Poly1305 it is a view of the
+   * received datagram (decrypted in place; the datagram is not reused, so it
+   * may be kept); with AES-GCM a fresh buffer.
+   */
   onData(data: Buffer): void;
   /** Handshake failure, fatal alert or close_notify from the peer. Not called after {@link DtlsServer.close}. */
   onClose(reason: string): void;
@@ -135,8 +149,10 @@ export interface DtlsServerOptions {
   mtu?: number;
   /** First retransmission timeout of flight 4 (default 1000 ms, doubles up to 8 s). */
   retransmitMs?: number;
-  /** Cipher suites in preference order (default: all of {@link SUITES}). */
+  /** Cipher suites in preference order (default: all of {@link SUITES}, ChaCha20-Poly1305 first). */
   suites?: readonly number[];
+  /** ChaCha20-Poly1305 implementation (default 'js', allocation-free). */
+  chacha?: ChaChaImpl;
 }
 
 interface Reassembly {
@@ -399,13 +415,46 @@ export class DtlsServer {
         return; // truncated: drop the rest of the datagram
       }
       if (version >>> 8 === 0xfe && type >= 20 && type <= 23) {
-        const fragment = Buffer.from(buf.buffer, buf.byteOffset + off + RECORD_HEADER, length);
-        this.handleRecord(type, version, epoch, seqHi, seqLo, fragment, peerKey);
+        if (epoch === 1 && type === ContentType.ApplicationData && this.state === 'connected') {
+          this.handleAppData(version, seqHi, seqLo, buf, off + RECORD_HEADER, length); // hot path: no fragment view
+        } else {
+          const fragment = Buffer.from(buf.buffer, buf.byteOffset + off + RECORD_HEADER, length);
+          this.handleRecord(type, version, epoch, seqHi, seqLo, fragment, peerKey);
+        }
       } else {
         this.badRecords++;
       }
       off = end;
     }
+  }
+
+  /** Epoch-1 application data while connected (the steady state). */
+  private handleAppData(version: number, seqHi: number, seqLo: number, buf: Uint8Array, off: number, length: number): void {
+    const rc = this.readCipher;
+    if (rc === null) {
+      this.badRecords++;
+      return;
+    }
+    const seq = seqHi * 4294967296 + seqLo;
+    if (!this.replay.check(seq)) {
+      this.replayed++;
+      return;
+    }
+    const plain = rc.openAt(ContentType.ApplicationData, version, 1, seqHi, seqLo, buf, off, length);
+    if (plain === null) {
+      this.badRecords++;
+      return;
+    }
+    this.replay.mark(seq);
+    if (plain.length > MAX_PLAINTEXT) {
+      this.fail(AlertDescription.RecordOverflow, 'record-overflow');
+      return;
+    }
+    if (!this.peerHasFinished) {
+      this.peerHasFinished = true;
+      this.lastFlight = null;
+    }
+    this.opts.onData(plain);
   }
 
   private handleRecord(
@@ -779,8 +828,10 @@ export class DtlsServer {
         const k = suite.keyLength;
         const iv = suite.ivLength;
         const block = prf(suite.hash, master, 'key expansion', Buffer.concat([this.serverRandom!, this.clientRandom!]), 2 * k + 2 * iv);
-        this.pendingRead = new RecordCipher(suite, Buffer.from(block.subarray(0, k)), Buffer.from(block.subarray(2 * k, 2 * k + iv)));
-        this.pendingWrite = new RecordCipher(suite, Buffer.from(block.subarray(k, 2 * k)), Buffer.from(block.subarray(2 * k + iv, 2 * k + 2 * iv)));
+        const impl = this.opts.chacha ?? 'js';
+        this.pendingRead = new RecordCipher(suite, Buffer.from(block.subarray(0, k)), Buffer.from(block.subarray(2 * k, 2 * k + iv)), impl);
+        this.pendingWrite = new RecordCipher(suite, Buffer.from(block.subarray(k, 2 * k)), Buffer.from(block.subarray(2 * k + iv, 2 * k + 2 * iv)), impl);
+        block.fill(0);
         block.fill(0);
         this.expect = 'cv';
         return;
@@ -824,8 +875,14 @@ export class DtlsServer {
         this.expect = 'done';
         this.transcript = [];
         this.reassembly.clear();
+        this.helloReassembly = null;
         this.clientRandom = null;
         this.serverRandom = null;
+        // handshake-only secrets/keys: not needed once the record keys exist
+        this.masterSecret!.fill(0);
+        this.masterSecret = null;
+        this.ecdhe = null;
+        this.clientKey = null;
         this.state = 'connected';
         this.sendFlight(flight);
         this.lastPeerTriggeredRetransmit = Date.now();
@@ -883,9 +940,23 @@ export class DtlsServer {
   /** Encrypts and sends one application-data record. false when not connected or too large. */
   send(data: Uint8Array): boolean {
     if (this.state !== 'connected' || data.length > MAX_PLAINTEXT) return false;
-    this.opts.send(this.sealRecord(ContentType.ApplicationData, data));
+    const c = this.writeCipher!;
+    const size = RECORD_HEADER + data.length + c.overhead;
+    const sb = this.opts.sendBuffer;
+    // no shared scratch from the host: an exact-size record (send() then gets the whole buffer)
+    const rec = sb !== undefined ? sb(size) : Buffer.allocUnsafe(size);
+    const epoch = this.writeEpoch;
+    const hi = this.writeSeqHi[epoch]!;
+    const lo = this.writeSeqLo[epoch]!;
+    this.nextWriteSeq(epoch);
+    const n = c.seal(ContentType.ApplicationData, DTLS_1_2, epoch, hi, lo, data, rec, RECORD_HEADER);
+    writeRecordHeader(rec, ContentType.ApplicationData, DTLS_1_2, epoch, hi, lo, n);
+    this.opts.send(rec, RECORD_HEADER + n);
     return true;
   }
+
+  /** Largest application-data record {@link send} produces (header + max plaintext + AEAD overhead). */
+  static readonly MAX_RECORD = RECORD_HEADER + MAX_PLAINTEXT + 8 + TAG_LENGTH;
 
   private nextWriteSeq(epoch: number): void {
     let lo = this.writeSeqLo[epoch]! + 1;
@@ -1010,9 +1081,15 @@ export class DtlsServer {
     this.helloReassembly = null;
     this.masterSecret?.fill(0);
     this.masterSecret = null;
+    this.pendingRead?.wipe();
+    this.pendingWrite?.wipe();
     this.pendingRead = null;
     this.pendingWrite = null;
     this.ecdhe = null;
+    this.readCipher?.wipe();
+    this.writeCipher?.wipe();
+    this.readCipher = null;
+    this.writeCipher = null;
   }
 
   /** Local close: close_notify when connected, no callback. Idempotent. */
@@ -1020,8 +1097,6 @@ export class DtlsServer {
     if (this.state === 'closed') return;
     if (this.state === 'connected') this.sendAlert(AlertLevel.Warning, AlertDescription.CloseNotify);
     this.release();
-    this.readCipher = null;
-    this.writeCipher = null;
   }
 }
 

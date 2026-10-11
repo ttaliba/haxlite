@@ -306,6 +306,10 @@ export interface HaxliteConfig {
    * `peerBackend: 'rtc'` settings: `{ port: 40000, publicAddresses: ['203.0.113.7'] }`.
    * `publicAddresses` defaults to the machine's public interface addresses;
    * without one (NAT / cloud 1:1 NAT) it must be given, or HBInit rejects.
+   * Rooms of one process with the same settings share one endpoint / UDP
+   * socket (`shared: false` for a socket per room); `certificateFile` keeps
+   * the DTLS identity on disk; `cipherSuites` sets the DTLS preference
+   * (default ChaCha20-Poly1305, then AES-GCM). See docs/10.
    */
   rtc?: RtcBackendOptions | null;
 }
@@ -382,7 +386,7 @@ export interface HaxliteRoomExtensions {
   setMaxPlayers(n: number): void;
   /** Edge tunnel statistics (state, data plane, RTT, peers, bytes), null without `haxlite.edge`. */
   edgeStats(): EdgeBackendStats | null;
-  /** haxlite-rtc endpoint counters (sessions, packets, bytes, handshakes), null unless `peerBackend: 'rtc'`. */
+  /** haxlite-rtc endpoint counters (sessions, packets, bytes, handshakes; of the whole shared endpoint), null unless `peerBackend: 'rtc'`. */
   rtcStats(): RtcEndpointStats | null;
   /** UDP port players connect to with `peerBackend: 'rtc'` (null otherwise / until listening). */
   readonly rtcPort: number | null;

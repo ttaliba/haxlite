@@ -257,9 +257,18 @@ export class HostRoom {
   /** Reused for every client message (a nested message gets its own). */
   private readonly reader = new Reader(new Uint8Array(0));
   private readerBusy = false;
+  /**
+   * The peer backend's bundling scope (haxlite-rtc), or null: every wake-up,
+   * client message and top-level action runs inside it, so all the messages
+   * one peer gets from it (event, heartbeat, pong, SACK…) leave as one packet
+   * when it ends — before control returns to the event loop.
+   */
+  private readonly bundle: { cork(): void; uncork(): void } | null;
 
   constructor(opts: HostRoomOptions) {
     this.transport = opts.transport;
+    const b = (opts.transport as Partial<HostTransport>).backend;
+    this.bundle = b !== undefined && b.cork !== undefined && b.uncork !== undefined ? (b as { cork(): void; uncork(): void }) : null;
     this.state = opts.state ?? createHostRoomState();
     this.now = opts.now ?? (() => performance.now());
     this.hbFrames = opts.heartbeatFrames ?? HostDefaults.heartbeatFrames;
@@ -615,8 +624,14 @@ export class HostRoom {
       this.deferred.push(fn);
       return;
     }
-    this.invoke(fn);
-    this.settle();
+    const b = this.bundle;
+    if (b !== null) b.cork();
+    try {
+      this.invoke(fn);
+      this.settle();
+    } finally {
+      if (b !== null) b.uncork();
+    }
   }
 
   /** After a top-level operation: run the actions deferred by hooks, then re-arm the clock. */
@@ -856,11 +871,19 @@ export class HostRoom {
     const c = this.connectionOf(peer);
     if (c === null || c.closed) return;
     if (this.sequencer.busy) {
-      this.deferred.push(() => this.processMessage(c, data));
+      // `data` may be a transient view (haxlite-rtc backend): copy what outlives the call
+      const copy = data.slice();
+      this.deferred.push(() => this.processMessage(c, copy));
       return;
     }
-    this.processMessage(c, data);
-    this.settle();
+    const b = this.bundle;
+    if (b !== null) b.cork();
+    try {
+      this.processMessage(c, data);
+      this.settle();
+    } finally {
+      if (b !== null) b.uncork();
+    }
   }
 
   private processMessage(c: HostConnection, data: Uint8Array): void {

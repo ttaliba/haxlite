@@ -297,7 +297,11 @@ export class HostTransport {
   onRoomLink: ((link: string, roomId: string) => void) | null = null;
   /** A verified player is ready: send it the snapshot. */
   onPeerJoin: ((peer: Peer, info: JoinInfo) => void) | null = null;
-  /** A message from a joined peer (raw bytes, type byte first). Flood-checked already. */
+  /**
+   * A message from a joined peer (raw bytes, type byte first). Flood-checked
+   * already. `data` is only valid during the call (the `rtc` backend may hand
+   * out a view of a reused buffer): copy it to keep it.
+   */
   onPeerMessage: ((peer: Peer, data: Uint8Array, channel: number) => void) | null = null;
   /** A joined peer is gone (not called for peers that never joined). */
   onPeerClose: ((peer: Peer, reason: PeerCloseReason) => void) | null = null;
@@ -1003,7 +1007,8 @@ export class HostTransport {
       return;
     }
     if (state === 'challenged' && data.length > 0 && data[0] === 0) {
-      this.handleHandshake(peer, data).catch((err: unknown) => {
+      // copy: `data` may be a transient view (rtc backend) and the handshake spans an await
+      this.handleHandshake(peer, data.slice()).catch((err: unknown) => {
         this.reportError(err);
         this.safely(() => this.closePeer(peer, 'protocol'));
       });

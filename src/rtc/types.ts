@@ -31,8 +31,17 @@ export interface SctpAssociationOptions {
   localPort?: number;
   /** Peer SCTP port (a=sctp-port of the offer, default 5000). */
   remotePort?: number;
-  /** A complete user message. The receiver may keep `data`. */
+  /**
+   * A complete user message. The receiver may keep `data` unless
+   * {@link transientDelivery} is set.
+   */
   onMessage(channelId: number, data: Uint8Array): void;
+  /**
+   * `onMessage` data may be a view into a scratch buffer of the association,
+   * valid only during the callback (0 allocations per received message).
+   * Data layers that do not know the option ignore it (and deliver fresh buffers).
+   */
+  transientDelivery?: boolean;
   /** Exceptions thrown by the callbacks above. */
   onError?(err: unknown): void;
   /** Association established: the channels are usable. */
@@ -44,7 +53,7 @@ export interface SctpAssociationOptions {
 }
 
 export interface SctpAssociationLike {
-  /** One decrypted DTLS application-data record (freshly allocated; may be kept). */
+  /** One decrypted DTLS application-data record (a view of the received datagram, not reused; may be kept). */
   input(packet: Uint8Array): void;
   /** Queues a user message; false when not open or over the buffer limit. */
   send(channelId: number, data: Uint8Array): boolean;
@@ -75,6 +84,10 @@ export interface RtcSession {
   addRemoteCandidate(candidate: string): void;
   onOpen?: () => void;
   onClose?: (reason: string) => void;
+  /**
+   * One received message. `data` is valid only during the callback (it may
+   * be a view into a reused buffer of the data layer): copy it to keep it.
+   */
   onMessage?: (channelId: number, data: Uint8Array) => void;
   /**
    * One data channel was closed by the browser (`dc.close()` → SCTP stream

@@ -16,3 +16,4 @@ export {
   type SctpFactory,
 } from './types.js';
 export { rawDataLayer } from './raw-layer.js';
+export { acquireSharedEndpoint, sharedEndpointCount, type SharedEndpointLease } from './shared.js';

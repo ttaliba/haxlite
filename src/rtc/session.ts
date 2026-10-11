@@ -29,8 +29,12 @@ export interface SessionHost {
   readonly mtu: number;
   readonly maxMessageSize: number;
   readonly sctpPort: number;
-  /** Sends a datagram; counts it. */
-  sendTo(dest: ValidatedAddress, buf: Buffer): void;
+  /** Sends buf[0, length) (default: all of it) synchronously; counts it. */
+  sendTo(dest: ValidatedAddress, buf: Buffer, length?: number): void;
+  /** Shared scratch buffer (≥ size bytes) to seal one outgoing record into right before {@link sendTo}. */
+  sendBuffer(size: number): Buffer;
+  /** DTLS cipher suites in preference order (undefined: the DTLS default). */
+  readonly suites: readonly number[] | undefined;
   /** Registers `dest` in the 5-tuple map (stealing it from another session if needed). */
   bindAddress(dest: ValidatedAddress): void;
   /** Removes the session from every map. */
@@ -101,10 +105,12 @@ export class RtcSessionImpl implements RtcSession {
       certificate: host.certificate,
       remoteFingerprint: { algorithm: offer.fingerprintAlgorithm, digest: offer.fingerprint },
       mtu: host.mtu,
-      send: (d) => {
+      ...(host.suites !== undefined ? { suites: host.suites } : null),
+      send: (d, len) => {
         const dest = this.dest;
-        if (dest !== null) this.host.sendTo(dest, d);
+        if (dest !== null) this.host.sendTo(dest, d, len);
       },
+      sendBuffer: host.sendBuffer,
       onConnected: () => this.onDtlsConnected(),
       onData: (d) => {
         const s = this.sctp;
@@ -227,6 +233,8 @@ export class RtcSessionImpl implements RtcSession {
         channels: HAXBALL_CHANNELS.map((c) => ({ ...c })),
         maxMessageSize: this.offer.maxMessageSize,
         maxReceiveMessageSize: this.host.maxMessageSize,
+        // onMessage data is only valid during the callback (documented on RtcSession.onMessage)
+        transientDelivery: true,
         onError: reportError,
         localPort: this.host.sctpPort,
         remotePort: this.offer.sctpPort,

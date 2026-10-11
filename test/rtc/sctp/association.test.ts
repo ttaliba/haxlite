@@ -308,6 +308,99 @@ describe('payload edge cases', () => {
     p.sim.run(1000);
     expect(byCh(p.b, 1).length).toBe(30);
   });
+
+  it('while corked, the end-of-input SACK waits and leaves bundled with data of several streams', () => {
+    const p = makePair({ recordWire: true });
+    expect(connectPair(p)).toBe(true);
+    p.b.sctp.cork();
+    const before = p.b.wire.length;
+    p.a.sctp.send(0, msg(0, 1));
+    p.a.sctp.send(0, msg(0, 2));
+    p.sim.run(50); // b received both packets (SACK owed at once: 2 packets) but is corked
+    expect(byCh(p.b, 0).length).toBe(2);
+    expect(p.b.wire.length).toBe(before);
+    for (const ch of [1, 2, 0]) expect(p.b.sctp.send(ch, msg(ch, 7))).toBe(true);
+    p.b.sctp.uncork();
+    const out = p.b.wire.slice(before);
+    expect(out.length).toBe(1);
+    expect(chunkTypes(out[0])).toEqual([3, 0, 0, 0]); // SACK + 3 DATA chunks
+    expect(dataChunks(out[0]).map((c) => c.sid)).toEqual([1, 2, 0]);
+    p.sim.run(1000);
+    expect(p.a.received.map((r) => r.ch)).toEqual([1, 2, 0]);
+    expect(p.a.sctp.bufferedAmount).toBe(0);
+    noErrors(p.a, p.b);
+  });
+
+  it('nested cork: only the outermost uncork sends', () => {
+    const p = makePair({ recordWire: true });
+    expect(connectPair(p)).toBe(true);
+    const before = p.a.wire.length;
+    p.a.sctp.cork();
+    p.a.sctp.cork();
+    p.a.sctp.send(1, msg(1, 1));
+    p.a.sctp.uncork();
+    expect(p.a.wire.length).toBe(before);
+    p.a.sctp.uncork();
+    p.a.sctp.uncork(); // unbalanced extra uncork is harmless
+    expect(p.a.wire.length).toBe(before + 1);
+  });
+
+  for (const seed of [11, 12, 13]) {
+    it(`seed ${seed}: per-iteration corking (sends and inputs) over a lossy link keeps channel semantics`, () => {
+      // Every "loop iteration" of a side (a tick or a packet arrival) runs corked
+      // and uncorks at its end, like the rtc backend's setImmediate bundling.
+      const p = makePair({ seed, link: { loss: 0.1, dup: 0.05, delay: 25, jitter: 30 }, recordWire: true });
+      expect(connectPair(p)).toBe(true);
+      for (const side of [p.a, p.b]) {
+        const s = side.sctp;
+        const input = s.input.bind(s);
+        s.input = (pkt: Uint8Array) => {
+          s.cork();
+          input(pkt);
+          s.uncork();
+        };
+      }
+      const N = 400;
+      let i = 0;
+      const tick = (): void => {
+        p.a.sctp.cork();
+        p.b.sctp.cork();
+        for (let k = 0; k < 4 && i < N; k++, i++) {
+          for (const ch of [0, 1, 2]) {
+            expect(p.a.sctp.send(ch, msg(ch, i, 20 + ((i * 37) % 300)))).toBe(true);
+            expect(p.b.sctp.send(ch, msg(ch, i, 20 + ((i * 53) % 300)))).toBe(true);
+          }
+        }
+        p.a.sctp.uncork();
+        p.b.sctp.uncork();
+        if (i < N) p.sim.at(16, tick);
+      };
+      tick();
+      p.sim.runUntil(() => i >= N && byCh(p.b, 0).length === N && byCh(p.b, 1).length === N && byCh(p.a, 0).length === N && byCh(p.a, 1).length === N, 300_000);
+      p.sim.run(5000);
+      for (const [rx, tx] of [
+        [p.b, p.a],
+        [p.a, p.b],
+      ] as const) {
+        expect(byCh(rx, 0).map(msgId)).toEqual([...Array(N).keys()]);
+        expect(byCh(rx, 0).every((m) => checkMsg(0, m))).toBe(true);
+        const ru = byCh(rx, 1);
+        expect(new Set(ru.map(msgId)).size).toBe(N);
+        expect(ru.every((m) => checkMsg(1, m))).toBe(true);
+        const uu = byCh(rx, 2).map(msgId);
+        expect(new Set(uu).size).toBe(uu.length);
+        expect(uu.length).toBeLessThan(N);
+        const tsns = tx.wire.flatMap(dataChunks).filter((c) => c.sid === 2).map((c) => c.tsn);
+        expect(new Set(tsns).size).toBe(tsns.length); // uu never retransmitted
+        expect(tx.wire.every((w) => w.length <= 1200)).toBe(true);
+        // real bundling happened: packets with DATA of several streams
+        expect(tx.wire.some((w) => new Set(dataChunks(w).map((c) => c.sid)).size === 3)).toBe(true);
+        expect(tx.sctp.stats().retransmissions).toBeGreaterThan(0);
+        expect(tx.sctp.bufferedAmount).toBe(0);
+      }
+      noErrors(p.a, p.b);
+    });
+  }
 });
 
 describe('zero checksum (RFC 9653)', () => {
@@ -439,5 +532,36 @@ describe('congestion / timers', () => {
     // Nothing outstanding: no more events once idle.
     p.sim.run(1000);
     expect(p.sim.step()).toBe(false);
+  });
+});
+
+describe('transientDelivery', () => {
+  it('hands out reused scratch views (valid during the call); fragmented messages stay correct', () => {
+    const seen: Uint8Array[] = [];
+    const copies: { ch: number; data: Uint8Array }[] = [];
+    const p = makePair({
+      optsB: {
+        transientDelivery: true,
+        onMessage: (ch, d) => {
+          seen.push(d);
+          copies.push({ ch, data: d.slice() });
+        },
+      },
+    });
+    expect(connectPair(p)).toBe(true);
+    for (let i = 0; i < 20; i++) p.a.sctp.send(i % 3 === 2 ? 1 : 0, msg(i % 3 === 2 ? 1 : 0, i, 30));
+    p.a.sctp.send(0, msg(0, 100, 5000)); // fragmented: an owned copy
+    p.a.sctp.send(1, new Uint8Array(0));
+    p.sim.run(2000);
+    expect(copies.length).toBe(22);
+    for (const c of copies.slice(0, 20)) expect(checkMsg(c.ch, c.data)).toBe(true);
+    expect(checkMsg(0, copies[20].data)).toBe(true);
+    expect(copies[20].data.length).toBe(5000);
+    expect(copies[21].data.length).toBe(0);
+    // every 30-byte delivery was the same view object (no allocation per message)
+    const small = seen.slice(0, 20);
+    expect(new Set(small).size).toBe(1);
+    expect(small[0].length).toBe(30);
+    noErrors(p.a, p.b);
   });
 });

@@ -119,12 +119,34 @@ describe.skipIf(!hasChromium)('Chromium ↔ haxlite-rtc (ICE-lite + DTLS)', () =
     expect(offer).toContain('m=application');
     expect(result.state).toBe('connected');
     expect(result.dtls).toMatchObject({ dtlsState: 'connected', dtlsRole: 'client', tlsVersion: 'FEFD' });
+    // Chromium offers ChaCha20-Poly1305 in DTLS 1.2 and we prefer it (allocation-free JS AEAD)
+    expect(result.dtls).toMatchObject({ dtlsCipher: 'TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256' });
+    expect((session as unknown as RtcSessionImpl).cipherSuite).toBe('TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256');
     expect(session.remoteAddress).not.toBeNull();
     // the browser keeps ICE consent alive; our side is past the DTLS handshake
     expect(['dtls', 'open']).toContain(session.state);
     console.log(`[chromium ${browser.version()}] connected in ${result.ms} ms, ${JSON.stringify(result.dtls)}`);
     session.close();
     await page.close();
+  }, 30_000);
+
+  it('cipherSuites: AES-128-GCM preferred by configuration is negotiated with Chromium too', async () => {
+    const aesEp = await RtcEndpoint.listen({ address: '127.0.0.1', publicAddresses: ['127.0.0.1'], dataLayer: rawDataLayer, cipherSuites: ['aes128gcm', 'chacha20'] });
+    try {
+      const page = await newPage();
+      const offer = await page.evaluate((ch: typeof HAXBALL) => (globalThis as G).makeOffer(ch) as Promise<string>, HAXBALL);
+      const session = aesEp.createSession(offer);
+      const result = await page.evaluate(
+        (a: [string, number]) => (globalThis as G).applyAnswer(a[0], a[1]) as Promise<PageResult>,
+        [session.answerSdp, 10_000] as [string, number],
+      );
+      expect(result.state).toBe('connected');
+      expect(result.dtls).toMatchObject({ dtlsCipher: 'TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256' });
+      session.close();
+      await page.close();
+    } finally {
+      await aesEp.close();
+    }
   }, 30_000);
 
   it('a wrong answer fingerprint makes Chromium fail (it verifies our certificate)', async () => {

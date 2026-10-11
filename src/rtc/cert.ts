@@ -8,6 +8,7 @@ import {
   X509Certificate,
   createHash,
   createPrivateKey,
+  generateKeyPair,
   generateKeyPairSync,
   randomBytes,
   sign,
@@ -108,6 +109,43 @@ const OID_CN = '2.5.4.3';
 
 // ---------------------------------------------------------------- certificate
 
+interface CertOptions {
+  commonName?: string;
+  validDays?: number;
+}
+
+/** DER of a self-signed v3 certificate for `spki`, signed by `signer`. */
+function buildCertificate(spki: Uint8Array, opts: CertOptions, signer: (tbs: Uint8Array) => Uint8Array): Buffer;
+function buildCertificate(spki: Uint8Array, opts: CertOptions, signer: (tbs: Uint8Array) => Promise<Uint8Array>): Promise<Buffer>;
+function buildCertificate(
+  spki: Uint8Array,
+  opts: CertOptions,
+  signer: (tbs: Uint8Array) => Uint8Array | Promise<Uint8Array>,
+): Buffer | Promise<Buffer> {
+  const serial = randomBytes(16);
+  serial[0] = serial[0]! & 0x7f;
+  if (serial[0] === 0) serial[0] = 1;
+  const name = derSeq(derSet(derSeq(derOid(OID_CN), derUtf8(opts.commonName ?? 'haxlite'))));
+  const now = Date.now();
+  const notBefore = new Date(now - 86_400_000);
+  const notAfter = new Date(now + (opts.validDays ?? 365) * 86_400_000);
+  const algId = derSeq(derOid(OID_ECDSA_SHA256));
+  const tbs = derSeq(
+    derExplicit(0, derSmallInt(2)), // v3
+    derUInt(serial),
+    algId,
+    name,
+    derSeq(derTime(notBefore), derTime(notAfter)),
+    name,
+    spki,
+  );
+  const finish = (sig: Uint8Array) => Buffer.from(derSeq(tbs, algId, derBitString(sig)));
+  const sig = signer(tbs);
+  return sig instanceof Promise ? sig.then(finish) : finish(sig);
+}
+
+let processDefault: Promise<RtcCertificate> | null = null;
+
 /** Our DTLS identity: private key + DER certificate + SDP fingerprint. */
 export class RtcCertificate {
   /** DER of the X.509 certificate. */
@@ -115,52 +153,97 @@ export class RtcCertificate {
   readonly privateKey: KeyObject;
   /** sha-256 of {@link der} (the SDP a=fingerprint). */
   readonly fingerprint: Uint8Array;
-  readonly x509: X509Certificate;
+  private parsed: X509Certificate | null;
 
-  private constructor(derBytes: Buffer, privateKey: KeyObject) {
+  /** `x509` given = imported (validated); null = built here from `privateKey` (trusted, parsed on demand). */
+  private constructor(derBytes: Buffer, privateKey: KeyObject, x509: X509Certificate | null) {
     this.der = derBytes;
     this.privateKey = privateKey;
     this.fingerprint = createHash('sha256').update(derBytes).digest();
-    this.x509 = new X509Certificate(derBytes);
-    if (this.x509.publicKey.asymmetricKeyType !== 'ec' || privateKey.asymmetricKeyDetails?.namedCurve !== 'prime256v1') {
-      throw new Error('RtcCertificate: only ECDSA P-256 keys are supported');
+    this.parsed = x509;
+    if (x509 !== null) {
+      if (x509.publicKey.asymmetricKeyType !== 'ec' || privateKey.asymmetricKeyDetails?.namedCurve !== 'prime256v1') {
+        throw new Error('RtcCertificate: only ECDSA P-256 keys are supported');
+      }
+      if (!x509.checkPrivateKey(privateKey)) throw new Error('RtcCertificate: key does not match certificate');
     }
-    if (!this.x509.checkPrivateKey(privateKey)) throw new Error('RtcCertificate: key does not match certificate');
+  }
+
+  /** The parsed certificate (parsed lazily for generated ones: nothing on the hot path needs it). */
+  get x509(): X509Certificate {
+    return (this.parsed ??= new X509Certificate(this.der));
   }
 
   /**
    * New self-signed ECDSA P-256 certificate (CN = `commonName`, random
-   * serial, valid from 1 day ago for `validDays`).
+   * serial, valid from 1 day ago for `validDays`). Synchronous (≈ 1–3 ms on
+   * the main thread); see {@link generateAsync}.
    */
-  static generate(opts: { commonName?: string; validDays?: number } = {}): RtcCertificate {
+  static generate(opts: CertOptions = {}): RtcCertificate {
     const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
     const spki = publicKey.export({ type: 'spki', format: 'der' });
-    const serial = randomBytes(16);
-    serial[0] = serial[0]! & 0x7f;
-    if (serial[0] === 0) serial[0] = 1;
-    const name = derSeq(derSet(derSeq(derOid(OID_CN), derUtf8(opts.commonName ?? 'haxlite'))));
-    const now = Date.now();
-    const notBefore = new Date(now - 86_400_000);
-    const notAfter = new Date(now + (opts.validDays ?? 365) * 86_400_000);
-    const algId = derSeq(derOid(OID_ECDSA_SHA256));
-    const tbs = derSeq(
-      derExplicit(0, derSmallInt(2)), // v3
-      derUInt(serial),
-      algId,
-      name,
-      derSeq(derTime(notBefore), derTime(notAfter)),
-      name,
-      new Uint8Array(spki),
+    const der = buildCertificate(spki, opts, (tbs) => sign('sha256', tbs, { key: privateKey, dsaEncoding: 'der' }));
+    return new RtcCertificate(der, privateKey, null);
+  }
+
+  /** Like {@link generate}, with key generation and signing on the libuv thread pool. */
+  static async generateAsync(opts: CertOptions = {}): Promise<RtcCertificate> {
+    const { privateKey, publicKey } = await new Promise<{ privateKey: KeyObject; publicKey: KeyObject }>((resolve, reject) =>
+      generateKeyPair('ec', { namedCurve: 'prime256v1' }, (err, publicKey, privateKey) => (err ? reject(err) : resolve({ publicKey, privateKey }))),
     );
-    const sig = sign('sha256', tbs, { key: privateKey, dsaEncoding: 'der' });
-    const cert = derSeq(tbs, algId, derBitString(sig));
-    return new RtcCertificate(Buffer.from(cert), privateKey);
+    const spki = publicKey.export({ type: 'spki', format: 'der' });
+    const der = await buildCertificate(
+      spki,
+      opts,
+      (tbs) => new Promise<Uint8Array>((resolve, reject) => sign('sha256', tbs, { key: privateKey, dsaEncoding: 'der' }, (err, sig) => (err ? reject(err) : resolve(sig)))),
+    );
+    return new RtcCertificate(der, privateKey, null);
+  }
+
+  /**
+   * The process-wide default certificate: generated once (asynchronously) and
+   * shared by every endpoint that is not given one. WebRTC authenticates it
+   * only through the SDP fingerprint of each answer, so sharing it between
+   * rooms reveals nothing a player could not already see.
+   */
+  static processDefault(): Promise<RtcCertificate> {
+    const p = (processDefault ??= RtcCertificate.generateAsync());
+    p.catch(() => {
+      if (processDefault === p) processDefault = null; // retry next time
+    });
+    return p;
+  }
+
+  /**
+   * Persistent identity: loads the PEM certificate + key from `file`, or
+   * generates one and writes it there (mode 0600) when the file is missing or
+   * its certificate expires within a day. Saves the key generation at every
+   * start and keeps the fingerprint stable across restarts.
+   */
+  static async loadOrCreate(file: string, opts: CertOptions = {}): Promise<RtcCertificate> {
+    const fs = await import('node:fs/promises');
+    let text: string | null = null;
+    try {
+      text = await fs.readFile(file, 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+    if (text !== null) {
+      const cert = RtcCertificate.fromPem(text, text);
+      if (Date.parse(cert.x509.validTo) - Date.now() > 86_400_000) return cert;
+    }
+    const cert = await RtcCertificate.generateAsync(opts);
+    const pem = cert.toPem();
+    const tmp = `${file}.${process.pid}.tmp`;
+    await fs.writeFile(tmp, pem.cert + pem.key, { mode: 0o600 });
+    await fs.rename(tmp, file);
+    return cert;
   }
 
   /** From PEM/DER certificate + PEM private key (persisted identity). */
   static fromPem(certPem: string | Buffer, keyPem: string | Buffer): RtcCertificate {
     const x = new X509Certificate(certPem);
-    return new RtcCertificate(x.raw, createPrivateKey(keyPem));
+    return new RtcCertificate(x.raw, createPrivateKey(keyPem), x);
   }
 
   /** PEM export (`{ cert, key }`). */

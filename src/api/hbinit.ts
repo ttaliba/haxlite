@@ -314,7 +314,15 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     const cb = roomLinkHandler;
     if (cb != null) cb(link);
     else pendingLink = link;
-    finishInit(null);
+    // peerBackend 'rtc' binds its UDP socket during signaling: resolve once it
+    // listens (rtcPort set), or reject with the listen error
+    const b = transport.backend;
+    if (!initialized && b instanceof RtcPeerBackend && !b.ready) {
+      b.whenListening().then(
+        () => finishInit(null),
+        (err: unknown) => finishInit(err),
+      );
+    } else finishInit(null);
   };
 
   /** Official `c(event)`: apply in a microtask, in call order. */

@@ -12,6 +12,8 @@ import { buildAnswer, hostCandidates, parseOffer, type HostCandidate } from './s
 import { RtcSessionImpl, type SessionHost, type ValidatedAddress } from './session.js';
 import { StunMessage, StunType, parseStun } from './stun.js';
 import { SctpAssociation } from './sctp/index.js';
+import { DtlsServer } from './dtls/server.js';
+import { resolveSuites } from './dtls/crypto.js';
 import type { RtcSession, SctpFactory } from './types.js';
 
 export interface RtcEndpointOptions {
@@ -23,7 +25,10 @@ export interface RtcEndpointOptions {
   publicAddresses: string[];
   /** Advertised port when a 1:1 NAT maps a different one (default: the bound port). */
   publicPort?: number;
+  /** DTLS identity (default: {@link certificateFile} if set, else the process-wide {@link RtcCertificate.processDefault}). */
   certificate?: RtcCertificate;
+  /** Load/persist the DTLS identity in this PEM file ({@link RtcCertificate.loadOrCreate}). */
+  certificateFile?: string;
   /** Close an open session after this long without ICE consent (default 30 000 ms). */
   idleTimeoutMs?: number;
   /** Close a session not open this long after createSession (default 20 000 ms). */
@@ -37,6 +42,13 @@ export interface RtcEndpointOptions {
   maxMessageSize?: number;
   /** Socket buffer sizes (best effort, default 4 MiB). */
   socketBufferSize?: number;
+  /**
+   * DTLS cipher suites in server preference order, as IANA names, ids or
+   * `'chacha20'` / `'aes128gcm'` / `'aes256gcm'`. Default: ChaCha20-Poly1305
+   * (allocation-free JS AEAD), AES-128-GCM, AES-256-GCM — browsers without
+   * ChaCha20 get AES-GCM.
+   */
+  cipherSuites?: readonly (number | string)[];
 }
 
 export interface RtcEndpointStats {
@@ -73,9 +85,20 @@ function randomIceString(n: number): string {
 /** Default data-channel layer: R2's SCTP association (src/rtc/sctp). */
 const defaultDataLayer: SctpFactory = (o) => new SctpAssociation(o);
 
+/**
+ * dgram `lookup` for IP literals: answers synchronously. Every address this
+ * endpoint binds or sends to is an IP literal (validated public/bind
+ * addresses, kernel-reported sources), so the default `dns.lookup` only adds a
+ * `process.nextTick` hop and two closures per datagram — and makes the send
+ * asynchronous, which would forbid reusing the send buffer.
+ */
+function literalLookup(address: string, family: unknown, cb: (err: Error | null, address: string, family: number) => void): void {
+  cb(null, address, typeof family === 'number' ? family : isIP(address));
+}
+
 function bindSocket(type: 'udp4' | 'udp6', address: string, port: number, bufSize: number): Promise<Socket> {
   return new Promise((resolve, reject) => {
-    const sock = dgram.createSocket({ type, ipv6Only: type === 'udp6', reuseAddr: false });
+    const sock = dgram.createSocket({ type, ipv6Only: type === 'udp6', reuseAddr: false, lookup: literalLookup as never });
     const onError = (err: Error) => {
       sock.close();
       reject(err);
@@ -106,6 +129,8 @@ export class RtcEndpoint {
   /** remote address → remote port → validated address (DTLS demux). */
   private readonly byAddress = new Map<string, Map<number, ValidatedAddress>>();
   private readonly stunScratch = new StunMessage();
+  /** Shared seal buffer for outgoing records (replaced if the kernel ever queues a send that still references it). */
+  private sendScratch: Buffer = Buffer.allocUnsafeSlow(2048);
   private readonly host: SessionHost;
   private sweepTimer: NodeJS.Timeout | null = null;
   private closed = false;
@@ -145,14 +170,24 @@ export class RtcEndpoint {
       mtu: opts.mtu ?? 1200,
       maxMessageSize: opts.maxMessageSize ?? 262144,
       sctpPort: 5000,
-      sendTo: (dest, buf) => {
+      suites: opts.cipherSuites !== undefined ? resolveSuites(opts.cipherSuites) : undefined,
+      sendTo: (dest, buf, length = buf.length) => {
         counters.packetsOut++;
-        counters.bytesOut += buf.length;
+        counters.bytesOut += length;
+        const sock = dest.sock;
         try {
-          dest.sock.send(buf, dest.port, dest.address);
+          // synchronous (literalLookup): dgram tries the send right away
+          sock.send(buf, 0, length, dest.port, dest.address);
         } catch {
           /* socket closed */
+          return;
         }
+        // EAGAIN: libuv queued the datagram and still references `buf`: never reuse it
+        if (buf === this.sendScratch && sock.getSendQueueCount() !== 0) this.sendScratch = Buffer.allocUnsafeSlow(buf.length);
+      },
+      sendBuffer: (size) => {
+        if (this.sendScratch.length < size) this.sendScratch = Buffer.allocUnsafeSlow(Math.min(Math.max(size, 2 * this.sendScratch.length), DtlsServer.MAX_RECORD));
+        return this.sendScratch;
       },
       bindAddress: (v) => this.bindAddress(v),
       unregister: (s) => this.unregister(s),
@@ -181,6 +216,14 @@ export class RtcEndpoint {
     let port = opts.port ?? 0;
     const sockets: Socket[] = [];
     const dataLayer = opts.dataLayer ?? defaultDataLayer;
+    // the key pair is generated on the thread pool while the socket binds
+    const certificatePromise: Promise<RtcCertificate> =
+      opts.certificate !== undefined
+        ? Promise.resolve(opts.certificate)
+        : opts.certificateFile !== undefined
+          ? RtcCertificate.loadOrCreate(opts.certificateFile)
+          : RtcCertificate.processDefault();
+    certificatePromise.catch(() => {}); // awaited below (unless binding fails first)
     try {
       if (opts.address !== undefined) {
         const fam = isIP(opts.address);
@@ -209,7 +252,14 @@ export class RtcEndpoint {
       throw err;
     }
     port = sockets[0]!.address().port;
-    return new RtcEndpoint(opts, sockets, port, opts.certificate ?? RtcCertificate.generate(), dataLayer);
+    let certificate: RtcCertificate;
+    try {
+      certificate = await certificatePromise;
+    } catch (err) {
+      for (const s of sockets) s.close();
+      throw err;
+    }
+    return new RtcEndpoint(opts, sockets, port, certificate, dataLayer);
   }
 
   /** Our candidate lines (no `a=`), identical for every session. */

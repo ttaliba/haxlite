@@ -29,6 +29,7 @@ export interface PeerLinkEvents {
    */
   onChannelOpen(index: number, remoteAddress: string | null): void;
   onChannelClosed(index: number): void;
+  /** A message on channel `index`. Binary `data` is only valid during the call (copy to keep it). */
   onMessage(index: number, data: string | Uint8Array): void;
   /** Connection-level `failed`/`closed`. */
   onConnectionState(state: 'failed' | 'closed'): void;
@@ -82,6 +83,13 @@ export interface PeerBackend {
    * backend send one tunnel message instead of one per player.
    */
   sendMany?(links: readonly PeerLink[], channel: number, data: Uint8Array): void;
+  /**
+   * Optional bundling scope (nestable): the sends issued until the matching
+   * {@link uncork} may be held and sent together (one packet per peer) when
+   * the outermost scope ends. HostRoom wraps each wake-up / message / action.
+   */
+  cork?(): void;
+  uncork?(): void;
 }
 
 export interface LocalPeerBackendOptions {

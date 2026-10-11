@@ -103,14 +103,28 @@ describe.skipIf(!hasOpenssl)('DTLS server ↔ openssl s_client -dtls1_2', () => 
   const ec = ecClientCert();
   const certArgs = (c = ec) => ['-cert', c.certFile, '-key', c.keyFile];
 
-  it('default handshake: x25519 + AES-128-GCM, echo works', async () => {
+  it('default handshake: x25519 + ChaCha20-Poly1305 (our first preference), echo works', async () => {
     h = await startDtlsHarness({ fingerprint: ec.sha256 });
     const r = await runOpenssl(h.port, certArgs(), ['hello', 'world']);
     expect(r.echoed).toBe(true);
     const srv = h.events.connected[0]!;
-    expect(srv.suite?.name).toBe('TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256');
+    expect(srv.suite?.name).toBe('TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256');
     expect(srv.group).toBe(29);
     expect(h.events.data).toEqual(['hello\n', 'world\n']);
+  }, 20_000);
+
+  it('server preference AES-128-GCM first (configurable), echo works', async () => {
+    h = await startDtlsHarness({ fingerprint: ec.sha256, suites: [0xc02b, 0xcca9] });
+    const r = await runOpenssl(h.port, certArgs(), ['hello']);
+    expect(r.echoed).toBe(true);
+    expect(h.events.connected[0]!.suite?.name).toBe('TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256');
+  }, 20_000);
+
+  it('client without ChaCha20 gets AES-128-GCM', async () => {
+    h = await startDtlsHarness({ fingerprint: ec.sha256 });
+    const r = await runOpenssl(h.port, [...certArgs(), '-cipher', 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384'], ['x']);
+    expect(r.echoed).toBe(true);
+    expect(h.events.connected[0]!.suite?.name).toBe('TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256');
   }, 20_000);
 
   it.each([
@@ -162,8 +176,13 @@ describe.skipIf(!hasOpenssl)('DTLS server ↔ openssl s_client -dtls1_2', () => 
     expect(r.echoed).toBe(true);
   }, 20_000);
 
-  it('drops replayed records (every client datagram delivered twice)', async () => {
-    h = await startDtlsHarness({ fingerprint: ec.sha256, mangle: (d) => [d, d] });
+  const RECORD_SUITES: [string, number[] | undefined][] = [
+    ['ChaCha20-Poly1305 (JS, in place)', undefined],
+    ['AES-128-GCM (node:crypto)', [0xc02b]],
+  ];
+
+  it.each(RECORD_SUITES)('drops replayed records (every client datagram delivered twice) — %s', async (_n, suites) => {
+    h = await startDtlsHarness({ fingerprint: ec.sha256, mangle: (d) => [d, d], ...(suites ? { suites } : {}) });
     const r = await runOpenssl(h.port, certArgs(), ['one', 'two', 'three']);
     expect(r.echoed).toBe(true);
     expect(h.events.data).toEqual(['one\n', 'two\n', 'three\n']); // each exactly once
@@ -171,10 +190,11 @@ describe.skipIf(!hasOpenssl)('DTLS server ↔ openssl s_client -dtls1_2', () => 
     expect(srv.replayed).toBeGreaterThanOrEqual(4); // Finished + 3 data records (at least)
   }, 20_000);
 
-  it('drops records that do not authenticate', async () => {
+  it.each(RECORD_SUITES)('drops records that do not authenticate — %s', async (_n, suites) => {
     let corrupted = 0;
     h = await startDtlsHarness({
       fingerprint: ec.sha256,
+      ...(suites ? { suites } : {}),
       mangle: (d) => {
         if (d[0] === 23 && corrupted === 0) {
           corrupted++;

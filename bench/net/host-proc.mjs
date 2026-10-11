@@ -138,6 +138,8 @@ async function haxliteFactory() {
     host.start();
     return {
       players: () => host.getPlayerList().map((p) => p.id),
+      // haxlite-rtc endpoint counters (UDP datagrams in/out), null for other backends
+      rtcStats: () => transport.backend?.stats?.() ?? null,
       setTeam: (id, t) => host.setPlayerTeam(id, t),
       startGame: () => {
         host.setScoreLimit(0);
@@ -448,6 +450,20 @@ function stopMeasure() {
 
 // ------------------------------------------------------------- main
 
+/** Summed haxlite-rtc endpoint counters of every room (null when no room uses peerBackend 'rtc'). */
+function rtcTotals() {
+  let out = null;
+  for (const r of rooms) {
+    const st = r.rtcStats?.();
+    if (!st) continue;
+    out ??= { packetsIn: 0, packetsOut: 0, bytesOut: 0 };
+    out.packetsIn += st.packetsIn;
+    out.packetsOut += st.packetsOut;
+    out.bytesOut += st.bytesOut;
+  }
+  return out;
+}
+
 const factories = { haxlite: haxliteFactory, official: officialFactory, nodehaxball: nodeHaxballFactory };
 const factory = factories[impl.split(':')[0]];
 if (!factory) throw new Error(`unknown impl ${impl}`);
@@ -489,12 +505,21 @@ process.on('message', (msg) => {
       case 'measure-start':
         profileStart();
         startMeasure(msg);
+        meas.rtc0 = rtcTotals();
         send({ type: 'measuring' });
         break;
-      case 'measure-stop':
-        send({ type: 'stats', stats: stopMeasure(), players: rooms.map((r) => r.players().length) });
+      case 'measure-stop': {
+        const rtc0 = meas?.rtc0 ?? null;
+        const stats = stopMeasure();
+        const rtc1 = rtcTotals();
+        if (rtc0 !== null && rtc1 !== null) {
+          const perS = (k) => +(((rtc1[k] - rtc0[k]) / stats.wallMs) * 1000).toFixed(1);
+          stats.rtc = { packetsInPerS: perS('packetsIn'), packetsOutPerS: perS('packetsOut'), bytesOutPerS: perS('bytesOut') };
+        }
+        send({ type: 'stats', stats, players: rooms.map((r) => r.players().length) });
         profileStop();
         break;
+      }
       case 'exit':
         process.exit(0);
     }

@@ -117,7 +117,7 @@ describe.skipIf(!hasChromium)('SctpAssociation ↔ Chromium (dcsctp)', () => {
     const offer = await page.evaluate(() => (globalThis as G).setup() as Promise<string>, null);
     const s = ep.createSession(offer);
     const got: Uint8Array[][] = [[], [], []];
-    s.onMessage = (ch, d) => got[ch].push(d);
+    s.onMessage = (ch, d) => got[ch].push(d.slice()); // data is only valid during the callback
     const opened = new Promise<void>((r) => (s.onOpen = r));
     const states = await page.evaluate((sdp: string) => (globalThis as G).answer(sdp) as Promise<string[]>, s.answerSdp);
     await opened;

@@ -90,10 +90,30 @@ describe("peerBackend: 'rtc' configuration", () => {
     if (detected !== null) expect(detected.length).toBeGreaterThan(0);
   });
 
-  it('a port already in use is reported through onError and the room never registers', async () => {
+  it('rooms with the same settings share one endpoint (one UDP socket); the last one closes it', async () => {
+    const a = await startHost();
+    const b = await startHost();
+    await a.backend.whenListening();
+    await b.backend.whenListening();
+    expect(a.backend.endpoint).not.toBeNull();
+    expect(b.backend.endpoint).toBe(a.backend.endpoint);
+    const own = await startHost({ rtcEndpoint: { ...LOOPBACK, shared: false } });
+    await own.backend.whenListening();
+    expect(own.backend.endpoint).not.toBe(a.backend.endpoint);
+    const ep = a.backend.endpoint!;
+    a.t.stop();
+    await a.backend.whenClosed();
+    expect((ep as unknown as { closed: boolean }).closed).toBe(false); // b still uses it
+    b.t.stop();
+    await b.backend.whenClosed();
+    expect((ep as unknown as { closed: boolean }).closed).toBe(true);
+  });
+
+  it('a port already in use (unshared endpoint) is reported through onError', async () => {
     const first = await startHost();
+    await first.backend.whenListening();
     const port = first.backend.port!;
-    const t = new HostTransport({ token: 'thr1.test', masterUrl: master.httpBase, peerBackend: 'rtc', rtcEndpoint: { ...LOOPBACK, port } });
+    const t = new HostTransport({ token: 'thr1.test', masterUrl: master.httpBase, peerBackend: 'rtc', rtcEndpoint: { ...LOOPBACK, port, shared: false } });
     transports.push(t);
     const err = withTimeout(new Promise<Error>((resolve) => (t.onError = resolve)), 5000, 'onError');
     t.start();

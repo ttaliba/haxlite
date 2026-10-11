@@ -420,6 +420,8 @@ async function main(): Promise<void> {
           `    cpu ${h.cpuPct.toFixed(2)} %  rss ${(h.rssMean / MB).toFixed(1)} MB  heap ${(h.heapUsedMean / MB).toFixed(1)} MB  ` +
             (h.eld ? `lag p50 ${h.eld.p50.toFixed(2)} p99 ${h.eld.p99.toFixed(2)} max ${h.eld.max.toFixed(1)} ms  ` : '') +
             (h.cpuSplit ? `js ${h.cpuSplit.mainPct.toFixed(2)} other ${h.cpuSplit.otherPct.toFixed(2)}  thr ${h.threadCount} fd ${h.fdCount}  wake ${h.wakeups?.voluntaryPerS}/s  ` : '') +
+            `gc ${((h.gcCount / h.wallMs) * 60_000).toFixed(1)}/min ${((h.gcMs / h.wallMs) * 60_000).toFixed(1)} ms/min  ` +
+            (h.rtc ? `udp in ${h.rtc.packetsInPerS}/s out ${h.rtc.packetsOutPerS}/s  ` : '') +
             `link ${run.startup.links[0].createToLinkMs.toFixed(0)} ms  foreign ${run.machine.foreignPct.toFixed(0)} %  valid ${run.valid}`,
         );
       }

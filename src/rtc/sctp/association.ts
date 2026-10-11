@@ -10,13 +10,17 @@
  *   statelessly with an HMAC-protected state cookie.
  * - Hot paths avoid allocations: outgoing payloads are copied into a FIFO
  *   byte arena, chunk metadata lives in typed-array rings indexed by TSN, and
- *   packets are built in a shared module-level buffer. The only steady-state
- *   allocation is the Uint8Array handed to `onMessage` (a copy by default, a
- *   view with `zeroCopyDelivery`).
+ *   packets are built in a shared module-level buffer. The Uint8Array handed
+ *   to `onMessage` is a view of the input packet (`zeroCopyDelivery`, one
+ *   small view object per message), a copy, or — with `transientDelivery` —
+ *   a cached view of a per-association scratch buffer valid only during the
+ *   callback (no allocation at all for unfragmented messages).
  * - `send` never delays (no Nagle): a message is transmitted at once if the
  *   congestion/receive windows allow. Sends issued while processing an
  *   incoming packet (from `onMessage`) or between {@link cork}/{@link uncork}
- *   are bundled into as few packets as possible, together with the SACK.
+ *   are bundled (RFC 9260 §6.10: DATA chunks of any streams, plus the SACK
+ *   and control chunks) into as few MTU-sized packets as possible; while
+ *   corked even the end-of-input flush (SACK) waits for the outermost uncork.
  * - A single timer per association (injectable `setTimer`/`clearTimer`) is
  *   re-armed lazily: a timer that fires early just re-arms.
  * - `input` never throws on malformed packets (everything is bounds-checked
@@ -45,7 +49,10 @@ export interface SctpAssociationOptions {
   channels: SctpChannelConfig[];
   /** Remote max-message-size (from SDP): larger sends are refused. */
   maxMessageSize: number;
-  /** A complete message; the callee may keep `data` (see `zeroCopyDelivery`). */
+  /**
+   * A complete message. The callee may keep `data` unless `transientDelivery`
+   * is set (then it is only valid during the call: copy what you retain).
+   */
   onMessage(channelId: number, data: Uint8Array, ppid: number): void;
   /** Association established (all pre-negotiated channels are open). */
   onOpen(): void;
@@ -85,6 +92,13 @@ export interface SctpAssociationOptions {
    * allocated and never reused). Set false if the caller reuses input buffers.
    */
   zeroCopyDelivery?: boolean;
+  /**
+   * `onMessage` data is only valid during the call (default false): an
+   * unfragmented message is copied into a per-association scratch buffer and
+   * handed out as a cached view of it, so receiving allocates nothing.
+   * Reassembled (fragmented / out-of-order) messages are still owned copies.
+   */
+  transientDelivery?: boolean;
   /** Delayed-SACK timeout (ms). Default 200. */
   sackDelay?: number;
   rtoInitial?: number;
@@ -317,6 +331,11 @@ export class SctpAssociation {
   private readonly zeroCkEnabled: boolean;
   private readonly acceptDcep: boolean;
   private readonly zeroCopy: boolean;
+  private readonly transient: boolean;
+  /** transientDelivery scratch (lazily allocated) and its cached views by length. */
+  private scratch: Uint8Array | null = null;
+  private scratchViews: (Uint8Array | undefined)[] | null = null;
+  private scratchBusy = false;
   private readonly sackDelay: number;
   private readonly rtoInitial: number;
   private readonly rtoMin: number;
@@ -498,6 +517,7 @@ export class SctpAssociation {
     this.zeroCkEnabled = opts.zeroChecksum ?? true;
     this.acceptDcep = opts.acceptDcep ?? false;
     this.zeroCopy = opts.zeroCopyDelivery ?? true;
+    this.transient = opts.transientDelivery ?? false;
     this.sackDelay = opts.sackDelay ?? 200;
     this.rtoInitial = opts.rtoInitial ?? 500;
     this.rtoMin = opts.rtoMin ?? 200;
@@ -574,13 +594,22 @@ export class SctpAssociation {
     return this.enqueue(channelId, data, ppid, (cf & CH_ORDERED) !== 0, this.chMaxRtx[channelId]);
   }
 
-  /** Bundles subsequent sends until {@link uncork} (no timer involved). */
+  /**
+   * Bundles subsequent sends (and the SACK / control chunks owed after
+   * incoming packets) until the matching {@link uncork}; nestable. No timer
+   * is involved: the caller must uncork (e.g. at the end of the event-loop
+   * iteration). Retransmission timers keep firing and sending while corked.
+   */
   cork(): void {
     this.corked++;
   }
 
+  /** Ends one {@link cork}; the outermost one sends everything pending. */
   uncork(): void {
-    if (this.corked > 0 && --this.corked === 0 && this.flushNeeded && !this.inInput) this.flush();
+    if (this.corked > 0 && --this.corked === 0 && this.flushNeeded && !this.inInput && !this.dead) {
+      this.t = this.nowFn();
+      this.flush();
+    }
   }
 
   /** Closes one channel: resets our outgoing stream (RFC 8831 §6.7). */
@@ -1432,6 +1461,13 @@ export class SctpAssociation {
       this.performIncomingReset(d.sids);
       if (((d.seq + 1) >>> 0) === this.peerReqExpected) this.lastPeerReqResult = RR_PERFORMED;
     }
+    if (this.corked > 0) {
+      // Corked (e.g. per event-loop-iteration bundling): the SACK and any
+      // data wait for the outermost uncork, which bundles them together.
+      this.flushNeeded = true;
+      this.schedule();
+      return;
+    }
     this.flush();
   }
 
@@ -1977,9 +2013,40 @@ export class SctpAssociation {
       this.c.droppedMessages++;
       return;
     }
-    const data =
-      ppid === PPID_BINARY_EMPTY || ppid === PPID_STRING_EMPTY ? EMPTY : this.zeroCopy ? p.subarray(off, off + len) : p.slice(off, off + len);
+    if (ppid === PPID_BINARY_EMPTY || ppid === PPID_STRING_EMPTY) {
+      this.c.messagesReceived++;
+      this.callOnMessage(sid, EMPTY, ppid);
+      return;
+    }
+    if (this.transient && !this.scratchBusy && len <= this.maxFrag) {
+      // Copy into the scratch buffer (tens of bytes for HaxBall) and hand out
+      // its cached view of that length: no allocation. scratchBusy guards
+      // against a nested delivery (callback feeding this association again
+      // is deferred by `input`, but stay safe).
+      let sc = this.scratch;
+      let views = this.scratchViews;
+      if (sc === null || views === null) {
+        sc = this.scratch = new Uint8Array(this.maxFrag);
+        views = this.scratchViews = [];
+      }
+      if (len <= 64) for (let k = 0; k < len; k++) sc[k] = p[off + k];
+      else sc.set(p.subarray(off, off + len));
+      const view = (views[len] ??= sc.subarray(0, len));
+      this.c.messagesReceived++;
+      this.scratchBusy = true;
+      try {
+        this.callOnMessage(sid, view, ppid);
+      } finally {
+        this.scratchBusy = false;
+      }
+      return;
+    }
+    const data = this.zeroCopy && !this.transient ? p.subarray(off, off + len) : p.slice(off, off + len);
     this.c.messagesReceived++;
+    this.callOnMessage(sid, data, ppid);
+  }
+
+  private callOnMessage(sid: number, data: Uint8Array, ppid: number): void {
     try {
       this.onMessageFn(sid, data, ppid);
     } catch (e) {
