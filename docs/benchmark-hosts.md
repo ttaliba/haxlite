@@ -167,5 +167,3 @@ Métricas añadidas al arnés para esta tanda (solo `bench/`, sin tocar las libr
 hilo JS / resto (`host.cpuSplit`), despertares (`host.wakeups`, de `voluntary_ctxt_switches` de
 `/proc/self/task/*/status`), tiempo de entrada por cliente (`join[].joinMs`) y versión del
 `node-datachannel` de node-haxball en `info.versions`.
-
----
