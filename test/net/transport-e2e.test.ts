@@ -6,7 +6,8 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { FakeMaster } from '../fake-master/index.js';
 import { cleanupNodeHaxball, nodeHaxballFor } from '../fake-master/node-haxball.js';
-import { HostTransport, shutdownWebRtc, type JoinInfo, type Peer, type PeerCloseReason } from '../../src/net/index.js';
+import { HostTransport, RtcPeerBackend, shutdownWebRtc, type JoinInfo, type Peer, type PeerCloseReason } from '../../src/net/index.js';
+import { RTC_UNDER_TEST, testTransportBackend } from '../peer-backend-env.js';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Any = any;
@@ -21,7 +22,7 @@ beforeAll(async () => {
   nh = nodeHaxballFor(master);
 });
 
-afterEach(() => {
+afterEach(async () => {
   for (const j of joins.splice(0)) {
     try {
       j.cancel();
@@ -29,7 +30,10 @@ afterEach(() => {
       /* already gone */
     }
   }
-  for (const t of transports.splice(0)) t.stop();
+  for (const t of transports.splice(0)) {
+    t.stop();
+    if (t.backend instanceof RtcPeerBackend) await t.backend.whenClosed();
+  }
 });
 
 afterAll(async () => {
@@ -43,7 +47,7 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
 }
 
 async function startHost(opts: Partial<ConstructorParameters<typeof HostTransport>[0]> = {}) {
-  const t = new HostTransport({ token: 'thr1.test', masterUrl: master.httpBase, iceServers: [], public: true, ...opts });
+  const t = new HostTransport({ token: 'thr1.test', masterUrl: master.httpBase, iceServers: [], public: true, ...testTransportBackend(), ...opts });
   transports.push(t);
   const room = master.waitForRoom();
   const link = new Promise<string>((resolve) => (t.onRoomLink = (l) => resolve(l)));
@@ -110,7 +114,8 @@ describe('HostTransport + node-haxball client', () => {
     expect(t.peers.length).toBe(0);
   });
 
-  it('connects with every host candidate withheld (iceCandidatePolicy: client reaches us peer-reflexively)', async () => {
+  // node-datachannel only: haxlite-rtc ignores iceCandidatePolicy (it announces exactly its publicAddresses)
+  it.skipIf(RTC_UNDER_TEST)('connects with every host candidate withheld (iceCandidatePolicy: client reaches us peer-reflexively)', async () => {
     let withheld = 0;
     const { t, fakeRoom } = await startHost({
       iceCandidatePolicy: () => {

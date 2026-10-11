@@ -6,6 +6,12 @@
 > **salientes** hacia el edge. Ningún SDP, candidato ICE ni paquete que reciba un jugador
 > contiene la dirección del host.
 >
+> Desde la versión 2 del túnel **ni el edge ni el host necesitan addons nativos**: los jugadores
+> se atienden con haxlite-rtc ([doc 10](10-haxlite-rtc.md): ICE-lite + DTLS 1.2 + SCTP en
+> TypeScript, un único puerto UDP) y el plano de datos host↔edge es nuestra propia asociación
+> SCTP sobre datagramas UDP cifrados con AES-128-GCM (§1.3). node-datachannel queda como opción
+> (`playerBackend: 'ndc'`, `dataPlane: 'webrtc'`) y solo se carga si se usa.
+>
 > Contexto y alternativas: [08 — Ocultar y proteger la IP](08-ocultar-ip.md). Esto implementa
 > el "algo delante" del nivel 3 de ese informe, pero sin TURN ni proxy UDP: el edge **termina**
 > el WebRTC de los jugadores y reenvía solo los payloads de los data channels.
@@ -15,24 +21,24 @@
 ## 1. Arquitectura
 
 ```
- jugadores (cliente oficial)                       EDGE (IP pública, protegida)
- ┌──────────┐  WebRTC: ICE/DTLS/SCTP, 3 canales    ┌──────────────────────────────────┐
- │ browser  │═══ negociados ro / ru / uu ═════════▶│ PeerConnection por jugador       │
- └──────────┘                                       │ (node-datachannel, wrappers      │
-      ▲ señalización (offer/answer/candidatos)      │  crash-safe de src/net/webrtc)   │
-      │                                             │ flood por jugador, cuotas por key│
- ┌────┴──────────────┐                              └──────────────┬───────────────────┘
- │ master haxball.com│◀── WS de señalización ──┐        túnel      │ (el host se conecta
- └───────────────────┘   (token, sala, offers) │  ┌───────────────┘  hacia AFUERA)
-                                               │  │ control: WebSocket (wss) autenticado (HMAC)
+ jugadores (cliente oficial)                        EDGE (IP pública, protegida)
+ ┌──────────┐  WebRTC: ICE/DTLS/SCTP, 3 canales     ┌────────────────────────────────────┐
+ │ browser  │═══ negociados ro / ru / uu ══════════▶│ haxlite-rtc: ICE-lite, 1 socket UDP │
+ └──────────┘   (UDP :40000, un puerto para todos)  │ para todos los jugadores            │
+      ▲ señalización (offer/answer/candidatos)      │ flood por jugador, cuotas por key   │
+      │                                             └──────────────┬──────────────────────┘
+ ┌────┴──────────────┐                                     túnel   │ (el host se conecta
+ │ master haxball.com│◀── WS de señalización ──┐  ┌───────────────┘  hacia AFUERA)
+ └───────────────────┘   (token, sala, offers) │  │ control: WebSocket (wss, TCP :8443), HMAC + x25519
+                                               │  │ datos:   SCTP sobre UDP+AES-128-GCM (UDP :8443)
                                          ┌─────┴──▼──────────────────────────────┐
                                          │ host haxlite (detrás de NAT, sin       │
                                          │ sockets hacia jugadores): HostRoom,    │
                                          │ HostTransport + EdgePeerBackend        │
                                          └────────────────────────────────────────┘
-                                            datos: 1 PeerConnection host↔edge con 3 canales
-                                            (ro/ru/uu) multiplexando a todos los jugadores,
-                                            o el mismo WebSocket si el UDP está bloqueado
+                                   todos los jugadores de la sala multiplexados en UNA
+                                   asociación SCTP (streams = canales), o el mismo
+                                   WebSocket si el UDP está bloqueado
 ```
 
 Reparto de responsabilidades:
@@ -41,66 +47,154 @@ Reparto de responsabilidades:
 |---|---|---|
 | Token y WS con el master (`p2p.haxball.com`) | **sí** (sin cambios) | no |
 | Admisión previa a WebRTC (4100–4104, bans por IP/conn/srflx, contraseña, `onJoinRequest`) | **sí** | no |
-| PeerConnection del jugador, ICE/DTLS/SCTP, `iceCandidatePolicy` | no | **sí** |
+| Conexión WebRTC del jugador (ICE-lite/DTLS/SCTP), direcciones anunciadas | no | **sí** |
 | Challenge + verificación de identidad (ECDSA), `auth`, bans por auth | **sí** | no (no entiende el protocolo del juego) |
 | Lógica de juego, secuenciador, kicks, "Bad actor" | **sí** | no |
 | Límite de flood por jugador | sí (paridad oficial) | **sí, antes del túnel**: avisa al host, que expulsa con "Bad actor" |
-| Timeouts (canal 0 en 10 s, inactividad 10 s) | sí | limpieza propia (15 s) |
+| Timeouts (canal 0 en 10 s, inactividad 10 s) | sí | limpieza propia (15 s) y consentimiento ICE (30 s) |
 
 El edge es **agnóstico del juego**: mueve payloads por `(slot del jugador, canal)` en ambos
 sentidos y reporta el ciclo de vida del jugador (canal abierto/cerrado, fallo, flood) y la
-dirección remota del par ICE elegido (`getSelectedCandidatePair`).
+dirección remota del jugador (la del par nominado por ICE; las IPs srflx para bans las sigue
+sacando el host de la *offer* y de los candidatos que llegan por el master, como siempre).
+
+Dos *backends* de jugadores (`playerBackend`):
+
+| | `'rtc'` (por defecto) | `'ndc'` |
+|---|---|---|
+| Implementación | haxlite-rtc (`src/rtc`, TypeScript puro) | node-datachannel / libdatachannel (addon nativo) |
+| Puertos UDP | **uno** para todos los jugadores (`webrtc.port`) | uno por PeerConnection (`portRange`), o uno con `enableIceUdpMux` |
+| ICE | *lite*: el edge solo contesta Binding requests autenticados; **nunca** envía comprobaciones | completo (envía checks a los candidatos remotos permitidos por `remoteCandidatePolicy`) |
+| Direcciones anunciadas | exactamente `webrtc.publicAddresses` | las que descubre libjuice, filtradas por `iceCandidatePolicy` |
+| Detrás de NAT | solo NAT 1:1 con `publicAddresses` (+ `publicPort`) | STUN (`iceServers`) |
+| CPU (17 jugadores, §7) | **−30 %** por jugador | referencia |
 
 ### 1.1 Flujo de una entrada
 
 1. El master le pasa la *offer* del jugador al host (como siempre). El host aplica **todas** las
    comprobaciones oficiales sin crear nada de WebRTC.
-2. El host manda `PeerOpen{slot, sdp}` por el túnel. El edge crea la PeerConnection (3 canales
-   negociados, mismas opciones que el host directo) y devuelve `PeerAnswer` (SDP ya filtrado con
-   la política del edge) y sus candidatos (`PeerLocalCandidate`, `PeerGathered`).
+2. El host manda `PeerOpen{slot, sdp}` por el túnel. El edge crea la conexión (3 canales
+   negociados) y devuelve `PeerAnswer` (SDP ya filtrado con la política del edge), sus
+   candidatos (`PeerLocalCandidate`) y `PeerGathered`. Con haxlite-rtc todo sale en el acto: la
+   respuesta ya trae los candidatos (`a=end-of-candidates`).
 3. El host reenvía answer y candidatos al master **exactamente como hoy** (espera ≤ 500 ms a
    que termine la recolección, `[0][peer]` al final). Los candidatos que el jugador manda después
    (`[4]`) el host los registra (IPs srflx para bans) y los reenvía al edge
-   (`PeerRemoteCandidate`, con el retraso de 2,5 s de las conexiones "reverse").
+   (`PeerRemoteCandidate`, con el retraso de 2,5 s de las conexiones "reverse"); con ICE-lite
+   son solo una pista (el navegador es quien comprueba; el edge aprende su dirección como
+   *peer-reflexive* del primer Binding autenticado).
 4. Cuando el canal 0 abre en el edge, este manda `PeerChannelOpen` **en banda** (por el canal
    `ro` del túnel, ordenado antes del primer mensaje del jugador). El host envía el challenge,
    verifica el handshake y sigue igual que con un jugador directo.
 
-### 1.2 Protocolo del túnel (versión 1)
+### 1.2 Protocolo del túnel (versiones 1 y 2)
 
 Definido en `src/net/edge-protocol.ts`. Mensajes binarios `[u8 tipo]…`; strings con la
 codificación del códec (`varuint` + UTF-8).
 
-* **Control (WebSocket, una conexión por sala):** el edge saluda `Hello[u8 versión][nonce 32 B]`;
-  el host responde `Auth[u8 versión][keyId][HMAC-SHA256(secret, "haxlite-edge/1" ‖ nonce)][flags]`;
-  el edge compara en tiempo constante (`timingSafeEqual`; un keyId desconocido también cuesta un
-  HMAC) y contesta `AuthOk[u32 sesión][u16 máx. jugadores][flags]`. El secreto nunca viaja.
-* **Datos:** `flags & 1` → una PeerConnection host↔edge con 3 canales negociados que replican la
-  fiabilidad de `ro`/`ru`/`uu` (el canal del túnel **es** el canal del jugador). Trama:
-  `[u16 slot][payload]` — 2 bytes de overhead. `slot = 0` lleva un mensaje de control en banda.
-  Sin el flag (o como *fallback*), todo va por el WebSocket: `[0x70+canal][u16 slot][payload]`.
-* **Carriles `ro` (`flags & 2`, `AuthFlag.RoLanes`):** el host lo pide en `Auth` y el edge lo
-  confirma en `AuthOk`. Entonces el tráfico `ro` de los jugadores (¡los clientes mandan **todos**
-  sus eventos/inputs por `ro`!) se reparte en 16 canales ordenados del túnel según `slot % 16`
-  (carril 0 = canal 0, carril k = canal 2 + k): una pérdida en el tramo host↔edge solo retrasa el
-  `ro` de los jugadores de ese carril, no el de todos. El orden por jugador se mantiene: todo el
-  `ro` de un slot y su control en banda (`PeerChannelOpen`/`PeerClosed`/`PeerClose`) van por su
-  carril; un multicast `ro` sale como un mensaje por carril en uso. Un host o un edge que no
-  conocen el flag siguen con el canal `ro` único (interoperan en ambos sentidos).
-* **Multicast:** las difusiones del host (eventos, heartbeats, CheckConsistency) salen como **un**
-  mensaje `[0][0][0x40][canal][n][slot × n][payload]` en vez de uno por jugador: la subida del
-  host no crece con el número de jugadores.
-* Señalización del túnel (offer/answer/candidatos de la PeerConnection host↔edge) por el
-  WebSocket, o sea, **solo con el edge**. El host retiene sus candidatos hasta aplicar la answer
-  (evita la carrera DTLS de libdatachannel en loopback).
-* Liveness: el edge hace `ping` de WebSocket cada 10 s (dos sin respuesta = sesión muerta); el
-  host manda `Ping` de aplicación cada 5 s (mide el RTT del túnel) y da el túnel por caído si en
-  15 s no llegó nada.
+**Control (WebSocket, una conexión por sala):**
 
-Por qué UDP para los datos: sin *head-of-line blocking* TCP para `uu`/`ru` (inputs y heartbeats
-no esperan retransmisiones de otros), y el host atraviesa su NAT con una conexión saliente (el
-edge tiene IP pública; los candidatos del host ni siquiera hacen falta: el edge lo aprende como
-*peer-reflexive*).
+```
+edge → host  Hello    [u8 1][32 B nonce][u8 versiónMáx = 2]      (un host v1 ignora el último byte)
+host → edge  Auth v2  [u8 2][string keyId][32 B mac2][u8 flags][32 B x25519 hostPub  si flags & Udp]
+             mac2 = HMAC-SHA256(secret, "haxlite-edge/2" ‖ nonce ‖ u8 flags ‖ hostPub)
+host → edge  Auth v1  [u8 1][string keyId][32 B HMAC-SHA256(secret, "haxlite-edge/1" ‖ nonce)][u8 flags]
+edge → host  AuthOk   [u32 sesión][u16 máx. jugadores][u8 flags concedidos]
+             + si Udp: [32 B edgePub][u32 connId][u16 puertoUdp][string hostUdp][32 B okMac]
+             okMac = HMAC-SHA256(secret, "haxlite-edge/2 ok" ‖ nonce ‖ hostPub ‖ AuthOk hasta antes del MAC)
+```
+
+El edge compara en tiempo constante (`timingSafeEqual`; un keyId desconocido también cuesta un
+HMAC). El secreto nunca viaja. `mac2` ata los flags pedidos y la clave efímera del host a la
+API key; `okMac` prueba que el edge también conoce la clave (autenticación **mutua**, aun sin
+TLS) y ata su clave efímera, el connId y el destino UDP. Un `okMac` inválido es un `EdgeError`
+fatal de tipo `auth`.
+
+**Flags** (`Auth` = pedidos; `AuthOk` = concedidos, nunca más de lo pedido):
+
+| Flag | Valor | |
+|---|---|---|
+| `WebRtc` | 1 | plano de datos legado: una PeerConnection node-datachannel host↔edge (señalización `TunnelOffer/Answer/Candidate` por el WS) |
+| `RoLanes` | 2 | carriles `ro` (abajo); con `Udp` o `WebRtc` |
+| `Udp` | 4 | **túnel v2** (§1.3), solo en `Auth` versión 2 |
+
+Sin flags de plano concedidos, todo va por el WebSocket: `[0x70+canal][u16 slot][payload]`.
+
+**Compatibilidad:** el edge v2 acepta `Auth` v1 y v2; el host v2 habla v1 con un edge que no
+manda el byte de versión máxima (entonces `dataPlane: 'udp'` cae al WebSocket, o a la
+PeerConnection si se pidió `'webrtc'`). Un host que pide un plano que el edge no concede
+(`tunnel.udp: false`, `tunnel.allowWebRtc: false`, node-datachannel no instalado) recibe el
+WebSocket (o un error si `fallbackWs: false`).
+
+**Datos** (en cualquier plano UDP): trama `[u16 slot][payload]` — 2 bytes de overhead; el canal
+del túnel **es** el canal del jugador (`ro` 0 ordenado y fiable, `ru` 1 desordenado y fiable,
+`uu` 2 sin retransmisión). `slot = 0` lleva un mensaje de control en banda.
+
+* **Carriles `ro`** (`RoLanes`): el tráfico `ro` de los jugadores (¡los clientes mandan
+  **todos** sus eventos/inputs por `ro`!) se reparte en 16 canales ordenados según `slot % 16`
+  (carril 0 = canal 0, carril k = canal 2 + k): una pérdida en el tramo host↔edge solo retrasa
+  el `ro` de los jugadores de ese carril. El orden por jugador se mantiene: todo el `ro` de un
+  slot y su control en banda (`PeerChannelOpen`/`PeerClosed`/`PeerClose`) van por su carril; un
+  multicast `ro` sale como un mensaje por carril en uso.
+* **Multicast:** las difusiones del host (eventos, heartbeats, CheckConsistency) salen como **un**
+  mensaje `[0][0][0x40][canal][n][slot × n][payload]` en vez de uno por jugador. En el túnel v2
+  los mensajes de un multicast (uno por carril) se agrupan en el mínimo de datagramas (`cork`).
+* Liveness: el edge hace `ping` de WebSocket cada 10 s (dos sin respuesta = sesión muerta); el
+  host manda `Ping` de aplicación cada 5 s por el WS **y** un `Ping` UDP autenticado (keep-alive
+  del NAT + RTT del plano de datos) y da el túnel por caído si en 15 s no llegó nada por el WS o
+  nada autenticado por el UDP. El edge cierra un túnel v2 sin datagramas autenticados en 30 s.
+
+### 1.3 Plano de datos v2: SCTP sobre UDP cifrado
+
+`src/net/edge-udp.ts` (común), `src/edge/tunnel-udp.ts` (edge). Sin WebRTC, sin ICE, sin DTLS:
+la autenticación ya ocurrió en el WebSocket, así que solo hace falta un canal cifrado con
+estado mínimo.
+
+* **Claves por sesión.** Ambos lados generan un par x25519 **efímero** por sesión y se mandan la
+  mitad pública en `Auth`/`AuthOk` (cubierta por `mac2`/`okMac`). Después:
+
+  ```
+  salt  = HMAC-SHA256(apiSecret, "haxlite-tunnel/2 salt" ‖ nonce del Hello)
+  okm   = HKDF-SHA256(X25519(priv, pubDelOtro), salt, "haxlite-tunnel/2" ‖ hostPub ‖ edgePub ‖ u32 connId, 64)
+  s_h2e = okm[0..32), s_e2h = okm[32..64)                       (un secreto por sentido)
+  clave_e = HKDF(s_e, "…key", 16), iv_e = HKDF(s_e, "…iv", 12), s_{e+1} = HKDF(s_e, "…next", 32)
+  ```
+
+  *Forward secrecy*: las claves privadas x25519 se descartan apenas se calcula el secreto
+  compartido; filtrar más tarde la API key no descifra sesiones grabadas. La API key entra en
+  la derivación: aun con el control sin TLS, un intermediario que no la conoce no puede derivar
+  las claves de datos (y `okMac`/`mac2` impiden sustituir las claves efímeras).
+* **Datagrama** (ambos sentidos):
+
+  ```
+  [u8 tipo][u32 connId][u16 época][u48 seq] [AES-128-GCM(payload)] [tag 16 B]
+   └────────────── 13 B de cabecera = AAD ─┘        nonce = iv_época XOR (0⁶ ‖ seq48)
+  ```
+
+  `tipo`: `0xF0` paquete SCTP, `0xF1` Ping `[f64]`, `0xF2` Pong (eco del mismo tamaño), `0xF3`
+  cierre. Overhead total por datagrama: 29 B (un registro DTLS 1.2 con AES-GCM: 37 B). `seq` es por
+  sentido y época, estrictamente creciente: el nonce nunca se repite (una clave por sentido, así
+  que un datagrama reflejado tampoco abre). **Ventana anti-replay** de 1024 datagramas.
+  **Ratchet** cada 2²⁴ datagramas por sentido: época + 1 con claves derivadas de la anterior
+  (que se borra; la previa se acepta 30 s para paquetes reordenados) — muy por debajo de los
+  límites de uso de AES-GCM, sin renegociar nada.
+* **SCTP**: `src/rtc/sctp` (el mismo de haxlite-rtc), el host es el iniciador (`connect()`) y el
+  edge el lado pasivo (INIT sin estado, cookie HMAC). Streams = canales del túnel (0 `ro`,
+  1 `ru`, 2 `uu` con `maxRetransmits: 0`, 3–17 carriles `ro`), mensajes de hasta 1 MiB, paquetes
+  SCTP ≤ 1200 B (+ 29 B + IP/UDP ≤ 1280). *Zero checksum* (RFC 9653): la integridad la da el AEAD.
+  Como los dos extremos son nuestros, el ajuste es agresivo: SACK diferido 20 ms (WebRTC usa
+  200 ms), RTO mínimo 60 ms (≥ 200 ms en WebRTC), RTO máx. 3 s — una pérdida en el tramo
+  host↔edge se repara en decenas de ms (§7.1).
+* **Un puerto UDP en el edge para todos los hosts** (`tunnel.port`, por defecto el mismo número
+  que el control: TCP **y** UDP 8443). Demultiplexado por `connId` (aleatorio, emitido por el
+  WS). El host usa un socket UDP *conectado* (el kernel descarta todo lo que no venga del edge),
+  **habla primero** (Ping + INIT): atraviesa cualquier NAT sin STUN ni candidatos, y el Ping
+  periódico mantiene viva la asociación del NAT.
+* **Cambio de dirección del host** (NAT rebinding): el edge adopta la nueva dirección de origen
+  solo con un datagrama **autenticado** que además es el más nuevo visto (un datagrama repetido
+  o atrasado no puede desviar el tráfico).
+* *Fallback*: si la asociación no sube en `dataPlaneTimeoutMs` (5 s), el host reconecta con
+  todo por el WebSocket (igual que antes).
 
 ## 2. Uso desde el host
 
@@ -111,8 +205,8 @@ const room = await HBInit({
     edge: {
       url: 'wss://edge.midominio.com:8443/tunnel',
       key: 'alice:9fH3…',        // la entrega el operador del edge
+      // dataPlane: 'udp',       // (por defecto) túnel v2; 'webrtc' = PeerConnection legada; 'ws'
       // fallbackWs: true,       // (por defecto) si el UDP al edge está bloqueado, todo por el WS
-      // dataPlane: 'ws',        // forzar el WS desde el principio
     },
   },
 });
@@ -127,36 +221,45 @@ Con `HostTransport` directamente: `new HostTransport({ token, edge: { url, key }
 |---|---|---|
 | `url` | — | `wss://host:puerto/tunnel` (`ws://` solo para pruebas/LAN) |
 | `key` | — | `"<keyId>:<secret>"` |
+| `dataPlane` | `'udp'` | `'udp'` = túnel v2 (§1.3, sin addons); `'webrtc'` = PeerConnection node-datachannel (carga el addon); `'ws'` = forzar el WebSocket |
 | `roLanes` | `true` | pedir los carriles `ro` (§1.2); `false` = un solo canal `ro` en el túnel |
-| `fallbackWs` | `true` | si la PeerConnection de datos no sube en `dataPlaneTimeoutMs`, reconecta con todo por el WebSocket (queda en WS hasta reiniciar la sala) |
-| `dataPlane` | `'webrtc'` | `'ws'` para forzar el WebSocket |
-| `bindAddress` | — | dirección local para el WS y la PeerConnection del túnel |
-| `iceServers` | ninguno | STUN/TURN de la PeerConnection del túnel (normalmente innecesario) |
-| `portRange` | — | puertos UDP locales del túnel |
+| `fallbackWs` | `true` | si el plano UDP no sube en `dataPlaneTimeoutMs` (o el edge no lo concede), todo por el WebSocket (queda en WS hasta reiniciar la sala) |
+| `bindAddress` | — | dirección local para el WS y el socket UDP del túnel |
+| `iceServers` / `portRange` | ninguno / — | solo `dataPlane: 'webrtc'` |
 | `connectTimeoutMs` / `dataPlaneTimeoutMs` | 10 s / 5 s | |
 | `reconnectMinMs` / `reconnectMaxMs` | 250 ms / 10 s | backoff exponencial; tras una caída el primer reintento es inmediato |
-| `pingIntervalMs` / `pingTimeoutMs` | 5 s / 15 s | |
+| `pingIntervalMs` / `pingTimeoutMs` | 5 s / 15 s | también el keep-alive UDP y su timeout |
 | `wsOptions` | — | opciones del cliente `ws` (p. ej. `ca` para un certificado propio) |
 
 Comportamiento:
 
 * **Arranque:** el host **no** registra la sala en el master hasta que el túnel está listo. Una
-  clave inválida o una versión de protocolo incompatible es un `EdgeError` *fatal* y `HBInit`
-  rechaza enseguida; los errores de red se reintentan hasta `initTimeoutMs`.
+  clave inválida, un `AuthOk` sin MAC válido o una versión de protocolo incompatible es un
+  `EdgeError` *fatal* y `HBInit` rechaza enseguida; los errores de red se reintentan hasta
+  `initTimeoutMs`.
 * **Caída del túnel:** los jugadores conectados se pierden (el cliente oficial no puede
   reconectarse ni renegociar), se emiten sus `onPlayerLeave` y `onBackendState('down')`; el host
   reintenta enseguida y con backoff. Mientras tanto las entradas se rechazan con 4104. La sala
   (link, estado, bans) sigue viva; al volver: `onBackendState('ready')`.
 * `iceServers`, `iceCandidatePolicy` y `portRange` del host **no se usan** con edge: el host no
   crea PeerConnections de jugadores (el test E2E lo verifica).
-* `getPlayerConnection(id).remoteAddress`: dirección del jugador **vista por el edge** (la que
-  usa el par ICE elegido). Los bans oficiales siguen siendo por `conn` + srflx (llegan por el
-  master), igual que sin edge.
+* **Sin addon nativo:** con `dataPlane: 'udp'` o `'ws'` el host no carga node-datachannel (el
+  módulo del túnel legado se importa solo con `'webrtc'`, y `src/net/webrtc.ts` carga el addon
+  recién en la primera PeerConnection). `test/edge/edge-no-native.test.ts` lo verifica (§8).
+* `getPlayerConnection(id).remoteAddress`: dirección del jugador **vista por el edge** (la del
+  par nominado). Los bans oficiales siguen siendo por `conn` + srflx (llegan por el master),
+  igual que sin edge.
+* `edgeStats()` → `{state, dataPlane: 'udp'|'webrtc'|'ws', roLanes, sessionId, rttMs, peers,
+  sessions, bytes/messages In/Out, udp}`; `rttMs` es el RTT del plano UDP cuando existe; `udp`
+  trae los contadores del túnel v2 (datagramas, rechazados, ratchets, estado SCTP,
+  retransmisiones).
 
 ## 3. Despliegue del edge en un servidor dedicado
 
 Requisitos: Node ≥ 22, una IP pública (idealmente con mitigación DDoS aguas arriba, ver
-[08 §3 nivel 2](08-ocultar-ip.md)), un nombre DNS para el certificado TLS.
+[08 §3 nivel 2](08-ocultar-ip.md)), un nombre DNS para el certificado TLS. **Ningún addon
+nativo** se carga con la configuración por defecto (node-datachannel sigue en `dependencies`
+para `playerBackend: 'ndc'` y el túnel legado, pero ni se importa; §8).
 
 ```sh
 git clone … haxlite && cd haxlite && npm ci && npm run build
@@ -176,16 +279,22 @@ node bin/haxlite-edge.js genkey alice
     "keyFile": "/etc/letsencrypt/live/edge.midominio.com/privkey.pem"
   },
   "keysFile": "/etc/haxlite-edge/keys.txt",
+  "playerBackend": "rtc",
   "webrtc": {
     "bindAddress": "203.0.113.10",
-    "portRange": [40000, 40999],
-    "iceCandidatePolicy": "public",
-    "remoteCandidatePolicy": "public"
+    "port": 40000,
+    "publicAddresses": ["203.0.113.10"]
   },
+  "tunnel": { "port": 8443 },
   "limits": { "maxPeersPerSession": 40, "maxPeersPerKey": 256, "maxSessionsPerKey": 16 },
   "stats": { "path": "/stats", "token": "cambiar-esto", "logIntervalMs": 60000 }
 }
 ```
+
+En una nube con NAT 1:1 (la interfaz tiene una IP privada): `bindAddress` = la privada (o sin
+poner) y `publicAddresses` = la pública; si el puerto externo difiere, `publicPort`. Sin
+`publicAddresses`, el edge anuncia `bindAddress` si es una IP concreta, o las IPs públicas de sus
+interfaces; si no encuentra ninguna, no arranca (mejor que anunciar una dirección inservible).
 
 `/etc/haxlite-edge/keys.txt` (permisos 600; una por línea, `#` comenta):
 
@@ -225,7 +334,8 @@ WantedBy=multi-user.target
 * TLS: el usuario `haxlite` tiene que poder leer los PEM (p. ej. un *deploy hook* de certbot que
   los copie a `/etc/haxlite-edge/` con el grupo correcto y haga `systemctl reload haxlite-edge`;
   **SIGHUP recarga el certificado** sin cortar túneles). Alternativa: terminar TLS en nginx/caddy
-  con `proxy_pass` de WebSocket a `127.0.0.1:8443` (solo el control; el UDP no pasa por ahí).
+  con `proxy_pass` de WebSocket a `127.0.0.1:8443` (solo el control; el UDP no pasa por ahí:
+  entonces fijar `tunnel.port` y abrirlo aparte).
 * SIGINT/SIGTERM cierran todos los túneles con 4503; los hosts reconectan solos (al reiniciar el
   edge se pierden los jugadores conectados).
 * Desarrollo, sin compilar: `npm run edge -- --config edge.json` o
@@ -238,12 +348,12 @@ WantedBy=multi-user.target
 | Tráfico | Regla |
 |---|---|
 | TCP 8443 (control) | abierto (autenticado con HMAC); si los hosts tienen IP fija, mejor solo desde ellas. Rate-limit de conexiones nuevas (`ct state new limit rate 20/second`) |
-| UDP `portRange` (40000–40999) | jugadores **y** túneles de datos. Es el `ROOM_PORTS` de [`ops/haxguard/haxguard.nft`](../ops/haxguard/haxguard.nft): descartar fragmentos, puertos origen < 1024 y reflectores, aceptar STUN con límite por origen |
+| UDP 8443 (túnel v2) | **solo de los hosts** si tienen IP fija; si no, abierto: sin un `connId` vigente y un MAC válido el edge no responde nada (§4) |
+| UDP 40000 (jugadores, `webrtc.port`) | el `ROOM_PORTS` de [`ops/haxguard/haxguard.nft`](../ops/haxguard/haxguard.nft): descartar fragmentos, puertos origen < 1024 y reflectores, aceptar STUN con límite por origen. Con `'rtc'` es **un** puerto para todos los jugadores |
 | `GET /stats` | ponerle `stats.token` o no exponerlo (bind privado / firewall) |
 
-Con `enableIceUdpMux: true` todas las PeerConnections comparten `portRange[0]` (un solo puerto
-para filtrar, como en haxguard); sin mux, una por conexión (permite la atribución por puerto de
-08 §3).
+Con `playerBackend: 'ndc'` el rango es `portRange` (una PeerConnection por puerto salvo
+`enableIceUdpMux`, que permite la atribución por puerto de 08 §3).
 
 **Host** (casa / VPS): **no necesita ningún puerto entrante**. Recomendado: firewall de salida que
 solo permita UDP hacia la IP del edge (más DNS y HTTPS/WSS al master). Así ni un error de
@@ -267,24 +377,47 @@ Varias salas en un mismo host = varias sesiones de túnel con la misma clave (cu
 ## 4. Modelo de seguridad
 
 * **La IP del host nunca llega a un jugador.** Los jugadores solo intercambian SDP/candidatos con
-  PeerConnections del edge; el edge filtra **sus propias** direcciones con
-  `iceCandidatePolicy` (por defecto `'public'`: ni LAN ni loopback) y jamás pone una dirección del
-  host en nada que envíe (la conoce solo como origen del WS y del túnel). El test E2E liga el edge
-  a 127.0.0.2 y el host a 127.0.0.3 y comprueba que **todo** lo que reciben los clientes
-  (answers, candidatos en el SDP y *trickle*) nombra solo 127.0.0.2, que 127.0.0.3 no aparece en
-  ningún byte, y que el par ICE elegido de cada cliente apunta al edge.
+  el edge; con haxlite-rtc el edge anuncia **exactamente** `publicAddresses` (y además filtra con
+  `iceCandidatePolicy`), y jamás pone una dirección del host en nada que envíe (la conoce solo
+  como origen del WS y del túnel). El test E2E liga el edge a 127.0.0.2 y el host a 127.0.0.3 y
+  comprueba —con ambos backends— que **todo** lo que reciben los clientes (answers, candidatos en
+  el SDP y *trickle*) nombra solo 127.0.0.2, que 127.0.0.3 no aparece en ningún byte, y que el
+  par ICE elegido de cada cliente apunta al edge.
 * **Lo que el host le deja ver al master** no cambia: el master ya veía la IP del host (WS de
   señalización) y nunca la reenvía a los clientes.
 * **Autenticación de hosts:** clave por host/tenant, desafío-respuesta HMAC-SHA256 con nonce de
   32 B por conexión, comparación en tiempo constante, IDs desconocidos indistinguibles por
-  tiempo. Usar `wss://` en producción: sin TLS el HMAC protege la clave pero no la sesión.
+  tiempo. En v2 el edge **también** se autentica ante el host (`okMac`). Usar `wss://` en
+  producción: aunque las claves del túnel v2 no se pueden derivar sin la API key, el control
+  (offers, slots) solo va cifrado con TLS.
+* **Túnel v2 (UDP):**
+  * Confidencialidad e integridad: AES-128-GCM con claves por sesión y por sentido (§1.3);
+    cabecera autenticada; ventana anti-replay de 1024; ratchet de claves cada 2²⁴ datagramas;
+    *forward secrecy* por x25519 efímero.
+  * **Sin amplificación ni reflexión:** un datagrama con un `connId` desconocido se descarta
+    sin hacer criptografía y **sin respuesta**; el edge **nunca** envía nada a una dirección de
+    la que no recibió antes un datagrama que pasó el AEAD con las claves de ese túnel (el primer
+    paquete del host tiene que estar autenticado; hasta entonces la salida SCTP se descarta). Las
+    únicas respuestas a un datagrama del host son las de SCTP y un Pong **del mismo tamaño** que
+    el Ping. Un datagrama reflejado no abre (otra clave), uno repetido cae en la ventana.
+  * **Rate limits por `connId`:** un *token bucket* para los datagramas desde la dirección
+    autenticada (`tunnel.maxPps`, 20 000/s, ráfaga de 2 s) y otro chico para cualquier otro
+    origen (`maxForeignPps`, 20/s): un atacante que conoce un `connId` (32 bits aleatorios, solo
+    visible en el camino) no puede hacer gastar al edge más de 20 intentos de AEAD por segundo.
+  * La dirección del host solo cambia con un datagrama autenticado que además es el más nuevo:
+    no se puede secuestrar el tráfico con datagramas repetidos. Un atacante **en el camino** que
+    adelanta una copia de un datagrama legítimo podría redirigir respuestas (cifradas) hasta el
+    siguiente datagrama del host — sin ganancia (no las puede leer) y sin amplificación.
+  * Túnel sin datagramas autenticados en 30 s → cerrado.
+* **Jugadores con haxlite-rtc (ICE-lite):** el edge **nunca** inicia comprobaciones ICE: un host
+  (o un jugador) no puede hacer que el edge mande STUN a ninguna parte. Solo responde Binding
+  requests con MESSAGE-INTEGRITY válido para el ufrag de esa sesión, y DTLS solo desde
+  direcciones así validadas (cookie HMAC antes de guardar estado). Con `'ndc'`, como antes: los
+  candidatos remotos pasan por `remoteCandidatePolicy` (por defecto `'public'`), máximo 32 por
+  conexión, y lo único que se puede provocar son binding requests STUN (sin amplificación).
 * **Un host malicioso no puede convertir el edge en un cañón:** cada entrada se valida (tamaños de
-  SDP/candidato/mid, slots, longitudes de string; un mensaje malformado cierra la sesión con 4400).
-  Los candidatos remotos (de jugadores y del túnel) pasan por `remoteCandidatePolicy` (por
-  defecto `'public'`: el edge no envía checks a loopback/LAN/reservadas, y las conexiones igual
-  suben por *peer-reflexive*), máximo 32 por conexión. Lo único que un host puede provocar es lo
-  que provocaría un navegador cualquiera: binding requests STUN (sin amplificación) hacia
-  direcciones públicas que él elija, acotadas por las cuotas.
+  SDP/candidato/mid/host UDP, slots, longitudes de string, claves x25519 de orden bajo; un
+  mensaje malformado cierra la sesión con 4400).
 * **Cuotas:** sesiones totales (`maxSessions`), por clave (`maxSessionsPerKey` / `maxSessions` de
   la clave), jugadores por sala y por clave, negociaciones simultáneas por sala (16, como el
   4104 oficial) y ritmo de `PeerOpen` (ráfaga 30, 1 cada 100 ms). Excederlas devuelve
@@ -292,8 +425,10 @@ Varias salas en un mismo host = varias sesiones de túnel con la misma clave (cu
 * **Flood de jugadores:** *token bucket* oficial (100, 1/16 ms) por jugador **en el edge**: el
   exceso no llega al túnel; el edge cierra al jugador y avisa `PeerClosed(Flood)`, y el host lo
   expulsa con "Bad actor" (misma semántica que el host oficial; el host conserva además su propio
-  bucket). Un mensaje de texto (no binario) → `PeerClosed(Protocol)` → "Bad actor".
-* **Aislamiento entre tenants:** cada sesión solo ve sus slots; las estadísticas son por clave.
+  bucket y sus límites por evento, p. ej. chat 10/900 ms). Con `'ndc'`, un mensaje de texto (no
+  binario) → `PeerClosed(Protocol)` → "Bad actor".
+* **Aislamiento entre tenants:** cada sesión solo ve sus slots y su `connId`; las estadísticas
+  son por clave.
 
 Lo que el edge **no** resuelve: un ataque volumétrico contra el edge (para eso, hosting con
 mitigación aguas arriba + haxguard), ni la atribución de filtraciones (la IP del edge es pública
@@ -304,8 +439,10 @@ por diseño; con un /64 IPv6 en el edge se puede seguir aplicando el "canary" de
 JSON (`--config` o `HAXLITE_EDGE_CONFIG`) + variables de entorno (ganan): `HAXLITE_EDGE_HOST`,
 `HAXLITE_EDGE_PORT`, `HAXLITE_EDGE_KEYS` (`id:secret,id2:secret2`), `HAXLITE_EDGE_KEYS_FILE`,
 `HAXLITE_EDGE_TLS_CERT`/`HAXLITE_EDGE_TLS_KEY`, `HAXLITE_EDGE_BIND`, `HAXLITE_EDGE_PORT_RANGE`
-(`40000-40999`), `HAXLITE_EDGE_STATS_TOKEN`, `HAXLITE_EDGE_LOG_INTERVAL_MS`. Programático:
-`new EdgeServer(opts)` / `EdgeServer.start(opts)` de `src/edge`.
+(`40000-40999`), `HAXLITE_EDGE_PLAYER_BACKEND` (`rtc`/`ndc`), `HAXLITE_EDGE_PUBLIC_ADDRESSES`
+(IPs separadas por comas), `HAXLITE_EDGE_TUNNEL_PORT` (número u `off`),
+`HAXLITE_EDGE_STATS_TOKEN`, `HAXLITE_EDGE_LOG_INTERVAL_MS`. Programático:
+`new EdgeServer(opts)` + `listen()` / `EdgeServer.start(opts)` de `src/edge`.
 
 | Clave | Por defecto | |
 |---|---|---|
@@ -313,13 +450,24 @@ JSON (`--config` o `HAXLITE_EDGE_CONFIG`) + variables de entorno (ganan): `HAXLI
 | `tls.certFile` / `tls.keyFile` | — | PEM → `wss://`; SIGHUP recarga |
 | `keys[]` | — | `{id, secret (≥ 16 caracteres), maxSessions?, maxPeers?, label?}` |
 | `keysFile` | — | JSON (array) o `id:secret` por línea |
-| `webrtc.bindAddress` | todas | dirección local (y anunciada) de las PeerConnections |
-| `webrtc.portRange` | efímeros | rango UDP de jugadores y túneles |
-| `webrtc.enableIceUdpMux` | false | todas las conexiones en un puerto (en el edge **no** ahorra CPU: +6 % medido, §7.1; el host sí lo usa por defecto) |
-| `webrtc.iceServers` | STUN de Google | para descubrir la IP pública detrás de NAT 1:1 (nubes con IP privada) |
+| `playerBackend` | `'rtc'` | `'rtc'` = haxlite-rtc; `'ndc'` = node-datachannel |
+| `webrtc.bindAddress` | todas | dirección local de los jugadores (`'rtc'`: y anunciada si no hay `publicAddresses`) |
+| `webrtc.publicAddresses` | `bindAddress` o IPs públicas de las interfaces | `'rtc'`: las **únicas** direcciones anunciadas |
+| `webrtc.port` / `webrtc.publicPort` | `portRange[0]` o efímero / el mismo | `'rtc'`: puerto UDP de todos los jugadores |
+| `webrtc.consentTimeoutMs` | 30 000 | `'rtc'`: sin Binding autenticado del navegador en este tiempo → cerrado |
+| `webrtc.portRange` | efímeros | `'ndc'`: rango UDP de jugadores y túneles legados |
+| `webrtc.enableIceUdpMux` | false | `'ndc'`: todas las conexiones en un puerto (en el edge **no** ahorra CPU, §7.1 de la versión anterior) |
+| `webrtc.iceServers` | STUN de Google | `'ndc'` / túnel legado |
 | `webrtc.iceCandidatePolicy` | `'public'` | candidatos propios anunciados (`'all'` solo para pruebas en loopback) |
 | `webrtc.remoteCandidatePolicy` | `'public'` | candidatos remotos aceptados (`'private'`/`'all'` para LAN/pruebas) |
-| `webrtc.rtc` | — | extras de node-datachannel para las conexiones de jugadores (`mtu`, `maxMessageSize`…) |
+| `webrtc.rtc` | — | `'ndc'`: extras de node-datachannel (`mtu`, `maxMessageSize`…) |
+| `tunnel.udp` | true | aceptar túneles v2 |
+| `tunnel.port` | el puerto de `listen` (UDP), o efímero si está ocupado | puerto UDP del túnel v2 para todos los hosts |
+| `tunnel.bindAddress` | `webrtc.bindAddress`, si no `listen.host` | |
+| `tunnel.publicHost` / `tunnel.publicPort` | el host de la URL del WS / el puerto ligado | destino que se comunica a los hosts en `AuthOk` |
+| `tunnel.maxPps` / `tunnel.maxForeignPps` | 20 000 / 20 | buckets por `connId` (§4) |
+| `tunnel.idleTimeoutMs` | 30 000 | túnel sin datagramas autenticados |
+| `tunnel.allowWebRtc` | true | conceder el túnel legado a quien lo pida (carga node-datachannel en ese momento) |
 | `limits.maxSessions` | 1000 | túneles simultáneos |
 | `limits.maxSessionsPerKey` / `maxPeersPerKey` | 16 / 256 | cuotas por defecto de cada clave |
 | `limits.maxPeersPerSession` | 40 | jugadores por sala |
@@ -332,115 +480,111 @@ JSON (`--config` o `HAXLITE_EDGE_CONFIG`) + variables de entorno (ganan): `HAXLI
 | `limits.allowWsDataPlane` | true | aceptar túneles con los datos por WebSocket |
 | `stats.path` / `stats.token` / `stats.logIntervalMs` | `/stats` / — / 60 000 | JSON por HTTP(S) y línea de log periódica |
 
-`GET /stats` (con `Authorization: Bearer <token>` si hay token) devuelve sesiones, jugadores,
-fallos de autenticación, por clave `{sessions, peers, bytesIn/Out, messagesIn/Out, ppsIn/Out,
-floods}` (pps desde la consulta anterior), objetos nativos vivos y RSS. Del lado del host:
-`room.haxlite.edgeStats()` → `{state, dataPlane, sessionId, rttMs, peers, sessions, bytes/messages
-In/Out}`.
+`GET /stats` (con `Authorization: Bearer <token>` si hay token) devuelve `playerBackend`,
+sesiones, jugadores, fallos de autenticación, sesiones por plano de datos (`dataPlanes`), por
+clave `{sessions, peers, bytesIn/Out, messagesIn/Out, ppsIn/Out, floods}` (pps desde la consulta
+anterior), `rtc` (contadores del endpoint de jugadores: sesiones, abiertas, STUN rechazados,
+handshakes…), `tunnel` (puerto, túneles, datagramas, `unknownConn`, `rateLimited`, `rejected`,
+`migrations`), `webrtc` (objetos nativos; `null` si node-datachannel nunca se cargó) y RSS.
 
 ## 6. Límites y decisiones
 
 * *Head-of-line* en el túnel: los clientes oficiales mandan **todos** sus eventos (inputs, chat)
   por `ro`, así que con un único canal `ro` en el túnel una pérdida en el tramo host↔edge frenaba
   los inputs de **todos** los jugadores hasta la retransmisión. Con los carriles `ro` (§1.2, por
-  defecto) solo se frena el carril del paquete perdido (≈ 1/16 de los jugadores): con 2–5 % de
-  pérdida en el túnel el RTT medio por `ro` baja a la mitad del exceso (§7.1). Eventos del host
+  defecto) solo se frena el carril del paquete perdido (≈ 1/16 de los jugadores), y en el túnel
+  v2 la retransmisión llega mucho antes (SACK 20 ms, RTO ≥ 60 ms; §7.1). Eventos del host
   (`ru`) y heartbeats (`uu`) nunca sufren HOL. Con el *fallback* WebSocket todo es TCP (HOL
   total): usarlo solo si el UDP está bloqueado.
-* Sin *batching* de mensajes chicos: cada mensaje de jugador es un mensaje de túnel (+2 bytes).
-  Agruparlos añadiría latencia y las mediciones (§7) no lo justifican; el multicast ya elimina el
-  caso caro (difusiones).
+* Por qué SCTP propio sobre UDP+AEAD y no DTLS/ICE: la autenticación ya existe (WS + API key),
+  el host siempre inicia y el edge tiene IP pública, así que ICE y el handshake DTLS sobran; un
+  canal AEAD con claves derivadas del WS cuesta 29 B por datagrama, ningún RTT extra de
+  handshake y cero estado en el edge antes de autenticar. SCTP (no un protocolo propio de
+  fiabilidad) porque ya está probado contra Chromium y libdatachannel y da exactamente la
+  semántica de los canales (ordenado/desordenado/parcialmente fiable por stream).
+* Puerto UDP del túnel separado del de los jugadores: se puede restringir a las IPs de los
+  hosts en el firewall, y los ataques a uno no compiten por el socket del otro.
+* Sin *batching* artificial de mensajes chicos: cada mensaje de jugador es un mensaje de túnel
+  (+2 bytes) y sale en el acto (sin Nagle); SCTP agrupa solo lo que ya está en cola (p. ej. los
+  carriles de un multicast, o lo enviado mientras se procesa un datagrama).
 * Asignación de slots monótona (u16, se reutiliza tras 65 535 entradas): un cierre en vuelo nunca
   se confunde con una entrada nueva.
 * Si el edge se reinicia o el túnel cae, los jugadores se pierden (limitación del cliente oficial).
-* El edge no aplica límites de ancho de banda por clave (solo cuotas de conexiones y flood por
-  jugador); las estadísticas por clave permiten detectar abusos.
-* Cero asignaciones por mensaje en los caminos calientes salvo las inevitables (el `Buffer` que
-  entrega node-datachannel por mensaje recibido y la vista `subarray`): los encabezados se
-  escriben en un buffer *scratch* reutilizado (node-datachannel copia de forma síncrona). Quitar
-  el encabezado es una vista (`subarray`), el multicast entrega **la misma** vista del payload a
-  cada jugador y se parsea en el sitio (sin `Reader`). Anteponer el slot en el sentido
-  jugador→host cuesta una copia del payload al *scratch* (no hay espacio previo en el `Buffer` que
-  entrega node-datachannel); son decenas de bytes.
+* El edge no aplica límites de ancho de banda por clave (solo cuotas de conexiones, flood por
+  jugador y pps por túnel); las estadísticas por clave permiten detectar abusos.
+* Cero asignaciones evitables en los caminos calientes: los encabezados se escriben en un buffer
+  *scratch* reutilizado (SCTP copia de forma síncrona); quitar el encabezado es una vista, el
+  multicast entrega **la misma** vista del payload a cada jugador y se parsea en el sitio. Por
+  datagrama del túnel: el buffer de salida (cabecera + cifrado) y el texto plano descifrado (que
+  SCTP entrega por vistas, sin otra copia).
 * Sin temporizadores en vacío: el ping de keep-alive a los hosts (10 s) solo corre mientras hay
   sesiones; el barrido de negociaciones colgadas (1 s) solo mientras hay alguna negociación
-  pendiente. Un edge sin sesiones no despierta nunca (y libera los hilos nativos de libdatachannel
-  15 s después de cerrar su última PeerConnection, ver `setWebRtcIdleRelease`).
+  pendiente; el barrido de túneles UDP solo con túneles; el de haxlite-rtc solo con jugadores. Un
+  edge sin sesiones no despierta nunca, y con la configuración por defecto no tiene hilos nativos.
+* Con haxlite-rtc no se distingue un mensaje de texto de uno binario (la sesión no expone el
+  PPID): un texto llega al host como bytes y el host lo valida como cualquier mensaje binario (no
+  hay `PeerClosed(Protocol)` como con `'ndc'`).
 
 ## 7. Overhead medido (loopback)
 
 `scripts/edge-latency.ts` (procesos separados: clientes + master / host / edge; carga de
 "jugador ocupado" de bench/net: un cambio de teclas cada 60–250 ms por jugador, partido en
 curso; sonda RTT con el mensaje Ping del cliente cada 50 ms, alternando `ro` y `uu`; el Pong
-vuelve por `uu`):
+vuelve por `uu`). Modos: `direct`, `edge[-rtc|-ndc][-udp|-webrtc|-ws]` (por defecto
+`rtc`/`udp`, o sea `edge` = la configuración nueva y `edge-ndc-webrtc` = la anterior):
 
 ```sh
-node --experimental-transform-types --no-warnings --import ./scripts/ts-resolve.mjs \
-     scripts/edge-latency.ts --players 8 --seconds 20 --runs 2
+flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings \
+  --import ./scripts/ts-resolve.mjs scripts/edge-latency.ts \
+  --players 16 --seconds 20 --runs 3 --modes edge-rtc-udp,edge-ndc-webrtc
 ```
 
-Medido en el contenedor de desarrollo (Linux, Node 22.22, loopback; edge en 127.0.0.2, túnel del
-host en 127.0.0.3). "CPU %" = tiempo de CPU del proceso (todos sus hilos, incluidos los de
-libdatachannel) / tiempo real; "por jugador" = dividido por los jugadores conectados (carga + sonda).
-~200 muestras de RTT por canal y corrida.
+Medido en el contenedor de desarrollo (Linux, 4 vCPU, Node 22.22, loopback; edge en 127.0.0.2,
+túnel del host en 127.0.0.3). "CPU %" = tiempo de CPU del proceso (todos sus hilos, incluidos
+los de libdatachannel cuando los hay) / tiempo real; "por jugador" = dividido por los jugadores
+conectados (carga + sonda). ~200 muestras de RTT por canal y corrida.
 
-**9 jugadores** (8 de carga + sonda), 2 corridas de 20 s:
+{{TABLA_CPU}}
 
-| Modo | RTT `ro` p50 / p99 (ms) | RTT `uu` p50 / p99 (ms) | CPU host (% total) | CPU host %/jugador | CPU edge %/jugador |
-|---|---|---|---|---|---|
-| directo (sin edge) | 1,03 / 2,81 · 1,05 / 3,04 | 1,00 / 4,07 · 1,04 / 3,11 | 10,5 · 10,8 | 1,17 · 1,20 | — |
-| edge, datos por UDP (PeerConnection) | 1,69 / 5,85 · 1,64 / 5,79 | 1,73 / 4,16 · 1,72 / 4,09 | 6,3 · 6,1 | 0,70 · 0,68 | 1,26 · 1,22 |
-| edge, datos por WebSocket (*fallback*) | 1,61 / 5,08 · 1,69 / 3,13 | 1,62 / 8,02 · 1,68 / 3,49 | 5,0 · 5,2 | 0,56 · 0,58 | 1,23 · 1,30 |
+## 7.1 Pérdida en el tramo host↔edge: túnel v1 vs v2
 
-**17 jugadores** (16 + sonda), 1 corrida de 20 s:
+`--loss <pct>`: regla nftables (`numgen random`) que descarta ese % del UDP 127.0.0.2↔127.0.0.3
+en ambos sentidos (solo el túnel; los jugadores no se tocan). 17 jugadores, 2 × 40 s por
+configuración, carriles `ro` activos en todos los casos.
 
-| Modo | RTT `ro` p50 / p99 (ms) | RTT `uu` p50 / p99 (ms) | CPU host (% total) | CPU host %/jugador | CPU edge %/jugador |
-|---|---|---|---|---|---|
-| directo | 1,02 / 3,67 | 1,00 / 2,37 | 19,4 | 1,14 | — |
-| edge (UDP) | 1,68 / 4,53 | 1,70 / 6,63 | 8,1 | 0,48 | 1,24 |
-| edge (WS) | 1,56 / 3,53 | 1,50 / 3,99 | 6,4 | 0,38 | 1,18 |
+{{TABLA_PERDIDA}}
 
-Ninguna corrida perdió pings (`lost: 0`).
+### 7.2 Mediciones de la versión anterior (node-datachannel en ambos lados)
 
-* **Latencia agregada por el edge: ≈ +0,65 ms en la mediana** (≈ 1,0 → 1,7 ms de ida y vuelta
-  completa) y +1–3 ms en el p99, en el mismo equipo. Es el costo de un salto extra con dos
-  pasadas por el event loop de Node (hilo de libdatachannel → JS → hilo de libdatachannel) en el
-  edge y una en el host; el RTT directo de ~1 ms en loopback ya es casi todo eso mismo.
-* **CPU del host: −40 % con 9 jugadores, −58 % con 17**, y el costo por jugador *baja* al subir
-  jugadores (multicast + una sola sesión DTLS/SCTP). El edge gasta ≈ 1,2 % de un núcleo por
-  jugador (≈ lo que gastaba el host directo: es el WebRTC de los jugadores que se mudó ahí).
-* En loopback el WebSocket rinde igual o mejor que el UDP (sin pérdidas, TCP no paga nada); con
-  pérdida real en el tramo host↔edge el UDP evita el *head-of-line blocking* de `ru`/`uu`, por eso
-  es el modo por defecto.
+Para referencia (mismo script, `edge` = `edge-ndc-webrtc` de hoy):
 
-Lectura:
+* 9 jugadores: directo RTT `ro` p50 1,03 ms / CPU host 10,5 %; edge (PeerConnection) RTT `ro` p50
+  1,69 ms / CPU host 6,3 % / edge 1,26 %/jugador; edge (WS) 1,61 ms / 5,0 % / 1,23 %/jugador.
+* 17 jugadores: directo 1,02 ms / 19,4 %; edge (UDP) 1,68 ms / 8,1 % / 1,24 %/jugador; edge (WS)
+  1,56 ms / 6,4 % / 1,18 %/jugador.
+* Carriles `ro` con 2 % / 5 % de pérdida en el túnel: RTT `ro` medio 2,79 → 2,09 ms y
+  4,94 → 3,24 ms (un canal → carriles); `enableIceUdpMux` en el edge: +6 % de CPU.
 
-* **Latencia:** el edge agrega un salto en el mismo equipo (SCTP/DTLS extra + dos pasadas por el
-  event loop de Node); en producción se suma además el tramo de red host↔edge, que conviene
-  minimizar eligiendo un edge en la misma ciudad/proveedor que el host (o que los jugadores, si
-  el host está lejos: el camino jugador→edge→host puede incluso ser mejor que el directo).
-* **CPU del host:** baja, porque el host ya no hace DTLS/SCTP por jugador (una sola conexión con
-  el edge) y las difusiones salen una vez (multicast). El costo se traslada al edge, que es
-  donde están los recursos.
+## 8. Sin addons nativos
 
-### 7.1 Pasada de ligereza (red) y pérdida en el túnel
-
-Detalle y comandos en [07 «Pasada de ligereza — red»](07-benchmarks.md#pasada-de-ligereza--red-srcnet-srcedge).
-
-* **Pérdida en el tramo host↔edge** (`--loss`, regla nftables solo sobre el UDP 127.0.0.2↔127.0.0.3;
-  17 jugadores, 2 × 40 s por configuración):
-
-  | pérdida | RTT `ro` media (ms): 1 canal `ro` → carriles | RTT `ro` p99 (ms) | RTT `uu` media (ms) |
-  |---|---|---|---|
-  | 2 % | 2,79 · 2,31 → **2,09 · 2,02** | 37,3 · 36,9 → 26,8 · 24,7 | 1,73 · 1,53 → 1,65 · 1,60 |
-  | 5 % | 4,94 · 4,80 → **3,24 · 3,34** | 40,9 · 53,2 → 46,4 · 43,0 | 1,82 · 1,77 → 1,60 · 1,52 |
-
-  El exceso medio de `ro` sobre `uu` baja a la mitad; el p99 lo siguen dominando las pérdidas de
-  los propios paquetes de la sonda.
-* **Sin pérdida** (9 jugadores, 3 × 20 s intercaladas, mediana): CPU host 4,86 → 4,72 %, CPU edge
-  10,06 → 9,68 % (1,12 → 1,08 %/jugador, dentro del ruido), RTT `ro` p50 1,58 → 1,44 ms. Los
-  carriles no cuestan CPU (sin carriles: 4,64 / 9,83 %).
-* **`enableIceUdpMux` en el edge**: 17 jugadores, 3 × 30 s: CPU edge 17,0 → 18,1 % y RTT +0,1–0,2 ms;
-  queda desactivado por defecto (en el host directo sí ahorra, ver docs/07).
-* En vacío el edge no despierta: keep-alive y barrido solo con sesiones/negociaciones, y los hilos
-  nativos se liberan 15 s después de la última PeerConnection.
+* `src/edge/server.ts` y `src/net/edge-client.ts` no importan node-datachannel: todo lo que lo usa
+  (túnel legado y `playerBackend: 'ndc'`) está en `src/net/edge-ndc.ts` y se carga con
+  `import()` solo cuando un host pide `WebRtc` o el operador elige `'ndc'`; el build (rolldown)
+  lo deja en su propio *chunk*.
+* `test/edge/edge-no-native.test.ts` arranca, en procesos separados, un edge con la configuración
+  por defecto y una sala completa (`HBInit`) hosteada a través de él por el túnel v2; un cliente
+  node-haxball real entra y chatea; ambos procesos registran **todas** las llamadas a
+  `process.dlopen` y toda resolución de un especificador `node-datachannel`
+  (`module.registerHooks`) desde antes de importar haxlite: ambas listas quedan vacías y
+  `require.cache` no tiene nada de node-datachannel. Control positivo en el mismo test: con
+  `playerBackend: 'ndc'` la trampa sí ve el addon.
+* `test/rtc-interop/edge.interop.ts` (`npm run test:interop`): Chromium real (la página del banco
+  de interoperabilidad, copia del uso de WebRTC del cliente oficial) negocia a través del host →
+  túnel → edge (haxlite-rtc) y intercambia 300 mensajes por canal en ambos sentidos; luego 10
+  navegadores a la vez, cerrados desde el host.
+* Combinaciones probadas en `npm test` (`test/edge/`): `rtc`+`udp` (por defecto), `ndc`+`webrtc`
+  (E2E completo de > 3000 frames con ambos), `ndc`+`udp`, `rtc`+`webrtc`, `rtc`+`ws`, edge sin
+  túnel v2 → WS, edge sin túnel legado → WS, host v2 ↔ edge protocolo 1 (falso) → WS, `AuthOk`
+  falsificado → error fatal, ataques UDP (connId desconocido, datagramas falsos, repetidos desde
+  otra dirección: sin respuesta y sin desvío), NAT rebinding seguido y ratchet de claves en
+  partida.

@@ -3,36 +3,50 @@
  * {@link PeerBackend} whose player PeerConnections live on a remote edge.
  *
  * ```
- *  HostTransport ── createPeer(offer) ──▶ EdgePeerBackend ══ WS (control) ══▶ edge ── WebRTC ── player
- *                ◀─ answer/candidates ──                 ══ PC 3 ch (data) ══▶
+ *  HostTransport ── createPeer(offer) ──▶ EdgePeerBackend ══ WS (control, wss)        ══▶ edge ── WebRTC ── player
+ *                ◀─ answer/candidates ──                 ══ UDP: SCTP over AES-GCM ══▶
  * ```
  *
- * This process only opens OUTBOUND connections to the edge (WebSocket +
- * optionally one host↔edge PeerConnection whose candidates are exchanged
- * with the edge only). If the tunnel drops, every player is lost (official
- * clients cannot reconnect) and the tunnel is re-established with backoff;
- * joins are refused (4104) meanwhile.
+ * This process only opens OUTBOUND connections to the edge: the control
+ * WebSocket and, for the data plane, one UDP "socket" to the edge's tunnel
+ * port (tunnel v2, `edge-udp.ts`: our own SCTP over AEAD datagrams, no
+ * native addon), or the legacy host↔edge node-datachannel PeerConnection
+ * (`dataPlane: 'webrtc'`, loaded lazily), or the WebSocket itself. If the
+ * tunnel drops, every player is lost (official clients cannot reconnect) and
+ * the tunnel is re-established with backoff; joins are refused (4104)
+ * meanwhile.
  */
+import dgram from 'node:dgram';
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
 import WebSocket, { type ClientOptions, type RawData } from 'ws';
-import type { DataChannel, PeerConnection } from 'node-datachannel';
 import { Reader, Writer } from '../codec/index.js';
 import { CHANNELS } from './constants.js';
 import { candidateLine, toNativeIceServers, type IceServerConfig } from './ice.js';
 import type { PeerBackend, PeerLink, PeerLinkEvents } from './peer-backend.js';
-import { closeNative, createDataChannel, createPeerConnection } from './webrtc.js';
 import {
   AuthFlag,
+  EDGE_LEGACY_VERSION,
   EDGE_NONCE_LENGTH,
   EDGE_PROTOCOL_VERSION,
   EDGE_RO_LANES,
+  EDGE_X25519_LENGTH,
   EdgeCloseCode,
   EdgeLimits,
   EdgeMsg,
   EdgePeerClose,
   edgeAuthMac,
+  edgeAuthMacV2,
+  edgeAuthOkMac,
+  edgeMacEqual,
   parseEdgeKey,
   roLaneChannel,
 } from './edge-protocol.js';
+import { UdpTunnelPlane, deriveTunnelSecrets, x25519Generate, x25519Shared, type UdpPlaneStats, type X25519Pair } from './edge-udp.js';
+import type { NdcTunnelPlane } from './edge-ndc.js';
+
+/** Data plane of a tunnel: `'udp'` (v2, default), `'webrtc'` (legacy node-datachannel), `'ws'`. */
+export type EdgeDataPlane = 'udp' | 'webrtc' | 'ws';
 
 export interface EdgeOptions {
   /** Control endpoint, e.g. `wss://edge.example.com:8443/tunnel` (`ws://` only for tests/LAN). */
@@ -40,13 +54,19 @@ export interface EdgeOptions {
   /** API key issued by the edge operator: `"<keyId>:<secret>"`. */
   key: string;
   /**
-   * When the UDP data plane (host↔edge PeerConnection) cannot be established
-   * within `dataPlaneTimeoutMs`, carry all player traffic over the WebSocket
-   * instead (TCP: head-of-line blocking, slightly more latency). Default true.
+   * When the UDP data plane (tunnel v2, or the legacy PeerConnection) cannot
+   * be established within `dataPlaneTimeoutMs` (or the edge does not grant
+   * it), carry all player traffic over the WebSocket instead (TCP:
+   * head-of-line blocking, slightly more latency). Default true.
    */
   fallbackWs?: boolean;
-  /** Start directly with `'ws'` (UDP known to be blocked). Default `'webrtc'`. */
-  dataPlane?: 'webrtc' | 'ws';
+  /**
+   * `'udp'` (default): tunnel v2, SCTP over AES-GCM UDP datagrams to the
+   * edge's tunnel port (pure TypeScript). `'webrtc'`: the legacy host↔edge
+   * node-datachannel PeerConnection (loads the native addon). `'ws'`: start
+   * directly on the WebSocket (UDP known to be blocked).
+   */
+  dataPlane?: EdgeDataPlane;
   /**
    * Ask the edge for `ro` lanes ({@link AuthFlag.RoLanes}): player `ro`
    * traffic spread over several ordered tunnel channels so a loss on the
@@ -54,11 +74,11 @@ export interface EdgeOptions {
    * (ignored by edges that don't support it).
    */
   roLanes?: boolean;
-  /** Local address for the outbound WebSocket and the tunnel PeerConnection. */
+  /** Local address for the outbound WebSocket and the tunnel's UDP socket / PeerConnection. */
   bindAddress?: string;
-  /** STUN/TURN for the tunnel PeerConnection (default none: the edge is public). */
+  /** `dataPlane: 'webrtc'` only: STUN/TURN for the tunnel PeerConnection (default none: the edge is public). */
   iceServers?: readonly IceServerConfig[];
-  /** Local UDP port range of the tunnel PeerConnection. */
+  /** `dataPlane: 'webrtc'` only: local UDP port range of the tunnel PeerConnection. */
   portRange?: readonly [number, number] | null;
   /** WS connect + auth deadline. Default 10 s. */
   connectTimeoutMs?: number;
@@ -67,13 +87,20 @@ export interface EdgeOptions {
   /** Reconnect backoff: first delay (doubles up to `reconnectMaxMs`). Default 250 ms / 10 s. */
   reconnectMinMs?: number;
   reconnectMaxMs?: number;
-  /** Application ping period and dead-tunnel timeout. Default 5 s / 15 s. */
+  /**
+   * Application ping period and dead-tunnel timeout. Default 5 s / 15 s. With
+   * the UDP tunnel the host also sends an authenticated UDP ping each period
+   * (NAT keep-alive + RTT) and drops the tunnel when nothing authenticated
+   * came back over UDP for `pingTimeoutMs`.
+   */
   pingIntervalMs?: number;
   pingTimeoutMs?: number;
   /** Extra `ws` client options (TLS `ca`, `rejectUnauthorized`, `agent`…). */
   wsOptions?: ClientOptions;
   /** Debug logger. */
   log?: (msg: string) => void;
+  /** @internal tests/benchmarks: UDP tunnel SCTP overrides and rekey threshold. */
+  udpTuning?: { sctp?: Record<string, number>; rekeyAfterPackets?: number };
 }
 
 export type EdgeState = 'idle' | 'connecting' | 'ready' | 'reconnecting' | 'stopped';
@@ -94,7 +121,7 @@ export class EdgeError extends Error {
 
 export interface EdgeBackendStats {
   state: EdgeState;
-  dataPlane: 'webrtc' | 'ws' | null;
+  dataPlane: EdgeDataPlane | null;
   /** Ordered tunnel channels carrying player `ro` traffic (1 = single channel; null when not ready). */
   roLanes: number | null;
   sessionId: number | null;
@@ -107,6 +134,8 @@ export interface EdgeBackendStats {
   bytesIn: number;
   messagesOut: number;
   messagesIn: number;
+  /** UDP tunnel counters (`dataPlane: 'udp'`), else null. */
+  udp: UdpPlaneStats | null;
 }
 
 const Phase = {
@@ -173,7 +202,7 @@ export class EdgePeerBackend implements PeerBackend {
   /** @internal */ readonly links = new Map<number, EdgeLink>();
   private nextSlot = 1;
   /** Current data-plane preference (switches to 'ws' after a fallback). */
-  private mode: 'webrtc' | 'ws';
+  private mode: EdgeDataPlane;
   private backoff: number;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private sessions = 0;
@@ -184,7 +213,7 @@ export class EdgePeerBackend implements PeerBackend {
     const { id, secret } = parseEdgeKey(opts.key);
     this.keyId = id;
     this.secret = secret;
-    this.mode = opts.dataPlane ?? 'webrtc';
+    this.mode = opts.dataPlane ?? 'udp';
     this.backoff = opts.reconnectMinMs ?? 250;
     if (!/^wss?:\/\//i.test(opts.url)) throw new Error('edge url must start with ws:// or wss://');
   }
@@ -204,6 +233,7 @@ export class EdgePeerBackend implements PeerBackend {
       peers: this.links.size,
       sessions: this.sessions,
       ...this.counters,
+      udp: s !== null && s.phase === Phase.Ready ? s.udpStats() : null,
     };
   }
 
@@ -359,24 +389,40 @@ export class EdgePeerBackend implements PeerBackend {
   }
 }
 
-/** One tunnel connection attempt / session (WS + optional data-plane PeerConnection). */
+/** Host name of a `ws(s)://` URL, without IPv6 brackets. */
+function urlHost(url: string): string {
+  const h = new URL(url).hostname;
+  return h.startsWith('[') && h.endsWith(']') ? h.slice(1, -1) : h;
+}
+
+/** Granted ready data plane: the UDP tunnel or the legacy PeerConnection. */
+interface DataPlane {
+  ready(ch: number): boolean;
+  send(ch: number, frame: Uint8Array): boolean;
+  cork?(): void;
+  uncork?(): void;
+}
+
+/** One tunnel connection attempt / session (WS + optional UDP / PeerConnection data plane). */
 class TunnelSession {
   phase: Phase = Phase.Hello;
-  readonly mode: 'webrtc' | 'ws';
+  /** Data plane: the requested one until `AuthOk`, then the granted one. */
+  mode: EdgeDataPlane;
   sessionId: number | null = null;
-  rttMs: number | null = null;
+  private wsRttMs: number | null = null;
   private readonly backend: EdgePeerBackend;
   private readonly ws: WebSocket;
-  private pc: PeerConnection | null = null;
-  /** Tunnel channels: ro, ru, uu, then the extra `ro` lanes. */
-  private dcs: (DataChannel | null)[] = [null, null, null];
-  private dcOpen = [false, false, false];
   /** `ro` lanes granted by the edge (1 = the single `ro` channel). */
   private lanes = 1;
-
-  get roLanes(): number {
-    return this.lanes;
-  }
+  /** Flags requested in `Auth`. */
+  private requested = 0;
+  private nonce: Uint8Array | null = null;
+  private x25519: X25519Pair | null = null;
+  private plane: DataPlane | null = null;
+  private udp: UdpTunnelPlane | null = null;
+  private udpSock: dgram.Socket | null = null;
+  private udpStartedAt = 0;
+  private ndc: NdcTunnelPlane | null = null;
   private answerApplied = false;
   private readonly heldCandidates: [string, string][] = [];
   private readonly heldRemote: [string, string][] = [];
@@ -386,7 +432,20 @@ class TunnelSession {
   private readonly w = new Writer(1024);
   private scratch = Buffer.allocUnsafe(4096);
 
-  constructor(backend: EdgePeerBackend, mode: 'webrtc' | 'ws') {
+  get roLanes(): number {
+    return this.lanes;
+  }
+
+  /** UDP round trip when the UDP tunnel is up, else the WebSocket's. */
+  get rttMs(): number | null {
+    return this.udp?.rttMs ?? this.wsRttMs;
+  }
+
+  udpStats(): UdpPlaneStats | null {
+    return this.udp?.stats() ?? null;
+  }
+
+  constructor(backend: EdgePeerBackend, mode: EdgeDataPlane) {
     this.backend = backend;
     this.mode = mode;
     const o = backend.opts;
@@ -456,13 +515,8 @@ class TunnelSession {
   }
 
   private sendDc(ch: number, frame: Uint8Array): boolean {
-    const dc = this.dcs[ch];
-    if (dc == null || !this.dcOpen[ch]) return false;
-    try {
-      if (!dc.sendMessageBinary(frame)) return false;
-    } catch {
-      return false;
-    }
+    const p = this.plane;
+    if (p === null || !p.ready(ch) || !p.send(ch, frame)) return false;
     const c = this.backend.counters;
     c.messagesOut++;
     c.bytesOut += frame.length;
@@ -499,47 +553,54 @@ class TunnelSession {
   /**
    * One tunnel message for many players (`Multicast`), in chunks of 255
    * slots. On `ro` with lanes, one message per lane in use (each slot's `ro`
-   * order lives on its lane).
+   * order lives on its lane); on the UDP tunnel they are bundled into as few
+   * datagrams as possible.
    */
   sendMulticast(ch: number, links: readonly EdgeLink[], data: Uint8Array): void {
-    const lanes = ch === 0 && this.mode !== 'ws' ? this.lanes : 1;
-    for (let lane = 0; lane < lanes; lane++) {
-      let start = 0;
-      for (;;) {
-        // next ≤ 255 slots of this lane, written straight into the frame
-        const ws = this.mode === 'ws';
-        const room = lanes === 1 ? Math.min(255, links.length - start) : 255; // slots this frame can take
-        const size = (ws ? 0 : 2) + 3 + 2 * room + data.length;
-        const buf = ws ? Buffer.allocUnsafe(size) : this.ensureScratch(size);
-        let p = ws ? 0 : 2;
-        if (!ws) {
-          buf[0] = 0;
-          buf[1] = 0;
+    const ws = this.mode === 'ws';
+    const lanes = ch === 0 && !ws ? this.lanes : 1;
+    const plane = this.plane;
+    plane?.cork?.();
+    try {
+      for (let lane = 0; lane < lanes; lane++) {
+        let start = 0;
+        for (;;) {
+          // next ≤ 255 slots of this lane, written straight into the frame
+          const room = lanes === 1 ? Math.min(255, links.length - start) : 255; // slots this frame can take
+          const size = (ws ? 0 : 2) + 3 + 2 * room + data.length;
+          const buf = ws ? Buffer.allocUnsafe(size) : this.ensureScratch(size);
+          let p = ws ? 0 : 2;
+          if (!ws) {
+            buf[0] = 0;
+            buf[1] = 0;
+          }
+          buf[p++] = EdgeMsg.Multicast;
+          buf[p++] = ch;
+          const countAt = p++;
+          let count = 0;
+          while (start < links.length && count < 255) {
+            const slot = links[start++]!.slot;
+            if (lanes > 1 && slot % lanes !== lane) continue;
+            buf[p++] = slot >>> 8;
+            buf[p++] = slot & 0xff;
+            count++;
+          }
+          if (count > 0) {
+            buf[countAt] = count;
+            buf.set(data, p);
+            const n = p + data.length;
+            if (ws) {
+              const c = this.backend.counters;
+              c.messagesOut++;
+              c.bytesOut += n;
+              this.sendWs(buf.subarray(0, n));
+            } else this.sendDc(lane === 0 ? ch : 2 + lane, buf.subarray(0, n));
+          }
+          if (start >= links.length) break;
         }
-        buf[p++] = EdgeMsg.Multicast;
-        buf[p++] = ch;
-        const countAt = p++;
-        let count = 0;
-        while (start < links.length && count < 255) {
-          const slot = links[start++]!.slot;
-          if (lanes > 1 && slot % lanes !== lane) continue;
-          buf[p++] = slot >>> 8;
-          buf[p++] = slot & 0xff;
-          count++;
-        }
-        if (count > 0) {
-          buf[countAt] = count;
-          buf.set(data, p);
-          const n = p + data.length;
-          if (ws) {
-            const c = this.backend.counters;
-            c.messagesOut++;
-            c.bytesOut += n;
-            this.sendWs(buf.subarray(0, n));
-          } else this.sendDc(lane === 0 ? ch : 2 + lane, buf.subarray(0, n));
-        }
-        if (start >= links.length) break;
       }
+    } finally {
+      plane?.uncork?.();
     }
   }
 
@@ -558,56 +619,34 @@ class TunnelSession {
       this.backend.onPeerData(type - EdgeMsg.Data0, (data[1]! << 8) | data[2]!, data.subarray(3));
       return;
     }
-    this.onControl(new Reader(data));
+    this.onControl(new Reader(data), data);
   }
 
-  private onControl(r: Reader): void {
+  private onControl(r: Reader, raw: Uint8Array): void {
     const type = r.u8();
     switch (type) {
-      case EdgeMsg.Hello: {
-        if (this.phase !== Phase.Hello) throw new Error('unexpected hello');
-        const version = r.u8();
-        if (version !== EDGE_PROTOCOL_VERSION) {
-          this.fail(new EdgeError(`edge speaks protocol ${version}, host ${EDGE_PROTOCOL_VERSION}`, 'version', true));
-          return;
-        }
-        const nonce = r.bytes(EDGE_NONCE_LENGTH);
-        const w = this.control(EdgeMsg.Auth);
-        w.u8(EDGE_PROTOCOL_VERSION);
-        w.string(this.backend.keyId);
-        w.bytes(edgeAuthMac(this.backend.secret, nonce));
-        w.u8(this.mode === 'webrtc' ? AuthFlag.WebRtc | (this.backend.opts.roLanes !== false ? AuthFlag.RoLanes : 0) : 0);
-        this.phase = Phase.Auth;
-        this.sendWs(w.copyBytes());
+      case EdgeMsg.Hello:
+        this.onHello(r);
         return;
-      }
-      case EdgeMsg.AuthOk: {
-        if (this.phase !== Phase.Auth) throw new Error('unexpected auth ok');
-        this.sessionId = r.u32();
-        r.u16(); // maxPeers (informational)
-        const granted = r.remaining > 0 ? r.u8() : 0;
-        if (this.mode === 'webrtc' && (granted & AuthFlag.RoLanes) !== 0 && this.backend.opts.roLanes !== false) this.lanes = EDGE_RO_LANES;
-        this.startPing();
-        if (this.mode === 'ws') this.becomeReady();
-        else this.startDataPlane();
+      case EdgeMsg.AuthOk:
+        this.onAuthOk(r, raw);
         return;
-      }
       case EdgeMsg.TunnelAnswer: {
-        const pc = this.pc;
-        if (pc === null || this.phase !== Phase.DataPlane || this.answerApplied) throw new Error('unexpected tunnel answer');
-        pc.setRemoteDescription(readStr(r, EdgeLimits.maxSdp), 'answer');
+        const ndc = this.ndc;
+        if (ndc === null || this.phase !== Phase.DataPlane || this.answerApplied) throw new Error('unexpected tunnel answer');
+        ndc.setAnswer(readStr(r, EdgeLimits.maxSdp));
         this.answerApplied = true;
-        for (const [c, m] of this.heldRemote.splice(0)) this.addTunnelCandidate(c, m);
+        for (const [c, m] of this.heldRemote.splice(0)) ndc.addRemoteCandidate(c, m);
         for (const [c, m] of this.heldCandidates.splice(0)) this.sendTunnelCandidate(c, m);
         return;
       }
       case EdgeMsg.TunnelCandidate: {
         const c = readStr(r, EdgeLimits.maxCandidate);
         const m = readStr(r, EdgeLimits.maxMid);
-        if (this.pc === null) return;
+        if (this.ndc === null) return;
         if (!this.answerApplied) {
           if (this.heldRemote.length < EdgeLimits.maxRemoteCandidates) this.heldRemote.push([c, m]);
-        } else this.addTunnelCandidate(c, m);
+        } else this.ndc.addRemoteCandidate(c, m);
         return;
       }
       case EdgeMsg.Ping: {
@@ -618,7 +657,7 @@ class TunnelSession {
         return;
       }
       case EdgeMsg.Pong:
-        this.rttMs = performance.now() - r.f64();
+        this.wsRttMs = performance.now() - r.f64();
         return;
       case EdgeMsg.Error: {
         const code = r.u16();
@@ -638,6 +677,102 @@ class TunnelSession {
     }
   }
 
+  /** `Hello [u8 1][nonce][u8 maxVersion]`: answers with a v2 `Auth` (or v1 for an old edge). */
+  private onHello(r: Reader): void {
+    if (this.phase !== Phase.Hello) throw new Error('unexpected hello');
+    const first = r.u8();
+    if (first !== EDGE_LEGACY_VERSION && first !== EDGE_PROTOCOL_VERSION) {
+      this.fail(new EdgeError(`edge speaks protocol ${first}, host ${EDGE_PROTOCOL_VERSION}`, 'version', true));
+      return;
+    }
+    const nonce = r.bytesCopy(EDGE_NONCE_LENGTH);
+    this.nonce = nonce;
+    const version = Math.min(r.remaining > 0 ? r.u8() : first, EDGE_PROTOCOL_VERSION);
+    const o = this.backend.opts;
+    const lanes = o.roLanes !== false ? AuthFlag.RoLanes : 0;
+    const w = this.control(EdgeMsg.Auth);
+    if (version >= 2) {
+      let flags = 0;
+      let hostPub: Buffer | null = null;
+      if (this.mode === 'udp') {
+        flags = AuthFlag.Udp | lanes;
+        this.x25519 = x25519Generate();
+        hostPub = this.x25519.publicKey;
+      } else if (this.mode === 'webrtc') flags = AuthFlag.WebRtc | lanes;
+      this.requested = flags;
+      w.u8(2);
+      w.string(this.backend.keyId);
+      w.bytes(edgeAuthMacV2(this.backend.secret, nonce, flags, hostPub));
+      w.u8(flags);
+      if (hostPub !== null) w.bytes(hostPub);
+    } else {
+      // protocol-1 edge: no UDP tunnel
+      if (this.mode === 'udp') {
+        if (o.fallbackWs === false) {
+          this.fail(new EdgeError('edge speaks protocol 1 (no UDP tunnel) and fallbackWs is off', 'version', true));
+          return;
+        }
+        this.backend.log('edge speaks protocol 1: no UDP tunnel, using the WebSocket data plane');
+      }
+      const flags = this.mode === 'webrtc' ? AuthFlag.WebRtc | lanes : 0;
+      this.requested = flags;
+      w.u8(EDGE_LEGACY_VERSION);
+      w.string(this.backend.keyId);
+      w.bytes(edgeAuthMac(this.backend.secret, nonce));
+      w.u8(flags);
+    }
+    this.phase = Phase.Auth;
+    this.sendWs(w.copyBytes());
+  }
+
+  private onAuthOk(r: Reader, raw: Uint8Array): void {
+    if (this.phase !== Phase.Auth) throw new Error('unexpected auth ok');
+    const o = this.backend.opts;
+    this.sessionId = r.u32();
+    r.u16(); // maxPeers (informational)
+    const granted = r.remaining > 0 ? r.u8() : 0;
+    if ((granted & ~this.requested) !== 0) throw new Error('edge granted flags that were not requested');
+    if ((granted & AuthFlag.RoLanes) !== 0 && o.roLanes !== false) this.lanes = EDGE_RO_LANES;
+    if ((granted & AuthFlag.Udp) !== 0) {
+      const edgePub = r.bytesCopy(EDGE_X25519_LENGTH);
+      const connId = r.u32();
+      const port = r.u16();
+      const udpHost = readStr(r, EdgeLimits.maxUdpHost);
+      const macAt = r.pos;
+      const mac = r.bytes(32);
+      const x = this.x25519!;
+      const want = edgeAuthOkMac(this.backend.secret, this.nonce!, x.publicKey, raw.subarray(0, macAt));
+      if (!edgeMacEqual(want, mac)) {
+        this.fail(new EdgeError('the edge could not prove it knows the key (AuthOk MAC mismatch)', 'auth', true));
+        return;
+      }
+      if (port === 0 || connId === 0) throw new Error('bad UDP tunnel endpoint');
+      this.mode = 'udp';
+      this.startPing();
+      this.startUdpPlane(edgePub, connId, udpHost.length > 0 ? udpHost : urlHost(o.url), port);
+      return;
+    }
+    this.x25519 = null;
+    if ((granted & AuthFlag.WebRtc) !== 0) {
+      this.mode = 'webrtc';
+      this.startPing();
+      this.startNdcPlane();
+      return;
+    }
+    // the edge put this session's data on the WebSocket
+    if (this.requested !== 0) {
+      if (o.fallbackWs === false) {
+        this.fail(new EdgeError('the edge did not grant a UDP data plane and fallbackWs is off', 'tunnel'));
+        return;
+      }
+      this.backend.log('edge granted no UDP data plane: using the WebSocket');
+    }
+    this.mode = 'ws';
+    this.lanes = 1;
+    this.startPing();
+    this.becomeReady();
+  }
+
   private onWsClose(code: number, reason: string): void {
     if (this.phase === Phase.Closed) return;
     let err: EdgeError;
@@ -650,9 +785,10 @@ class TunnelSession {
 
   // ---------------------------------------------------------------- data plane
 
-  private startDataPlane(): void {
-    this.phase = Phase.DataPlane;
+  /** Data-plane deadline: then fall back to the WebSocket (reconnect) or fail. */
+  private armDataPlaneDeadline(): void {
     const o = this.backend.opts;
+    this.phase = Phase.DataPlane;
     if (this.deadline !== null) clearTimeout(this.deadline);
     this.deadline = setTimeout(() => {
       if (this.phase !== Phase.DataPlane) return;
@@ -661,89 +797,135 @@ class TunnelSession {
         this.fail(new EdgeError('UDP data plane timed out, falling back to WebSocket', 'tunnel'), true);
       } else this.fail(new EdgeError('UDP data plane timed out', 'tunnel'));
     }, o.dataPlaneTimeoutMs ?? 5_000);
+  }
+
+  /** Tunnel v2: SCTP (we initiate) over AES-GCM datagrams from one connected UDP socket. */
+  private startUdpPlane(edgePub: Uint8Array, connId: number, host: string, port: number): void {
+    this.armDataPlaneDeadline();
+    const o = this.backend.opts;
+    const x = this.x25519!;
+    this.x25519 = null; // the private key lives only until the shared secret is computed
+    const secrets = deriveTunnelSecrets(x25519Shared(x.privateKey, edgePub), this.backend.secret, this.nonce!, x.publicKey, edgePub, connId);
+    void (async () => {
+      const bindFamily = o.bindAddress !== undefined ? isIP(o.bindAddress) : 0;
+      const target = isIP(host) !== 0 ? { address: host, family: isIP(host) } : await lookup(host, { family: bindFamily === 0 ? undefined : bindFamily });
+      if (this.phase !== Phase.DataPlane) return;
+      const sock = dgram.createSocket({ type: target.family === 6 ? 'udp6' : 'udp4' });
+      this.udpSock = sock;
+      sock.on('error', (err) => this.backend.log(`tunnel udp: ${err.message}`));
+      await new Promise<void>((resolve, reject) => {
+        sock.once('error', reject);
+        sock.bind({ port: 0, ...(o.bindAddress !== undefined ? { address: o.bindAddress } : null) }, () => {
+          sock.off('error', reject);
+          resolve();
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        sock.once('error', reject);
+        sock.connect(port, target.address, () => {
+          sock.off('error', reject);
+          resolve();
+        });
+      });
+      if (this.phase !== Phase.DataPlane || this.udpSock !== sock) return;
+      try {
+        sock.setRecvBufferSize(1 << 20);
+        sock.setSendBufferSize(1 << 20);
+      } catch {
+        /* capped by the kernel */
+      }
+      this.udpStartedAt = performance.now();
+      const plane = new UdpTunnelPlane({
+        role: 'client',
+        connId,
+        secrets,
+        lanes: this.lanes,
+        transmit: (d) => {
+          try {
+            sock.send(d);
+          } catch {
+            /* closed */
+          }
+        },
+        events: {
+          onOpen: () => {
+            if (this.udp === plane && this.phase === Phase.DataPlane) this.becomeReady();
+          },
+          onMessage: (ch, data) => {
+            if (this.udp === plane) this.onDcMessage(ch, data);
+          },
+          onClose: (reason) => {
+            if (this.udp === plane) this.fail(new EdgeError(`UDP tunnel closed (${reason})`, 'tunnel'));
+          },
+          onError: (err) => this.backend.log(`tunnel udp: ${(err as Error)?.message ?? err}`),
+        },
+        ...(o.udpTuning?.sctp !== undefined ? { sctp: o.udpTuning.sctp } : null),
+        ...(o.udpTuning?.rekeyAfterPackets !== undefined ? { rekeyAfterPackets: o.udpTuning.rekeyAfterPackets } : null),
+      });
+      this.udp = plane;
+      this.plane = { ready: () => plane.open, send: (ch, f) => plane.send(ch, f), cork: () => plane.cork(), uncork: () => plane.uncork() };
+      sock.on('message', (msg: Buffer) => {
+        if (this.udp === plane) plane.receive(msg);
+      });
+    })().catch((err: Error) => {
+      if (this.phase === Phase.DataPlane) this.fail(new EdgeError(`UDP tunnel: ${err.message}`, 'tunnel'), o.fallbackWs !== false);
+    });
+  }
+
+  /** Legacy data plane: one node-datachannel PeerConnection (the native addon is loaded only now). */
+  private startNdcPlane(): void {
+    this.armDataPlaneDeadline();
+    const o = this.backend.opts;
     const range = o.portRange;
-    const onError = (err: Error) => this.backend.log(`tunnel pc error: ${err.message}`);
-    try {
-      const pc = createPeerConnection(
-        'haxlite-edge-tunnel',
-        {
-          iceServers: toNativeIceServers(o.iceServers ?? []),
-          ...(o.bindAddress !== undefined ? { bindAddress: o.bindAddress } : null),
-          ...(range ? { portRangeBegin: range[0], portRangeEnd: range[1] } : null),
-          maxMessageSize: 1 << 20,
-          disableAutoNegotiation: true,
-        },
-        {
-          onLocalCandidate: (cand, mid) => {
-            if (this.pc !== pc) return;
-            const line = candidateLine(cand);
-            if (this.answerApplied) this.sendTunnelCandidate(line, mid);
-            else this.heldCandidates.push([line, mid]);
+    void import('./edge-ndc.js')
+      .then((mod) => {
+        if (this.phase !== Phase.DataPlane) return;
+        const ndc = new mod.NdcTunnelPlane(
+          'haxlite-edge-tunnel',
+          {
+            iceServers: toNativeIceServers(o.iceServers ?? []),
+            ...(o.bindAddress !== undefined ? { bindAddress: o.bindAddress } : null),
+            ...(range ? { portRangeBegin: range[0], portRangeEnd: range[1] } : null),
+            maxMessageSize: 1 << 20,
           },
-          onStateChange: (state) => {
-            if (this.pc !== pc) return;
-            if (state === 'failed' || state === 'closed') this.fail(new EdgeError(`tunnel connection ${state}`, 'tunnel'));
-          },
-          onError,
-        },
-      );
-      this.pc = pc;
-      const total = CHANNELS.length + this.lanes - 1;
-      this.dcs = new Array<DataChannel | null>(total).fill(null);
-      this.dcOpen = new Array<boolean>(total).fill(false);
-      for (let i = 0; i < total; i++) {
-        const cfg = CHANNELS[i] ?? { label: `ro${i - 2}`, ordered: true, reliable: true };
-        const dc = createDataChannel(
-          pc,
-          `tunnel-${cfg.label}`,
-          { negotiated: true, id: i, unordered: !cfg.ordered, ...(cfg.reliable ? {} : { maxRetransmits: 0 }) },
+          this.lanes,
           {
             onOpen: () => {
-              if (this.dcs[i] !== dc) return;
-              this.dcOpen[i] = true;
-              if (this.phase === Phase.DataPlane && this.dcOpen.every((x) => x)) this.becomeReady();
+              if (this.ndc === ndc && this.phase === Phase.DataPlane) this.becomeReady();
             },
-            onClosed: () => {
-              if (this.dcs[i] !== dc) return;
-              this.dcOpen[i] = false;
-              this.fail(new EdgeError(`tunnel channel ${cfg.label} closed`, 'tunnel'));
+            onMessage: (ch, data) => {
+              if (this.ndc === ndc) this.onDcMessage(ch, data);
             },
-            onMessage: (msg) => {
-              if (this.dcs[i] !== dc || typeof msg === 'string') return;
-              this.onDcMessage(i, msg instanceof ArrayBuffer ? Buffer.from(msg) : msg);
+            onClose: (reason) => {
+              if (this.ndc === ndc) this.fail(new EdgeError(reason, 'tunnel'));
             },
-            onError,
+            onLocalCandidate: (line, mid) => {
+              if (this.ndc !== ndc) return;
+              if (this.answerApplied) this.sendTunnelCandidate(line, mid);
+              else this.heldCandidates.push([line, mid]);
+            },
+            onError: (err) => this.backend.log(`tunnel pc error: ${err.message}`),
           },
         );
-        this.dcs[i] = dc;
-      }
-      pc.setLocalDescription('offer');
-      const sdp = pc.localDescription()?.sdp;
-      if (sdp === undefined) throw new Error('no local offer');
-      const w = this.control(EdgeMsg.TunnelOffer);
-      w.string(sdp);
-      this.sendWs(w.copyBytes());
-    } catch (err) {
-      this.fail(new EdgeError(`tunnel peer connection: ${(err as Error).message}`, 'tunnel'), o.fallbackWs !== false);
-    }
+        this.ndc = ndc;
+        this.plane = ndc;
+        const w = this.control(EdgeMsg.TunnelOffer);
+        w.string(ndc.createOffer());
+        this.sendWs(w.copyBytes());
+      })
+      .catch((err: Error) => {
+        if (this.phase === Phase.DataPlane) this.fail(new EdgeError(`tunnel peer connection: ${err.message}`, 'tunnel'), o.fallbackWs !== false);
+      });
   }
 
   private sendTunnelCandidate(c: string, mid: string): void {
     const w = this.control(EdgeMsg.TunnelCandidate);
-    w.string(c);
+    w.string(candidateLine(c));
     w.string(mid);
     this.sendWs(w.copyBytes());
   }
 
-  private addTunnelCandidate(c: string, mid: string): void {
-    try {
-      this.pc?.addRemoteCandidate(c, mid);
-    } catch {
-      /* ignore */
-    }
-  }
-
-  private onDcMessage(ch: number, msg: Buffer): void {
+  private onDcMessage(ch: number, msg: Uint8Array): void {
     if (this.phase !== Phase.Ready || msg.length < 2) return;
     const c = this.backend.counters;
     c.messagesIn++;
@@ -782,6 +964,14 @@ class TunnelSession {
         this.fail(new EdgeError('tunnel timed out (no traffic from the edge)', 'tunnel'));
         return;
       }
+      const udp = this.udp;
+      if (udp !== null) {
+        if (now - Math.max(udp.lastRx, this.udpStartedAt) > timeout) {
+          this.fail(new EdgeError('UDP tunnel timed out (nothing authenticated from the edge)', 'tunnel'));
+          return;
+        }
+        udp.ping(); // NAT keep-alive (we always send first) + RTT
+      }
       const w = this.control(EdgeMsg.Ping);
       w.f64(now);
       this.sendWs(w.copyBytes());
@@ -818,14 +1008,25 @@ class TunnelSession {
     this.deadline = null;
     if (this.pingTimer !== null) clearInterval(this.pingTimer);
     this.pingTimer = null;
-    for (let i = 0; i < this.dcs.length; i++) {
-      const dc = this.dcs[i];
-      this.dcs[i] = null;
-      this.dcOpen[i] = false;
-      if (dc != null) closeNative(dc);
+    this.plane = null;
+    this.x25519 = null;
+    const udp = this.udp;
+    this.udp = null;
+    if (udp !== null) udp.close(); // ABORT + Close datagram, best effort
+    const sock = this.udpSock;
+    this.udpSock = null;
+    if (sock !== null) {
+      // let the goodbye datagrams leave first
+      setImmediate(() => {
+        try {
+          sock.close();
+        } catch {
+          /* already closed */
+        }
+      });
     }
-    const pc = this.pc;
-    this.pc = null;
-    if (pc !== null) closeNative(pc);
+    const ndc = this.ndc;
+    this.ndc = null;
+    if (ndc !== null) ndc.close();
   }
 }

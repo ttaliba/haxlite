@@ -32,14 +32,27 @@
  *
  * Closes are also deferred to `setImmediate` ({@link closeNative}) so the
  * library is never re-entered from inside one of its own callbacks.
+ *
+ * node-datachannel is loaded lazily, on the first PeerConnection: loading the
+ * addon alone starts 4 native threads, which a process that only uses the
+ * haxlite-rtc backend (`peerBackend: 'rtc'`) or an edge never needs.
  */
-import {
-  PeerConnection,
-  cleanup,
-  type DataChannel,
-  type DataChannelInitConfig,
-  type RtcConfig,
-} from 'node-datachannel';
+import { createRequire } from 'node:module';
+import type * as NodeDataChannel from 'node-datachannel';
+import type { DataChannel, DataChannelInitConfig, PeerConnection, RtcConfig } from 'node-datachannel';
+
+let ndcLib: typeof NodeDataChannel | null = null;
+
+/** node-datachannel, loaded on first use (CommonJS build, synchronous). */
+function ndc(): typeof NodeDataChannel {
+  if (ndcLib === null) ndcLib = createRequire(import.meta.url)('node-datachannel') as typeof NodeDataChannel;
+  return ndcLib;
+}
+
+/** True once node-datachannel has been loaded in this process (diagnostics/tests). */
+export function webRtcLoaded(): boolean {
+  return ndcLib !== null;
+}
 
 type ErrorSink = ((err: Error) => void) | null | undefined;
 
@@ -211,7 +224,7 @@ export function createPeerConnection(name: string, config: RtcConfig, h: PeerCon
     clearTimeout(idleTimer);
     idleTimer = null;
   }
-  const pc = new PeerConnection(name, config);
+  const pc = new (ndc().PeerConnection)(name, config);
   createdCount++;
   livePcs.set(pc, name);
   try {
@@ -277,9 +290,10 @@ function runCloses(): void {
   closeScheduled = false;
   // DataChannels before their PeerConnection keeps libdatachannel's teardown ordered.
   const batch = closeQueue.splice(0);
+  const PC = ndcLib?.PeerConnection; // loaded: natives exist
   for (let pass = 0; pass < 2; pass++) {
     for (const obj of batch) {
-      if ((pass === 0) === (obj instanceof PeerConnection)) continue;
+      if ((pass === 0) === (PC !== undefined && obj instanceof PC)) continue;
       try {
         obj.close();
       } catch {
@@ -329,8 +343,10 @@ async function doShutdown(timeoutMs: number): Promise<void> {
     });
   }
   if (createdCount !== generation) return; // WebRTC in use again
+  const lib = ndcLib;
+  if (lib === null) return; // never loaded: nothing to release
   try {
-    cleanup();
+    lib.cleanup();
   } catch (err) {
     // libdatachannel gave up waiting for its own teardown ("cleanup timeout
     // (possible deadlock)", seen only when called right after closes, never

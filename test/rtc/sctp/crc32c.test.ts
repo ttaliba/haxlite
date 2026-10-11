@@ -1,6 +1,6 @@
 /** CRC32c: RFC 3720 Appendix B.4 vectors + a bitwise reference. */
 import { describe, expect, it } from 'vitest';
-import { crc32c, readChecksum, sctpChecksum, writeChecksum } from '../../../src/rtc/sctp/crc32c.js';
+import { crc32c, crc32cFinish, crc32cUpdate, readChecksum, sctpChecksum, writeChecksum } from '../../../src/rtc/sctp/crc32c.js';
 import { mulberry32 } from './harness.js';
 
 function reference(buf: Uint8Array): number {
@@ -48,5 +48,47 @@ describe('crc32c', () => {
     z.fill(0, 8, 12);
     expect(stored).toBe(reference(z));
     expect(sctpChecksum(pkt, pkt.length)).toBe(stored);
+  });
+
+  it('slicing-by-8 equals a simple one-table (Sarwate) CRC for random buffers, offsets and split updates', () => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? (c >>> 1) ^ 0x82f63b78 : c >>> 1;
+      t[n] = c >>> 0;
+    }
+    const simple = (b: Uint8Array, s: number, e: number): number => {
+      let c = 0xffffffff;
+      for (let i = s; i < e; i++) c = t[(c ^ b[i]!) & 0xff]! ^ (c >>> 8);
+      return ~c >>> 0;
+    };
+    const rnd = mulberry32(99);
+    for (let n = 0; n < 3000; n++) {
+      const len = Math.floor(rnd() * (n < 2000 ? 160 : 2048));
+      const buf = Uint8Array.from({ length: len }, () => Math.floor(rnd() * 256));
+      const s = Math.floor(rnd() * (len + 1));
+      const e = s + Math.floor(rnd() * (len - s + 1));
+      expect(crc32c(buf, s, e)).toBe(simple(buf, s, e));
+      // running state split at an arbitrary point
+      const mid = s + Math.floor(rnd() * (e - s + 1));
+      expect(crc32cFinish(crc32cUpdate(crc32cUpdate(-1, buf, s, mid), buf, mid, e))).toBe(simple(buf, s, e));
+      // Buffer subclass at an unaligned offset (what DTLS hands to SCTP)
+      const pad = Buffer.alloc(len + 3);
+      pad.set(buf, 3);
+      expect(crc32c(pad.subarray(3), s, e)).toBe(simple(buf, s, e));
+    }
+  });
+
+  it('sctpChecksum leaves the packet unchanged and ignores the stored field', () => {
+    const rnd = mulberry32(5);
+    for (let n = 0; n < 200; n++) {
+      const len = 12 + Math.floor(rnd() * 1200);
+      const pkt = Uint8Array.from({ length: len }, () => Math.floor(rnd() * 256));
+      const copy = pkt.slice();
+      const z = pkt.slice();
+      z.fill(0, 8, 12);
+      expect(sctpChecksum(pkt, len)).toBe(reference(z));
+      expect(pkt).toEqual(copy);
+    }
   });
 });

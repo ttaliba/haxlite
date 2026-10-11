@@ -93,4 +93,5 @@ export {
   parseEdgeKey,
   roLaneChannel,
 } from './edge-protocol.js';
-export { liveWebRtcObjects, setWebRtcIdleRelease, shutdownWebRtc, webRtcStats, type WebRtcStats } from './webrtc.js';
+export { liveWebRtcObjects, setWebRtcIdleRelease, shutdownWebRtc, webRtcLoaded, webRtcStats, type WebRtcStats } from './webrtc.js';
+export { RtcPeerBackend, detectPublicAddresses, resolvePublicAddresses, type RtcBackendOptions } from './rtc-backend.js';

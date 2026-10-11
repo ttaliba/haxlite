@@ -6,11 +6,16 @@
  * and `src/net/edge-protocol.ts` for the wire format.
  *
  * ```
- *  player ══ WebRTC (ro/ru/uu) ══▶ EdgeServer ── EdgeSession (per host tunnel) ══ WS + PC ══ host
+ *  player ══ WebRTC (ro/ru/uu) ══▶ EdgeServer ── EdgeSession (per host tunnel) ══ WS + UDP (SCTP/AES-GCM) ══ host
+ *          haxlite-rtc, 1 UDP port                                               1 UDP port for all tunnels
  * ```
  *
  * One {@link EdgeSession} per tunnel WebSocket (one room). Many hosts (API
  * keys) and many rooms per key, each bounded by per-key quotas.
+ *
+ * With `playerBackend: 'rtc'` (default) and tunnel v2 hosts nothing here
+ * loads node-datachannel: the `'ndc'` player backend and the legacy WebRTC
+ * tunnel live in `src/net/edge-ndc.ts`, imported on first use only.
  */
 import type { IncomingMessage, Server as HttpServer, ServerResponse } from 'node:http';
 import type { Server as HttpsServer } from 'node:https';
@@ -25,9 +30,9 @@ import { readFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
-import type { DataChannel, PeerConnection, RtcConfig } from 'node-datachannel';
+import type { RtcConfig } from 'node-datachannel';
 import { Reader, Writer } from '../codec/index.js';
-import { CHANNELS, DEFAULT_ICE_SERVERS, NetDefaults } from '../net/constants.js';
+import { DEFAULT_ICE_SERVERS, NetDefaults } from '../net/constants.js';
 import {
   candidateLine,
   classifyAddress,
@@ -38,24 +43,54 @@ import {
   type IceCandidatePolicy,
   type IceServerConfig,
 } from '../net/ice.js';
-import { LocalPeerLink, type PeerLinkEvents } from '../net/peer-backend.js';
+import type { PeerLink, PeerLinkEvents } from '../net/peer-backend.js';
 import { TokenBucket } from '../net/rate-limit.js';
-import { closeNative, createDataChannel, createPeerConnection, shutdownWebRtc, webRtcStats } from '../net/webrtc.js';
+import type { WebRtcStats } from '../net/webrtc.js';
+import type { NdcTunnelPlane } from '../net/edge-ndc.js';
+import type { RtcEndpointStats } from '../rtc/index.js';
 import {
   AuthFlag,
   EDGE_DEFAULT_PATH,
+  EDGE_LEGACY_VERSION,
   EDGE_MAC_LENGTH,
   EDGE_NONCE_LENGTH,
   EDGE_PROTOCOL_VERSION,
   EDGE_RO_LANES,
+  EDGE_X25519_LENGTH,
   EdgeCloseCode,
   EdgeLimits,
   EdgeMsg,
   EdgePeerClose,
   edgeAuthMac,
+  edgeAuthMacV2,
+  edgeAuthOkMac,
   edgeMacEqual,
   roLaneChannel,
 } from '../net/edge-protocol.js';
+import { deriveTunnelSecrets, x25519Generate, x25519Shared } from '../net/edge-udp.js';
+import { NdcPlayers, RtcPlayers, detectPublicAddresses, type EdgePlayerBackendKind, type EdgePlayers } from './players.js';
+import { EdgeUdpServer, type EdgeTunnelOptions, type EdgeTunnelStats, type EdgeUdpConn } from './tunnel-udp.js';
+
+export type { EdgeTunnelOptions, EdgeTunnelStats } from './tunnel-udp.js';
+export type { EdgePlayerBackendKind } from './players.js';
+
+type NdcModule = typeof import('../net/edge-ndc.js');
+let ndcModule: NdcModule | null = null;
+let ndcLoading: Promise<NdcModule | null> | null = null;
+
+/** Loads `src/net/edge-ndc.ts` (node-datachannel) once; null when the addon is unavailable. */
+function loadNdc(log: (m: string) => void): Promise<NdcModule | null> {
+  if (ndcModule !== null) return Promise.resolve(ndcModule);
+  ndcLoading ??= import('../net/edge-ndc.js').then(
+    (m) => (ndcModule = m),
+    (err: Error) => {
+      log(`node-datachannel unavailable: ${err.message}`);
+      ndcLoading = null;
+      return null;
+    },
+  );
+  return ndcLoading;
+}
 
 /** One API key (tenant). */
 export interface EdgeKeyConfig {
@@ -70,13 +105,27 @@ export interface EdgeKeyConfig {
 }
 
 export interface EdgeWebRtcOptions {
-  /** STUN/TURN for the edge's own PeerConnections (default Google STUN, to learn the public IP behind 1:1 NAT). */
+  /**
+   * `'rtc'` only: the addresses announced to players (IP literals, v4 and/or
+   * v6) — the ONLY ones ever written into answers/candidates. Default:
+   * `bindAddress` if it is a specific IP, else this machine's interface
+   * addresses allowed by `iceCandidatePolicy` (public ones by default). Set it
+   * behind a 1:1 NAT (cloud VM with a private interface address).
+   */
+  publicAddresses?: string[];
+  /** `'rtc'` only: the players' UDP port (default `portRange[0]`, else ephemeral). */
+  port?: number;
+  /** `'rtc'` only: advertised port when a NAT maps a different one. */
+  publicPort?: number;
+  /** `'rtc'` only: ICE consent timeout of a player (no authenticated STUN this long → closed). Default 30 s. */
+  consentTimeoutMs?: number;
+  /** `'ndc'` (and legacy tunnels): STUN/TURN for the edge's own PeerConnections (default Google STUN, to learn the public IP behind 1:1 NAT). */
   iceServers?: readonly IceServerConfig[];
-  /** UDP port range for player and tunnel PeerConnections (one port each unless `enableIceUdpMux`). */
+  /** UDP port range for player and tunnel PeerConnections (`'ndc'`: one port each unless `enableIceUdpMux`; `'rtc'`: `portRange[0]`). */
   portRange?: readonly [number, number] | null;
   /** Local address to bind (and announce). */
   bindAddress?: string;
-  /** All PeerConnections on one UDP port (`portRange[0]`). */
+  /** `'ndc'` only: all PeerConnections on one UDP port (`portRange[0]`). */
   enableIceUdpMux?: boolean;
   /**
    * Which of the edge's own candidates are announced (to players and hosts).
@@ -125,6 +174,14 @@ export interface EdgeLimitsOptions {
 }
 
 export interface EdgeServerOptions {
+  /**
+   * Player-facing WebRTC: `'rtc'` (default) = haxlite-rtc (pure TypeScript,
+   * ICE-lite, one UDP port for every player); `'ndc'` = node-datachannel
+   * PeerConnections (native addon, loaded on demand).
+   */
+  playerBackend?: EdgePlayerBackendKind;
+  /** Host↔edge tunnel v2 (UDP) settings. */
+  tunnel?: EdgeTunnelOptions;
   /** Listen address. Default `'0.0.0.0'`. */
   host?: string;
   /** Listen port. Default 8443 (0 = ephemeral). */
@@ -166,11 +223,19 @@ export interface EdgeKeyStats {
 
 export interface EdgeStats {
   uptimeSec: number;
+  playerBackend: EdgePlayerBackendKind;
   sessions: number;
   peers: number;
   authFailures: number;
   keys: EdgeKeyStats[];
-  webrtc: ReturnType<typeof webRtcStats>;
+  /** node-datachannel objects (null while the addon was never loaded). */
+  webrtc: WebRtcStats | null;
+  /** haxlite-rtc player endpoint counters (`playerBackend: 'rtc'`). */
+  rtc: RtcEndpointStats | null;
+  /** Tunnel v2 UDP socket counters (null when disabled). */
+  tunnel: EdgeTunnelStats | null;
+  /** Sessions per data plane. */
+  dataPlanes: { udp: number; webrtc: number; ws: number };
   memoryRssMb: number;
 }
 
@@ -236,6 +301,12 @@ export class EdgeServer {
   /** @internal */ readonly tunnelRtc: RtcConfig;
   /** @internal */ readonly icePolicy: IceCandidatePolicy;
   /** @internal */ readonly remotePolicy: 'public' | 'private' | 'all';
+  /** @internal */ readonly playerBackend: EdgePlayerBackendKind;
+  /** @internal player connections (set by {@link listen}). */
+  players: EdgePlayers | null = null;
+  /** @internal tunnel v2 socket (set by {@link listen}; null when disabled). */
+  udp: EdgeUdpServer | null = null;
+  /** @internal */ readonly allowWebRtcTunnel: boolean;
   private readonly startedAt = performance.now();
   private authFailures = 0;
   private nextSessionId = 1;
@@ -279,6 +350,9 @@ export class EdgeServer {
     this.tunnelRtc = { ...base, maxMessageSize: 1 << 20, disableAutoNegotiation: true };
     this.icePolicy = w.iceCandidatePolicy ?? 'public';
     this.remotePolicy = w.remoteCandidatePolicy ?? 'public';
+    this.playerBackend = opts.playerBackend ?? 'rtc';
+    if (this.playerBackend !== 'rtc' && this.playerBackend !== 'ndc') throw new Error(`playerBackend must be 'rtc' or 'ndc'`);
+    this.allowWebRtcTunnel = opts.tunnel?.allowWebRtc !== false;
 
     if (opts.server) {
       this.server = opts.server;
@@ -302,18 +376,67 @@ export class EdgeServer {
     return s;
   }
 
+  /**
+   * Binds the player UDP socket ('rtc') or loads node-datachannel ('ndc'),
+   * the tunnel v2 UDP socket, then the control listener.
+   */
   async listen(): Promise<void> {
-    if (this.ownsServer && !this.server.listening) {
-      await new Promise<void>((resolve, reject) => {
-        this.server.once('error', reject);
-        this.server.listen(this.opts.port ?? 8443, this.opts.host ?? '0.0.0.0', () => {
-          this.server.off('error', reject);
-          resolve();
+    const w = this.opts.webrtc ?? {};
+    const t = this.opts.tunnel ?? {};
+    try {
+      if (this.players === null) {
+        if (this.playerBackend === 'rtc') {
+          const publicAddresses = w.publicAddresses ?? detectPublicAddresses(w.bindAddress, this.icePolicy);
+          if (publicAddresses.length === 0) {
+            throw new Error("playerBackend 'rtc': no public address to announce (set webrtc.publicAddresses or webrtc.bindAddress)");
+          }
+          this.players = await RtcPlayers.start({
+            port: w.port ?? w.portRange?.[0] ?? 0,
+            ...(w.bindAddress !== undefined ? { address: w.bindAddress } : null),
+            publicAddresses,
+            ...(w.publicPort !== undefined ? { publicPort: w.publicPort } : null),
+            handshakeTimeoutMs: this.limits.channelOpenTimeoutMs + 1000,
+            ...(w.consentTimeoutMs !== undefined ? { idleTimeoutMs: w.consentTimeoutMs } : null),
+          });
+          this.log(`players: haxlite-rtc on UDP ${(this.players as RtcPlayers).port}, announcing ${publicAddresses.join(', ')}`);
+        } else {
+          this.players = await NdcPlayers.start(this.playerRtc);
+          ndcModule = (this.players as NdcPlayers).mod;
+        }
+      }
+      if (this.ownsServer && !this.server.listening) {
+        await new Promise<void>((resolve, reject) => {
+          this.server.once('error', reject);
+          this.server.listen(this.opts.port ?? 8443, this.opts.host ?? '0.0.0.0', () => {
+            this.server.off('error', reject);
+            resolve();
+          });
         });
-      });
+      }
+      if (this.udp === null && t.udp !== false) {
+        const host = this.opts.host ?? '0.0.0.0';
+        const bind = t.bindAddress ?? w.bindAddress ?? (host === '' ? '0.0.0.0' : host);
+        const wsPort = this.server.listening ? (this.server.address() as AddressInfo).port : 0;
+        this.udp = await EdgeUdpServer.listen(bind, t.port ?? wsPort, t, t.port === undefined);
+        this.log(`tunnel v2: UDP ${bind}:${this.udp.port}`);
+      }
+    } catch (err) {
+      await this.players?.close();
+      this.players = null;
+      throw err;
     }
     const every = this.opts.statsLogIntervalMs ?? 0;
-    if (every > 0) this.statsTimer = setInterval(() => this.logStats(), every);
+    if (every > 0 && this.statsTimer === null) this.statsTimer = setInterval(() => this.logStats(), every);
+  }
+
+  /** UDP port of the tunnel v2 socket (null when disabled or not listening). */
+  get tunnelPort(): number | null {
+    return this.udp?.port ?? null;
+  }
+
+  /** UDP port of the haxlite-rtc player socket (null with `playerBackend: 'ndc'`). */
+  get playerPort(): number | null {
+    return this.players instanceof RtcPlayers ? this.players.port : null;
   }
 
   /** Bound address (`{address, port}`). */
@@ -363,12 +486,20 @@ export class EdgeServer {
       this.server.closeAllConnections?.();
       await new Promise<void>((resolve) => this.server.close(() => resolve()));
     }
-    if (opts.shutdownWebRtc) await shutdownWebRtc();
+    const udp = this.udp;
+    this.udp = null;
+    if (udp !== null) await udp.close();
+    const players = this.players;
+    this.players = null;
+    if (players !== null) await players.close();
+    if (opts.shutdownWebRtc && ndcModule !== null) await ndcModule.shutdownWebRtc();
   }
 
   stats(): EdgeStats {
     const now = performance.now();
     let peers = 0;
+    const dataPlanes = { udp: 0, webrtc: 0, ws: 0 };
+    for (const s of this.sessions) if (s.dataPlane !== null) dataPlanes[s.dataPlane]++;
     const keys: EdgeKeyStats[] = [];
     for (const k of this.keys.values()) {
       peers += k.peers;
@@ -392,11 +523,15 @@ export class EdgeServer {
     }
     return {
       uptimeSec: Math.round((now - this.startedAt) / 1000),
+      playerBackend: this.playerBackend,
       sessions: this.sessions.size,
       peers,
       authFailures: this.authFailures,
       keys,
-      webrtc: webRtcStats(),
+      webrtc: ndcModule !== null ? ndcModule.webRtcStats() : null,
+      rtc: this.players instanceof RtcPlayers ? this.players.stats() : null,
+      tunnel: this.udp?.stats() ?? null,
+      dataPlanes,
       memoryRssMb: Math.round(process.memoryUsage().rss / 1048576),
     };
   }
@@ -407,7 +542,10 @@ export class EdgeServer {
       .filter((k) => k.sessions > 0 || k.ppsIn > 0)
       .map((k) => `${k.id}: ${k.sessions}s/${k.peers}p in ${k.ppsIn}pps out ${k.ppsOut}pps`)
       .join('; ');
-    this.log(`stats sessions=${s.sessions} peers=${s.peers} pcs=${s.webrtc.peerConnections} rss=${s.memoryRssMb}MB${per ? ` | ${per}` : ''}`);
+    const native = s.webrtc !== null ? ` pcs=${s.webrtc.peerConnections}` : '';
+    const rtc = s.rtc !== null ? ` rtc=${s.rtc.open}/${s.rtc.sessions}` : '';
+    const tun = s.tunnel !== null ? ` udp=${s.tunnel.tunnels}` : '';
+    this.log(`stats sessions=${s.sessions} peers=${s.peers}${rtc}${tun}${native} rss=${s.memoryRssMb}MB${per ? ` | ${per}` : ''}`);
   }
 
   // ------------------------------------------------------------------ HTTP
@@ -457,10 +595,13 @@ export class EdgeServer {
 
   // ------------------------------------------------------------------ auth / quotas
 
-  /** @internal Returns the key state if the MAC matches, else null (constant-time on the MAC). */
-  authenticate(keyId: string, nonce: Uint8Array, mac: Uint8Array): KeyState | null {
+  /**
+   * @internal Returns the key state if the MAC matches, else null
+   * (constant-time on the MAC). `mac(secret)` computes the expected MAC.
+   */
+  authenticate(keyId: string, mac: Uint8Array, expectedFor: (secret: string) => Uint8Array): KeyState | null {
     const k = this.keys.get(keyId);
-    const expected = edgeAuthMac(k?.cfg.secret ?? this.dummySecret, nonce);
+    const expected = expectedFor(k?.cfg.secret ?? this.dummySecret);
     const ok = edgeMacEqual(expected, mac);
     if (k === undefined || !ok) {
       this.authFailures++;
@@ -500,10 +641,11 @@ const SPhase = {
 } as const;
 type SPhase = (typeof SPhase)[keyof typeof SPhase];
 
+
 /** A player connection on the edge. */
 class EdgePeer {
   readonly slot: number;
-  link: LocalPeerLink | null = null;
+  link: PeerLink | null = null;
   readonly open = [false, false, false];
   bucket: TokenBucket | null = null;
   remoteCandidates = 0;
@@ -514,20 +656,31 @@ class EdgePeer {
   }
 }
 
+/** The tunnel data plane once granted (UDP tunnel v2 or legacy PeerConnection). */
+interface DataPlane {
+  ready(ch: number): boolean;
+  send(ch: number, frame: Uint8Array): boolean;
+}
+
+type DataPlaneKind = 'udp' | 'webrtc' | 'ws';
+
 /** One host tunnel (one room). */
 class EdgeSession {
   readonly id: number;
   phase: SPhase = SPhase.Hello;
+  /** Granted data plane (null before `AuthOk`). */
+  dataPlane: DataPlaneKind | null = null;
   private readonly edge: EdgeServer;
   private readonly ws: WebSocket;
   private readonly remote: string;
   private readonly nonce = randomBytes(EDGE_NONCE_LENGTH);
   private key: KeyState | null = null;
+  /** `Auth` accepted, `AuthOk` waiting for node-datachannel to load. */
+  private authing = false;
   private wsData = false;
-  private pc: PeerConnection | null = null;
-  /** Tunnel channels: ro, ru, uu, then the extra `ro` lanes. */
-  private dcs: (DataChannel | null)[] = [null, null, null];
-  private dcOpen = [false, false, false];
+  private plane: DataPlane | null = null;
+  private udpConn: EdgeUdpConn | null = null;
+  private ndc: NdcTunnelPlane | null = null;
   /** `ro` lanes granted to this host ({@link AuthFlag.RoLanes}; 1 = single `ro` channel). */
   private lanes = 1;
   private tunnelRemoteCandidates = 0;
@@ -559,9 +712,11 @@ class EdgeSession {
     ws.on('close', () => this.teardown());
     ws.on('error', () => this.teardown());
     this.deadline = setTimeout(() => this.close(EdgeCloseCode.Timeout, 'auth timeout'), edge.limits.authTimeoutMs);
+    // [u8 1][nonce][u8 maxVersion]: protocol-1 hosts read the first two fields only
     const w = this.control(EdgeMsg.Hello);
-    w.u8(EDGE_PROTOCOL_VERSION);
+    w.u8(EDGE_LEGACY_VERSION);
     w.bytes(this.nonce);
+    w.u8(EDGE_PROTOCOL_VERSION);
     this.sendWs(w.copyBytes());
   }
 
@@ -596,17 +751,14 @@ class EdgeSession {
   /** In-band control about `slot` (ordered with its `ro` data): the slot's `ro` lane, or the WS. */
   private sendInBand(slot: number, bytes: Uint8Array): void {
     const ch = roLaneChannel(slot, this.lanes);
-    if (!this.wsData && this.dcOpen[ch]) {
+    const plane = this.plane;
+    if (!this.wsData && plane !== null && plane.ready(ch)) {
       const n = bytes.length + 2;
       const buf = this.ensureScratch(n);
       buf[0] = 0;
       buf[1] = 0;
       buf.set(bytes, 2);
-      try {
-        this.dcs[ch]!.sendMessageBinary(buf.subarray(0, n));
-      } catch {
-        /* closing */
-      }
+      plane.send(ch, buf.subarray(0, n));
     } else this.sendWs(bytes);
   }
 
@@ -630,18 +782,14 @@ class EdgeSession {
       return;
     }
     const tch = ch === 0 ? roLaneChannel(slot, this.lanes) : ch;
-    const dc = this.dcs[tch];
-    if (dc == null || !this.dcOpen[tch]) return;
+    const plane = this.plane;
+    if (plane === null || !plane.ready(tch)) return;
     const n = 2 + data.length;
     const buf = this.ensureScratch(n);
     buf[0] = slot >>> 8;
     buf[1] = slot & 0xff;
     buf.set(data, 2);
-    try {
-      dc.sendMessageBinary(buf.subarray(0, n));
-    } catch {
-      /* closing */
-    }
+    plane.send(tch, buf.subarray(0, n));
   }
 
   /** Host → player, with the official channel-0 fallback. */
@@ -689,7 +837,7 @@ class EdgeSession {
       case EdgeMsg.Pong:
         return;
     }
-    if (this.key === null) throw new Error('not authenticated');
+    if (this.key === null || this.authing) throw new Error('not authenticated');
     switch (type) {
       case EdgeMsg.TunnelOffer:
         this.onTunnelOffer(readStr(r, EdgeLimits.maxSdp));
@@ -697,13 +845,9 @@ class EdgeSession {
       case EdgeMsg.TunnelCandidate: {
         const c = candidateLine(readStr(r, EdgeLimits.maxCandidate));
         const mid = readStr(r, EdgeLimits.maxMid);
-        if (this.pc === null || ++this.tunnelRemoteCandidates > EdgeLimits.maxRemoteCandidates) return;
+        if (this.ndc === null || ++this.tunnelRemoteCandidates > EdgeLimits.maxRemoteCandidates) return;
         if (!remoteCandidateOk(this.edge.remotePolicy, c)) return;
-        try {
-          this.pc.addRemoteCandidate(c, mid);
-        } catch {
-          /* ignore */
-        }
+        this.ndc.addRemoteCandidate(c, mid);
         return;
       }
       case EdgeMsg.PeerOpen:
@@ -721,7 +865,7 @@ class EdgeSession {
   }
 
   /** Data-plane frame from the host on tunnel channel `ch`. */
-  private onDcMessage(ch: number, msg: Buffer): void {
+  private onDcMessage(ch: number, msg: Uint8Array): void {
     // DataPlane too: the host may see the channels open (and use them) a moment before we do
     if ((this.phase !== SPhase.Ready && this.phase !== SPhase.DataPlane) || msg.length < 2) return;
     const slot = (msg[0]! << 8) | msg[1]!;
@@ -737,7 +881,7 @@ class EdgeSession {
   }
 
   /** `[u8 channel][u8 n][u16 slot × n][payload]` starting at `at`: one payload view for every slot. */
-  private onMulticast(d: Buffer, at: number): void {
+  private onMulticast(d: Uint8Array, at: number): void {
     if (at + 2 > d.length) return;
     const ch = d[at]!;
     const start = at + 2;
@@ -750,16 +894,22 @@ class EdgeSession {
   // ---------------------------------------------------------------- auth + data plane
 
   private onAuth(r: Reader): void {
-    if (this.phase !== SPhase.Hello || this.key !== null) throw new Error('unexpected auth');
+    if (this.phase !== SPhase.Hello || this.key !== null || this.authing) throw new Error('unexpected auth');
     const version = r.u8();
-    if (version !== EDGE_PROTOCOL_VERSION) {
-      this.close(EdgeCloseCode.Version, `edge speaks protocol ${EDGE_PROTOCOL_VERSION}`);
+    if (version !== EDGE_LEGACY_VERSION && version !== EDGE_PROTOCOL_VERSION) {
+      this.close(EdgeCloseCode.Version, `edge speaks protocols ${EDGE_LEGACY_VERSION}-${EDGE_PROTOCOL_VERSION}`);
       return;
     }
     const keyId = readStr(r, EdgeLimits.maxKeyId);
     const mac = r.bytes(EDGE_MAC_LENGTH);
-    const flags = r.u8();
-    const k = this.edge.authenticate(keyId, this.nonce, mac);
+    let flags = r.u8();
+    let hostPub: Uint8Array | null = null;
+    if (version === EDGE_LEGACY_VERSION) flags &= AuthFlag.WebRtc | AuthFlag.RoLanes;
+    else if ((flags & AuthFlag.Udp) !== 0) hostPub = r.bytesCopy(EDGE_X25519_LENGTH);
+    const nonce = this.nonce;
+    const k = this.edge.authenticate(keyId, mac, (secret) =>
+      version === EDGE_LEGACY_VERSION ? edgeAuthMac(secret, nonce) : edgeAuthMacV2(secret, nonce, flags, hostPub),
+    );
     if (k === null) {
       this.edge.log(`session ${this.id} from ${this.remote}: authentication failed (key "${keyId.slice(0, 32)}")`);
       this.close(EdgeCloseCode.AuthFailed, 'authentication failed');
@@ -769,91 +919,131 @@ class EdgeSession {
       this.close(EdgeCloseCode.Quota, 'too many sessions for this key');
       return;
     }
-    const webrtc = (flags & AuthFlag.WebRtc) !== 0;
-    if (!webrtc && !this.edge.limits.allowWsDataPlane) {
+    // data plane: the UDP tunnel, else the legacy PeerConnection, else this WebSocket
+    const lim = this.edge.limits;
+    let plane: DataPlaneKind = 'ws';
+    if (hostPub !== null && this.edge.udp !== null) plane = 'udp';
+    else if ((flags & AuthFlag.WebRtc) !== 0 && this.edge.allowWebRtcTunnel) plane = 'webrtc';
+    if (plane === 'ws' && !lim.allowWsDataPlane) {
       this.close(EdgeCloseCode.Quota, 'WebSocket data plane disabled on this edge');
       return;
     }
     this.key = k;
     k.sessions++;
+    if (plane === 'webrtc' && ndcModule === null) {
+      // the legacy tunnel needs node-datachannel: load it now (only hosts asking for it pay for it)
+      this.authing = true;
+      void loadNdc((m) => this.edge.log(m)).then((mod) => {
+        this.authing = false;
+        if (this.phase === SPhase.Closed) return;
+        if (mod === null && !lim.allowWsDataPlane) {
+          this.close(EdgeCloseCode.Quota, 'no WebRTC on this edge and WebSocket data plane disabled');
+          return;
+        }
+        this.grant(mod !== null ? 'webrtc' : 'ws', version, flags, hostPub);
+      });
+      return;
+    }
+    this.grant(plane, version, flags, hostPub);
+  }
+
+  /** Sends `AuthOk` for the chosen data plane and arms its deadline. */
+  private grant(plane: DataPlaneKind, version: number, flags: number, hostPub: Uint8Array | null): void {
+    const k = this.key!;
     const lim = this.edge.limits;
     this.openBucket = new TokenBucket(lim.peerOpenCapacity, lim.peerOpenMsPerToken);
-    this.wsData = !webrtc;
-    if (webrtc && (flags & AuthFlag.RoLanes) !== 0) this.lanes = EDGE_RO_LANES;
+    this.dataPlane = plane;
+    this.wsData = plane === 'ws';
+    if (plane !== 'ws' && (flags & AuthFlag.RoLanes) !== 0) this.lanes = EDGE_RO_LANES;
+    const lanesFlag = this.lanes > 1 ? AuthFlag.RoLanes : 0;
+    const granted = plane === 'udp' ? AuthFlag.Udp | lanesFlag : plane === 'webrtc' ? AuthFlag.WebRtc | lanesFlag : 0;
     const w = this.control(EdgeMsg.AuthOk);
     w.u32(this.id);
     w.u16(Math.min(lim.maxPeersPerSession, 0xffff));
-    w.u8(webrtc ? flags & (AuthFlag.WebRtc | AuthFlag.RoLanes) : 0);
-    this.sendWs(w.copyBytes());
-    this.edge.log(`session ${this.id}: key "${k.cfg.id}" from ${this.remote} (data plane ${webrtc ? 'webrtc' : 'ws'})`);
+    w.u8(granted);
+    if (plane === 'udp') {
+      const udp = this.edge.udp!;
+      const x = x25519Generate();
+      let shared: Buffer;
+      try {
+        shared = x25519Shared(x.privateKey, hostPub!);
+      } catch {
+        this.close(EdgeCloseCode.Protocol, 'bad key share');
+        return;
+      }
+      const nonce = this.nonce;
+      const conn = udp.open((connId) => deriveTunnelSecrets(shared, k.cfg.secret, nonce, hostPub!, x.publicKey, connId), this.lanes, {
+        onOpen: () => {
+          if (this.udpConn !== conn || this.phase !== SPhase.DataPlane) return;
+          this.dataPlaneUp();
+        },
+        onMessage: (ch, data) => {
+          if (this.udpConn === conn) this.onDcMessage(ch, data);
+        },
+        onClose: (reason) => {
+          if (this.udpConn === conn) this.close(EdgeCloseCode.Timeout, `tunnel ${reason}`);
+        },
+        onError: (err) => this.edge.log(`session ${this.id}: tunnel: ${(err as Error)?.message ?? err}`),
+      });
+      this.udpConn = conn;
+      this.plane = { ready: () => conn.plane.open, send: (ch, f) => conn.plane.send(ch, f) };
+      const t = this.edge.opts.tunnel ?? {};
+      w.bytes(x.publicKey);
+      w.u32(conn.connId);
+      w.u16(t.publicPort ?? udp.port);
+      w.string(t.publicHost ?? '');
+      const body = w.copyBytes();
+      const okMac = edgeAuthOkMac(k.cfg.secret, nonce, hostPub!, body);
+      const msg = Buffer.allocUnsafe(body.length + okMac.length);
+      msg.set(body, 0);
+      msg.set(okMac, body.length);
+      this.sendWs(msg);
+    } else this.sendWs(w.copyBytes());
+    this.edge.log(`session ${this.id}: key "${k.cfg.id}" from ${this.remote} (protocol ${version}, data plane ${plane}${this.lanes > 1 ? ', ro lanes' : ''})`);
     if (this.deadline !== null) clearTimeout(this.deadline);
     this.deadline = null;
-    if (webrtc) {
+    if (plane !== 'ws') {
       this.phase = SPhase.DataPlane;
       this.deadline = setTimeout(() => this.close(EdgeCloseCode.Timeout, 'data plane timeout'), lim.dataPlaneTimeoutMs);
     } else this.phase = SPhase.Ready;
   }
 
+  private dataPlaneUp(): void {
+    if (this.deadline !== null) clearTimeout(this.deadline);
+    this.deadline = null;
+    this.phase = SPhase.Ready;
+    this.edge.log(`session ${this.id}: data plane up (${this.dataPlane})`);
+  }
+
   private onTunnelOffer(sdp: string): void {
-    if (this.phase !== SPhase.DataPlane || this.pc !== null) throw new Error('unexpected tunnel offer');
+    const mod = ndcModule;
+    if (this.phase !== SPhase.DataPlane || this.dataPlane !== 'webrtc' || this.ndc !== null || mod === null) throw new Error('unexpected tunnel offer');
     const policy = this.edge.icePolicy;
-    const onError = (err: Error) => this.edge.log(`session ${this.id}: tunnel pc error: ${err.message}`);
-    const pc = createPeerConnection(`edge-tunnel-${this.id}`, this.edge.tunnelRtc, {
+    const ndc = new mod.NdcTunnelPlane(`edge-tunnel-${this.id}`, this.edge.tunnelRtc, this.lanes, {
+      onOpen: () => {
+        if (this.ndc === ndc && this.phase === SPhase.DataPlane) this.dataPlaneUp();
+      },
+      onMessage: (ch, data) => {
+        if (this.ndc === ndc) this.onDcMessage(ch, data);
+      },
+      onClose: (reason) => {
+        if (this.ndc === ndc) this.close(EdgeCloseCode.Timeout, reason);
+      },
       onLocalCandidate: (cand, mid) => {
-        if (this.pc !== pc) return;
-        const line = filterCandidate(candidateLine(cand), policy);
+        if (this.ndc !== ndc) return;
+        const line = filterCandidate(cand, policy);
         if (line === null || line.length === 0) return;
         const w = this.control(EdgeMsg.TunnelCandidate);
         w.string(line);
         w.string(mid);
         this.sendWs(w.copyBytes());
       },
-      onStateChange: (state) => {
-        if (this.pc !== pc) return;
-        if (state === 'failed' || state === 'closed') this.close(EdgeCloseCode.Timeout, `tunnel connection ${state}`);
-      },
-      onError,
+      onError: (err) => this.edge.log(`session ${this.id}: tunnel pc error: ${err.message}`),
     });
-    this.pc = pc;
-    const total = CHANNELS.length + this.lanes - 1;
-    this.dcs = new Array<DataChannel | null>(total).fill(null);
-    this.dcOpen = new Array<boolean>(total).fill(false);
-    for (let i = 0; i < total; i++) {
-      const cfg = CHANNELS[i] ?? { label: `ro${i - 2}`, ordered: true, reliable: true };
-      const dc = createDataChannel(
-        pc,
-        `tunnel-${cfg.label}`,
-        { negotiated: true, id: i, unordered: !cfg.ordered, ...(cfg.reliable ? {} : { maxRetransmits: 0 }) },
-        {
-          onOpen: () => {
-            if (this.dcs[i] !== dc) return;
-            this.dcOpen[i] = true;
-            if (this.phase === SPhase.DataPlane && this.dcOpen.every((x) => x)) {
-              if (this.deadline !== null) clearTimeout(this.deadline);
-              this.deadline = null;
-              this.phase = SPhase.Ready;
-              this.edge.log(`session ${this.id}: data plane up`);
-            }
-          },
-          onClosed: () => {
-            if (this.dcs[i] !== dc) return;
-            this.dcOpen[i] = false;
-            this.close(EdgeCloseCode.Timeout, `tunnel channel ${cfg.label} closed`);
-          },
-          onMessage: (msg) => {
-            if (this.dcs[i] !== dc || typeof msg === 'string') return;
-            this.onDcMessage(i, msg instanceof ArrayBuffer ? Buffer.from(msg) : msg);
-          },
-          onError,
-        },
-      );
-      this.dcs[i] = dc;
-    }
+    this.ndc = ndc;
+    this.plane = ndc;
     // remote (host) candidates inside the offer obey the remote policy too
-    pc.setRemoteDescription(filterSdp(sdp, this.edge.remotePolicy), 'offer');
-    pc.setLocalDescription('answer');
-    const answer = pc.localDescription()?.sdp;
-    if (answer === undefined) throw new Error('no tunnel answer');
+    const answer = ndc.answer(filterSdp(sdp, this.edge.remotePolicy));
     const w = this.control(EdgeMsg.TunnelAnswer);
     w.string(filterSdp(answer, policy));
     this.sendWs(w.copyBytes());
@@ -876,8 +1066,9 @@ class EdgeSession {
   private onPeerOpen(slot: number, sdp: string): void {
     const k = this.key!;
     const lim = this.edge.limits;
+    const players = this.edge.players;
     // DataPlane is accepted: the host may see the tunnel channels open a moment before the edge does
-    if (this.phase !== SPhase.Ready && this.phase !== SPhase.DataPlane) return this.refuse(slot, EdgePeerClose.Failed, 'not ready');
+    if ((this.phase !== SPhase.Ready && this.phase !== SPhase.DataPlane) || players === null) return this.refuse(slot, EdgePeerClose.Failed, 'not ready');
     if (slot === 0 || this.peers.has(slot)) return this.refuse(slot, EdgePeerClose.Limit, 'slot in use');
     if (this.peers.size >= lim.maxPeersPerSession) return this.refuse(slot, EdgePeerClose.Limit, 'session peer limit');
     if (k.peers >= this.edge.peerQuota(k)) return this.refuse(slot, EdgePeerClose.Limit, 'key peer quota');
@@ -894,12 +1085,14 @@ class EdgeSession {
     const policy = this.edge.icePolicy;
     const ev: PeerLinkEvents = {
       onLocalDescription: (answer) => {
+        if (peer.closed) return;
         const w = this.control(EdgeMsg.PeerAnswer);
         w.u16(slot);
         w.string(filterSdp(answer, policy));
         this.sendWs(w.copyBytes());
       },
       onLocalCandidate: (cand, mid) => {
+        if (peer.closed) return;
         const line = filterCandidate(candidateLine(cand), policy);
         if (line === null || line.length === 0) return;
         const w = this.control(EdgeMsg.PeerLocalCandidate);
@@ -909,6 +1102,7 @@ class EdgeSession {
         this.sendWs(w.copyBytes());
       },
       onGatheringComplete: () => {
+        if (peer.closed) return;
         const w = this.control(EdgeMsg.PeerGathered);
         w.u16(slot);
         this.sendWs(w.copyBytes());
@@ -945,7 +1139,9 @@ class EdgeSession {
       onError: (err) => this.edge.log(`session ${this.id}: peer slot ${slot}: ${err.message}`),
     };
     try {
-      peer.link = new LocalPeerLink(`edge-${this.id}-${slot}`, this.edge.playerRtc, filterSdp(sdp, this.edge.remotePolicy), ev);
+      const link = players.createLink(`edge-${this.id}-${slot}`, filterSdp(sdp, this.edge.remotePolicy), ev);
+      if (peer.closed) link.close();
+      else peer.link = link;
     } catch (err) {
       this.edge.log(`session ${this.id}: peer slot ${slot}: bad offer: ${(err as Error).message}`);
       this.closePeer(slot, EdgePeerClose.Failed);
@@ -963,7 +1159,7 @@ class EdgeSession {
 
   /**
    * Closes a player connection; `reason !== null` reports it to the host
-   * (in-band). Host-requested closes keep the PeerConnection 250 ms so a
+   * (in-band). Host-requested closes keep the connection 250 ms so a
    * just-sent kick notice can leave first.
    */
   private closePeer(slot: number, reason: number | null, lingerMs = reason === null ? 250 : 0): void {
@@ -1019,15 +1215,13 @@ class EdgeSession {
     this.sweepTimer = null;
     for (const slot of [...this.peers.keys()]) this.closePeer(slot, null, 0);
     if (this.key !== null) this.key.sessions--;
-    for (let i = 0; i < this.dcs.length; i++) {
-      const dc = this.dcs[i];
-      this.dcs[i] = null;
-      this.dcOpen[i] = false;
-      if (dc != null) closeNative(dc);
-    }
-    const pc = this.pc;
-    this.pc = null;
-    if (pc !== null) closeNative(pc);
+    this.plane = null;
+    const conn = this.udpConn;
+    this.udpConn = null;
+    if (conn !== null) conn.close();
+    const ndc = this.ndc;
+    this.ndc = null;
+    if (ndc !== null) ndc.close();
     this.edge.log(`session ${this.id}: closed`);
   }
 }

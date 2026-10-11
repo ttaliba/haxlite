@@ -17,9 +17,11 @@
  * opt-in.
  *
  * Where the player PeerConnections live is a {@link PeerBackend}: this
- * process ({@link LocalPeerBackend}, default) or a remote haxlite Edge
- * (`edge: {url, key}` → `EdgePeerBackend`, docs/09), which keeps this
- * machine's address away from players. Everything above (admission, answer
+ * process — node-datachannel ({@link LocalPeerBackend}, `peerBackend: 'ndc'`,
+ * default) or haxlite-rtc ({@link RtcPeerBackend}, `peerBackend: 'rtc'`: pure
+ * TypeScript ICE-lite, one UDP port, needs a public address; docs/10) — or a
+ * remote haxlite Edge (`edge: {url, key}` → `EdgePeerBackend`, docs/09), which
+ * keeps this machine's address away from players. Everything above (admission, answer
  * timing, challenge, handshake, flood, timeouts, bans) is identical for both.
  *
  * Usage:
@@ -56,6 +58,7 @@ import { defaultRoomInfo, encodeRoomInfo, type RoomInfo } from './room-info.js';
 import { HostSignaling, type HostSignalingOptions, type SignalingOffer } from './signaling.js';
 import { Writer } from '../codec/index.js';
 import { LocalPeerBackend, type PeerBackend, type PeerLink, type PeerLinkEvents } from './peer-backend.js';
+import { RtcPeerBackend, type RtcBackendOptions } from './rtc-backend.js';
 
 /** Lifecycle of a {@link Peer}. */
 export type PeerState =
@@ -252,7 +255,8 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   /**
    * Delay between channel-0 open and the challenge (official: 0). Default 40 ms
    * so libdatachannel-based clients (node-haxball) don't drop it; see
-   * `maybeSendChallenge`.
+   * `maybeSendChallenge`. Same default with `peerBackend: 'rtc'` (the delay
+   * protects the client side, whatever the server stack).
    */
   challengeDelayMs?: number;
   /** Debug logger (peer lifecycle). */
@@ -265,8 +269,21 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
    * See docs/09-haxlite-edge.md.
    */
   edge?: EdgeOptions | null;
-  /** Custom peer backend (advanced; overrides `edge`). */
+  /** Custom peer backend (advanced; overrides `edge` and `peerBackend`). */
   backend?: PeerBackend | null;
+  /**
+   * Where player connections are terminated when there is no `edge`:
+   * `'ndc'` (default) node-datachannel/libdatachannel — full ICE with STUN,
+   * works behind NAT; `'rtc'` haxlite-rtc (`src/rtc`) — pure TypeScript
+   * ICE-lite/DTLS/SCTP, every player on one UDP port, no native threads, about
+   * half the CPU per player, but the host must be directly reachable at
+   * {@link RtcBackendOptions.publicAddresses} (public IP or 1:1 NAT). With
+   * `'rtc'`, `iceServers`, `iceCandidatePolicy`, `portRange` and `rtc` are
+   * ignored (see {@link rtcEndpoint}). See docs/10.
+   */
+  peerBackend?: 'ndc' | 'rtc';
+  /** `peerBackend: 'rtc'` settings: UDP `port`, bind `address`, `publicAddresses`, timeouts… */
+  rtcEndpoint?: RtcBackendOptions | null;
 }
 
 /** See {@link HostTransportOptions.challengeDelayMs}. */
@@ -331,7 +348,11 @@ export class HostTransport {
     this.opts = opts;
     if (opts.backend != null) this.backend = opts.backend;
     else if (opts.edge != null) this.backend = new EdgePeerBackend(opts.edge);
+    else if (opts.peerBackend === 'rtc') this.backend = new RtcPeerBackend(opts.rtcEndpoint ?? {});
     else {
+      if (opts.peerBackend !== undefined && opts.peerBackend !== 'ndc') {
+        throw new TypeError(`peerBackend must be 'ndc' or 'rtc' (got ${JSON.stringify(opts.peerBackend)})`);
+      }
       const iceServers: (string | NativeIceServer)[] = toNativeIceServers(opts.iceServers ?? DEFAULT_ICE_SERVERS);
       const range = opts.portRange;
       const rtc: RtcConfig = {

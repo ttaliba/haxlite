@@ -58,6 +58,7 @@ export class RtcSessionImpl implements RtcSession {
   onOpen?: () => void;
   onClose?: (reason: string) => void;
   onMessage?: (channelId: number, data: Uint8Array) => void;
+  onChannelClose?: (channelId: number) => void;
 
   state: RtcSessionState = 'new';
   /** Last authenticated Binding request (ms, endpoint clock); 0 = none yet. */
@@ -248,6 +249,16 @@ export class RtcSessionImpl implements RtcSession {
           }
         },
         onClose: (reason) => this.terminate(`sctp:${reason}`),
+        onChannelClose: (channelId) => {
+          const cb = this.onChannelClose;
+          // not while tearing down (teardown nulls `sctp` before closing it)
+          if (cb === undefined || this.state !== 'open' || this.sctp === null) return;
+          try {
+            cb(channelId);
+          } catch (err) {
+            reportError(err);
+          }
+        },
       });
     } catch (err) {
       reportError(err);

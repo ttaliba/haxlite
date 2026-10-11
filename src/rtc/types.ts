@@ -39,6 +39,8 @@ export interface SctpAssociationOptions {
   onOpen(): void;
   /** Association gone (ABORT, SHUTDOWN, failure). Called at most once, never after close(). */
   onClose(reason: string): void;
+  /** One channel closed (the peer reset its stream, e.g. `dc.close()`), at most once per channel. */
+  onChannelClose?(channelId: number): void;
 }
 
 export interface SctpAssociationLike {
@@ -70,6 +72,12 @@ export interface RtcSession {
   onOpen?: () => void;
   onClose?: (reason: string) => void;
   onMessage?: (channelId: number, data: Uint8Array) => void;
+  /**
+   * One data channel was closed by the browser (`dc.close()` → SCTP stream
+   * reset, RFC 8831 §6.7) while the session stays open. At most once per
+   * channel; never after {@link onClose} or a local close().
+   */
+  onChannelClose?: (channelId: number) => void;
   /** Sends one message; false when not open or the data layer refused it. */
   send(channelId: number, data: Uint8Array): boolean;
   /** Nominated (or, before nomination, last validated) remote address. */

@@ -8,7 +8,9 @@
  *   "tls": { "certFile": "/etc/haxlite-edge/fullchain.pem", "keyFile": "/etc/haxlite-edge/privkey.pem" },
  *   "keys": [{ "id": "alice", "secret": "…", "maxSessions": 4, "maxPeers": 64 }],
  *   "keysFile": "/etc/haxlite-edge/keys.txt",
- *   "webrtc": { "bindAddress": "203.0.113.10", "portRange": [40000, 40999], "iceCandidatePolicy": "public" },
+ *   "playerBackend": "rtc",
+ *   "webrtc": { "bindAddress": "203.0.113.10", "port": 40000, "publicAddresses": ["203.0.113.10"] },
+ *   "tunnel": { "port": 8443, "maxPps": 20000 },
  *   "limits": { "maxPeersPerSession": 40, "floodCapacity": 100, "floodMsPerToken": 16 },
  *   "stats": { "path": "/stats", "token": "…", "logIntervalMs": 60000 }
  * }
@@ -16,7 +18,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import type { EdgeKeyConfig, EdgeLimitsOptions, EdgeServerOptions, EdgeWebRtcOptions } from './server.js';
+import type { EdgeKeyConfig, EdgeLimitsOptions, EdgePlayerBackendKind, EdgeServerOptions, EdgeTunnelOptions, EdgeWebRtcOptions } from './server.js';
 
 export interface EdgeConfigFile {
   listen?: { host?: string; port?: number; path?: string };
@@ -24,7 +26,11 @@ export interface EdgeConfigFile {
   keys?: EdgeKeyConfig[];
   /** Extra keys: a JSON array of {@link EdgeKeyConfig} or one `id:secret` per line (`#` comments). */
   keysFile?: string;
+  /** `'rtc'` (default, pure TypeScript) or `'ndc'` (node-datachannel). */
+  playerBackend?: EdgePlayerBackendKind;
   webrtc?: EdgeWebRtcOptions;
+  /** Tunnel v2 (UDP) settings. */
+  tunnel?: EdgeTunnelOptions;
   limits?: EdgeLimitsOptions;
   stats?: { path?: string | null; token?: string | null; logIntervalMs?: number };
 }
@@ -73,7 +79,10 @@ function portRange(v: string): [number, number] {
  * | `HAXLITE_EDGE_KEYS_FILE` | keys file (see {@link EdgeConfigFile.keysFile}) |
  * | `HAXLITE_EDGE_TLS_CERT` / `HAXLITE_EDGE_TLS_KEY` | PEM paths (`wss://`) |
  * | `HAXLITE_EDGE_BIND` | WebRTC bind address |
- * | `HAXLITE_EDGE_PORT_RANGE` | WebRTC UDP range `40000-40999` |
+ * | `HAXLITE_EDGE_PORT_RANGE` | WebRTC UDP range `40000-40999` (`'rtc'`: its first port) |
+ * | `HAXLITE_EDGE_PLAYER_BACKEND` | `rtc` / `ndc` |
+ * | `HAXLITE_EDGE_PUBLIC_ADDRESSES` | `'rtc'`: announced IPs, comma-separated |
+ * | `HAXLITE_EDGE_TUNNEL_PORT` | tunnel v2 UDP port (`off` disables tunnel v2) |
  * | `HAXLITE_EDGE_STATS_TOKEN` | bearer token for `GET /stats` |
  * | `HAXLITE_EDGE_LOG_INTERVAL_MS` | stats log line period |
  */
@@ -92,6 +101,23 @@ export function loadEdgeConfig(argv: readonly string[] = process.argv.slice(2), 
   const webrtc: EdgeWebRtcOptions = { ...cfg.webrtc };
   if (env.HAXLITE_EDGE_BIND) webrtc.bindAddress = env.HAXLITE_EDGE_BIND;
   if (env.HAXLITE_EDGE_PORT_RANGE) webrtc.portRange = portRange(env.HAXLITE_EDGE_PORT_RANGE);
+  if (env.HAXLITE_EDGE_PUBLIC_ADDRESSES) {
+    webrtc.publicAddresses = env.HAXLITE_EDGE_PUBLIC_ADDRESSES.split(',')
+      .map((a) => a.trim())
+      .filter((a) => a.length > 0);
+  }
+  const playerBackend = (env.HAXLITE_EDGE_PLAYER_BACKEND ?? cfg.playerBackend ?? 'rtc') as EdgePlayerBackendKind;
+  if (playerBackend !== 'rtc' && playerBackend !== 'ndc') throw new Error(`bad player backend "${playerBackend}" (rtc | ndc)`);
+  const tunnel: EdgeTunnelOptions = { ...cfg.tunnel };
+  const tp = env.HAXLITE_EDGE_TUNNEL_PORT;
+  if (tp !== undefined && tp !== '') {
+    if (tp === 'off') tunnel.udp = false;
+    else {
+      const n = Number(tp);
+      if (!Number.isInteger(n) || n < 0 || n > 65535) throw new Error(`bad tunnel port ${tp}`);
+      tunnel.port = n;
+    }
+  }
 
   let tls = cfg.tls ?? null;
   if (env.HAXLITE_EDGE_TLS_CERT || env.HAXLITE_EDGE_TLS_KEY) {
@@ -109,7 +135,9 @@ export function loadEdgeConfig(argv: readonly string[] = process.argv.slice(2), 
     path: cfg.listen?.path ?? '/tunnel',
     tls,
     keys,
+    playerBackend,
     webrtc,
+    tunnel,
     limits: cfg.limits ?? {},
     statsPath: cfg.stats?.path === undefined ? '/stats' : cfg.stats.path,
     statsToken: env.HAXLITE_EDGE_STATS_TOKEN ?? cfg.stats?.token ?? null,

@@ -1,9 +1,13 @@
 // haxlite Edge overhead on loopback: message RTT and host CPU per player,
-// direct haxlite host vs the same host behind a haxlite Edge (UDP data plane,
-// and optionally the WebSocket fallback).
+// direct haxlite host vs the same host behind a haxlite Edge.
 //
 //   node --experimental-transform-types --no-warnings --import ./scripts/ts-resolve.mjs \
 //        scripts/edge-latency.ts [--players 8] [--seconds 20] [--modes direct,edge,edge-ws] [--runs 1]
+//
+// Modes: `direct`, or `edge[-<players>][-<plane>]` with players `rtc` (haxlite-rtc,
+// default) | `ndc` (node-datachannel) and tunnel data plane `udp` (tunnel v2,
+// default) | `webrtc` (legacy PeerConnection) | `ws`. `edge` = edge-rtc-udp (the
+// defaults), `edge-ndc-webrtc` = the previous defaults, `edge-ws` = edge-rtc-ws.
 //
 // Processes (so CPU is attributed correctly):
 //   main   FakeMaster + node-haxball load clients (busy-player input model of
@@ -55,10 +59,12 @@ async function edgeMain(): Promise<void> {
   const { EdgeServer } = (await import(mod('edge/index'))) as typeof import('../src/edge/index.js');
   process.on('disconnect', () => process.exit(0));
   const extra = JSON.parse(process.env.EDGE_BENCH_WEBRTC || '{}');
+  const playerBackend = (process.argv[3] ?? 'rtc') as 'rtc' | 'ndc';
   const edge = await EdgeServer.start({
     host: EDGE_IP,
     port: 0,
     keys: [KEY],
+    playerBackend,
     webrtc: { bindAddress: EDGE_IP, iceServers: [], iceCandidatePolicy: 'all', ...extra },
   });
   let cpu0 = process.cpuUsage();
@@ -84,7 +90,7 @@ async function hostMain(): Promise<void> {
   const extra = JSON.parse(process.env.EDGE_BENCH_EDGE_OPTS || '{}');
   const edge =
     edgeUrl && edgeUrl !== '-'
-      ? { url: edgeUrl, key: `${KEY.id}:${KEY.secret}`, bindAddress: HOST_IP, dataPlane: dataPlane as 'webrtc' | 'ws', ...extra }
+      ? { url: edgeUrl, key: `${KEY.id}:${KEY.secret}`, bindAddress: HOST_IP, dataPlane: dataPlane as 'udp' | 'webrtc' | 'ws', fallbackWs: false, ...extra }
       : null;
   const transport = new HostTransport({
     token: 'thr1.bench',
@@ -110,7 +116,15 @@ async function hostMain(): Promise<void> {
       t0 = performance.now();
     } else if (m.cmd === 'measure-stop') {
       const c = process.cpuUsage(cpu0);
-      send({ type: 'cpu', cpuMs: (c.user + c.system) / 1000, wallMs: performance.now() - t0, rssMb: process.memoryUsage().rss / 1048576 });
+      const es = (transport.backend as { stats?: () => { dataPlane: string | null; udp: { sctp: { retransmissions: number; fastRetransmits: number } } | null } }).stats?.();
+      send({
+        type: 'cpu',
+        cpuMs: (c.user + c.system) / 1000,
+        wallMs: performance.now() - t0,
+        rssMb: process.memoryUsage().rss / 1048576,
+        dataPlane: es?.dataPlane ?? null,
+        tunnelRetx: es?.udp ? es.udp.sctp.retransmissions + es.udp.sctp.fastRetransmits : null,
+      });
     }
   });
   host.start();
@@ -165,7 +179,25 @@ interface Result {
   hostRssMb: number;
   edgeCpuPct: number | null;
   edgeCpuPctPerPlayer: number | null;
+  edgeRssMb: number | null;
+  /** Data plane the host actually used. */
+  dataPlane: string | null;
+  /** Host-side SCTP retransmissions on the UDP tunnel (null otherwise). */
+  tunnelRetx: number | null;
   lost: number;
+}
+
+/** `edge[-rtc|-ndc][-udp|-webrtc|-ws]` → players / plane. */
+function parseMode(mode: string): { players: 'rtc' | 'ndc'; plane: 'udp' | 'webrtc' | 'ws' } {
+  const parts = mode.split('-').slice(1);
+  let players: 'rtc' | 'ndc' = 'rtc';
+  let plane: 'udp' | 'webrtc' | 'ws' = 'udp';
+  for (const p of parts) {
+    if (p === 'rtc' || p === 'ndc') players = p;
+    else if (p === 'udp' || p === 'webrtc' || p === 'ws') plane = p;
+    else throw new Error(`bad mode ${mode}`);
+  }
+  return { players, plane };
 }
 
 async function runMode(mode: string, players: number, seconds: number, seed: number): Promise<Result> {
@@ -176,11 +208,12 @@ async function runMode(mode: string, players: number, seconds: number, seed: num
   const master = await FakeMaster.start();
   let edgeProc: ChildProcess | null = null;
   let edgeUrl = '-';
-  if (mode !== 'direct') {
-    edgeProc = child('edge', []);
+  const cfg = mode === 'direct' ? null : parseMode(mode);
+  if (cfg !== null) {
+    edgeProc = child('edge', [cfg.players]);
     edgeUrl = (await next<{ url: string }>(edgeProc, 'edge')).url;
   }
-  const hostProc = child('host', [master.httpBase, edgeUrl, mode === 'edge-ws' ? 'ws' : 'webrtc']);
+  const hostProc = child('host', [master.httpBase, edgeUrl, cfg?.plane ?? 'udp']);
   const { roomId } = await next<{ roomId: string }>(hostProc, 'link');
 
   // load clients (node-haxball)
@@ -273,8 +306,8 @@ async function runMode(mode: string, players: number, seconds: number, seed: num
   hostProc.send({ cmd: 'measure-stop' });
   const edgeCpu = edgeProc ? next<{ cpuMs: number; wallMs: number }>(edgeProc, 'cpu') : null;
   edgeProc?.send({ cmd: 'measure-stop' });
-  const hc = await hostCpu;
-  const ec = edgeCpu ? await edgeCpu : null;
+  const hc = (await hostCpu) as { cpuMs: number; wallMs: number; rssMb: number; dataPlane: string | null; tunnelRetx: number | null };
+  const ec = edgeCpu ? ((await edgeCpu) as { cpuMs: number; wallMs: number; rssMb: number }) : null;
   await new Promise((r) => setTimeout(r, 200));
   running = false;
 
@@ -294,6 +327,9 @@ async function runMode(mode: string, players: number, seconds: number, seed: num
     hostRssMb: Math.round(hc.rssMb),
     edgeCpuPct: ec ? +((ec.cpuMs / ec.wallMs) * 100).toFixed(2) : null,
     edgeCpuPctPerPlayer: ec ? +((ec.cpuMs / ec.wallMs) * 100 / total).toFixed(3) : null,
+    edgeRssMb: ec ? Math.round(ec.rssMb) : null,
+    dataPlane: hc.dataPlane,
+    tunnelRetx: hc.tunnelRetx,
     lost: sentOn.size,
   };
 
@@ -356,10 +392,10 @@ async function orchestrate(): Promise<void> {
       console.log(JSON.stringify(res));
     }
   }
-  console.log('\nmode     players  RTT ro p50/p99 (ms)  RTT uu p50/p99 (ms)  host CPU %/player  host CPU %  edge CPU %/player');
+  console.log('\nmode              players  RTT ro p50/p99 (ms)  RTT uu p50/p99 (ms)  host CPU %/player  host CPU %  edge CPU %/player  edge CPU %  lost');
   for (const r of results) {
     console.log(
-      `${r.mode.padEnd(8)} ${String(r.players).padStart(7)}  ${`${r.rttRo.p50} / ${r.rttRo.p99}`.padEnd(20)} ${`${r.rttUu.p50} / ${r.rttUu.p99}`.padEnd(20)} ${String(r.hostCpuPctPerPlayer).padEnd(18)} ${String(r.hostCpuPct).padEnd(11)} ${r.edgeCpuPctPerPlayer ?? '-'}`,
+      `${r.mode.padEnd(17)} ${String(r.players).padStart(7)}  ${`${r.rttRo.p50} / ${r.rttRo.p99}`.padEnd(20)} ${`${r.rttUu.p50} / ${r.rttUu.p99}`.padEnd(20)} ${String(r.hostCpuPctPerPlayer).padEnd(18)} ${String(r.hostCpuPct).padEnd(11)} ${String(r.edgeCpuPctPerPlayer ?? '-').padEnd(18)} ${String(r.edgeCpuPct ?? '-').padEnd(10)} ${r.lost}`,
     );
   }
   const { cleanupNodeHaxball } = await import('../test/fake-master/node-haxball.js');

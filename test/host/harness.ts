@@ -15,7 +15,8 @@
  */
 import { FakeMaster, type FakeRoom } from '../fake-master/index.js';
 import { cleanupNodeHaxball, nodeHaxballFor } from '../fake-master/node-haxball.js';
-import { HostTransport, shutdownWebRtc } from '../../src/net/index.js';
+import { HostTransport, RtcPeerBackend, shutdownWebRtc } from '../../src/net/index.js';
+import { testTransportBackend } from '../peer-backend-env.js';
 import { Writer } from '../../src/codec/index.js';
 import { EventType } from '../../src/protocol.js';
 import { writeRoomState, type SetPlayerSyncEvent } from '../../src/room/index.js';
@@ -91,7 +92,14 @@ export class E2E {
       e.master = await FakeMaster.start();
       e.nh = nodeHaxballFor(e.master);
     }
-    e.transport = new HostTransport({ token: 'thr1.test', masterUrl: e.master.httpBase, iceServers: [], public: true, ...opts.transport });
+    e.transport = new HostTransport({
+      token: 'thr1.test',
+      masterUrl: e.master.httpBase,
+      iceServers: [],
+      public: true,
+      ...testTransportBackend(),
+      ...opts.transport,
+    });
     const { transport: _t, shared: _s, ...hostOpts } = opts;
     e.host = new HostRoom({ state: createHostRoomState({ roomName: 'e2e', playerName: 'Host' }), ...hostOpts, transport: e.transport });
     e.host.onError = (err) => e.errors.push(err);
@@ -208,6 +216,8 @@ export class E2E {
       c.cancel();
     }
     this.host?.stop();
+    const b = this.transport?.backend;
+    if (b instanceof RtcPeerBackend) await b.whenClosed();
     if (this.ownsMaster) await this.master?.close();
   }
 }

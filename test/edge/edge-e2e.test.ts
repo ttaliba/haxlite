@@ -11,8 +11,12 @@
  * received names ONLY the edge (127.0.0.2), the host's 127.0.0.3 appears
  * nowhere, every client's selected ICE pair points at the edge, and the
  * host process never creates a player PeerConnection of its own.
+ *
+ * Runs twice: the defaults (players on haxlite-rtc, tunnel v2 = SCTP over
+ * AES-GCM UDP) and the legacy stack (players on node-datachannel, WebRTC
+ * tunnel).
  */
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { FakeMaster } from '../fake-master/index.js';
 import { nodeHaxballFor } from '../fake-master/node-haxball.js';
 import { E2E, shutdownAll, sleep, waitFor, withTimeout, type Any, type ClientHandle } from '../host/harness.js';
@@ -22,7 +26,23 @@ import { EdgePeerBackend, liveWebRtcObjects, webRtcStats } from '../../src/net/i
 import type { Player } from '../../src/room/index.js';
 import { EDGE_IP, HOST_IP, edgeConfig, inspectClientSignaling, makeKey, selectedRemote, startEdge } from './harness.js';
 
-afterAll(() => shutdownAll());
+let master: FakeMaster;
+const clientPcs: Any[] = [];
+let nh: Any;
+// node-haxball keeps its backend config module-global: one master for the file
+beforeAll(async () => {
+  master = await FakeMaster.start();
+  nh = nodeHaxballFor(master, { onPeerConnection: (pc) => clientPcs.push(pc) });
+});
+afterAll(async () => {
+  await master?.close();
+  await shutdownAll();
+});
+
+const CONFIGS = [
+  { players: 'rtc', plane: 'udp' },
+  { players: 'ndc', plane: 'webrtc' },
+] as const;
 
 function drive(c: ClientHandle, seed: number, chat: boolean): { stop(): void; done: Promise<void> } {
   const rnd = prng(seed);
@@ -40,15 +60,13 @@ function drive(c: ClientHandle, seed: number, chat: boolean): { stop(): void; do
   return { stop: () => (running = false), done };
 }
 
-describe('HostRoom behind a haxlite Edge with node-haxball clients', () => {
+describe.each(CONFIGS)('HostRoom behind a haxlite Edge with node-haxball clients (players $players, tunnel $plane)', ({ players, plane }) => {
   it('converges over > 3000 frames, late join, chat, kick/ban, IP isolation, clean shutdown', async () => {
     const key = makeKey('e2e');
-    const edge = await startEdge([key]);
-    const master = await FakeMaster.start();
+    const edge = await startEdge([key], { playerBackend: players });
     master.clientMessages = [];
-    const clientPcs: Any[] = [];
-    const nh = nodeHaxballFor(master, { onPeerConnection: (pc) => clientPcs.push(pc) });
-    const e = await E2E.start({ shared: { master, nh }, transport: { edge: edgeConfig(edge, key) } });
+    clientPcs.length = 0;
+    const e = await E2E.start({ shared: { master, nh }, transport: { edge: edgeConfig(edge, key, { dataPlane: plane }) } });
     let localPcSeen = false;
     const pcWatch = setInterval(() => {
       if (liveWebRtcObjects().some((n) => /^haxlite-\d+/.test(n))) localPcSeen = true;
@@ -57,7 +75,8 @@ describe('HostRoom behind a haxlite Edge with node-haxball clients', () => {
       const host = e.host;
       const backend = e.transport.backend as EdgePeerBackend;
       expect(backend).toBeInstanceOf(EdgePeerBackend);
-      expect(backend.stats().dataPlane).toBe('webrtc');
+      expect(backend.stats().dataPlane).toBe(plane);
+      expect(edge.stats().playerBackend).toBe(players);
       const joins: Player[] = [];
       const kicks: [string, string, boolean, string | null][] = [];
       const chats: string[] = [];
@@ -180,7 +199,6 @@ describe('HostRoom behind a haxlite Edge with node-haxball clients', () => {
     } finally {
       clearInterval(pcWatch);
       await e.close();
-      await master.close();
     }
     // ---- clean shutdown: the tunnel session ends, the edge closes, no native leaks
     await waitFor(() => edge.stats().sessions === 0, 5000, 'tunnel closed');

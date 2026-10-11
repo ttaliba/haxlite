@@ -209,6 +209,19 @@ describe('EdgeServer vs raw tunnel clients', () => {
     expect(cfg.keys).toEqual([{ id: 'h1', secret: '0123456789abcdef0123' }]);
     expect(cfg.webrtc).toEqual({ bindAddress: '203.0.113.7', portRange: [40000, 40999] });
     expect(cfg.statsToken).toBe('tok');
+    expect(cfg.playerBackend).toBe('rtc'); // default: haxlite-rtc
+    expect(cfg.tunnel).toEqual({});
+    const cfg2 = loadEdgeConfig([], {
+      HAXLITE_EDGE_KEYS: 'h1:0123456789abcdef0123',
+      HAXLITE_EDGE_PLAYER_BACKEND: 'ndc',
+      HAXLITE_EDGE_PUBLIC_ADDRESSES: '203.0.113.7, 2001:db8::7',
+      HAXLITE_EDGE_TUNNEL_PORT: '9443',
+    });
+    expect(cfg2.playerBackend).toBe('ndc');
+    expect(cfg2.webrtc!.publicAddresses).toEqual(['203.0.113.7', '2001:db8::7']);
+    expect(cfg2.tunnel).toEqual({ port: 9443 });
+    expect(loadEdgeConfig([], { HAXLITE_EDGE_KEYS: 'h1:0123456789abcdef0123', HAXLITE_EDGE_TUNNEL_PORT: 'off' }).tunnel).toEqual({ udp: false });
+    expect(() => loadEdgeConfig([], { HAXLITE_EDGE_KEYS: 'h1:0123456789abcdef0123', HAXLITE_EDGE_PLAYER_BACKEND: 'x' })).toThrow(/player backend/);
     expect(() => loadEdgeConfig([], {})).toThrow(/no API keys/);
     expect(() => new EdgeServer({ keys: [{ id: 'x', secret: 'short' }] })).toThrow(/too short/);
   });

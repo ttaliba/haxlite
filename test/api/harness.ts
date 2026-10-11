@@ -6,6 +6,7 @@ import { FakeMaster } from '../fake-master/index.js';
 import { cleanupNodeHaxball, nodeHaxballFor } from '../fake-master/node-haxball.js';
 import { HBInit, type RoomConfigObject, type RoomObject } from '../../src/api/index.js';
 import { shutdownWebRtc } from '../../src/net/index.js';
+import { testHaxliteBackend } from '../peer-backend-env.js';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type Any = any;
@@ -54,6 +55,7 @@ export async function startRoom(env: Env, config: RoomConfigObject = {}): Promis
       masterUrl: env.master.httpBase,
       iceServers: [],
       shutdownWebRtcOnLastStop: false,
+      ...testHaxliteBackend(),
       ...config.haxlite,
       // loopback test: the host must offer its 127.0.0.1 candidates
       transport: { iceCandidatePolicy: 'all', ...config.haxlite?.transport },

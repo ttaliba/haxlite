@@ -1,5 +1,5 @@
 /**
- * haxlite Edge tunnel protocol (version 1), shared by the host side
+ * haxlite Edge tunnel protocol (versions 1 and 2), shared by the host side
  * (`edge-client.ts`) and the edge server (`src/edge`). See
  * docs/09-haxlite-edge.md.
  *
@@ -8,16 +8,27 @@
  * length + UTF-8). The edge speaks first:
  *
  * ```
- * edge → host  Hello      [u8 version][32 B nonce]
- * host → edge  Auth       [u8 version][string keyId][32 B HMAC-SHA256(secret, "haxlite-edge/1" ‖ nonce)][u8 flags]
- * edge → host  AuthOk     [u32 sessionId][u16 maxPeers][u8 flags]
+ * edge → host  Hello      [u8 1][32 B nonce][u8 maxVersion = 2]     (v1 hosts ignore the trailing byte)
+ * host → edge  Auth v1    [u8 1][string keyId][32 B HMAC(secret, "haxlite-edge/1" ‖ nonce)][u8 flags]
+ * host → edge  Auth v2    [u8 2][string keyId][32 B mac2][u8 flags][32 B x25519 hostPub  if flags & Udp]
+ *                         mac2 = HMAC-SHA256(secret, "haxlite-edge/2" ‖ nonce ‖ u8 flags ‖ hostPub?)
+ * edge → host  AuthOk     [u32 sessionId][u16 maxPeers][u8 granted flags]
+ *                         + if granted & Udp: [32 B edgePub][u32 connId][u16 udpPort][string udpHost][32 B okMac]
+ *                         okMac = HMAC-SHA256(secret, "haxlite-edge/2 ok" ‖ nonce ‖ hostPub ‖ AuthOk bytes before okMac)
  * ```
  *
- * Data plane: either one PeerConnection host↔edge with three negotiated
- * channels mirroring `ro`/`ru`/`uu` (flag {@link AuthFlag.WebRtc}), or the
- * WebSocket itself (fallback, UDP blocked). Data frames on a tunnel data
- * channel are `[u16 slot][payload]` (the tunnel channel is the player
- * channel); slot 0 carries an in-band control message `[u16 0][u8 type] …`.
+ * Data plane, one of:
+ * * **UDP tunnel (v2, {@link AuthFlag.Udp})**: our own SCTP association
+ *   (src/rtc/sctp; host = initiator) over AES-128-GCM-sealed UDP datagrams to
+ *   the edge's tunnel port, keys from an x25519 exchange bound to the API key
+ *   (`edge-udp.ts`). No WebRTC, no native addon.
+ * * **WebRTC (legacy, {@link AuthFlag.WebRtc})**: one node-datachannel
+ *   PeerConnection host↔edge with negotiated channels (loaded lazily).
+ * * **WebSocket** (fallback, UDP blocked): this same WebSocket.
+ *
+ * Data frames on a tunnel channel (SCTP stream / data channel) are
+ * `[u16 slot][payload]` (the tunnel channel is the player channel); slot 0
+ * carries an in-band control message `[u16 0][u8 type] …`.
  * With {@link AuthFlag.RoLanes}, `ro` frames of slot `s` (and in-band
  * control about `s`) travel on tunnel channel {@link roLaneChannel}`(s)`;
  * tunnel channels ≥ 3 are `ro` lanes.
@@ -32,7 +43,10 @@
  */
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
-export const EDGE_PROTOCOL_VERSION = 1;
+/** Highest tunnel protocol version this build speaks (v1 is still accepted both ways). */
+export const EDGE_PROTOCOL_VERSION = 2;
+/** First byte of `Hello` (and the version of legacy `Auth`): v1 hosts check it. */
+export const EDGE_LEGACY_VERSION = 1;
 /** Default WebSocket path of the edge's control endpoint. */
 export const EDGE_DEFAULT_PATH = '/tunnel';
 export const EDGE_NONCE_LENGTH = 32;
@@ -93,6 +107,13 @@ export const AuthFlag = {
    * that does not echo it keeps the single `ro` channel (interoperable both ways).
    */
   RoLanes: 2,
+  /**
+   * Tunnel v2 data plane (protocol version 2 only): SCTP over AES-GCM-sealed
+   * UDP to the edge's tunnel port (see `edge-udp.ts`). `Auth` then carries the
+   * host's x25519 public key and `AuthOk` the edge's, the connection id and
+   * the UDP endpoint. Combinable with {@link RoLanes}.
+   */
+  Udp: 4,
 } as const;
 
 /** Ordered tunnel channels carrying player `ro` traffic when {@link AuthFlag.RoLanes} is granted. */
@@ -141,6 +162,8 @@ export const EdgeLimits = {
   maxKeyId: 128,
   /** Remote candidates accepted per player connection. */
   maxRemoteCandidates: 32,
+  /** Max `udpHost` length in `AuthOk`. */
+  maxUdpHost: 255,
   /** Max player payload (bytes). */
   maxPayload: 262_144,
   /** Max WS message (payload + headers). */
@@ -156,9 +179,32 @@ export function parseEdgeKey(key: string): { id: string; secret: string } {
   return { id, secret: key.slice(i + 1) };
 }
 
-/** `HMAC-SHA256(secret, "haxlite-edge/1" ‖ nonce)`. */
+/** v1 `Auth` MAC: `HMAC-SHA256(secret, "haxlite-edge/1" ‖ nonce)`. */
 export function edgeAuthMac(secret: string, nonce: Uint8Array): Buffer {
-  return createHmac('sha256', secret).update(`haxlite-edge/${EDGE_PROTOCOL_VERSION}`).update(nonce).digest();
+  return createHmac('sha256', secret).update(`haxlite-edge/${EDGE_LEGACY_VERSION}`).update(nonce).digest();
+}
+
+/** x25519 public key length (tunnel v2). */
+export const EDGE_X25519_LENGTH = 32;
+
+/**
+ * v2 `Auth` MAC: `HMAC-SHA256(secret, "haxlite-edge/2" ‖ nonce ‖ u8 flags ‖ hostPub)`
+ * (`hostPub` empty without {@link AuthFlag.Udp}). Binds the requested flags
+ * and the host's ephemeral key to the API key.
+ */
+export function edgeAuthMacV2(secret: string, nonce: Uint8Array, flags: number, hostPub: Uint8Array | null): Buffer {
+  const h = createHmac('sha256', secret).update('haxlite-edge/2').update(nonce).update(Uint8Array.of(flags & 0xff));
+  if (hostPub !== null) h.update(hostPub);
+  return h.digest();
+}
+
+/**
+ * v2 `AuthOk` MAC (edge → host, proves the edge knows the key too):
+ * `HMAC-SHA256(secret, "haxlite-edge/2 ok" ‖ nonce ‖ hostPub ‖ body)` where
+ * `body` is the `AuthOk` message from its type byte up to the MAC.
+ */
+export function edgeAuthOkMac(secret: string, nonce: Uint8Array, hostPub: Uint8Array, body: Uint8Array): Buffer {
+  return createHmac('sha256', secret).update('haxlite-edge/2 ok').update(nonce).update(hostPub).update(body).digest();
 }
 
 /** Constant-time comparison of two MACs. */

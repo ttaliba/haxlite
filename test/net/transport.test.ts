@@ -15,6 +15,7 @@ import {
   type Peer,
   type PeerCloseReason,
 } from '../../src/net/index.js';
+import { RTC_UNDER_TEST, testTransportBackend } from '../peer-backend-env.js';
 import { Reader } from '../../src/codec/index.js';
 
 let master: FakeMaster;
@@ -41,7 +42,7 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
 }
 
 async function startHost(opts: Partial<HostTransportOptions> = {}) {
-  const t = new HostTransport({ token: 'thr1.test', masterUrl: master.httpBase, iceServers: [], log: process.env.NET_DEBUG ? (m) => console.log('[host]', performance.now() | 0, m) : undefined, ...opts });
+  const t = new HostTransport({ token: 'thr1.test', masterUrl: master.httpBase, iceServers: [], log: process.env.NET_DEBUG ? (m) => console.log('[host]', performance.now() | 0, m) : undefined, ...testTransportBackend(), ...opts });
   transports.push(t);
   const room = master.waitForRoom();
   t.start();
@@ -243,7 +244,8 @@ describe('handshake and identity', () => {
 });
 
 describe('ICE privacy and deployment options', () => {
-  it("default policy never sends non-public host addresses; withholding every candidate still connects (peer-reflexive)", async () => {
+  // node-datachannel only (haxlite-rtc announces exactly its publicAddresses: test/net/rtc-backend.test.ts)
+  it.skipIf(RTC_UNDER_TEST)("default policy never sends non-public host addresses; withholding every candidate still connects (peer-reflexive)", async () => {
     const seen: string[] = [];
     const { roomId, t } = await startHost({
       iceCandidatePolicy: (c) => {
@@ -263,7 +265,7 @@ describe('ICE privacy and deployment options', () => {
     expect(c.answerCandidates.filter((x) => x.candidate.length > 0)).toEqual([]);
   });
 
-  it("'all' exposes host candidates; portRange bounds the ICE port", async () => {
+  it.skipIf(RTC_UNDER_TEST)("'all' exposes host candidates; portRange bounds the ICE port", async () => {
     const { roomId, t } = await startHost({ iceCandidatePolicy: 'all', portRange: [41000, 41010] });
     const j = nextJoin(t);
     const c = join(roomId);

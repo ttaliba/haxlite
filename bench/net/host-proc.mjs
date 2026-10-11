@@ -88,14 +88,23 @@ function earlySendDelay(PeerConnection, delayMs = 40) {
 //                 setTeam(id, team), startGame() }
 
 /**
- * A/B variants (diagnostics, src/net tuning): impl `haxlite:<name>` reads
+ * A/B variants (diagnostics, src/net tuning): impl `haxlite:<name>` — built-in
+ * `haxlite:rtc` (peerBackend 'rtc') and `haxlite:ndc`, or from
  * `HAXLITE_BENCH_VARIANTS` = JSON `{ "<name>": { dist?, transport?, sctp?, logger? } }`:
  * another compiled build (path relative to the repo), extra HostTransport
  * options, node-datachannel `setSctpSettings(…)` and `initLogger(level)`.
  */
+/** Built-in variants (overridable through HAXLITE_BENCH_VARIANTS). */
+const BUILTIN_VARIANTS = {
+  // peerBackend 'rtc' (haxlite-rtc) on loopback, the clients' only route to the host
+  rtc: { transport: { peerBackend: 'rtc', rtcEndpoint: { address: '127.0.0.1', publicAddresses: ['127.0.0.1'] } } },
+  // explicit node-datachannel (same as plain `haxlite`)
+  ndc: { transport: { peerBackend: 'ndc' } },
+};
+
 function variantOf(name) {
   if (!name.startsWith('haxlite:')) return {};
-  const all = JSON.parse(process.env.HAXLITE_BENCH_VARIANTS ?? '{}');
+  const all = { ...BUILTIN_VARIANTS, ...JSON.parse(process.env.HAXLITE_BENCH_VARIANTS ?? '{}') };
   const v = all[name.slice('haxlite:'.length)];
   if (v === undefined) throw new Error(`unknown variant ${name}`);
   return v;

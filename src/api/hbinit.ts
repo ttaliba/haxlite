@@ -23,6 +23,7 @@ import {
   EdgePeerBackend,
   HostTransport,
   MasterError,
+  RtcPeerBackend,
   fetchGeo,
   shutdownWebRtc,
   type BanList,
@@ -222,6 +223,8 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
   if (hx.joinRateLimit !== undefined) transportOpts.joinRateLimit = hx.joinRateLimit;
   if (hx.bans !== undefined) transportOpts.bans = hx.bans;
   if (hx.edge != null) transportOpts.edge = hx.edge;
+  if (hx.peerBackend !== undefined) transportOpts.peerBackend = hx.peerBackend;
+  if (hx.rtc != null) transportOpts.rtcEndpoint = hx.rtc;
   const transport = new HostTransport(transportOpts);
   const host = new HostRoom({
     transport,
@@ -334,6 +337,8 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
       initResolve = initReject = null;
       rej?.(new Error('room stopped before initialization'));
     }
+    const backend = transport.backend;
+    if (backend instanceof RtcPeerBackend) await backend.whenClosed(); // UDP socket released
     if (liveRooms === 0 && hx.shutdownWebRtcOnLastStop !== false) {
       // let pending native callbacks drain first
       await new Promise<void>((r) => setImmediate(r));
@@ -418,6 +423,14 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     edgeStats() {
       const b = transport.backend;
       return b instanceof EdgePeerBackend ? b.stats() : null;
+    },
+    rtcStats() {
+      const b = transport.backend;
+      return b instanceof RtcPeerBackend ? b.stats() : null;
+    },
+    get rtcPort() {
+      const b = transport.backend;
+      return b instanceof RtcPeerBackend ? b.port : null;
     },
     get onBackendState() {
       return transport.onBackendState;

@@ -42,6 +42,7 @@ s.addRemoteCandidate('candidate:…');  // optional hint only (ICE-lite: peer-re
 s.onOpen = () => {};    // DTLS connected + SCTP association up (channels 0/1/2 usable)
 s.onMessage = (channelId, data) => {}; // data: Uint8Array, the receiver may keep it
 s.onClose = (reason) => {};            // once; never called after a local close()
+s.onChannelClose = (channelId) => {};  // the browser closed one channel (dc.close() → stream reset); session still open
 s.send(0, bytes);       // false if not open / buffer full; bytes may be reused after return
 s.remoteAddress;        // { address, port } of the nominated pair, or null
 s.close();              // sends SCTP ABORT/close_notify best effort, idempotent

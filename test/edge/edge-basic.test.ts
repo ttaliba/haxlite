@@ -99,7 +99,8 @@ describe('haxlite Edge tunnel', () => {
       expect(info.remoteAddress).toMatch(/^127\./);
       const st = room.haxlite.edgeStats()!;
       expect(st.state).toBe('ready');
-      expect(st.dataPlane).toBe('webrtc');
+      expect(st.dataPlane).toBe('udp');
+      expect(st.udp?.sctp.state).toBe('established');
       expect(st.peers).toBe(1);
       expect(st.rttMs === null || st.rttMs >= 0).toBe(true);
       open.leave();
@@ -207,8 +208,8 @@ describe('haxlite Edge tunnel', () => {
     const e1 = await E2E.start({ shared: { master, nh }, transport: { edge: edgeConfig(edge, keyA) } });
     const e2 = await E2E.start({ shared: { master, nh }, transport: { edge: edgeConfig(edge, keyB) } });
     try {
-      expect(backendOf(e1).stats().dataPlane).toBe('webrtc');
-      expect(backendOf(e2).stats().dataPlane).toBe('webrtc');
+      expect(backendOf(e1).stats().dataPlane).toBe('udp');
+      expect(backendOf(e2).stats().dataPlane).toBe('udp');
       const c1 = await e1.join('one');
       const c2 = await e2.join('two');
       await waitFor(() => c1.room.players.length === 2 && c2.room.players.length === 2, 5000, 'lists');
@@ -275,8 +276,10 @@ describe('haxlite Edge tunnel', () => {
       const victim = await e.join('flooder', { sample: false });
       const other = await e.join('bystander', { sample: false });
       await waitFor(() => other.room.players.length === 3, 5000, 'list');
-      // 300 messages at once: the edge's bucket (100) runs out
-      for (let i = 0; i < 300; i++) victim.room.sendChat(`spam ${i}`);
+      // 300 messages at once: the edge's bucket (100) runs out. Inputs, not chats: the host's own
+      // chat limit (10 / 900 ms) would kick first when the edge relays each message as it arrives
+      // (haxlite-rtc handles every UDP packet as its own event)
+      for (let i = 0; i < 300; i++) victim.room.setKeyState(i & 1 ? 1 : 2);
       await waitFor(() => kicks.length > 0, 10_000, 'bad actor');
       expect(kicks[0]).toEqual(['flooder', 'Bad actor']);
       expect(edge.stats().keys.find((k) => k.id === 'alice')!.floods).toBeGreaterThanOrEqual(1);

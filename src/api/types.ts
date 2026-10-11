@@ -19,7 +19,9 @@ import type {
   HostTransportOptions,
   JoinDecision,
   JoinRequest,
+  RtcBackendOptions,
 } from '../net/index.js';
+import type { RtcEndpointStats } from '../rtc/index.js';
 import type { HostRoom } from '../host/index.js';
 import type { RoomEvent } from '../room/index.js';
 
@@ -292,6 +294,20 @@ export interface HaxliteConfig {
    * `transport.portRange` are then ignored (the edge has its own). See docs/09.
    */
   edge?: EdgeOptions | null;
+  /**
+   * Player connection stack when there is no `edge` ['ndc']:
+   * `'ndc'` node-datachannel (full ICE + STUN, works behind NAT);
+   * `'rtc'` haxlite-rtc (pure TypeScript ICE-lite/DTLS/SCTP: one UDP port for
+   * every player, no native threads, ≈ half the CPU per player) for servers
+   * with a public IP — configure it with {@link rtc}. See docs/10.
+   */
+  peerBackend?: 'ndc' | 'rtc';
+  /**
+   * `peerBackend: 'rtc'` settings: `{ port: 40000, publicAddresses: ['203.0.113.7'] }`.
+   * `publicAddresses` defaults to the machine's public interface addresses;
+   * without one (NAT / cloud 1:1 NAT) it must be given, or HBInit rejects.
+   */
+  rtc?: RtcBackendOptions | null;
 }
 
 /** Pre-join decision: `undefined`/`true` accept, `false` reject (banned, 4102), a number = close code. */
@@ -366,6 +382,10 @@ export interface HaxliteRoomExtensions {
   setMaxPlayers(n: number): void;
   /** Edge tunnel statistics (state, data plane, RTT, peers, bytes), null without `haxlite.edge`. */
   edgeStats(): EdgeBackendStats | null;
+  /** haxlite-rtc endpoint counters (sessions, packets, bytes, handshakes), null unless `peerBackend: 'rtc'`. */
+  rtcStats(): RtcEndpointStats | null;
+  /** UDP port players connect to with `peerBackend: 'rtc'` (null otherwise / until listening). */
+  readonly rtcPort: number | null;
   /**
    * Edge tunnel availability: `'down'` = tunnel lost (every player was
    * disconnected; joins refused until it reconnects), `'ready'` = (re)connected.
