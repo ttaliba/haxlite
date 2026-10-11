@@ -9,12 +9,15 @@
  */
 
 export class TokenBucket {
-  readonly capacity: number;
-  readonly msPerToken: number;
+  // Numeric initializers on purpose: a bare declaration defines the field as
+  // `undefined` first, which makes V8 store `last` (a double, updated on every
+  // take) as a freshly boxed HeapNumber each time instead of in place.
+  readonly capacity: number = 0;
+  readonly msPerToken: number = 0;
   /** Tokens available (`vb`). */
-  tokens: number;
+  tokens = 0;
   /** Reference time of the last refill (`Rc`). */
-  private last: number;
+  private last = 0;
 
   constructor(capacity: number, msPerToken: number, now: number = performance.now()) {
     this.capacity = capacity;

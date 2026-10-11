@@ -120,9 +120,13 @@ export class Peer {
   playerId = -1;
   /** Free for the host. */
   userData: unknown = null;
-  readonly createdAt: number;
+  // Numeric initializers (not bare declarations, which define the field as
+  // `undefined` first): the field gets a double representation and the
+  // per-message store of `now` updates it in place instead of boxing a new
+  // HeapNumber every time.
+  readonly createdAt: number = 0;
   /** performance.now() of the last message received (idle timeout). */
-  lastMessageAt: number;
+  lastMessageAt = 0;
 
   /**
    * Remote address of the selected ICE pair once channel 0 opened (what the
