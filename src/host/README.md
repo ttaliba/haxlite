@@ -59,6 +59,14 @@ host.start();
   ~1 ms early, which would cost a second wake-up): heartbeats leave ~1–2 ms after their frame
   boundary.
 
+* **Bundling scope**: every wake-up, client message and top-level action runs inside the peer
+  backend's optional `cork()`/`uncork()` (implemented by the haxlite-rtc backend): all the
+  messages one peer gets from that step (event on `ru`, heartbeat on `uu`, pong, the SACK it is
+  owed…) leave as one SCTP packet / DTLS record / datagram when the step ends, before control
+  returns to the event loop. No latency is added; other backends ignore it.
+* Received message bytes may be transient (rtc backend): `handleMessage` consumes them
+  synchronously and copies only when it has to defer the message.
+
 ## Netcode knobs (host-only, compatible with official clients)
 
 | Option | Default | Effect |

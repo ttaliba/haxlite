@@ -25,16 +25,18 @@
  *   configured public addresses are the only ones ever announced;
  * * the selected-pair address given with channel 0 is the source address of
  *   the browser's authenticated STUN checks (its NAT's public address);
- * * **per-iteration bundling**: the first `send` to a peer in an event-loop
- *   iteration corks its SCTP association and every corked peer is flushed
- *   from one `setImmediate` (the check phase of the same iteration). All the
- *   messages a peer gets in that iteration (event on `ru`, heartbeat on `uu`,
- *   pong, CheckConsistency…, plus the SACK it is owed) leave as one SCTP
- *   packet (RFC 9260 bundling, up to the MTU and the congestion window) →
- *   one DTLS record, one cipher operation, one datagram. Each message is
- *   still delivered separately to the data channel; no latency is added
- *   beyond the rest of the current iteration. Closing a link flushes first,
- *   so a kick message still precedes the ABORT;
+ * * **bundling**: the first `send` to a peer corks its SCTP association;
+ *   corked peers are flushed when the outermost {@link RtcPeerBackend.cork}
+ *   scope ends (HostRoom wraps every wake-up, client message and top-level
+ *   action: the flush happens before control returns to the event loop) or,
+ *   for sends outside any scope, from one `setImmediate` (check phase of the
+ *   same iteration). All the messages a peer gets in that scope (event on
+ *   `ru`, heartbeat on `uu`, pong, CheckConsistency…, plus the SACK it is
+ *   owed) leave as one SCTP packet (RFC 9260 bundling, up to the MTU and the
+ *   congestion window) → one DTLS record, one cipher operation, one
+ *   datagram. Each message is still delivered separately to the data
+ *   channel; no latency is added. Closing a link flushes first, so a kick
+ *   message still precedes the ABORT;
  * * received messages may be transient views (only valid during
  *   `onMessage`, see `transientDelivery` in src/rtc/sctp): the transport and
  *   the host consume them synchronously and copy what they keep.
@@ -42,6 +44,7 @@
 import { networkInterfaces } from 'node:os';
 import { isIP } from 'node:net';
 import type { RtcCertificate, RtcEndpoint, RtcEndpointStats, RtcSession, SharedEndpointLease } from '../rtc/index.js';
+import { freezeSctpClock, thawSctpClock } from '../rtc/sctp/clock.js';
 import { classifyAddress } from './ice.js';
 import type { PeerBackend, PeerLink, PeerLinkEvents } from './peer-backend.js';
 
@@ -168,6 +171,7 @@ class SendBundler {
     if (this.flushing) return;
     this.flushing = true;
     const l = this.list;
+    freezeSctpClock(); // one clock read for every association flushed here
     try {
       // a flush can deliver deferred input → host sends → new corks appended: same pass
       for (let i = 0; i < this.n; i++) {
@@ -179,11 +183,15 @@ class SendBundler {
       for (let i = 0; i < this.n; i++) l[i] = null;
       this.n = 0;
       this.flushing = false;
+      thawSctpClock();
     }
   }
 }
 
 const bundler = new SendBundler();
+
+/** Fallback delay after start() before the endpoint is brought up without an offer / whenListening() call. */
+const LISTEN_DELAY_MS = 50;
 
 /** {@link PeerBackend} over one haxlite-rtc {@link RtcEndpoint} (all peers on one UDP port). */
 export class RtcPeerBackend implements PeerBackend {
@@ -200,8 +208,10 @@ export class RtcPeerBackend implements PeerBackend {
   private closing: Promise<void> = Promise.resolve();
   /** Lease on the endpoint while owned and started. */
   private lease: SharedEndpointLease | null = null;
-  /** Settles when the endpoint of the current start() listens (rejects when it cannot). */
-  private listening: Promise<void> = Promise.resolve();
+  /** Settles when the endpoint of the current start() listens (rejects when it cannot); null until it begins. */
+  private listening: Promise<void> | null = null;
+  private listenTimer: NodeJS.Timeout | null = null;
+  private handlers: { onError(err: Error): void } | null = null;
   /** Between start() and the endpoint listening (or failing to). */
   private starting = false;
   /** Offers accepted while {@link starting}, answered once the endpoint listens. */
@@ -241,10 +251,30 @@ export class RtcPeerBackend implements PeerBackend {
 
   start(h: { onReady(): void; onDown(err: Error | null): void; onError(err: Error): void }): void {
     const gen = ++this.generation;
-    if (!this.owned || this.ep !== null || this.lease !== null) {
+    if (!this.owned || this.ep !== null || this.lease !== null || this.starting) {
       h.onReady();
       return;
     }
+    // Like 'ndc' (whose native library loads at the first peer), the room is
+    // announced at once and the endpoint comes up lazily: the rtc modules, the
+    // UDP socket and the certificate are set up on the first of (a) an offer
+    // (answered as soon as it listens, see DeferredRtcPeerLink), (b) a
+    // whenListening() call (HBInit, at the room link) or (c) LISTEN_DELAY_MS
+    // after start — so none of it delays the room link.
+    this.starting = true;
+    this.handlers = h;
+    this.listening = null;
+    const t = setTimeout(() => this.beginListen(gen), LISTEN_DELAY_MS);
+    t.unref?.();
+    this.listenTimer = t;
+    h.onReady();
+  }
+
+  private beginListen(gen: number): Promise<void> {
+    if (this.listening !== null) return this.listening;
+    if (this.listenTimer !== null) clearTimeout(this.listenTimer);
+    this.listenTimer = null;
+    const h = this.handlers!;
     const o = this.opts;
     const epOpts = {
       port: o.port ?? 0,
@@ -258,15 +288,9 @@ export class RtcPeerBackend implements PeerBackend {
       ...(o.maxSessions !== undefined ? { maxSessions: o.maxSessions } : null),
       ...(o.cipherSuites !== undefined ? { cipherSuites: o.cipherSuites } : null),
     };
-    // Like 'ndc' (whose library loads at the first peer), signaling starts at
-    // once: the rtc modules, the UDP socket and the certificate come up during
-    // the master round trips instead of before them. Until then `ready` is
-    // false and an early offer is refused like any offer to a backend not ready.
-    this.starting = true;
-    h.onReady();
-    this.listening = import('../rtc/index.js')
+    const p = import('../rtc/index.js')
       .then((rtc) => {
-        if (gen !== this.generation) return;
+        if (gen !== this.generation) throw new Error('stopped');
         const lease: SharedEndpointLease =
           o.shared === false
             ? (() => {
@@ -276,24 +300,33 @@ export class RtcPeerBackend implements PeerBackend {
             : rtc.acquireSharedEndpoint(epOpts);
         this.lease = lease;
         return lease.ready.then((ep) => {
-          if (gen !== this.generation) return;
+          if (gen !== this.generation) throw new Error('stopped');
           this.ep = ep;
           this.starting = false;
         });
       })
       .catch((err: unknown) => {
-        if (gen === this.generation) this.starting = false;
         const e = err instanceof Error ? err : new Error(String(err));
+        if (gen !== this.generation) throw e;
+        this.starting = false;
         const wrapped = new Error(`peerBackend 'rtc': cannot listen on UDP ${o.address ?? '*'}:${o.port ?? 0}: ${e.message}`, { cause: e });
-        if (gen === this.generation) h.onError(wrapped);
+        h.onError(wrapped);
         throw wrapped;
       });
-    this.listening.catch(() => {});
+    p.catch(() => {});
+    this.listening = p;
+    return p;
   }
 
-  /** Resolves once the endpoint of the last {@link start} listens (rejects with the listen error). */
+  /**
+   * Brings the endpoint up now if it is not yet (see {@link start}) and
+   * resolves once it listens; rejects with the listen error (or when the
+   * backend was stopped meanwhile).
+   */
   whenListening(): Promise<void> {
-    return this.listening;
+    if (this.ep !== null && this.listening === null) return Promise.resolve();
+    if (this.starting) return this.beginListen(this.generation);
+    return this.listening ?? Promise.reject(new Error("peerBackend 'rtc' is not started"));
   }
 
   /**
@@ -313,6 +346,9 @@ export class RtcPeerBackend implements PeerBackend {
   stop(): void {
     this.generation++;
     this.starting = false;
+    if (this.listenTimer !== null) clearTimeout(this.listenTimer);
+    this.listenTimer = null;
+    this.listening = null;
     for (const l of [...this.deferred]) l.close();
     for (const l of [...this.links]) l.close();
     if (this.owned) {

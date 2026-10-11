@@ -92,7 +92,8 @@ export async function startDtlsHarness(
         remoteFingerprint: { algorithm: o.algorithm ?? 'sha-256', digest: o.fingerprint },
         send: (d) => sock.send(d, r.port, r.address),
         onConnected: () => events.connected.push(srv!),
-        onData: (d) => {
+        onData: (buf, off, len) => {
+          const d = Buffer.from(buf.buffer, buf.byteOffset + off, len);
           events.data.push(d.toString());
           srv!.send(Buffer.from(`echo:${d.toString()}`));
         },

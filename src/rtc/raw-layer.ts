@@ -14,10 +14,10 @@ class RawLayer implements SctpAssociationLike {
     queueMicrotask(() => this.opts?.onOpen());
   }
 
-  input(packet: Uint8Array): void {
+  input(packet: Uint8Array, off = 0, len = packet.length - off): void {
     const o = this.opts;
-    if (o === null || packet.length === 0) return;
-    o.onMessage(packet[0]!, packet.subarray(1));
+    if (o === null || len <= 0) return;
+    o.onMessage(packet[off]!, packet.subarray(off + 1, off + len));
   }
 
   send(channelId: number, data: Uint8Array): boolean {

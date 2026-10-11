@@ -50,7 +50,7 @@ oficial (`ro` id 0 fiable y ordenado, `ru` id 1 fiable y desordenado, `uu` id 2 
 |---|---|---|
 | SDP (`sdp.ts`) | Lee la oferta, escribe la respuesta | `a=ice-lite`, `a=setup:passive`, candidatos `host` solo de `publicAddresses`, `a=end-of-candidates`, `a=max-message-size:262144` |
 | ICE‑lite (`stun.ts`, `session.ts`) | Responde Binding requests; nunca envía comprobaciones | USERNAME `nuestroUfrag:suyoUfrag`, MESSAGE‑INTEGRITY (HMAC‑SHA1) y FINGERPRINT obligatorios, rol *controlling* del navegador. Cada origen autenticado queda *validado*; USE‑CANDIDATE nomina. Consentimiento: si no llega ningún Binding autenticado en `idleTimeoutMs` (30 s) se cierra. Cambio de NAT solo con un Binding autenticado nuevo |
-| DTLS 1.2 (`dtls/`) | Servidor DTLS (RFC 6347) | Cookie HMAC (HelloVerifyRequest) antes de guardar estado; `ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (+ AES_256_GCM, CHACHA20_POLY1305); x25519 / P‑256; *extended master secret* obligatorio; certificado del cliente obligatorio y comparado (tiempo constante) con el `a=fingerprint` de la oferta; CertificateVerify comprobado; ventana anti‑replay de 64; retransmisión 1 s → 8 s; fragmentación y reensamblado; `close_notify`. Un Chromium que ofrece DTLS 1.3 recibe un ServerHello 1.2 y conecta |
+| DTLS 1.2 (`dtls/`) | Servidor DTLS (RFC 6347) | Cookie HMAC (HelloVerifyRequest) antes de guardar estado; preferencia `ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (AEAD en JS puro, sin asignaciones, cifra/descifra en el sitio: `dtls/chacha.ts`, §6.3), luego AES_128_GCM y AES_256_GCM (`node:crypto`), configurable con `cipherSuites`; x25519 / P‑256; *extended master secret* obligatorio; certificado del cliente obligatorio y comparado (tiempo constante) con el `a=fingerprint` de la oferta; CertificateVerify comprobado; ventana anti‑replay de 64; retransmisión 1 s → 8 s; fragmentación y reensamblado; `close_notify`. Un Chromium que ofrece DTLS 1.3 recibe un ServerHello 1.2 y conecta |
 | SCTP (`sctp/association.ts`) | Asociación SCTP sobre DTLS | RFC 9260, PR‑SCTP (RFC 3758) para `uu`, *stream reset* (RFC 6525) para cerrar canales, *zero checksum* (RFC 9653). Cookie de estado HMAC (INIT sin estado). Sin Nagle: un `send` sale en el acto si las ventanas lo permiten; los envíos hechos dentro de `onMessage` se agrupan en un paquete junto con el SACK. Un solo temporizador por asociación. Ruta caliente sin asignaciones (arena FIFO de bytes, anillos tipados indexados por TSN); `input` nunca lanza |
 | Certificado (`cert.ts`) | ECDSA P‑256 autofirmado | Codificador DER mínimo |
 
@@ -92,8 +92,11 @@ new HostTransport({ token, peerBackend: 'rtc', rtcEndpoint: { port: 40000, publi
 | `address` | comodín de cada familia de `publicAddresses` | dirección de *bind* |
 | `publicPort` | el puerto real | puerto anunciado si un NAT 1:1 lo traduce |
 | `idleTimeoutMs` / `handshakeTimeoutMs` / `maxSessions` | 30 s / 20 s / 10 000 | del endpoint; las de `HostTransport` (10 s de apertura, 10 s de inactividad, 16 negociaciones, `maxPlayers`) actúan antes |
-| `certificate` | uno nuevo por endpoint | certificado DTLS |
-| `endpoint` | — | un `RtcEndpoint` ya abierto, compartido por varias salas en un puerto (el backend no lo cierra) |
+| `certificate` | uno por proceso (`RtcCertificate.processDefault()`, clave generada en el *thread pool*) | certificado DTLS |
+| `certificateFile` | — | PEM (certificado + clave, modo 0600) donde guardar/cargar la identidad DTLS: huella estable entre reinicios y sin generar claves al arrancar (`RtcCertificate.loadOrCreate`) |
+| `shared` | `true` | todas las salas del proceso con la misma configuración (puerto —también 0—, direcciones, certificado, tiempos, suites) comparten **un** endpoint y un socket UDP (refcontado, `src/rtc/shared.ts`); `false` = endpoint propio |
+| `cipherSuites` | `['chacha20', 'aes128gcm', 'aes256gcm']` | preferencia DTLS del servidor (nombres IANA, ids o cortos); un cliente sin ChaCha20 negocia AES-GCM |
+| `endpoint` | — | un `RtcEndpoint` ya abierto (el backend no lo cierra) |
 
 Qué cambia y qué no respecto a node-datachannel (`'ndc'`, por defecto):
 
@@ -105,6 +108,13 @@ Qué cambia y qué no respecto a node-datachannel (`'ndc'`, por defecto):
   backend es `prefiltered` y solo anuncia `publicAddresses`.
 * La respuesta sale **sin la espera de 500 ms** de recolección (el SDP ya trae los candidatos y
   `a=end-of-candidates`).
+* **Arranque perezoso**, como `ndc` (que carga node-datachannel con el primer peer): la sala se
+  anuncia al maestro en el acto y los módulos rtc, el socket y el certificado se preparan con la
+  primera oferta, con `whenListening()` (HBInit lo llama al recibir el enlace y resuelve cuando el
+  puerto escucha, o rechaza con el error de *bind*) o 50 ms después de `start()`, lo primero que
+  ocurra. Una oferta que llega antes se contesta en cuanto escucha (`DeferredRtcPeerLink`).
+* `room.haxlite.rtcStats()` da los contadores del endpoint **compartido** (todas las salas que
+  lo usan).
 * Los tres canales abren a la vez. **`challengeDelayMs` se mantiene en 40 ms** también con `rtc`:
   protege al *cliente*. Medido con node-haxball (libdatachannel), 30 entradas por configuración:
   `rtc` con 0 ms falla **29/30** (el desafío llega con la asociación SCTP, antes de que el cliente
@@ -405,6 +415,189 @@ mensajes salientes frente a 9·N entrantes), y el beneficio global del backend `
 −35 % de CPU del proceso host completo (juego + red), 8 hilos nativos menos; lag del event loop p99
 1,13–1,20 → 1,30–1,50 ms.
 
+### 6.3 Pasada GC / bundling (SCTP, backend `rtc`, host)
+
+Objetivo: bajar la basura de la ruta de datos (GC) sin añadir latencia. Cambios (W1; los de
+DTLS/endpoint —ChaCha20-Poly1305 en JS, registros sellados en un búfer compartido, envío UDP
+síncrono— son de la pasada paralela de W2 y entran en la columna «después»):
+
+- **Bundling por paso del host** (`src/net/rtc-backend.ts`, `src/host/host-room.ts`): el primer
+  `send` a un peer «corcha» su asociación SCTP; `HostRoom` envuelve cada despertar del reloj, cada
+  mensaje de cliente y cada acción de nivel superior en `backend.cork()/uncork()`, y al cerrar el
+  ámbito más externo cada peer recibe **un paquete SCTP** con todos sus mensajes (evento en `ru`,
+  heartbeat en `uu`, pong…, más el SACK que se le debe: RFC 9260 §6.10, hasta la MTU y la ventana
+  de congestión). El flush ocurre antes de devolver el control al event loop: **cero latencia
+  añadida**. Envíos fuera de ámbito (desafío, kick desde código de usuario) se agrupan con un único
+  `setImmediate` (misma iteración). Cerrar un enlace vacía antes su lote (el kick precede al
+  ABORT). Mientras está corchada, la asociación difiere también el SACK de fin de `input`.
+- **Recepción sin asignaciones**: opción `transientDelivery` de `SctpAssociation` (la sesión la
+  activa): un mensaje no fragmentado se copia a un búfer de trabajo por asociación y se entrega
+  como vista cacheada de su longitud, válida solo durante `onMessage`. `HostTransport` copia el
+  único mensaje que retiene (el handshake, que cruza un `await`) y `HostRoom` el de la cola
+  diferida. `input(packet, off, len)` acepta el registro descifrado en su sitio, sin vista.
+- **Temporizadores**: un montículo de plazos por proceso con un solo `setTimeout`
+  (`src/rtc/sctp/timers.ts`) para las asociaciones con reloj/temporizadores por defecto: mover el
+  T3 en cada SACK ya no crea un `Timeout`.
+- **Reloj**: cada `performance.now()` asigna un HeapNumber en Node (~16 B). El reloj SCTP es de
+  milisegundos enteros (Smi) y se **congela** durante un flush del lote y durante los disparos del
+  montículo (`src/rtc/sctp/clock.ts`): una lectura por lote en vez de una por peer.
+- **Sin *boxing***: los valores de 32 bits fuera del rango Smi (TSN, CRC32c) devueltos o pasados
+  a funciones no *inlined* se empaquetan en un HeapNumber. El CRC se verifica con una función
+  booleana (`sctpChecksumMatches`) y el ack acumulado / a_rwnd del SACK pasan por campos.
+
+**Micro‑benchmark** `bench/rtc/sctp-host-alloc.ts` (SctpAssociation + `RtcPeerLink` + ámbitos de
+bundling con tráfico HaxBall: 20 peers, 60 Hz, inputs a 8 Hz por `ro`, ping 1 Hz, heartbeat cada 7
+frames, eco a todos por `ru`; perfil de asignaciones de V8 incluyendo objetos ya recolectados;
+los «navegadores» usan otra copia del módulo para separar sus asignaciones):
+
+| variante (300 s simulados) | mensajes / paquetes de salida | asignación del host |
+|---|---:|---:|
+| bundling por ámbito (como `HostRoom`) | 1 034 860 / 1 034 860 | **8,8 B/mensaje** — todo es la lectura de reloj por paquete recibido (`performance.now()`) |
+| `--no-bundle` (flush en cada `send`, como antes) | 1 034 860 / 1 034 860 | 8,7 B/mensaje (ídem) |
+| `--const-clock` (reloj inyectado constante) | 1 034 860 / 1 034 860 | **0,00 B/mensaje** (1,6 KiB en total) |
+
+Sin contar las lecturas de reloj, la ruta SCTP + `RtcPeerLink` + bundler **no asigna nada** en
+régimen estacionario (antes: una vista por mensaje recibido, un `Timeout` por re‑armado, un
+HeapNumber por SACK y por CRC verificado, las listas del lote). Con este tráfico el bundling no
+reduce paquetes (1,00 mensajes/paquete en ambos casos): cada paso del host envía un mensaje por
+peer.
+
+**Host completo**, `bench/net/run.ts game`, N = 20 clientes node-haxball, 3 × 60 s, misma
+sesión y `flock` (`bench/results/gc-bundling.json`; «antes» = build de `b423ffb`, «después» = el
+árbol con ambas pasadas):
+
+| variante | CPU % | GC/min | GC ms/min | heap MB | RSS MB | lag p99 ms | UDP salida / entrada /s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `rtc` antes | 7,34 · 7,73 · 8,23 | 55 · 55 · 55 | 138 · 139 · 140 | 14,3 | 87,4 | 2,09 · 2,37 · 4,07 | 2 620–2 660 / 1 520–1 545 |
+| **`rtc` después** | **5,30 · 6,08 · 5,76** | 49 · 50 · 50 | **19 · 20 · 23** | 14,2 | **77,8 · 81,4 · 82,0** | 2,23 · 3,05 · 2,02 | 2 575–2 630 / 1 500–1 530 |
+| `ndc` antes | 11,30 · 12,14 · 12,30 | 10 · 8 · 8 | 3,3 · 3,8 · 2,6 | 9,9 | 84,2–85,2 | 1,80 · 2,35 · 2,53 | — |
+| `ndc` después | 11,78 · 12,73 · 12,07 | 9 · 11 · 7 | 3,6 · 3,6 · 2,2 | 10,0–10,1 | 82,8–84,3 | 2,01 · 2,29 · 1,85 | — |
+
+Lectura:
+
+- **CPU −25 %** (7,7 → 5,8 %, mediana; menos de la mitad que `ndc`) y **tiempo de GC ÷ 6–7**
+  (139 → 20 ms/min: las recolecciones jóvenes pasan de ~2,5 ms a ~0,4 ms porque casi no sobrevive
+  nada). **RSS** −5 a −10 MB: ahora por debajo de `ndc`.
+- **El bundling apenas reduce datagramas** (−1 %): con este tráfico cada paso del host lleva ~1
+  mensaje por peer (los inputs llegan repartidos en el tiempo) y agruparlos más exigiría retrasar
+  envíos. La cadencia de datagramas (≈ 2 600/s de salida, ≈ 1 500/s de entrada, casi todo SACKs
+  de los clientes) queda fijada por el tráfico.
+- **Número de GC y heap: `ndc` sigue ganando.** Del ~1,5 MB/s de basura joven que queda, la pila
+  SCTP + backend aporta ≈ 0,04 MB/s (lecturas de reloj); el resto es por datagrama dentro de Node
+  (`dgram.send`: ~0,67 MB/s en SendWrap/listas/vistas; recepción: Buffer + `rinfo` ≈ 0,5 MB/s) y la
+  física (`collideDiscSegment` ≈ 0,12 MB/s, también presente en `ndc`). Con un semiespacio de
+  ~1 MB eso son ~50 recolecciones/min; `ndc` hace ese trabajo en hilos nativos. El heap (+4 MB)
+  es, según el análisis de la pasada DTLS, sobre todo código y fuentes de los módulos DTLS/SCTP
+  cargados (el estado SCTP por peer son unos pocos KB en *typed arrays*). Cifras de basura: perfil
+  de asignaciones del proceso host (`HOST_ALLOC_PROFILE`), N = 20.
+- **Lag p99**: sin cambio claro (2,0–3,1 frente a 1,9–2,5 ms de `ndc`); la red sigue corriendo en
+  el hilo JS.
+
+### 6.4 Pasada DTLS / endpoint / arranque (W2)
+
+Cambios (`src/rtc/dtls/*`, `endpoint.ts`, `session.ts`, `cert.ts`, `shared.ts`, arranque del
+backend `rtc`):
+
+- **ChaCha20‑Poly1305 en JS puro** (`src/rtc/dtls/chacha.ts`) como suite preferida. node:crypto
+  necesita un objeto `Cipher` nativo nuevo por registro (un AEAD no admite otro nonce) más búferes
+  de salida y de etiqueta: era la mayor fuente de basura y los objetos con respaldo nativo alargan
+  las pausas. La implementación nueva cifra en el sitio en un búfer compartido, descifra en el
+  sitio en el datagrama recibido **después** de verificar la etiqueta, y no asigna nada. Tiempo
+  constante en lo que JS permite: ChaCha20 es ARX sobre int32; Poly1305 usa limbs de 13 bits
+  (disposición de poly1305‑donna‑16) cuyas sumas parciales quedan < 2^32, reducción final con
+  máscaras y comparación de etiqueta por OR de diferencias; sin ramas ni tablas dependientes de
+  secretos. **AES no se implementa en JS** (las tablas no son de tiempo constante): AES‑GCM sigue
+  en node:crypto para clientes sin ChaCha20, con la preferencia configurable (`cipherSuites`).
+  Validación: vectores RFC 8439 §2.5.2 / §2.8.2 / A.3 (#5–#9), Poly1305 contra una referencia
+  BigInt, y **3 000 000 de casos aleatorios** (claves, nonces, AAD 0–40 B, 0–1 300 B,
+  desplazamientos no alineados) idénticos a `chacha20-poly1305` de node:crypto
+  (`HAXLITE_CHACHA_CASES=3000000 npx vitest run test/rtc/chacha.test.ts`); OpenSSL `s_client
+  -dtls1_2` con la suite por defecto y con `-cipher ECDHE-ECDSA-CHACHA20-POLY1305` (y un cliente
+  solo‑AES negocia AES‑128‑GCM); repetición y registros alterados se descartan con ambas AEAD.
+- **Chromium 141 ofrece ChaCha20 en DTLS 1.2 y lo negocia**: `getStats()` del navegador da
+  `dtlsCipher: TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (`test/rtc/chromium-dtls.test.ts`;
+  con `cipherSuites: ['aes128gcm', …]` da AES‑128‑GCM). Toda la suite de interoperabilidad (§4,
+  80 escenarios) y el cliente oficial sin modificar (§4.3) pasan con ChaCha20.
+- **Envío sin basura propia**: `dgram` con una `lookup` síncrona para literales IP (sin
+  `dns.lookup` + `process.nextTick` + dos cierres por datagrama, y el envío queda síncrono), los
+  registros se sellan en **un** búfer por endpoint (sustituido si el kernel encola un envío con
+  EAGAIN, comprobado con `getSendQueueCount()`) y se envían con vistas de longitud exacta
+  cacheadas. Recepción: el registro descifrado pasa a SCTP como `(datagrama, off, len)`.
+  Tras el handshake se liberan secreto maestro, ECDHE y clave del cliente.
+- **Endpoint compartido por defecto** (`src/rtc/shared.ts`, opción `rtc.shared`, por defecto
+  `true`): las salas de un proceso con la misma configuración comparten un endpoint refcontado (un
+  socket UDP); el último en salir lo cierra. 10 salas = 1 socket.
+- **Arranque**: certificado por proceso generado en el *thread pool* (`processDefault`, opcional
+  `certificateFile` en disco); el backend anuncia la sala en el acto y levanta módulos, socket y
+  certificado de forma perezosa (§3). Antes, `start()` cargaba los módulos rtc (~5 ms), generaba
+  la clave (~3–7 ms la primera vez) y abría el socket **antes** de hablar con el maestro.
+
+Micro‑benchmark de la AEAD (cifrar + descifrar un registro, mismo proceso, 300 000 registros;
+`GC` = recolecciones por 100 000 registros):
+
+| tamaño | node AES‑128‑GCM | node ChaCha20‑Poly1305 | **JS ChaCha20‑Poly1305** |
+|---:|---:|---:|---:|
+| 50 B | 6,6 µs · 71 GC (83 ms) | 9,2 µs · 35 GC (71 ms) | **1,8 µs · 0 GC** |
+| 120 B | 7,5 µs · 35 GC (79 ms) | 9,8 µs · 35 GC (79 ms) | **2,3 µs · 0 GC** |
+| 300 B | 10,7 µs · 35 GC (62 ms) | 13,4 µs · 35 GC (68 ms) | **4,7 µs · 0 GC** |
+| 600 B | 10,3 µs · 70 GC (56 ms) | 11,7 µs · 35 GC (68 ms) | **8,2 µs · 0 GC** |
+| 1 200 B | 10,6 µs · 35 GC (62 ms) | 14,7 µs · 35 GC (67 ms) | 15,8 µs · 0 GC |
+
+(El JS gana hasta ~800 B; los registros de HaxBall son de 30–400 B.)
+
+Perfil de asignaciones del host con N = 20 (`HOST_ALLOC_PROFILE`, incluye lo ya recolectado):
+**≈ 5,5 → 1,4 MB/s** de basura joven con ambas pasadas. Lo que queda es de Node: `dgram.send`
+≈ 0,67 MB/s (SendWrap, lista, cierre por datagrama) y la recepción (Buffer + `rinfo`) ≈ 0,54 MB/s;
+`ndc` asigna ≈ 0,16 MB/s en total.
+
+**Host completo**, misma sesión, `flock`, intercalado («antes» = build de `b423ffb`, «después» =
+árbol con las pasadas de W1 y W2; mediana de 3 × 60 s, arranque 10 repeticiones;
+`bench/results/rtc-dtls-endpoint-{startup,game,rooms}.json`):
+
+| escenario | métrica | `ndc` antes | `rtc` antes | `ndc` después | **`rtc` después** |
+|---|---|---:|---:|---:|---:|
+| arranque | proceso → link (ms) | 105,8 | 118,5 | 105,8 | **109,0** |
+| | creación → link (ms) | 12,8 | 23,0 | 12,7 | **13,1** |
+| | RSS / heap al link (MB) | 67,1 / 8,9 | 68,5 / 9,1 | 66,8 / 9,1 | 67,8 / 9,1 |
+| partida N = 20 | CPU % | 11,90 | 8,17 | 11,41 | **5,42** |
+| | RSS MB | 82,5 | 75,3 | 82,6 | **77,4** (72,5–77,8) |
+| | heap MB | **9,9** | 12,8 | 10,1 | 13,1 |
+| | GC/min · ms/min | **9 · 3,8** | 157 · 162 | 10 · 3,4 | 61 · 24,9 |
+| | lag p50 / p99 ms | 0,09 / 1,65 | 0,12 / 2,41 | 0,09 / 1,80 | 0,11 / 2,76 |
+| | hilos · fds · despertares/s | 19 · 27 · 4 183 | 11 · 25 · 514 | 19 · 27 · 4 225 | **11 · 25 · 489** |
+| | entrada p50 (ms) | 2 056 | 1 057 | 2 055 | **1 058** |
+| 10 salas × 4 | CPU % | 15,63 | 9,31 | 15,86 | **6,54** |
+| | RSS MB | 88,9 | 88,0 | 89,1 | **75,2** |
+| | heap MB | **11,0** | 15,6 | 11,2 | 13,5 |
+| | GC/min · ms/min | **20 · 6,8** | 33 · 94 | 21 · 5,9 | 39 · 14,9 |
+| | lag p99 ms | 1,82 | 2,01 | 1,74 | 1,95 |
+| | hilos · fds | 19 · 36 | 11 · 43 | 19 · 36 | **11 · 34** |
+
+(En «10 salas», `udp in/out` del arnés suma los contadores de cada sala, que ahora son los del
+endpoint compartido: aparecen ×10. Una repetición de `ndc antes` y `rtc antes` falló en esa tanda
+y su mediana es de 2.)
+
+Lectura:
+
+- **Gana**: CPU (−52 % frente a `ndc` con N = 20, −59 % con 10 salas), RSS (−5 / −14 MB), hilos,
+  fds (10 salas: 34 frente a 36; antes 43), despertares, tiempo de entrada, y el arranque queda
+  **a la par** (109,0 frente a 105,8 ms en esta tanda, 105,1 frente a 107,3 en la anterior: dentro
+  del ruido; creación → link 13,1 frente a 12,7 ms, antes 23).
+- **Pierde todavía**: número y tiempo de GC (61/min y 25 ms/min frente a 10 y 3,4; antes 157 y
+  162), heap (+3 MB) y lag p99 (+0,2 a +1 ms). Las causas son estructurales de hacer la red en el
+  hilo JS: la basura que queda es la de `dgram` de Node por datagrama (≈ 2 600 envíos y 1 500
+  recepciones por segundo con N = 20) y no se puede evitar sin un addon nativo o sin usar
+  internos de Node (`process.binding('udp_wrap')` reutilizando `SendWrap`: descartado por
+  frágil); el heap extra es código JIT y fuentes de los módulos DTLS/SCTP (instantánea de heap:
+  +1,25 MB de código, +0,26 MB de cadenas de fuente con comentarios; el estado por sesión es
+  pequeño), y el bench carga el JS de `tsc` sin minificar —con el paquete publicado (rolldown,
+  minificado) las fuentes ocupan menos—; el lag p99 lo marcan las pausas de GC y el trabajo de
+  red en el hilo JS.
+
+Reproducir: `HAXLITE_BENCH_VARIANTS` con `dist` de cada build (ver la cabecera de
+`bench/net/host-proc.mjs`) y `bench/net/run.ts startup|game|rooms`; diagnóstico con
+`HOST_ALLOC_PROFILE=<f>.heapprofile` y `HOST_HEAP_SNAPSHOT=<f>.heapsnapshot`.
+
 ## 7. Limitaciones
 
 - **Solo IP pública** (o NAT 1:1): ICE‑lite no hace comprobaciones ni reúne candidatos
@@ -415,8 +608,11 @@ mensajes salientes frente a 9·N entrantes), y el beneficio global del backend `
 - **El navegador siempre ofrece** y es cliente DTLS; haxlite-rtc no puede iniciar conexiones.
 - **DTLS 1.2 únicamente** (los navegadores con DTLS 1.3 negocian 1.2, comprobado con el field
   trial de Chromium); sin reanudación de sesión.
-- Todo corre en el hilo principal de Node: el cifrado AES‑GCM de `node:crypto` y el SCTP compiten
-  con la lógica del host (ver CPU en §6).
+- Todo corre en el hilo principal de Node: el cifrado (ChaCha20‑Poly1305 en JS, o AES‑GCM de
+  `node:crypto`) y el SCTP compiten con la lógica del host (ver CPU en §6).
+- Cada datagrama pasa por `dgram` de Node, que asigna objetos JS por envío (≈ 260 B) y por
+  recepción (≈ 350 B, el `Buffer` y el `rinfo`): con miles de datagramas/s es la basura que queda
+  (§6.3), y no se puede evitar sin un addon nativo.
 - **Interoperabilidad verificada solo con Chromium 141** (§5). Firefox, Safari y móviles están
   pendientes (§5.2). IPv6 no se pudo probar en esta VM.
 - Sin autodetección de la IP pública vía el maestro (el protocolo no la da): `publicAddresses`

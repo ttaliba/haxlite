@@ -21,14 +21,16 @@ Owners: R1 everything in `src/rtc/` except `src/rtc/sctp/` (R2) · tests `test/r
 ## Public API (`src/rtc/index.ts`)
 
 ```ts
-import { RtcEndpoint, RtcCertificate } from './rtc/index.js';
+import { RtcEndpoint, RtcCertificate, acquireSharedEndpoint } from './rtc/index.js';
 
 const ep = await RtcEndpoint.listen({
   port: 40000,                    // default 0 (ephemeral)
   address: '0.0.0.0',             // bind address; default: wildcard of the family of publicAddresses
   publicAddresses: ['203.0.113.7'], // the ONLY addresses ever put in SDP/candidates (IP literals, v4 and/or v6)
   publicPort: 40000,              // optional: advertised port when a 1:1 NAT maps it (default: bound port)
-  certificate: await RtcCertificate.generate(), // optional; default: one generated per endpoint
+  certificate: RtcCertificate.generate(), // optional; default: RtcCertificate.processDefault() (one per process, keygen off-thread)
+  certificateFile: '/var/lib/haxlite/dtls.pem', // optional: load/persist the identity (RtcCertificate.loadOrCreate)
+  cipherSuites: ['chacha20', 'aes128gcm', 'aes256gcm'], // DTLS server preference (this is the default)
   idleTimeoutMs: 30_000,          // no ICE consent (authenticated binding) for this long → close('timeout')
   handshakeTimeoutMs: 20_000,     // session not open this long after createSession → close('handshake-timeout')
   maxSessions: 10_000,
@@ -48,7 +50,15 @@ s.remoteAddress;        // { address, port } of the nominated pair, or null
 s.close();              // sends SCTP ABORT/close_notify best effort, idempotent
 await ep.close();       // closes every session ('endpoint-closed') and the socket(s)
 ep.stats();             // counters (see RtcEndpointStats in index.ts)
+s.cork(); s.send(…); s.send(…); s.uncork(); // bundle several messages into one SCTP packet / DTLS record
+
+// one endpoint (one UDP socket) per process and configuration, refcounted (src/rtc/shared.ts)
+const lease = acquireSharedEndpoint({ port: 0, publicAddresses: ['203.0.113.7'] });
+const shared = await lease.ready; … await lease.release(); // the last release closes it
 ```
+
+`onMessage` data is only valid during the callback (the SCTP layer delivers views into a reused
+scratch buffer: `transientDelivery`); copy what you keep.
 
 `onClose` reasons: `'remote-close'` (DTLS close_notify), `'timeout'` (ICE consent), `'handshake-timeout'`, `'dtls-alert:<n>'`
 (fatal alert received), `'dtls-error:<what>'` (we aborted the handshake: e.g.
@@ -98,8 +108,14 @@ assoc.close()         // no onClose afterwards
   close.
 * **DTLS 1.2 server** (RFC 6347, `dtls/server.ts`): HMAC cookie (HelloVerifyRequest, bound to
   the remote address and the ClientHello parameters) before any handshake state;
-  `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` preferred (+ AES_256_GCM_SHA384,
-  CHACHA20_POLY1305 — all three exercised against OpenSSL), x25519 preferred / secp256r1;
+  `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` preferred — Chromium 141 offers and
+  negotiates it — then AES_128_GCM / AES_256_GCM (all three exercised against OpenSSL;
+  `cipherSuites` changes the order). ChaCha20-Poly1305 records use `dtls/chacha.ts`: a pure-JS,
+  constant-time (ARX + 13-bit-limb Poly1305, no secret-dependent branches or tables),
+  allocation-free AEAD that encrypts the record in the shared send buffer and decrypts in place
+  in the received datagram (tag verified first); RFC 8439 vectors + millions of random cases
+  against node:crypto in test/rtc/chacha.test.ts. AES-GCM stays on node:crypto (one native
+  cipher object per record; AES is never done in JS). x25519 preferred / secp256r1;
   extended_master_secret **required** (RFC 7627, fatal handshake_failure otherwise);
   renegotiation_info (initial handshake only, renegotiation refused); mandatory client
   certificate whose hash must equal the SDP `a=fingerprint` (constant-time compare; fatal
@@ -113,4 +129,10 @@ assoc.close()         // no onClose afterwards
 * **DTLS 1.3**: Chromium 141 with `WebRTC-ForceDtls13` offers 1.3 via `supported_versions`;
   we answer a plain DTLS 1.2 ServerHello (no downgrade sentinel: we are not 1.3-capable) after
   a HelloVerifyRequest, and Chromium connects with 1.2 (test/rtc/chromium-dtls.test.ts).
-* Self-signed ECDSA P-256 certificate built with a minimal DER encoder (`cert.ts`).
+* Self-signed ECDSA P-256 certificate built with a minimal DER encoder (`cert.ts`); key
+  generation and signing on the libuv thread pool (`generateAsync`), one per process by default.
+* Hot path without per-packet garbage of our own: sends are synchronous (dgram `lookup` option =
+  literal pass-through, no `dns.lookup`/`nextTick` per datagram), records are sealed into one
+  endpoint-wide scratch buffer (replaced if the kernel ever queues a send) and sent through cached
+  exact-length views; received records are decrypted in place and handed to SCTP as
+  `(datagram, off, len)`. What remains is Node's own `dgram` bookkeeping per datagram.

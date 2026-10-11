@@ -33,8 +33,9 @@
  * during the call (DTLS encrypts them synchronously).
  */
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { readChecksum, sctpChecksum, writeChecksum } from './crc32c.js';
+import { sctpChecksumMatches, writeChecksum } from './crc32c.js';
 import { sharedTimers, TimerSlot } from './timers.js';
+import { sctpNow } from './clock.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -267,10 +268,10 @@ function w32(p: Uint8Array, o: number, v: number): void {
   p[o + 3] = v;
 }
 
-// Whole milliseconds: small integers stay unboxed (Smi) in every time field,
-// so the per-packet clock reads allocate nothing (until ~12 days of process
-// uptime, when they exceed the Smi range and are merely boxed again).
-const defaultNow = (): number => Math.floor(performance.now());
+// Whole milliseconds (small integers stay unboxed Smis in every time field),
+// frozen during a synchronous batch such as the rtc backend's bundle flush
+// (see ./clock.ts: each performance.now() call allocates).
+const defaultNow = sctpNow;
 const defaultSetTimer = (cb: () => void, ms: number): unknown => {
   const t = setTimeout(cb, ms);
   t.unref?.();
@@ -409,6 +410,9 @@ export class SctpAssociation {
   private lastFwdAt = -1e12;
   private orphanScan = false;
   private cumAtInput = 0;
+  /** processAck inputs (see there). */
+  private ackCum = 0;
+  private ackRwnd = 0;
 
   // --- send side
   private tCap = 0;
@@ -1356,8 +1360,8 @@ export class SctpAssociation {
     }
     const len = base + n; // end offset
     const c0 = base + 12; // first chunk
-    const stored = readChecksum(p, base);
-    if (!(stored === 0 && this.zeroCkEnabled && p[c0] !== CT_INIT) && stored !== sctpChecksum(p, n, base)) {
+    const zeroCk = (p[base + 8] | p[base + 9] | p[base + 10] | p[base + 11]) === 0;
+    if (!(zeroCk && this.zeroCkEnabled && p[c0] !== CT_INIT) && !sctpChecksumMatches(p, n, base)) {
       this.c.checksumErrors++;
       return;
     }
@@ -2143,11 +2147,17 @@ export class SctpAssociation {
     const arwnd = u32(p, off + 8);
     let nGap = u16(p, off + 12);
     if (16 + nGap * 4 > clen) nGap = (clen - 16) >> 2;
-    this.processAck(cum, arwnd, p, off + 16, nGap);
+    this.ackCum = cum;
+    this.ackRwnd = arwnd;
+    this.processAck(p, off + 16, nGap);
   }
 
   /** Cumulative ack + gap blocks (from SACK, or SHUTDOWN with nGap=0, arwnd=-1). */
-  private processAck(cum: number, arwnd: number, p: Uint8Array | null, gOff: number, nGap: number): void {
+  private processAck(p: Uint8Array | null, gOff: number, nGap: number): void {
+    // cum / a_rwnd come through fields: as call arguments, 32-bit values
+    // outside the Smi range are boxed (one HeapNumber per SACK)
+    const cum = this.ackCum;
+    const arwnd = this.ackRwnd;
     if (lt32(cum, this.tAcked)) return; // stale
     const lastSent = (this.tSendNext - 1) >>> 0;
     if (lt32(lastSent, cum)) {
@@ -2594,7 +2604,9 @@ export class SctpAssociation {
   private handleShutdown(cum: number): void {
     const st = this.state;
     if (st === S_ESTABLISHED || st === S_SHUTDOWN_PENDING || st === S_SHUTDOWN_RECEIVED) {
-      this.processAck(cum, -1, null, 0, 0);
+      this.ackCum = cum;
+      this.ackRwnd = -1;
+      this.processAck(null, 0, 0);
       this.state = S_SHUTDOWN_RECEIVED;
       this.checkShutdown();
     } else if (st === S_SHUTDOWN_SENT) {

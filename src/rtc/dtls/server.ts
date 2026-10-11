@@ -138,11 +138,11 @@ export interface DtlsServerOptions {
   sendBuffer?(size: number): Buffer;
   onConnected(): void;
   /**
-   * One application-data record. With ChaCha20-Poly1305 it is a view of the
-   * received datagram (decrypted in place; the datagram is not reused, so it
-   * may be kept); with AES-GCM a fresh buffer.
+   * One application-data record: `data[off, off+len)`. With
+   * ChaCha20-Poly1305 `data` is the received datagram, decrypted in place
+   * (never reused by us: may be kept); with AES-GCM a fresh buffer.
    */
-  onData(data: Buffer): void;
+  onData(data: Uint8Array, off: number, len: number): void;
   /** Handshake failure, fatal alert or close_notify from the peer. Not called after {@link DtlsServer.close}. */
   onClose(reason: string): void;
   /** Max datagram size we emit (default 1200). */
@@ -440,13 +440,13 @@ export class DtlsServer {
       this.replayed++;
       return;
     }
-    const plain = rc.openAt(ContentType.ApplicationData, version, 1, seqHi, seqLo, buf, off, length);
-    if (plain === null) {
+    const n = rc.openRange(ContentType.ApplicationData, version, 1, seqHi, seqLo, buf, off, length);
+    if (n < 0) {
       this.badRecords++;
       return;
     }
     this.replay.mark(seq);
-    if (plain.length > MAX_PLAINTEXT) {
+    if (n > MAX_PLAINTEXT) {
       this.fail(AlertDescription.RecordOverflow, 'record-overflow');
       return;
     }
@@ -454,7 +454,7 @@ export class DtlsServer {
       this.peerHasFinished = true;
       this.lastFlight = null;
     }
-    this.opts.onData(plain);
+    this.opts.onData(rc.plainBuf, rc.plainOff, n);
   }
 
   private handleRecord(
@@ -507,7 +507,7 @@ export class DtlsServer {
           this.peerHasFinished = true;
           this.lastFlight = null;
         }
-        this.opts.onData(plain);
+        this.opts.onData(plain, 0, plain.length);
         return;
       case ContentType.Handshake:
         this.handleHandshakeRecord(plain, 1, seqHi, seqLo, peerKey);

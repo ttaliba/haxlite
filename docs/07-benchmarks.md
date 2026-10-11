@@ -183,6 +183,30 @@ hilo JS / resto (`host.cpuSplit`), despertares (`host.wakeups`, de `voluntary_ct
 > a veces con ruido ajeno). Sus números no son comparables entre sí ni con la comparativa
 > unificada de arriba; se conservan por el análisis y los A/B internos.
 
+### Pasada rtc posterior a la tabla: DTLS, endpoint y arranque
+
+Tras la tabla unificada, dos pasadas sobre `haxlite + rtc` (detalle y tablas en
+[docs/10 §6.3–§6.4](10-haxlite-rtc.md)): bundling y SCTP sin asignaciones (W1) y DTLS/endpoint/
+arranque (W2): **ChaCha20‑Poly1305 en JS** (sin asignaciones, en el sitio; Chromium 141 lo
+negocia; AES‑GCM de node:crypto queda para clientes sin ChaCha20), envío UDP síncrono con búfer
+de sellado compartido, **un endpoint/socket por proceso** compartido por las salas y **arranque
+perezoso** del backend. Medido en una misma sesión (`bench/results/rtc-dtls-endpoint-*.json`),
+`rtc` antes → después, con `ndc` del mismo build al lado:
+
+| | `ndc` | `rtc` antes | `rtc` después |
+|---|---:|---:|---:|
+| arranque: proceso → link (ms) | 105,8 | 118,5 | 109,0 (a la par, ruido ±3) |
+| N = 20: CPU % | 11,41 | 8,17 | **5,42** |
+| N = 20: RSS / heap (MB) | 82,6 / **10,1** | 75,3 / 12,8 | **77,4** / 13,1 |
+| N = 20: GC/min · ms/min | **10 · 3,4** | 157 · 162 | 61 · 24,9 |
+| N = 20: lag p99 (ms) | **1,80** | 2,41 | 2,76 |
+| 10 salas: CPU % · fds | 15,86 · 36 | 9,31 · 43 | **6,54 · 34** |
+| 10 salas: RSS / heap (MB) | 89,1 / **11,2** | 88,0 / 15,6 | **75,2** / 13,5 |
+
+`rtc` sigue perdiendo en número/tiempo de GC, heap y lag p99: la basura restante es la de
+`dgram` de Node por datagrama (≈ 1,2 MB/s con N = 20) y el heap extra, código JIT y fuentes de
+DTLS/SCTP; ambas cosas son inherentes a hacer la red en el hilo JS sin addon nativo.
+
 ## 0. Resumen (histórico)
 
 Valores = mediana de 3 repeticiones (60 s de ventana tras 15 s de calentamiento; ociosa 3 × 200 s).
@@ -884,4 +908,36 @@ npm run bench:build
 flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
   bench/net/run.ts game --impl haxlite:ndc,haxlite:rtc --n 20 --reps 3 --warmup 15 --window 60 \
   --out bench/results/game-rtc-vs-ndc.json
+```
+
+## Pasada GC/bundling del backend `rtc` (SCTP, `rtc-backend`, host)
+
+Detalle y micro‑benchmark en docs/10 §6.3. Cambios: bundling por paso del host (cada despertar,
+mensaje de cliente o acción corre en un ámbito `cork()/uncork()` del backend: cada peer recibe un
+solo paquete SCTP con todos sus mensajes y el SACK, sin latencia añadida), recepción con vistas
+transitorias (0 asignaciones por mensaje), `input` por rango, montículo de temporizadores SCTP
+por proceso, reloj SCTP entero y congelado por lote, sin *boxing* de TSN/CRC. Junto con la pasada
+DTLS/endpoint paralela (ChaCha20-Poly1305 en JS, envío síncrono). Partida con 20 clientes, 3 × 60 s,
+misma sesión (`bench/results/gc-bundling.json`; «antes» = `b423ffb`):
+
+| variante | CPU % | GC/min | GC ms/min | heap MB | RSS MB | lag p99 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| `rtc` antes | 7,34 · 7,73 · 8,23 | 55 | 138–140 | 14,3 | 87,4 | 2,09 · 2,37 · 4,07 |
+| **`rtc` después** | **5,30 · 6,08 · 5,76** | 49–50 | **19–23** | 14,2 | **77,8–82,0** | 2,23 · 3,05 · 2,02 |
+| `ndc` después | 11,78 · 12,73 · 12,07 | 7–11 | 2,2–3,6 | 10,0–10,1 | 82,8–84,3 | 2,01 · 2,29 · 1,85 |
+
+`rtc` gana en CPU (−25 % frente a antes, < ½ de `ndc`) y ahora también en RSS; el tiempo de GC
+baja ÷ 6–7. Sigue perdiendo en número de GC, tiempo de GC y heap: la basura que queda (~1,5 MB/s)
+es casi toda por datagrama dentro de `node:dgram` (envío y recepción, ≈ 2 600 + 1 500 datagramas/s)
+más la física; la pila SCTP + backend aporta ≈ 0,04 MB/s (lecturas de reloj). El bundling apenas
+reduce datagramas (−1 %): con inputs repartidos en el tiempo cada paso del host lleva ~1 mensaje
+por peer, y agrupar más exigiría retrasar envíos. La tabla unificada no se toca (se volverá a medir
+en conjunto).
+
+```sh
+npm run bench:build   # y un build de la referencia en otro dist, vía HAXLITE_BENCH_VARIANTS (dist)
+flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+  bench/net/run.ts game --impl haxlite:rtc,haxlite:ndc --n 20 --reps 3 --out bench/results/gc-bundling.json
+flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+  bench/rtc/sctp-host-alloc.ts [--no-bundle] [--const-clock]
 ```

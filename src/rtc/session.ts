@@ -112,9 +112,9 @@ export class RtcSessionImpl implements RtcSession {
       },
       sendBuffer: host.sendBuffer,
       onConnected: () => this.onDtlsConnected(),
-      onData: (d) => {
+      onData: (d, off, len) => {
         const s = this.sctp;
-        if (s !== null) s.input(d);
+        if (s !== null) s.input(d, off, len);
       },
       onClose: (reason) => this.terminate(reason),
     });

@@ -82,6 +82,23 @@ export function sctpChecksum(pkt: Uint8Array, len: number, base = 0): number {
   return crc32cFinish(c);
 }
 
+/**
+ * Whether the checksum stored in `pkt[base+8..base+12)` matches the packet
+ * `pkt[base..base+len)`. Returns a boolean on purpose: a uint32 returned
+ * from a call that is not inlined is boxed (a HeapNumber per packet).
+ */
+export function sctpChecksumMatches(pkt: Uint8Array, len: number, base = 0): boolean {
+  let c = crc32cUpdate(-1, pkt, base, base + 8);
+  c = crc32cUpdate(c, ZERO4, 0, 4);
+  c = ~crc32cUpdate(c, pkt, base + 12, base + len);
+  return (
+    pkt[base + 8] === (c & 0xff) &&
+    pkt[base + 9] === ((c >>> 8) & 0xff) &&
+    pkt[base + 10] === ((c >>> 16) & 0xff) &&
+    pkt[base + 11] === ((c >>> 24) & 0xff)
+  );
+}
+
 /** Computes and stores the checksum of `pkt[0..len)` at offset 8 (little-endian, as SCTP requires). */
 export function writeChecksum(pkt: Uint8Array, len: number): void {
   pkt[8] = 0;

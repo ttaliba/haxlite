@@ -102,6 +102,7 @@ export function resolveSuites(list: readonly (number | string)[]): number[] {
 }
 
 export const TAG_LENGTH = 16;
+const EMPTY = new Uint8Array(0);
 export const RECORD_HEADER = 13;
 
 /** How ChaCha20-Poly1305 records are protected: the JS AEAD (default) or node:crypto (diagnostics / A-B). */
@@ -216,15 +217,33 @@ export class RecordCipher {
    * leaves `buf` untouched.
    */
   openAt(type: number, version: number, epoch: number, seqHi: number, seqLo: number, buf: Uint8Array, off: number, len: number): Buffer | null {
+    const n = this.openRange(type, version, epoch, seqHi, seqLo, buf, off, len);
+    if (n < 0) return null;
+    const b = this.plainBuf;
+    return Buffer.from(b.buffer, b.byteOffset + this.plainOff, n);
+  }
+
+  /** Where the plaintext of the last successful {@link openRange} is: plainBuf[plainOff, plainOff + length). */
+  plainBuf: Uint8Array = EMPTY;
+  plainOff = 0;
+
+  /**
+   * Allocation-free {@link openAt} (for the JS AEAD): returns the plaintext
+   * length (-1 when the record does not authenticate) and points
+   * {@link plainBuf}/{@link plainOff} at it.
+   */
+  openRange(type: number, version: number, epoch: number, seqHi: number, seqLo: number, buf: Uint8Array, off: number, len: number): number {
     const explicit = this.suite.explicitNonce;
     const ptLen = len - explicit - TAG_LENGTH;
-    if (ptLen < 0) return null;
+    if (ptLen < 0) return -1;
     const js = this.js;
     if (js !== null) {
       this.setNonce(epoch, seqHi, seqLo);
       this.setAad(type, version, epoch, seqHi, seqLo, ptLen);
-      if (!js.open(this.nonce, this.aad, 0, 13, buf, off, ptLen, buf, off + ptLen)) return null;
-      return Buffer.from(buf.buffer, buf.byteOffset + off, ptLen);
+      if (!js.open(this.nonce, this.aad, 0, 13, buf, off, ptLen, buf, off + ptLen)) return -1;
+      this.plainBuf = buf;
+      this.plainOff = off;
+      return ptLen;
     }
     if (explicit === 8) {
       const n = this.nonce;
@@ -240,9 +259,12 @@ export class RecordCipher {
       d.setAAD(this.aad);
       const pt = d.update(buf.subarray(off + explicit, off + explicit + ptLen));
       const fin = d.final(); // throws when the tag does not match
-      return fin.length === 0 ? pt : Buffer.concat([pt, fin]);
+      const out = fin.length === 0 ? pt : Buffer.concat([pt, fin]);
+      this.plainBuf = out;
+      this.plainOff = 0;
+      return out.length;
     } catch {
-      return null;
+      return -1;
     }
   }
 

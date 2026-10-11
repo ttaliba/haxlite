@@ -11,6 +11,7 @@
  * moving an association's deadline is an O(log n) heap update with no
  * allocation. Deadlines are `performance.now()` milliseconds.
  */
+import { freezeSctpClock, thawSctpClock } from './clock.js';
 
 /** One association's slot in the heap (allocated once per association). */
 export class TimerSlot {
@@ -18,7 +19,10 @@ export class TimerSlot {
   at = 0;
   /** Heap index, -1 = not queued. */
   index = -1;
-  constructor(readonly fire: () => void) {}
+  readonly fire: () => void;
+  constructor(fire: () => void) {
+    this.fire = fire;
+  }
 }
 
 /**
@@ -99,6 +103,7 @@ class SharedTimers {
     this.running = true;
     const due = this.due;
     let k = 0;
+    freezeSctpClock(); // the slots fired here share one clock read
     try {
       const limit = performance.now() + EARLY_MS;
       while (this.n > 0 && this.heap[0]!.at <= limit) {
@@ -120,6 +125,7 @@ class SharedTimers {
     } finally {
       for (let i = 0; i < k; i++) due[i] = undefined as unknown as TimerSlot;
       this.running = false;
+      thawSctpClock();
       this.arm();
     }
   }

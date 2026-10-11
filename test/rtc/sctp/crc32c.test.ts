@@ -1,6 +1,6 @@
 /** CRC32c: RFC 3720 Appendix B.4 vectors + a bitwise reference. */
 import { describe, expect, it } from 'vitest';
-import { crc32c, crc32cFinish, crc32cUpdate, readChecksum, sctpChecksum, writeChecksum } from '../../../src/rtc/sctp/crc32c.js';
+import { crc32c, crc32cFinish, crc32cUpdate, readChecksum, sctpChecksum, sctpChecksumMatches, writeChecksum } from '../../../src/rtc/sctp/crc32c.js';
 import { mulberry32 } from './harness.js';
 
 function reference(buf: Uint8Array): number {
@@ -89,6 +89,26 @@ describe('crc32c', () => {
       z.fill(0, 8, 12);
       expect(sctpChecksum(pkt, len)).toBe(reference(z));
       expect(pkt).toEqual(copy);
+    }
+  });
+
+  it('sctpChecksumMatches / sctpChecksum / readChecksum at an offset inside a larger buffer', () => {
+    const rnd = mulberry32(99);
+    for (let n = 0; n < 300; n++) {
+      const len = 16 + Math.floor(rnd() * 1200);
+      const base = Math.floor(rnd() * 9);
+      const buf = new Uint8Array(base + len + 7);
+      for (let i = 0; i < buf.length; i++) buf[i] = (rnd() * 256) | 0;
+      const pkt = buf.slice(base, base + len);
+      writeChecksum(pkt, len);
+      buf.set(pkt, base);
+      expect(readChecksum(buf, base)).toBe(readChecksum(pkt));
+      expect(sctpChecksum(buf, len, base)).toBe(readChecksum(pkt));
+      expect(sctpChecksumMatches(buf, len, base)).toBe(true);
+      expect(sctpChecksumMatches(pkt, len)).toBe(true);
+      const k = base + Math.floor(rnd() * len);
+      buf[k] ^= 1 << Math.floor(rnd() * 8);
+      expect(sctpChecksumMatches(buf, len, base)).toBe(false);
     }
   });
 });
