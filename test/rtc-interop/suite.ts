@@ -1,7 +1,7 @@
 /**
  * Real-browser interop scenarios, shared by every backend × network
  * condition. Run with `npm run test:interop` (env: RTC_INTEROP_BACKENDS=ndc,rtc,
- * RTC_INTEROP_CONDITIONS=loopback4,eth4,loopback6,lossy, RTC_INTEROP_IDLE=0 to
+ * RTC_INTEROP_CONDITIONS=loopback4,eth4,loopback6,lossy,dtls13, RTC_INTEROP_IDLE=0 to
  * skip the 40 s consent-freshness tests).
  */
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -18,6 +18,8 @@ export interface Condition {
   name: string;
   address: string;
   impair: ImpairOptions | null;
+  /** Extra Chromium flags. */
+  browserArgs?: string[];
   /** Reason to skip on this machine, or null. */
   skip: string | null;
 }
@@ -38,6 +40,8 @@ export function conditions(): Condition[] {
     { name: 'eth4', address: eth4 ?? '0.0.0.0', impair: null, skip: eth4 ? null : 'no non-loopback IPv4 interface' },
     { name: 'loopback6', address: '::1', impair: null, skip: has6 ? null : 'IPv6 disabled on this machine (no ::1)' },
     { name: 'lossy', address: '127.0.0.1', impair: LOSSY, skip: null },
+    // Chromium offering DTLS 1.3 (field trial; the default in upcoming releases)
+    { name: 'dtls13', address: '127.0.0.1', impair: null, browserArgs: ['--force-fieldtrials=WebRTC-ForceDtls13/Enabled/'], skip: null },
   ];
   const want = process.env.RTC_INTEROP_CONDITIONS?.split(',');
   return want ? all.filter((c) => want.includes(c.name)) : all;
@@ -172,7 +176,7 @@ export function defineInteropSuite(kind: BackendKind): void {
 
       beforeAll(async () => {
         srv = await InteropServer.start({ backend: kind, address: cond.address, impair: cond.impair });
-        browser = await launchChromium();
+        browser = await launchChromium({ args: cond.browserArgs ?? [] });
         pc = new PageClient(await openHarnessPage(browser, srv.url));
       }, 60_000);
       afterAll(async () => {
@@ -397,7 +401,7 @@ export function defineInteropSuite(kind: BackendKind): void {
         await pc.close(j!.index);
       });
 
-      it.skipIf(process.env.RTC_INTEROP_IDLE === '0' || cond.name === 'eth4')(
+      it.skipIf(process.env.RTC_INTEROP_IDLE === '0' || cond.name === 'eth4' || cond.name === 'dtls13')(
         'idle 40 s without app data: ICE consent keeps it alive',
         async () => {
           const { j, p } = await join1({ inactivityMs: null });

@@ -378,6 +378,9 @@ export class SctpAssociation {
   private sackNow = false;
   private pktsSinceSack = 0;
   private pktHadData = false;
+  private lastFwdAt = -1e12;
+  private orphanScan = false;
+  private cumAtInput = 0;
 
   // --- send side
   private tCap = 0;
@@ -544,6 +547,7 @@ export class SctpAssociation {
     this.inInput = true;
     try {
       this.t = this.nowFn();
+      this.cumAtInput = this.rCum;
       this.processPacket(packet);
     } catch (e) {
       // Only reachable through a bug: malformed input is rejected by bounds checks.
@@ -1410,6 +1414,10 @@ export class SctpAssociation {
 
   /** Post-packet bookkeeping: SACK policy, deferred stream resets, flush. */
   private afterInput(): void {
+    if (this.heldBytes > 0 && (this.orphanScan || (this.rCum !== this.cumAtInput && this.t - this.lastFwdAt < 10_000))) {
+      this.dropOrphanFragments();
+    }
+    this.orphanScan = false;
     if (this.pktHadData) {
       this.pktHadData = false;
       this.sackOwed = true;
@@ -2243,6 +2251,8 @@ export class SctpAssociation {
     const st = this.state;
     if (clen < 8 || (st !== S_ESTABLISHED && st !== S_SHUTDOWN_PENDING && st !== S_SHUTDOWN_SENT)) return;
     this.c.forwardTsnReceived++;
+    this.lastFwdAt = this.t;
+    this.orphanScan = true;
     this.sackNow = true;
     this.sackOwed = true;
     const newCum = u32(p, off + 4);
@@ -2255,12 +2265,9 @@ export class SctpAssociation {
       if (diff >= this.rxCap) {
         // Every TSN of the receive window is <= newCum.
         bits.fill(0);
-        for (let s = 0; s < this.rxCap; s++) if (hf[s] & H_HELD && !(hf[s] & H_PENDING) && le32(this.hTsn![s], newCum)) this.releaseSlot(s);
       } else {
         for (let t = (this.rCum + 1) >>> 0; ; t = (t + 1) >>> 0) {
-          const s = t & mask;
-          bits[s] = 0;
-          if (hf[s] & H_HELD && !(hf[s] & H_PENDING) && this.hTsn![s] === t) this.releaseSlot(s);
+          bits[t & mask] = 0;
           if (t === newCum) break;
         }
       }
@@ -2294,6 +2301,65 @@ export class SctpAssociation {
       }
       this.rNextSsn[sid] = ssn + 1;
       this.drainPending(sid);
+    }
+  }
+
+  /**
+   * Releases partial messages that can no longer complete. Only abandonment
+   * (FORWARD-TSN) creates them: a fragment run that breaks at a TSN <= rCum
+   * lost that fragment for good. Runs reaching past rCum may still complete.
+   * Two passes over the slots <= rCum: predecessor chain, then successor chain.
+   */
+  private dropOrphanFragments(): void {
+    const hf = this.hFlags!;
+    const mask = this.rxMask;
+    const cum = this.rCum;
+    const cap = this.rxCap;
+    // Ascending: a non-B fragment needs a live, matching predecessor.
+    let t = (cum - cap + 1) >>> 0;
+    let prevOk = false;
+    let prevSid = -1;
+    for (let n = 0; n < cap; n++, t = (t + 1) >>> 0) {
+      const s = t & mask;
+      const f = hf[s];
+      if (!(f & H_HELD) || f & H_PENDING) {
+        prevOk = false;
+        continue;
+      }
+      if (this.hTsn![s] !== t) {
+        // Same slot, other TSN: one above rCum is live data; one below the window is stale.
+        if (!lt32(cum, this.hTsn![s])) this.releaseSlot(s);
+        prevOk = false;
+        continue;
+      }
+      const ok = (f & F_B) !== 0 || (prevOk && prevSid === this.hSid![s]);
+      if (ok) {
+        prevOk = !(f & F_E);
+        prevSid = this.hSid![s];
+      } else {
+        this.releaseSlot(s);
+        prevOk = false;
+      }
+    }
+    // Descending: a fragment needs a live continuation unless it reaches past rCum.
+    t = cum;
+    let nextOk = false;
+    let nextSid = -1;
+    for (let n = 0; n < cap; n++, t = (t - 1) >>> 0) {
+      const s = t & mask;
+      const f = hf[s];
+      if (!(f & H_HELD) || f & H_PENDING || this.hTsn![s] !== t) {
+        nextOk = false;
+        continue;
+      }
+      const ok = !(f & F_E) && (n === 0 || (nextOk && nextSid === this.hSid![s]));
+      if (ok) {
+        nextOk = !(f & F_B);
+        nextSid = this.hSid![s];
+      } else {
+        this.releaseSlot(s);
+        nextOk = false;
+      }
     }
   }
 

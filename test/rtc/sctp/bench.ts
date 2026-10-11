@@ -5,11 +5,10 @@
  *   flock /tmp/haxlite-bench.lock node --experimental-strip-types --no-warnings \
  *     --import ./scripts/ts-resolve.mjs test/rtc/sctp/bench.ts [N]
  *
- * Allocation estimate: add `--trace-gc --min-semi-space-size=16 --max-semi-space-size=16`
- * and divide (scavenges × 16 MiB) by the message count, or read the
- * `young-gen bytes/msg` line (from v8 heap statistics around each run).
+ * Allocation estimate: run one variant (`bench.ts N <variant>`) with
+ * `--trace-gc --min-semi-space-size=16 --max-semi-space-size=16` and divide
+ * (scavenges × 16 MiB) by the message count (warm-up included).
  */
-import v8 from 'node:v8';
 import { SctpAssociation } from '../../../src/rtc/sctp/index.js';
 
 const N = Number(process.argv[2] ?? 1_000_000);
@@ -105,9 +104,6 @@ function bench(name: string, ch: number, batch: number, zeroCopy: boolean): void
   };
   run(Math.min(N, 200_000)); // warm-up
   const before = env.received;
-  const h0 = v8.getHeapStatistics();
-  const gcBefore = h0.total_heap_size;
-  void gcBefore;
   const ns = run(N);
   const got = env.received - before;
   const st = env.a.stats();
@@ -116,9 +112,15 @@ function bench(name: string, ch: number, batch: number, zeroCopy: boolean): void
   );
 }
 
+const ONLY = process.argv[3] === undefined ? -1 : Number(process.argv[3]);
+const VARIANTS: [string, number, number, boolean][] = [
+  ['uu (ch2) 1 msg/flush, zero-copy', 2, 1, true],
+  ['ru (ch1) 1 msg/flush, zero-copy', 1, 1, true],
+  ['ro (ch0) 1 msg/flush, zero-copy', 0, 1, true],
+  ['ro (ch0) 1 msg/flush, copy', 0, 1, false],
+  ['ro (ch0) corked 10 msgs/flush', 0, 10, true],
+];
 console.log(`node ${process.version}, ${N} messages of 30 B per run`);
-bench('uu (ch2) 1 msg/flush, zero-copy', 2, 1, true);
-bench('ru (ch1) 1 msg/flush, zero-copy', 1, 1, true);
-bench('ro (ch0) 1 msg/flush, zero-copy', 0, 1, true);
-bench('ro (ch0) 1 msg/flush, copy', 0, 1, false);
-bench('ro (ch0) corked 10 msgs/flush', 0, 10, true);
+VARIANTS.forEach((v, i) => {
+  if (ONLY < 0 || ONLY === i) bench(...v);
+});

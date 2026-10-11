@@ -127,6 +127,7 @@ describe('channel semantics over a lossy, reordering, duplicating link', () => {
         expect(tx.sctp.stats().abandonedMessages).toBeGreaterThan(0);
         expect(tx.sctp.stats().retransmissions).toBeGreaterThan(0);
         expect(tx.sctp.bufferedAmount).toBe(0);
+        expect(held(rx)).toBe(0);
       }
       noErrors(p.a, p.b);
     });

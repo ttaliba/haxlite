@@ -144,7 +144,7 @@ async function runOne(browser: Browser, kind: BackendKind, n: number): Promise<R
   let connected = 0;
   const joins = await Promise.all(
     pages.map((pg, k) =>
-      pg.evaluate((m) => (globalThis as unknown as { hx: Hx }).hx.connect(m, { inactivityMs: null }), Math.min(PER_PAGE, n - k * PER_PAGE)),
+      pg.evaluate((m) => (globalThis as unknown as { hx: Hx }).hx.connect(m, { inactivityMs: Infinity }), Math.min(PER_PAGE, n - k * PER_PAGE)),
     ),
   );
   for (const j of joins) connected += j.filter((x) => x !== null).length;
