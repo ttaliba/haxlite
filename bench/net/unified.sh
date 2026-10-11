@@ -5,7 +5,7 @@
 # haxlite + haxlite-rtc. Every scenario interleaves the four hosts within each
 # repetition; every run holds the shared benchmark lock of the VM.
 #
-#   sh bench/net/unified.sh            # ≈ 2.5 h → bench/results/unified-*.json
+#   sh bench/net/unified.sh            # ≈ 1 h 45 min → bench/results/unified-*.json
 #   node bench/net/report.mjs --unified
 set -eu
 cd "$(dirname "$0")/../.."
