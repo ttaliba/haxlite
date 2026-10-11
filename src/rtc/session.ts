@@ -74,6 +74,9 @@ export class RtcSessionImpl implements RtcSession {
   private readonly offer: OfferInfo;
   private readonly dtls: DtlsServer;
   private sctp: SctpAssociationLike | null = null;
+  /** cork() calls not yet balanced, and the association they were applied to. */
+  private corkDepth = 0;
+  private corkedSctp: SctpAssociationLike | null = null;
 
   constructor(
     host: SessionHost,
@@ -270,6 +273,24 @@ export class RtcSessionImpl implements RtcSession {
     if (this.state !== 'open') return false;
     const s = this.sctp;
     return s !== null && s.send(channelId, data);
+  }
+
+  /** Corks the SCTP association (see {@link RtcSession.cork}); balanced by {@link uncork}. */
+  cork(): void {
+    const s = this.sctp;
+    if (s === null || s.cork === undefined) return;
+    this.corkedSctp = s;
+    this.corkDepth++;
+    s.cork();
+  }
+
+  uncork(): void {
+    if (this.corkDepth === 0) return;
+    this.corkDepth--;
+    const s = this.corkedSctp;
+    if (this.corkDepth === 0) this.corkedSctp = null;
+    // the association may have been torn down meanwhile: still balance its counter (harmless after close)
+    if (s !== null && s.uncork !== undefined) s.uncork();
   }
 
   // ------------------------------------------------------------ lifecycle

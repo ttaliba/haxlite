@@ -50,6 +50,10 @@ export interface SctpAssociationLike {
   send(channelId: number, data: Uint8Array): boolean;
   /** Tears down (best-effort ABORT/SHUTDOWN). No callback afterwards. Idempotent. */
   close(): void;
+  /** Bundles subsequent sends into as few packets as possible until {@link uncork} (nestable). */
+  cork?(): void;
+  /** Ends one {@link cork}; the outermost uncork flushes. */
+  uncork?(): void;
 }
 
 export type SctpFactory = (opts: SctpAssociationOptions) => SctpAssociationLike;
@@ -80,6 +84,14 @@ export interface RtcSession {
   onChannelClose?: (channelId: number) => void;
   /** Sends one message; false when not open or the data layer refused it. */
   send(channelId: number, data: Uint8Array): boolean;
+  /**
+   * Bundles the following {@link send}s (e.g. one game tick's messages) into
+   * as few SCTP packets / DTLS records as possible until {@link uncork}.
+   * Nestable; a no-op before the data layer exists. Always pair with uncork.
+   */
+  cork(): void;
+  /** Ends one {@link cork}; the outermost uncork flushes the bundled data. */
+  uncork(): void;
   /** Nominated (or, before nomination, last validated) remote address. */
   readonly remoteAddress: RemoteAddress | null;
   /** 'new' → 'connecting' (ICE validated) → 'dtls' (handshake done) → 'open' (SCTP up) → 'closed'. */
