@@ -228,13 +228,13 @@ function isFailure(reason: string): boolean {
 
 class RtcPeerLink implements PeerLink {
   private ev: PeerLinkEvents | null;
+  private readonly s: RtcSession;
+  private readonly owner: Set<RtcPeerLink>;
   closed = false;
 
-  constructor(
-    private readonly s: RtcSession,
-    ev: PeerLinkEvents,
-    private readonly owner: Set<RtcPeerLink>,
-  ) {
+  constructor(s: RtcSession, ev: PeerLinkEvents, owner: Set<RtcPeerLink>) {
+    this.s = s;
+    this.owner = owner;
     this.ev = ev;
     s.onOpen = () => {
       // all three channels are usable together (one SCTP association)

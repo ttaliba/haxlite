@@ -69,12 +69,9 @@ async function until<T>(f: () => T | null | undefined | false, ms: number, what:
 /** A browser context where www.haxball.com / p2p.haxball.com are this test's FakeMaster + client files. */
 async function officialContext(browser: Browser, master: FakeMaster, log: string[]): Promise<BrowserContext> {
   const ctx = await browser.newContext();
-  await ctx.addInitScript(() => {
-    try {
-      if (location.hostname === 'www.haxball.com') localStorage.setItem('player_name', 'Officer');
-    } catch {
-      /* no storage */
-    }
+  // page-side code as strings: this file is type-checked without the DOM lib
+  await ctx.addInitScript({
+    content: "try { if (location.hostname === 'www.haxball.com') localStorage.setItem('player_name', 'Officer'); } catch (e) {}",
   });
   await ctx.route('**/*', async (route) => {
     const req = route.request();
@@ -95,6 +92,16 @@ async function officialContext(browser: Browser, master: FakeMaster, log: string
         status: r.status,
         headers: { 'content-type': r.headers.get('content-type') ?? 'application/octet-stream', 'access-control-allow-origin': '*' },
         body: Buffer.from(await r.arrayBuffer()),
+      });
+      return;
+    }
+    if (url.pathname === '/play') {
+      // the client refuses to start outside an iframe (`window.self != window.top`): a minimal
+      // top page like haxball.com/play (ours, not the official markup) embedding game.html
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/html; charset=utf-8',
+        body: `<!DOCTYPE html><html><body style="margin:0"><iframe src="${STATIC}game.html" style="width:1000px;height:700px;border:0"></iframe></body></html>`,
       });
       return;
     }
@@ -167,6 +174,7 @@ describe.skipIf(!AVAILABLE)('official HaxBall web client (game-min.js) in Chromi
           masterUrl: master.httpBase,
           iceServers: [],
           shutdownWebRtcOnLastStop: false,
+          checksumIntervalFrames: 60, // CheckConsistency every second (official: 10 s)
           peerBackend: backend,
           rtc: { address: '127.0.0.1', publicAddresses: ['127.0.0.1'] },
           transport: { iceCandidatePolicy: 'all' },
@@ -184,6 +192,13 @@ describe.skipIf(!AVAILABLE)('official HaxBall web client (game-min.js) in Chromi
           chats.push(`${p.name}: ${msg}`);
         };
         room.onPlayerInput = () => inputs++;
+        let checks = 0;
+        const seq = room.haxlite.host.sequencer;
+        const checksum = seq.checksum.bind(seq);
+        seq.checksum = () => {
+          checks++;
+          checksum();
+        };
         room.haxlite.host.onEventApplied = (ev) => {
           if (ev.type === EventType.SetPlayerSync) desyncs.push((ev as unknown as { desync: boolean }).desync);
         };
@@ -192,17 +207,33 @@ describe.skipIf(!AVAILABLE)('official HaxBall web client (game-min.js) in Chromi
         page = await ctx.newPage();
         const pageErrors: string[] = [];
         page.on('pageerror', (e) => pageErrors.push(e.message));
+        page.on('console', (m) => log.push(`console.${m.type()} ${m.text()}`));
         const t0 = performance.now();
-        await page.goto(`https://www.haxball.com${STATIC}game.html?c=${roomId}`);
-        const player = await until(() => joins[0], 30_000, `official client join (log: ${log.join(' | ')})`);
+        // like a shared room link: https://www.haxball.com/play?c=<id> (the game reads window.top's ?c=)
+        await page.goto(`https://www.haxball.com/play?c=${roomId}`);
+        const frame = (await (await page.waitForSelector('iframe')).contentFrame())!;
+        // the official client always starts with "Choose nickname" (prefilled from localStorage)
+        await frame.waitForSelector('.choose-nickname-view input[data-hook=input]', { timeout: 15_000 });
+        await frame.fill('.choose-nickname-view input[data-hook=input]', 'Officer');
+        await frame.click('.choose-nickname-view button[data-hook=ok]');
+        let player: PlayerObject;
+        try {
+          player = await until(() => joins[0], 30_000, 'official client join');
+        } catch (err) {
+          const body = await frame.evaluate('document.body.innerText').catch(() => '?');
+          throw new Error(`${(err as Error).message}; page: ${String(body).slice(0, 300)}; errors: ${pageErrors.join(' / ')}; log: ${log.join(' | ')}`);
+        }
         const joinMs = performance.now() - t0;
         expect(player.name).toBe('Officer');
-        expect(room.haxlite.getPlayerConnection(player.id)?.remoteAddress).toBe('127.0.0.1');
+        // rtc announces only 127.0.0.1; ndc (iceCandidatePolicy 'all') also offers the LAN address
+        const remote = room.haxlite.getPlayerConnection(player.id)?.remoteAddress ?? null;
+        if (backend === 'rtc') expect(remote).toBe('127.0.0.1');
+        else expect(remote).not.toBeNull();
 
         // the client is in the room: game view with the player list
-        await page.waitForSelector('.game-view', { timeout: 15_000 });
-        await page.waitForFunction(
-          () => [...document.querySelectorAll('.player-list-item [data-hook=name]')].some((e) => e.textContent === 'Officer'),
+        await frame.waitForSelector('.game-view', { timeout: 15_000 });
+        await frame.waitForFunction(
+          "[...document.querySelectorAll('.player-list-item [data-hook=name]')].some((e) => e.textContent === 'Officer')",
           undefined,
           { timeout: 15_000 },
         );
@@ -213,7 +244,7 @@ describe.skipIf(!AVAILABLE)('official HaxBall web client (game-min.js) in Chromi
         await until(() => room.getPlayerDiscProperties(player.id), 5000, 'player disc');
         await sleep(300);
         const x0 = room.getPlayerDiscProperties(player.id)!.x;
-        await page.focus('.game-view');
+        await frame.focus('.game-view');
         await page.keyboard.down('ArrowRight');
         await sleep(600);
         await page.keyboard.up('ArrowRight');
@@ -223,34 +254,37 @@ describe.skipIf(!AVAILABLE)('official HaxBall web client (game-min.js) in Chromi
 
         // chat host → client (announcement) and client → host
         room.sendAnnouncement('hello official client', null, 0x00ff00);
-        await page.waitForFunction(
-          () => (document.querySelector('.chatbox-view .log-contents')?.textContent ?? '').includes('hello official client'),
+        await frame.waitForFunction(
+          "(document.querySelector('.chatbox-view .log-contents')?.textContent ?? '').includes('hello official client')",
           undefined,
           { timeout: 10_000 },
         );
-        await page.fill('.chatbox-view input[data-hook=input]', 'hi from the official client');
-        await page.press('.chatbox-view input[data-hook=input]', 'Enter');
+        await frame.fill('.chatbox-view input[data-hook=input]', 'hi from the official client');
+        await frame.press('.chatbox-view input[data-hook=input]', 'Enter');
         await until(() => chats.includes('Officer: hi from the official client'), 10_000, 'client chat at the host');
 
         // a few seconds of play with CheckConsistency (every 600 frames = 10 s by default): use the knob
-        await page.focus('.game-view');
+        await frame.focus('.game-view');
         for (let i = 0; i < 6; i++) {
           await page.keyboard.down(i % 2 === 0 ? 'ArrowUp' : 'ArrowDown');
           await sleep(150);
           await page.keyboard.up(i % 2 === 0 ? 'ArrowUp' : 'ArrowDown');
           await page.keyboard.press('x');
         }
+        await sleep(1500);
+        // CheckConsistency was sent several times while playing and the client never reported a desync
+        expect(checks).toBeGreaterThanOrEqual(3);
         expect(desyncs.filter(Boolean)).toEqual([]);
 
         // kick: the official dialog with our reason
         room.kickPlayer(player.id, 'bye from haxlite', false);
-        await page.waitForSelector('.disconnected-view', { timeout: 10_000 });
-        const reason = await page.textContent('.disconnected-view [data-hook=reason]');
+        await frame.waitForSelector('.disconnected-view', { timeout: 10_000 });
+        const reason = await frame.textContent('.disconnected-view [data-hook=reason]');
         expect(reason).toContain('You were kicked');
         expect(reason).toContain('bye from haxlite');
         expect(pageErrors).toEqual([]);
         // diagnostics for docs/10
-        console.log(`[official-client ${backend}] page load → joined in ${joinMs.toFixed(0)} ms; inputs ${inputs}; checks ${desyncs.length}`);
+        console.log(`[official-client ${backend}] page load → joined in ${joinMs.toFixed(0)} ms; inputs ${inputs}; CheckConsistency ${checks}; desync reports ${desyncs.filter(Boolean).length}`);
       } finally {
         await page?.close().catch(() => {});
         await ctx.close().catch(() => {});

@@ -53,9 +53,10 @@ Dependencias permitidas (de arriba abajo, nunca al revés):
 | `src/model.ts` | punto único de importación del modelo (reexporta `sim/types.ts` y `room/types.ts`) | fundación |
 | `src/sim/` | `types.ts` (Disc, Vertex, Segment, Plane, Goal, Joint, PlayerPhysics, Stadium, World) + física, parser `.hbs`, serialización de estadios, estadios por defecto | **ingeniero A** |
 | `src/room/` | `types.ts` (TeamInfo/TEAMS, TeamColors, Player, GameState, RoomState) + reglas del partido, eventos, serialización del estado, checksum | **ingeniero B** |
-| `src/net/` | backend HTTP, WS de señalización, transporte WebRTC, handshake/identidad, bans, flood | **ingeniero C** |
+| `src/net/` | backend HTTP, WS de señalización, transporte WebRTC (backends de peers: node-datachannel `'ndc'`, haxlite-rtc `'rtc'`, edge), handshake/identidad, bans, flood | **ingeniero C** |
 | `src/host/` | secuenciador/netcode | fase 2 |
 | `src/api/` | capa compatible con `HBInit` | fase 2 |
+| `src/rtc/` | haxlite-rtc: WebRTC de data channels en TypeScript puro (ICE‑lite, DTLS 1.2, SCTP) para servidores con IP pública; lo usa `src/net/rtc-backend.ts` (`peerBackend: 'rtc'`). Ver [10](10-haxlite-rtc.md) | ingenieros R1/R2 |
 | `src/edge/` | haxlite Edge: gateway WebRTC que oculta la IP del host (servidor + CLI); el lado host es `src/net/edge-client.ts` (`HostTransportOptions.edge`). Ver [09](09-haxlite-edge.md) | ingeniero E |
 | `test/oracle/` | oráculos diferenciales (node-haxball y el script oficial) | fundación |
 | `test/<módulo>/` | tests de cada módulo | dueño del módulo |

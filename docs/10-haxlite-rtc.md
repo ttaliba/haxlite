@@ -61,29 +61,66 @@ const ep = await RtcEndpoint.listen({ port: 40000, publicAddresses: ['203.0.113.
 const s = ep.createSession(offerSdp);      // lanza RtcSdpError si la oferta no sirve
 s.answerSdp; s.localCandidates; s.mid;     // respuesta completa (ya trae los candidatos)
 s.onOpen = () => {}; s.onMessage = (canal, bytes) => {}; s.onClose = (motivo) => {};
+s.onChannelClose = (canal) => {};          // el navegador cerró un canal (reset de stream)
 s.send(0, bytes); s.close(); await ep.close();
 ```
 
 Motivos de `onClose`: `remote-close`, `timeout` (consentimiento ICE), `handshake-timeout`,
 `dtls-alert:<n>`, `dtls-error:<qué>`, `sctp:<motivo>`, `endpoint-closed`.
 
-## 3. Cómo activarlo
-
-La integración en el transporte del host se hará con una opción de backend de peers
-(**pendiente de cablear** en `src/net`):
+## 3. Cómo activarlo: `peerBackend: 'rtc'`
 
 ```ts
-HostTransport({ …, peerBackend: 'rtc', rtcPort: 40000, publicAddresses: ['203.0.113.7'] })
+// HBInit
+const room = await HBInit({ token, roomName: 'Sala', haxlite: {
+  peerBackend: 'rtc',
+  rtc: { port: 40000, publicAddresses: ['203.0.113.7'] },   // abrir 40000/udp
+} });
+room.haxlite.rtcPort;     // puerto UDP real (útil con port 0)
+room.haxlite.rtcStats();  // contadores del endpoint (sesiones, paquetes, bytes, handshakes)
+
+// HostTransport directo
+new HostTransport({ token, peerBackend: 'rtc', rtcEndpoint: { port: 40000, publicAddresses: ['203.0.113.7'] } });
 ```
 
-Mientras tanto, el adaptador `RtcPeerBackend` de `test/rtc-interop/harness/backends.ts` muestra
-cómo encaja `RtcEndpoint` en la interfaz `PeerBackend` de `src/net/peer-backend.ts` (la misma
-que usan `LocalPeerBackend` y el Edge): `createPeer(id, offer, eventos)` → `onLocalDescription`
-con `answerSdp`, `onLocalCandidate` por cada candidato, `onGatheringComplete`, y al abrir la
-asociación `onChannelOpen` de los tres canales a la vez.
+`rtc` (= `HostTransportOptions.rtcEndpoint`, tipo `RtcBackendOptions` en `src/net/rtc-backend.ts`):
 
-Requisitos: IP pública (o NAT 1:1 con `publicPort`) y **un** puerto UDP abierto para todos los
-jugadores. No hay STUN/TURN propio ni modo detrás de NAT: para eso sigue node-datachannel.
+| opción | por defecto | qué es |
+|---|---|---|
+| `publicAddresses` | IPs **públicas** de las interfaces (`os.networkInterfaces()` clasificadas con `classifyAddress`) | las **únicas** direcciones que se escriben en el SDP (candidatos `host`). Sin ninguna (NAT, nube con NAT 1:1 tipo AWS/GCP) `HBInit` rechaza / `new HostTransport` lanza con un mensaje que pide configurarla. El maestro **no** informa al host de su IP pública (el protocolo no la transmite; `api/geo` solo da país/coordenadas), así que no hay autodetección por el maestro |
+| `port` | 0 (efímero) | puerto UDP único para todos los jugadores |
+| `address` | comodín de cada familia de `publicAddresses` | dirección de *bind* |
+| `publicPort` | el puerto real | puerto anunciado si un NAT 1:1 lo traduce |
+| `idleTimeoutMs` / `handshakeTimeoutMs` / `maxSessions` | 30 s / 20 s / 10 000 | del endpoint; las de `HostTransport` (10 s de apertura, 10 s de inactividad, 16 negociaciones, `maxPlayers`) actúan antes |
+| `certificate` | uno nuevo por endpoint | certificado DTLS |
+| `endpoint` | — | un `RtcEndpoint` ya abierto, compartido por varias salas en un puerto (el backend no lo cierra) |
+
+Qué cambia y qué no respecto a node-datachannel (`'ndc'`, por defecto):
+
+* **Igual**: todo lo de `HostTransport` — admisión (4100–4104, bans por IP del maestro y srflx,
+  hook `onJoinRequest`, límite por IP) **antes** de crear ninguna sesión, desafío, handshake ECDSA,
+  límite de flood, inactividad de 10 s, kicks/bans (el aviso de kick se entrega antes del cierre),
+  códigos de cierre, `Peer.remoteAddress` (aquí: origen de los STUN autenticados del jugador).
+* **`iceCandidatePolicy`, `iceServers`, `portRange`, `rtc` (node-datachannel)** se ignoran: el
+  backend es `prefiltered` y solo anuncia `publicAddresses`.
+* La respuesta sale **sin la espera de 500 ms** de recolección (el SDP ya trae los candidatos y
+  `a=end-of-candidates`).
+* Los tres canales abren a la vez. **`challengeDelayMs` se mantiene en 40 ms** también con `rtc`:
+  protege al *cliente*. Medido con node-haxball (libdatachannel), 30 entradas por configuración:
+  `rtc` con 0 ms falla **29/30** (el desafío llega con la asociación SCTP, antes de que el cliente
+  dé sus canales por abiertos, y lo descarta); con 10 ms y 40 ms, 0/30 (`ndc`: 5/30 con 0 ms, 0/30
+  con 10 y 40). Los navegadores no lo necesitan (el host oficial manda el desafío sin espera).
+* Un `dc.close()` de un canal en el navegador (reset de stream) llega como
+  `RtcSession.onChannelClose(id)` → `onChannelClosed` del backend → el peer se cierra en el acto,
+  igual que el evento `closed` de un DataChannel de node-datachannel.
+* En reposo: sin sesiones el endpoint no tiene temporizadores (su barrido de 1 Hz se apaga en el
+  siguiente tick); queda solo el socket UDP. `room.haxlite.stop()` espera a que se libere.
+* node-datachannel ya **no se carga** si no se usa (`src/net/webrtc.ts` lo importa al crear la
+  primera PeerConnection): un proceso solo-`rtc` no tiene hilos nativos de WebRTC.
+
+**Recomendación**: `rtc` en servidores con IP pública (dedicados, VPS, edge); `ndc` en hosts detrás
+de NAT sin edge. El valor por defecto sigue siendo `ndc` (el único que funciona sin configurar en
+cualquier red); `rtc` exige `publicAddresses` alcanzables y el puerto UDP abierto.
 
 ## 4. Banco de interoperabilidad con navegadores reales (`test/rtc-interop/`)
 
@@ -137,6 +174,60 @@ RTC_INTEROP_REPORT=/tmp/obs.json …                     # vuelca tiempos medido
 
 `npm test` no lanza navegadores (los archivos son `*.interop.ts`, con su propio
 `test/rtc-interop/vitest.config.ts`).
+
+### 4.3 Cliente oficial real (`official-client.interop.ts`) y host haxlite completo
+
+El **cliente web oficial sin modificar** (`game.html`, `game-min.js` versión `0349dd60`, `res.dat`,
+`vendor/*.js`, CSS) en Chromium 141 headless, contra una sala creada con `HBInit` (host haxlite
+completo) con cada backend, sin red:
+
+* Playwright `context.route` sirve los archivos bajo su URL real
+  (`https://www.haxball.com/H4mQWPXF/__cache_static__/g/…`), proxifica
+  `https://www.haxball.com/rs/api/*` (`api/client`, `api/geo`…) al `FakeMaster` y devuelve vacío
+  para el resto (Google Fonts; reCAPTCHA nunca se pide). `https://www.haxball.com/play?c=<id>` es
+  una página mínima propia con el `<iframe>` del juego: **el cliente se niega a arrancar fuera de
+  un iframe** (`window.self != window.top`) y lee `?c=` de `window.top`.
+* `context.routeWebSocket` puentea `wss://p2p.haxball.com/client?id=…&token=…` al WebSocket de
+  señalización de clientes del `FakeMaster` (códigos de cierre preservados).
+* WebRTC real: Chromium ⇄ haxlite por 127.0.0.1.
+
+El test elige el apodo en el diálogo «Choose nickname» (el cliente siempre lo muestra), entra por
+el enlace de la sala y comprueba: `onPlayerJoin` en el host y la lista de jugadores en la vista de
+juego del cliente; flecha → mantenida 0,6 s ⇒ inputs en el host y el disco se mueve > 20 unidades;
+anuncio del host visible en el chat del cliente y mensaje escrito en el chat del cliente recibido
+por `onPlayerChat`; `CheckConsistency` cada 60 frames (≥ 3 durante la prueba) sin ningún informe de
+desincronización; `kickPlayer` ⇒ diálogo oficial «You were kicked» con nuestro motivo; ningún error
+de página.
+
+| backend | resultado | página → `onPlayerJoin` | inputs | CheckConsistency / desync |
+|---|---|---:|---:|---:|
+| `ndc` | ✅ (2/2 corridas) | 1 468–1 471 ms | 26 | 4 / 0 |
+| `rtc` | ✅ (2/2 corridas) | 1 348–1 353 ms | 26 | 4 / 0 |
+
+(Incluye ≈ 1 s de espera de recolección ICE del cliente, §5.1.) Los archivos del cliente son de
+HaxBall (todos los derechos reservados) y **no** están en el repositorio; la suite se salta sin
+ellos. Para correrla:
+
+```sh
+D=/ruta/al/cliente; B=https://www.haxball.com/H4mQWPXF/__cache_static__/g
+mkdir -p $D/vendor $D/images $D/icons/css $D/icons/font
+for f in game.html game-min.js game.css res.dat modernizr-custom.js vendor/pako-jszip.min.js \
+  vendor/perfect-scrollbar.min.js vendor/json5.min.js icons/css/fontello.css icons/font/fontello.woff2 \
+  images/bg.png images/flags.png images/haxball.png; do curl -sSf $B/$f -o $D/$f; done
+HAXBALL_CLIENT_DIR=$D npm run test:interop -- official-client
+```
+
+Además, las suites E2E del host (`test/host/e2e*`), de la API (`test/api`: hbinit, extensiones,
+varias salas, paridad con el headless oficial, apagado limpio del paquete construido) y del
+transporte (`test/net/transport*.test.ts`) corren **dos veces** en `npm test`: proyecto vitest `ndc`
+y proyecto `rtc` (`HAXLITE_TEST_PEER_BACKEND=rtc`, `test/peer-backend-env.ts`). Sus clientes son
+node-haxball y el cliente crudo de `test/net/raw-client.ts`, ambos libdatachannel: una segunda
+implementación WebRTC independiente frente a haxlite-rtc. Todas convergen (estados idénticos byte
+a byte, sin desync), y kicks, bans (IP del maestro + srflx, auth), flood, inactividad, sala llena,
+contraseña y apagado se comportan igual. `test/net/rtc-backend.test.ts` cubre lo específico
+(configuración, candidatos anunciados, cierre de un canal, kick + ban, endpoint sin
+temporizadores en reposo). En el proyecto `rtc` el proceso hijo del test de apagado comprueba que
+node-datachannel nunca se cargó.
 
 ## 5. Matriz de interoperabilidad
 
@@ -269,6 +360,51 @@ flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings 
   [--per-page 10] [--out bench/results/rtc-backends.json]
 ```
 
+### 6.1 CRC32c del SCTP
+
+Chromium 141 no negocia el *zero checksum* (RFC 9653), así que cada paquete SCTP lleva CRC32c en
+ambos sentidos. `test/rtc/sctp/bench.ts` (dos asociaciones en proceso, mensajes de 30 B; mismo
+proceso y build, 3 corridas intercaladas, `flock`):
+
+| variante | ns/mensaje |
+|---|---:|
+| `ro` sin CRC (zero checksum) | 341–375 |
+| `ro` con CRC32c (como con Chromium) | 510–532 |
+
+El CRC son ≈ 170–190 ns por mensaje de ida y vuelta (≈ 35 %; ~150 B checksumeados: paquete de
+datos de 60 B en ambos extremos + medio SACK de 28 B), ≈ 0,8 B/ns. La implementación ya era
+*slicing‑by‑8* (8 tablas, 8 B por iteración). Se probaron, con un micro‑benchmark de la mezcla real
+de paquetes y en el benchmark de asociación:
+
+| alternativa | resultado |
+|---|---|
+| *slicing‑by‑16* (una tabla de 16 KiB o 16 tablas separadas) | igual o peor (±10 %, ruido) |
+| lecturas de 32 bits vía un alias `Int32Array` de los buffers de envío alineados | −0–10 % en el micro, no medible en la asociación |
+| verificación en una pasada (campo puesto a cero y restaurado) en vez de tres llamadas | no medible |
+| WebAssembly *slicing‑by‑16* (clang `--target=wasm32 -O3`) copiando el paquete a la memoria lineal | 97–130 ns para 28–58 B (2–3× **peor**); solo gana desde ~1 KiB |
+| ídem sin copia (paquete ya en memoria WASM) | 31–49 ns para 28–58 B frente a 37–60 ns en JS: −15–20 % a cambio de mover los buffers de la asociación a memoria WASM |
+
+Ninguna mejora justifica el cambio: el límite son las cargas de *typed arrays* (un byte y una
+entrada de tabla por byte), no el ancho del *slicing*; WASM SIMD no tiene multiplicación sin
+acarreo. Se mantiene *slicing‑by‑8* (con las pruebas de vectores RFC 3720 y de equivalencia
+aleatoria contra una implementación de una tabla y contra la bit a bit, incluidas actualizaciones
+partidas y `Buffer` con desplazamiento no alineado). Para un host lo que pesa es el envío (≈ 8·N²
+mensajes salientes frente a 9·N entrantes), y el beneficio global del backend `rtc` ya se mide en
+§6.2.
+
+### 6.2 Host completo con 20 clientes: `rtc` vs `ndc`
+
+`bench/net/run.ts game` (docs/07, sección final): mismo build, 20 clientes node-haxball jugando,
+3 × 60 s:
+
+| backend | CPU % | hilos | fds | RSS MB | heap MB |
+|---|---:|---:|---:|---:|---:|
+| `ndc` | 18,97 · 19,46 · 18,74 | 19 | 27 | 84 | 9,9 |
+| **`rtc`** | **12,45 · 12,35 · 12,53** | **11** | 25 | 86–90 | 14,3 |
+
+−35 % de CPU del proceso host completo (juego + red), 8 hilos nativos menos; lag del event loop p99
+1,13–1,20 → 1,30–1,50 ms.
+
 ## 7. Limitaciones
 
 - **Solo IP pública** (o NAT 1:1): ICE‑lite no hace comprobaciones ni reúne candidatos
@@ -283,4 +419,5 @@ flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings 
   con la lógica del host (ver CPU en §6).
 - **Interoperabilidad verificada solo con Chromium 141** (§5). Firefox, Safari y móviles están
   pendientes (§5.2). IPv6 no se pudo probar en esta VM.
-- `peerBackend: 'rtc'` aún no está cableado en `HostTransport`.
+- Sin autodetección de la IP pública vía el maestro (el protocolo no la da): `publicAddresses`
+  explícitas salvo que una interfaz tenga IP pública.

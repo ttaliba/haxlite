@@ -67,7 +67,7 @@ Dos *backends* de jugadores (`playerBackend`):
 | ICE | *lite*: el edge solo contesta Binding requests autenticados; **nunca** envía comprobaciones | completo (envía checks a los candidatos remotos permitidos por `remoteCandidatePolicy`) |
 | Direcciones anunciadas | exactamente `webrtc.publicAddresses` | las que descubre libjuice, filtradas por `iceCandidatePolicy` |
 | Detrás de NAT | solo NAT 1:1 con `publicAddresses` (+ `publicPort`) | STUN (`iceServers`) |
-| CPU (17 jugadores, §7) | **−30 %** por jugador | referencia |
+| CPU del edge (17 jugadores, §7, con el túnel v2) | **−29 %** por jugador | referencia |
 
 ### 1.1 Flujo de una entrada
 
@@ -182,8 +182,8 @@ estado mínimo.
   edge el lado pasivo (INIT sin estado, cookie HMAC). Streams = canales del túnel (0 `ro`,
   1 `ru`, 2 `uu` con `maxRetransmits: 0`, 3–17 carriles `ro`), mensajes de hasta 1 MiB, paquetes
   SCTP ≤ 1200 B (+ 29 B + IP/UDP ≤ 1280). *Zero checksum* (RFC 9653): la integridad la da el AEAD.
-  Como los dos extremos son nuestros, el ajuste es agresivo: SACK diferido 20 ms (WebRTC usa
-  200 ms), RTO mínimo 60 ms (≥ 200 ms en WebRTC), RTO máx. 3 s — una pérdida en el tramo
+  Como los dos extremos son nuestros, el ajuste es agresivo: SACK diferido 10 ms (WebRTC usa
+  200 ms), RTO = SRTT + máx(4·RTTVAR, 20 ms) con mínimo 30 ms (≥ 200 ms en WebRTC), RTO máx. 3 s — una pérdida en el tramo
   host↔edge se repara en decenas de ms (§7.1).
 * **Un puerto UDP en el edge para todos los hosts** (`tunnel.port`, por defecto el mismo número
   que el control: TCP **y** UDP 8443). Demultiplexado por `connId` (aleatorio, emitido por el
@@ -492,8 +492,8 @@ handshakes…), `tunnel` (puerto, túneles, datagramas, `unknownConn`, `rateLimi
 * *Head-of-line* en el túnel: los clientes oficiales mandan **todos** sus eventos (inputs, chat)
   por `ro`, así que con un único canal `ro` en el túnel una pérdida en el tramo host↔edge frenaba
   los inputs de **todos** los jugadores hasta la retransmisión. Con los carriles `ro` (§1.2, por
-  defecto) solo se frena el carril del paquete perdido (≈ 1/16 de los jugadores), y en el túnel
-  v2 la retransmisión llega mucho antes (SACK 20 ms, RTO ≥ 60 ms; §7.1). Eventos del host
+  defecto) solo se frena el carril del paquete perdido (≈ 1/16 de los jugadores), y el túnel v2
+  (SACK 10 ms, RTO ≥ 30 ms) recorta la cola: p99 ≈ 32 vs 40–43 ms con 5 % de pérdida (§7.1). Eventos del host
   (`ru`) y heartbeats (`uu`) nunca sufren HOL. Con el *fallback* WebSocket todo es TCP (HOL
   total): usarlo solo si el UDP está bloqueado.
 * Por qué SCTP propio sobre UDP+AEAD y no DTLS/ICE: la autenticación ya existe (WS + API key),
@@ -544,15 +544,78 @@ túnel del host en 127.0.0.3). "CPU %" = tiempo de CPU del proceso (todos sus hi
 los de libdatachannel cuando los hay) / tiempo real; "por jugador" = dividido por los jugadores
 conectados (carga + sonda). ~200 muestras de RTT por canal y corrida.
 
-{{TABLA_CPU}}
+Contenedor recién reiniciado, una sola tanda intercalada (los números de otras tandas o de la
+versión anterior de este documento no son comparables: la carga del equipo cambia mucho entre
+sesiones). Cada celda: corridas separadas por « · ».
 
-## 7.1 Pérdida en el tramo host↔edge: túnel v1 vs v2
+**17 jugadores** (16 + sonda), 3 × 20 s:
+
+| Modo | RTT `ro` p50 / p99 (ms) | CPU host % (total) | CPU host %/jugador | CPU edge % (total) | CPU edge %/jugador |
+|---|---|---|---|---|---|
+| **edge `rtc` + túnel v2 (nuevo)** | 0,66 / 4,2 · 0,76 / 4,2 · 0,72 / 9,5 | 3,81 · 4,24 · 4,08 | 0,22 · 0,25 · 0,24 | 7,75 · 8,53 · 8,40 | **0,46 · 0,50 · 0,49** |
+| edge `ndc` + PeerConnection (anterior) | 0,83 / 6,9 · 0,90 / 7,6 · 0,83 / 10,1 | 3,99 · 4,20 · 4,08 | 0,24 · 0,25 · 0,24 | 11,33 · 12,09 · 11,82 | 0,67 · 0,71 · 0,70 |
+
+**9 jugadores** (8 + sonda), 2 × 20 s:
+
+| Modo | RTT `ro` p50 / p99 (ms) | RTT `uu` p50 / p99 (ms) | CPU host % | CPU edge %/jugador |
+|---|---|---|---|---|
+| directo (sin edge) | 0,50 / 2,5 · 0,48 / 3,9 | 0,50 / 2,0 · 0,47 / 2,8 | 4,85 · 4,84 | — |
+| **edge `rtc` + túnel v2** | 0,79 / 6,5 · 0,72 / 4,8 | 0,77 / 4,2 · 0,71 / 2,0 | 3,07 · 2,71 | **0,57 · 0,54** |
+| edge `ndc` + PeerConnection | 0,89 / 11,0 · 0,91 / 5,7 | 0,87 / 4,1 · 0,86 / 5,4 | 2,76 · 2,91 | 0,67 · 0,64 |
+| edge `rtc` + WebSocket | 0,73 / 5,2 · 0,72 / 6,0 | 0,71 / 3,6 · 0,71 / 3,1 | 2,13 · 2,03 | 0,52 · 0,53 |
+
+Ninguna corrida perdió pings (`lost: 0`).
+
+* **CPU del edge: −29 % por jugador con 17 jugadores** (0,48 vs 0,69 % de un núcleo; total 8,2 %
+  vs 11,7 %) y −15 % con 9. Desglose (tanda del §7.1 sin pérdida, 17 jugadores): jugadores en
+  haxlite-rtc con el túnel legado 9,2 % → además el túnel v2 7,9–8,1 %; `ndc`+PeerConnection
+  11,2–11,8 %. Todo en el hilo de JS: sin hilos nativos (antes ~4 hilos de libdatachannel y el
+  timer de usrsctp despertando cada 10 ms).
+* **CPU del host:** igual o algo menor que con la PeerConnection (3,5–4,1 % vs 3,8–4,2 % con
+  17 jugadores) aun haciendo SCTP + AES-GCM en JS: la asociación es una sola y el multicast
+  agrupa los carriles en pocos datagramas. Frente al host directo sigue siendo −35 / −45 %.
+* **Latencia:** el salto extra cuesta ≈ +0,25 ms de mediana sobre el directo (0,49 → 0,72–0,79
+  ms), ≈ 0,1–0,15 ms menos que el edge anterior. Los p99 en loopback (2–10 ms) son ruido del
+  planificador (4 vCPU compartidas por cliente, master, host y edge).
+* El WebSocket sigue siendo el más barato en loopback (TCP sin pérdidas no cuesta nada); con
+  pérdida real tiene *head-of-line blocking* total, por eso no es el modo por defecto.
+
+### 7.1 Pérdida en el tramo host↔edge: túnel v1 vs v2
 
 `--loss <pct>`: regla nftables (`numgen random`) que descarta ese % del UDP 127.0.0.2↔127.0.0.3
 en ambos sentidos (solo el túnel; los jugadores no se tocan). 17 jugadores, 2 × 40 s por
 configuración, carriles `ro` activos en todos los casos.
 
-{{TABLA_PERDIDA}}
+RTT de la sonda (ms; `ro` = mensajes del jugador → host, el sentido que sufre HOL). Cada celda:
+dos corridas.
+
+| Pérdida | Túnel | RTT `ro` p50 | RTT `ro` p99 | RTT `ro` media | RTT `uu` media | CPU edge % | retransm. SCTP (host) |
+|---|---|---|---|---|---|---|---|
+| 0 % | v1 (`ndc` + PeerConnection) | 0,80 · 0,86 | 4,6 · 5,0 | 1,03 · 0,97 | 0,96 · 1,05 | 11,2 · 11,8 | — |
+| 0 % | v1 (`rtc` + PeerConnection) | 0,83 · 0,81 | 7,7 · 2,1 | 1,11 · 0,86 | 1,09 · 0,90 | 9,2 · 9,2 | — |
+| 0 % | **v2** (`rtc` + UDP/SCTP) | **0,69 · 0,71** | 7,3 · 7,2 | 0,94 · 1,03 | 0,83 · 1,06 | **7,9 · 8,1** | 0 · 0 |
+| 2 % | v1 (`ndc`) | 0,91 · 0,93 | 26,9 · 21,3 | 1,74 · 1,61 | 0,99 · 1,17 | 12,2 · 12,0 | — |
+| 2 % | v1 (`rtc`) | 0,88 · 0,93 | 32,4 · 23,8 | 1,62 · 1,59 | 1,06 · 1,28 | 9,8 · 10,2 | — |
+| 2 % | **v2** | **0,76 · 0,75** | 29,5 · 30,7 | 1,35 · 1,59 | 0,86 · 0,89 | **8,7 · 8,4** | 149 · 140 |
+| 5 % | v1 (`ndc`) | 0,91 · 0,92 | 39,8 · 43,2 | 2,10 · 2,85 | 1,13 · 1,03 | 12,3 · 11,9 | — |
+| 5 % | v1 (`rtc`) | 1,01 · 0,93 | 40,9 · 39,7 | 3,00 · 2,37 | 1,33 · 1,39 | 10,5 · 9,9 | — |
+| 5 % | **v2** | **0,83 · 0,79** | **31,7 · 31,6** | 2,56 · 2,55 | 1,11 · 0,97 | **9,0 · 8,4** | 428 · 386 |
+
+Lectura:
+
+* El túnel v2 **no empeora nada con pérdida** y mejora la mediana en todos los casos (−0,1 a
+  −0,15 ms) y el p99 con 5 % (≈ 32 ms vs 40–43 ms). La media de `ro` queda igual (dentro del
+  ruido entre corridas).
+* El p99 de `ro` con pérdida lo dominan los mensajes de la sonda que caen en un paquete perdido:
+  a este ritmo de tráfico (≈ 150 paquetes/s edge→host) la recuperación llega por *fast
+  retransmit* (tres SACK con hueco ≈ 20 ms) antes que por RTO, en ambos túneles; el RTO bajo del
+  v2 (≥ 30 ms) recorta la cola cuando hay pocos paquetes detrás (5 %). Una recuperación más
+  rápida pediría un umbral de duplicados menor o RACK en `src/rtc/sctp` (pendiente).
+* `uu` (heartbeats/Pong) no se retransmite nunca: su RTT no depende del túnel; las pérdidas de la
+  sonda (`lost` 20–65 de ~800 por corrida) son los propios Ping/Pong `uu` descartados.
+* Ajuste del túnel v2 usado: SACK diferido 10 ms, RTO mín. 30 ms, varianza mín. 20 ms (en una
+  prueba previa con 60/40 ms la media de `ro` con 5 % de pérdida era peor; no comparable con esta
+  tanda por el reinicio del equipo).
 
 ### 7.2 Mediciones de la versión anterior (node-datachannel en ambos lados)
 

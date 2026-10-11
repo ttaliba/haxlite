@@ -49,6 +49,8 @@ Conclusiones cortas (detalle en §5):
   vez de 60; hilo JS −28 % con 4 clientes, GC a la mitad), camino de mensajes casi sin
   asignaciones (665 → 123 B/mensaje), arranque 192 → 139 ms, paquete instalado 1,4 → 0,77 MB, y
   flags recomendados (−7 MB de RSS).
+* **Backend `peerBackend: 'rtc'`** (haxlite-rtc, servidores con IP pública): con 20 clientes el
+  host completo baja de 19,1 % a **12,4 %** de CPU (−35 %) y de 19 a 11 hilos (sección final).
 
 ## 1. Qué se compara
 
@@ -663,4 +665,46 @@ HAXLITE_BENCH_VARIANTS='{"base":{"dist":"'$D'/base/dist"},"net":{"dist":"'$D'/fi
   bench/net/run.ts game --impl haxlite:base,haxlite:net --n 20 --reps 3 --warmup 10 --window 30
 flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./scripts/ts-resolve.mjs \
   scripts/edge-latency.ts --src $D/final/dist --players 16 --seconds 40 --modes edge --loss 2 [--edge-opts '{"roLanes":false}']
+```
+
+## Backend de peers: `peerBackend: 'rtc'` (haxlite-rtc) vs `'ndc'` (node-datachannel)
+
+Host completo (`HostRoom` + `HostTransport` del build actual) con **20 clientes node-haxball**
+jugando una partida (escenario *game* de §3), mismo build, solo cambia el backend de peers
+(`--impl haxlite:ndc,haxlite:rtc`, variantes integradas en `bench/net/host-proc.mjs`; `rtc` =
+`{ peerBackend: 'rtc', rtcEndpoint: { address: '127.0.0.1', publicAddresses: ['127.0.0.1'] } }`).
+3 repeticiones intercaladas × 60 s tras 15 s de calentamiento, `flock /tmp/haxlite-bench.lock`
+(`bench/results/game-rtc-vs-ndc.json`). Los clientes siguen siendo libdatachannel (node-haxball),
+así que solo cambia el lado del host.
+
+| backend | CPU % (3 reps) | hilos | fds | RSS MB | heap MB | lag p50 / p99 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| `ndc` (node-datachannel, mux UDP) | 18,97 · 19,46 · 18,74 | 19 | 27 | 84,2–84,4 | 9,9 | 0,13–0,14 / 1,13–1,20 |
+| **`rtc`** (haxlite-rtc) | **12,45 · 12,35 · 12,53** | **11** | **25** | 86,1–89,9 | 14,3 | 0,13–0,15 / 1,30–1,50 |
+
+* **CPU −35 %** (19,1 → 12,4 % de un núcleo, sin solapamiento entre repeticiones). Con
+  node-datachannel el hilo JS hace por cada envío una llamada nativa que copia el mensaje y corre
+  SCTP + DTLS + `sendto()`, y además corren 8 hilos nativos (RTC workers, usrsctp, libjuice);
+  haxlite-rtc hace el mismo trabajo en el hilo JS sin cruces nativos ni hilos.
+* **Hilos 19 → 11**: los 11 de `rtc` son los 7 de Node + los 4 del *threadpool* de libuv (lo
+  arranca la verificación ECDSA de los jugadores, `crypto.subtle`). node-datachannel ya no se carga
+  si no se usa (`src/net/webrtc.ts` lo importa perezosamente al crear la primera PeerConnection):
+  un host `rtc` no tiene ningún hilo nativo de WebRTC.
+* **Memoria**: RSS similar (+2–5 MB), heap +4,4 MB: el estado DTLS/SCTP de los 20 jugadores
+  vive en el heap de JS en vez de en memoria nativa.
+* **Lag del event loop**: igual en p50; p99 0,1–0,3 ms mayor (el trabajo de red ahora está en el
+  hilo JS), muy por debajo de un frame (16,7 ms).
+* **Entrada a la sala** (node-haxball, 30 entradas secuenciales, loopback): p50 ≈ 1,03 s con
+  `rtc` frente a ≈ 2,02 s con `ndc` (ICE‑lite: la respuesta sale sin esperar la recolección y el
+  cliente valida el único candidato al primer intento).
+
+Recomendación: **`rtc` en servidores con IP pública** (dedicados, VPS, edge) y **`ndc` detrás de
+NAT** sin edge (haxlite-rtc es ICE‑lite: no reúne candidatos srflx). El valor por defecto sigue
+siendo `ndc` porque es el único que funciona sin configuración en cualquier red (ver docs/10 §3).
+
+```sh
+npm run bench:build
+flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+  bench/net/run.ts game --impl haxlite:ndc,haxlite:rtc --n 20 --reps 3 --warmup 15 --window 60 \
+  --out bench/results/game-rtc-vs-ndc.json
 ```

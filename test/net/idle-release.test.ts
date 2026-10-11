@@ -6,6 +6,7 @@
  * src/net/webrtc.ts).
  */
 import { readdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { afterAll, describe, expect, it } from 'vitest';
 import { LocalPeerLink, setWebRtcIdleRelease, shutdownWebRtc, webRtcStats, type PeerLinkEvents } from '../../src/net/index.js';
 import { closeNative, createDataChannel, createPeerConnection } from '../../src/net/webrtc.js';
@@ -67,6 +68,9 @@ afterAll(async () => {
 describe('WebRTC idle release', () => {
   it('releases the native threads when idle and re-initialises on demand (cycled)', async () => {
     setWebRtcIdleRelease(30);
+    // node-datachannel is loaded lazily (src/net/webrtc.ts) and loading the addon alone starts
+    // threads that stay for the process lifetime: measure the base with the addon loaded
+    createRequire(import.meta.url)('node-datachannel');
     const base = threads();
     for (let i = 0; i < 12; i++) {
       const before = webRtcStats().releases;

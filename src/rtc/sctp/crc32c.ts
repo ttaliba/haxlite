@@ -6,15 +6,16 @@
  * SCTP stores the final value in the common header least-significant byte
  * first (i.e. little-endian), see {@link writeChecksum}.
  *
- * Speed (Node 22, Xeon 2.8 GHz VM, HaxBall-sized packets of 28–100 bytes):
- * ≈ 0.6–1 B/ns, about 300 ns of SCTP checksum work per 30-byte message
- * round trip when the peer does not negotiate RFC 9653 zero checksum
- * (Chromium 141). Alternatives measured and rejected (docs/10 §6.1):
- * slicing-by-16 (one 16 KiB table or 16 separate tables), 32-bit word reads
- * through an `Int32Array` alias of aligned send buffers, and a WebAssembly
- * slicing-by-16 (clang, with or without copying the packet into linear
- * memory) — none was more than ≈ 10 % faster at these sizes (within run-to-run
- * noise); typed-array table lookups, not the slicing width, bound the speed.
+ * Speed (Node 22, `test/rtc/sctp/bench.ts`): about 0.6–1 B/ns on HaxBall's
+ * 28–100-byte packets, i.e. ≈ 35 % of an SCTP message round trip when the
+ * peer does not negotiate RFC 9653 zero checksum (Chromium 141). Measured and
+ * rejected (docs/10 §6.1): slicing-by-16 (one 16 KiB table or 16 separate
+ * tables), 32-bit word reads through an `Int32Array` alias of aligned send
+ * buffers, a single-pass verification (field zeroed and restored), and a
+ * WebAssembly slicing-by-16 (clang; with or without copying the packet into
+ * linear memory): none beat this within run-to-run noise at these sizes —
+ * the typed-array loads, not the slicing width, bound a JS table CRC, and the
+ * WASM call + copy costs as much as the CRC of a small packet.
  */
 
 const T = new Int32Array(8 * 256);
@@ -68,27 +69,14 @@ export function crc32c(buf: Uint8Array, start = 0, end = buf.length): number {
   return crc32cFinish(crc32cUpdate(-1, buf, start, end));
 }
 
-/**
- * SCTP packet checksum of `pkt[0..len)`, computed as if bytes 8..11 were
- * zero. Single pass: the field is zeroed during the computation and restored
- * before returning, so the packet is unchanged afterwards (the caller owns it
- * and nothing else runs in between).
- */
+const ZERO4 = new Uint8Array(4);
+
+/** SCTP packet checksum of `pkt[0..len)`, computed as if bytes 8..11 were zero (the packet is not modified). */
 export function sctpChecksum(pkt: Uint8Array, len: number): number {
-  const b8 = pkt[8];
-  const b9 = pkt[9];
-  const b10 = pkt[10];
-  const b11 = pkt[11];
-  pkt[8] = 0;
-  pkt[9] = 0;
-  pkt[10] = 0;
-  pkt[11] = 0;
-  const c = crc32cUpdate(-1, pkt, 0, len);
-  pkt[8] = b8;
-  pkt[9] = b9;
-  pkt[10] = b10;
-  pkt[11] = b11;
-  return ~c >>> 0;
+  let c = crc32cUpdate(-1, pkt, 0, 8);
+  c = crc32cUpdate(c, ZERO4, 0, 4);
+  c = crc32cUpdate(c, pkt, 12, len);
+  return crc32cFinish(c);
 }
 
 /** Computes and stores the checksum of `pkt[0..len)` at offset 8 (little-endian, as SCTP requires). */

@@ -82,11 +82,11 @@ export const TUNNEL_SCTP_MTU = 1200;
  * the ≥ 200 ms WebRTC stacks use.
  */
 export const TUNNEL_SCTP_TUNING = {
-  sackDelay: 20,
+  sackDelay: 10,
   rtoInitial: 300,
-  rtoMin: 60,
+  rtoMin: 30,
   rtoMax: 3000,
-  rtoMinVariance: 40,
+  rtoMinVariance: 20,
   maxRetransmissions: 20,
   maxInitRetransmits: 12,
 };
