@@ -111,7 +111,9 @@ const CLIENT_SIG_ALGS: ReadonlyMap<number, { hash: string; key: 'ec' | 'rsa' }> 
 const FP_HASHES: Record<string, string> = { 'sha-224': 'sha224', 'sha-256': 'sha256', 'sha-384': 'sha384', 'sha-512': 'sha512' };
 
 /** Largest handshake message we reassemble (a client certificate chain). */
-const MAX_HANDSHAKE_MESSAGE = 32 * 1024;
+const MAX_HANDSHAKE_MESSAGE = 16 * 1024;
+/** Largest (fragmented) ClientHello we reassemble before the cookie exchange. */
+const MAX_CLIENT_HELLO = 8 * 1024;
 /** How far ahead of the next expected message_seq fragments are buffered. */
 const MAX_SEQ_AHEAD = 8;
 const MAX_PLAINTEXT = 16384;
@@ -341,6 +343,7 @@ export class DtlsServer {
   private nextReceiveSeq = 0;
   private nextSendSeq = 0;
   private reassembly = new Map<number, Reassembly>();
+  private helloReassembly: { seq: number; length: number; body: Buffer; have: Uint8Array; missing: number } | null = null;
   private expect: 'certificate' | 'cke' | 'cv' | 'ccs' | 'finished' | 'done' = 'certificate';
   private clientKey: KeyObject | null = null;
   private masterSecret: Buffer | null = null;
@@ -513,8 +516,30 @@ export class DtlsServer {
       p = bodyStart + fragLen;
 
       if (this.state === 'listen') {
-        if (msgType === HandshakeType.ClientHello && fragOff === 0 && fragLen === length && epoch === 0) {
+        if (msgType !== HandshakeType.ClientHello || epoch !== 0) {
+          this.badRecords++;
+        } else if (fragOff === 0 && fragLen === length) {
           this.handleInitialClientHello(frag, msgSeq, recSeqHi, recSeqLo, peerKey);
+        } else if (length <= MAX_CLIENT_HELLO) {
+          // Fragmented ClientHello (e.g. a DTLS 1.3 client with post-quantum key shares):
+          // one bounded reassembly buffer. The peer is already ICE-authenticated, so this is
+          // not an amplification/state-exhaustion vector.
+          let h = this.helloReassembly;
+          if (h === null || h.seq !== msgSeq || h.length !== length) {
+            h = { seq: msgSeq, length, body: Buffer.alloc(length), have: new Uint8Array(length), missing: length };
+            this.helloReassembly = h;
+          }
+          for (let i = 0; i < fragLen; i++) {
+            if (h.have[fragOff + i] === 0) {
+              h.have[fragOff + i] = 1;
+              h.body[fragOff + i] = frag[i]!;
+              h.missing--;
+            }
+          }
+          if (h.missing === 0) {
+            this.helloReassembly = null;
+            this.handleInitialClientHello(h.body, msgSeq, recSeqHi, recSeqLo, peerKey);
+          }
         } else {
           this.badRecords++;
         }
@@ -599,6 +624,7 @@ export class DtlsServer {
     }
     // Valid cookie: allocate the handshake.
     this.state = 'handshake';
+    this.helloReassembly = null;
     this.nextReceiveSeq = msgSeq + 1;
     this.nextSendSeq = msgSeq;
     this.writeSeqHi[0] = recSeqHi;
@@ -981,6 +1007,7 @@ export class DtlsServer {
     this.lastFlight = null;
     this.transcript = [];
     this.reassembly.clear();
+    this.helloReassembly = null;
     this.masterSecret?.fill(0);
     this.masterSecret = null;
     this.pendingRead = null;

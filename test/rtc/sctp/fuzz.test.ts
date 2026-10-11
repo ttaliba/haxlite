@@ -83,6 +83,30 @@ function localTag(s: SctpAssociation): number {
   return (s as unknown as { localTag: number }).localTag;
 }
 
+interface Internals {
+  rCum: number;
+  tAcked: number;
+  tSendNext: number;
+}
+
+/** Moves TSN-like fields of DATA / SACK / FORWARD-TSN / SHUTDOWN chunks into the target's live windows. */
+function rebase(pkt: Uint8Array, s: SctpAssociation, rnd: () => number): void {
+  const st = s as unknown as Internals;
+  const dv = new DataView(pkt.buffer, pkt.byteOffset, pkt.byteLength);
+  let off = 12;
+  while (off + 8 <= pkt.length) {
+    const type = pkt[off];
+    const len = dv.getUint16(off + 2);
+    if (len < 4 || off + len > pkt.length) break;
+    if (type === 0 || type === 192) dv.setUint32(off + 4, (st.rCum + Math.floor(rnd() * 40) - 4) >>> 0);
+    else if (type === 3 || type === 7) {
+      const span = (st.tSendNext - st.tAcked) >>> 0;
+      dv.setUint32(off + 4, (st.tAcked + Math.floor(rnd() * (span + 2)) - 1) >>> 0);
+    }
+    off += (len + 3) & ~3;
+  }
+}
+
 function retag(pkt: Uint8Array, tag: number): void {
   pkt[4] = tag >>> 24;
   pkt[5] = tag >>> 16;
@@ -121,14 +145,22 @@ describe('fuzz', () => {
     for (let n = 0; n < 100_000; n++) {
       const src = base[Math.floor(rnd() * base.length)];
       const other = base[Math.floor(rnd() * base.length)];
-      const pkt = mutate(src, rnd, other);
       const toFresh = rnd() < 0.15;
       const target = toFresh ? fresh.s : rnd() < 0.5 ? pair.b.sctp : pair.a.sctp;
+      const based = src.slice();
+      if (!toFresh && rnd() < 0.8) rebase(based, target, rnd);
+      const pkt = rnd() < 0.15 ? based : mutate(based, rnd, other);
       if (!toFresh && rnd() < 0.9) retag(pkt, localTag(target));
       if (rnd() < 0.9) writeChecksum(pkt, pkt.length);
       else if (rnd() < 0.5) pkt.fill(0, 8, 12);
       expect(() => target.input(pkt)).not.toThrow();
-      if (n % 64 === 0) pair.sim.run(50);
+      if (n % 64 === 0) {
+        for (const ch of [0, 1, 2]) {
+          pair.a.sctp.send(ch, msg(ch, n, n % 640 === 0 ? 4000 : 50));
+          pair.b.sctp.send(ch, msg(ch, n, 60));
+        }
+        pair.sim.run(50);
+      }
       if (n % 1000 === 999) {
         check(pair.a, pair.b);
         expect(fresh.errs).toEqual([]);
@@ -140,11 +172,13 @@ describe('fuzz', () => {
         connectPair(pair);
         restarts++;
       }
-      if (fresh.s.readyState !== 'closed' && rnd() < 0.001) fresh = listener();
+      if (rnd() < 0.001) fresh = listener();
     }
     check(pair.a, pair.b);
     // The associations stayed usable for most of the run.
     expect(restarts).toBeLessThan(5000);
+    const st = pair.b.sctp.stats();
+    expect(st.dataChunksReceived + st.sacksReceived).toBeGreaterThan(0);
   });
 
   it('random garbage never throws', () => {

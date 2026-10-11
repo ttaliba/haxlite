@@ -306,6 +306,40 @@ describe('DTLS cookie exchange and negotiation (hand-built ClientHello)', () => 
     s.close();
   });
 
+  it('reassembles a fragmented ClientHello (large DTLS 1.3/PQ hellos), in any order', () => {
+    const { s, sent } = server();
+    const whole = clientHelloDatagram({ recordSeq: 3 });
+    const fragment = (d: Buffer, cut: number) => {
+      // split the single handshake message of record `d` into two records at body offset `cut`
+      const hs = d.subarray(13);
+      const len = (hs[1]! << 16) | (hs[2]! << 8) | hs[3]!;
+      const body = hs.subarray(12);
+      const rec = (off: number, n: number, seq: number) => {
+        const h = Buffer.from(hs.subarray(0, 12));
+        h.writeUIntBE(off, 6, 3);
+        h.writeUIntBE(n, 9, 3);
+        const frag = Buffer.concat([h, body.subarray(off, off + n)]);
+        const r = Buffer.alloc(13);
+        r[0] = 22;
+        r.writeUInt16BE(0xfefd, 1);
+        r.writeUInt32BE(seq, 7);
+        r.writeUInt16BE(frag.length, 11);
+        return Buffer.concat([r, frag]);
+      };
+      return [rec(0, cut, 3), rec(cut, len - cut, 4)];
+    };
+    const [a, b] = fragment(whole.datagram, 40);
+    s.handleDatagram(b!, 'p'); // second half first
+    expect(sent).toHaveLength(0);
+    s.handleDatagram(a!, 'p');
+    expect(sent).toHaveLength(1);
+    const cookie = cookieOf(sent[0]!);
+    const second = clientHelloDatagram({ random: whole.random, cookie, messageSeq: 1 });
+    for (const f of fragment(second.datagram, 70)) s.handleDatagram(f, 'p');
+    expect(s.state).toBe('handshake');
+    s.close();
+  });
+
   it('ignores garbage without answering', () => {
     const { s, sent } = server();
     s.handleDatagram(Buffer.from('17fefd0000000000000000000400000000', 'hex'), 'p'); // app data epoch 0
