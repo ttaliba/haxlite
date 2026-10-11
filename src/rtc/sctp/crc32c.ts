@@ -71,11 +71,14 @@ export function crc32c(buf: Uint8Array, start = 0, end = buf.length): number {
 
 const ZERO4 = new Uint8Array(4);
 
-/** SCTP packet checksum of `pkt[0..len)`, computed as if bytes 8..11 were zero (the packet is not modified). */
-export function sctpChecksum(pkt: Uint8Array, len: number): number {
-  let c = crc32cUpdate(-1, pkt, 0, 8);
+/**
+ * SCTP packet checksum of `pkt[base..base+len)`, computed as if bytes 8..11
+ * of the packet were zero (the packet is not modified).
+ */
+export function sctpChecksum(pkt: Uint8Array, len: number, base = 0): number {
+  let c = crc32cUpdate(-1, pkt, base, base + 8);
   c = crc32cUpdate(c, ZERO4, 0, 4);
-  c = crc32cUpdate(c, pkt, 12, len);
+  c = crc32cUpdate(c, pkt, base + 12, base + len);
   return crc32cFinish(c);
 }
 
@@ -92,7 +95,7 @@ export function writeChecksum(pkt: Uint8Array, len: number): void {
   pkt[11] = c >>> 24;
 }
 
-/** Stored checksum of a packet (little-endian at offset 8). */
-export function readChecksum(pkt: Uint8Array): number {
-  return (pkt[8] | (pkt[9] << 8) | (pkt[10] << 16) | (pkt[11] << 24)) >>> 0;
+/** Stored checksum of a packet starting at `base` (little-endian at offset 8). */
+export function readChecksum(pkt: Uint8Array, base = 0): number {
+  return (pkt[base + 8] | (pkt[base + 9] << 8) | (pkt[base + 10] << 16) | (pkt[base + 11] << 24)) >>> 0;
 }

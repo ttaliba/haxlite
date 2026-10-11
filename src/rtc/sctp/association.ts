@@ -267,7 +267,10 @@ function w32(p: Uint8Array, o: number, v: number): void {
   p[o + 3] = v;
 }
 
-const defaultNow = (): number => performance.now();
+// Whole milliseconds: small integers stay unboxed (Smi) in every time field,
+// so the per-packet clock reads allocate nothing (until ~12 days of process
+// uptime, when they exceed the Smi range and are merely boxed again).
+const defaultNow = (): number => Math.floor(performance.now());
 const defaultSetTimer = (cb: () => void, ms: number): unknown => {
   const t = setTimeout(cb, ms);
   t.unref?.();
@@ -564,18 +567,26 @@ export class SctpAssociation {
     this.schedule();
   }
 
-  /** Feeds a packet received from DTLS. Never throws on malformed input. */
-  input(packet: Uint8Array): void {
+  /**
+   * Feeds a packet received from DTLS: `packet[off..off+len)` (default: all
+   * of it), so the caller can pass the decrypted record in place without a
+   * view. Never throws on malformed input.
+   */
+  input(packet: Uint8Array, off = 0, len = packet.length - off): void {
     if (this.dead) return;
+    if (!(off >= 0 && len >= 0 && off + len <= packet.length)) {
+      this.c.malformed++;
+      return;
+    }
     if (this.inInput || this.flushing) {
-      (this.deferredInput ??= []).push(packet.slice());
+      (this.deferredInput ??= []).push(packet.slice(off, off + len));
       return;
     }
     this.inInput = true;
     try {
       this.t = this.nowFn();
       this.cumAtInput = this.rCum;
-      this.processPacket(packet);
+      this.processPacket(packet, off, len);
     } catch (e) {
       // Only reachable through a bug: malformed input is rejected by bounds checks.
       this.c.internalErrors++;
@@ -1337,33 +1348,35 @@ export class SctpAssociation {
   // =========================================================================
   // Incoming packets
 
-  private processPacket(p: Uint8Array): void {
-    const len = p.length;
-    if (len < 16) {
+  /** The SCTP packet `p[base..base+n)`; chunk handlers get absolute offsets into `p`. */
+  private processPacket(p: Uint8Array, base: number, n: number): void {
+    if (n < 16) {
       this.c.malformed++;
       return;
     }
-    const stored = readChecksum(p);
-    if (!(stored === 0 && this.zeroCkEnabled && p[12] !== CT_INIT) && stored !== sctpChecksum(p, len)) {
+    const len = base + n; // end offset
+    const c0 = base + 12; // first chunk
+    const stored = readChecksum(p, base);
+    if (!(stored === 0 && this.zeroCkEnabled && p[c0] !== CT_INIT) && stored !== sctpChecksum(p, n, base)) {
       this.c.checksumErrors++;
       return;
     }
     this.c.packetsReceived++;
-    this.c.bytesReceived += len;
-    const vtag = u32(p, 4);
-    const first = p[12];
+    this.c.bytesReceived += n;
+    const vtag = u32(p, base + 4);
+    const first = p[c0];
     if (first === CT_INIT) {
-      const clen = u16(p, 14);
+      const clen = u16(p, c0 + 2);
       // INIT must be alone in its packet and carry vtag 0.
-      if (vtag !== 0 || clen < 20 || 12 + clen > len || 12 + ((clen + 3) & ~3) + 4 <= len) {
+      if (vtag !== 0 || clen < 20 || c0 + clen > len || c0 + ((clen + 3) & ~3) + 4 <= len) {
         this.c.malformed++;
         return;
       }
-      this.handleInit(p, 12, clen);
+      this.handleInit(p, c0, clen);
       return;
     }
     this.pktHadData = false;
-    let off = 12;
+    let off = c0;
     while (off + 4 <= len && !this.dead) {
       const type = p[off];
       const flags = p[off + 1];
@@ -1393,7 +1406,7 @@ export class SctpAssociation {
           if (ok) this.handleReconfig(p, off, clen);
           break;
         case CT_INIT_ACK:
-          if (ok && off === 12) this.handleInitAck(p, off, clen);
+          if (ok && off === c0) this.handleInitAck(p, off, clen);
           break;
         case CT_COOKIE_ACK:
           if (ok && this.state === S_COOKIE_ECHOED) this.established();
@@ -2263,7 +2276,7 @@ export class SctpAssociation {
     let rto = this.srtt + Math.max(4 * this.rttvar, this.rtoMinVar);
     if (rto < this.rtoMin) rto = this.rtoMin;
     if (rto > this.rtoMax) rto = this.rtoMax;
-    this.rto = rto;
+    this.rto = Math.ceil(rto); // integer ms: deadlines (t + rto) stay small integers
   }
 
   /** Marks a sent chunk for retransmission, or abandons its message (PR-SCTP). */

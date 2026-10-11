@@ -565,3 +565,53 @@ describe('transientDelivery', () => {
     noErrors(p.a, p.b);
   });
 });
+
+describe('input(packet, off, len)', () => {
+  it('processes a packet embedded in a larger buffer (decrypted record in place); bad ranges are malformed', () => {
+    const q: [SctpAssociation, Uint8Array][] = [];
+    let now = 0;
+    const got: number[] = [];
+    const mk = (peer: () => SctpAssociation) =>
+      new SctpAssociation({
+        send: (pkt) => {
+          // embed: 7 bytes of junk before, 5 after
+          const buf = new Uint8Array(pkt.length + 12).fill(0xee);
+          buf.set(pkt, 7);
+          q.push([peer(), buf]);
+        },
+        channels: [{ id: 0, ordered: true }],
+        maxMessageSize: 65536,
+        onMessage: (_ch, d) => got.push(d[0]!, d.length),
+        onOpen() {},
+        onClose() {},
+        now: () => now,
+        setTimer: () => 1,
+        clearTimer: () => {},
+        zeroChecksum: false, // exercise the CRC over the range
+      });
+    const a: SctpAssociation = mk(() => b);
+    const b: SctpAssociation = mk(() => a);
+    const pump = () => {
+      while (q.length > 0) {
+        const [to, buf] = q.shift()!;
+        to.input(buf, 7, buf.length - 12);
+      }
+    };
+    a.connect();
+    pump();
+    expect(a.readyState).toBe('established');
+    expect(b.readyState).toBe('established');
+    a.send(0, new Uint8Array([9, 8, 7]));
+    a.send(0, new Uint8Array(3000).fill(4)); // fragmented
+    now += 10;
+    pump();
+    expect(got).toEqual([9, 3, 4, 3000]);
+    const m0 = b.stats().malformed;
+    b.input(new Uint8Array(40), 30, 20);
+    b.input(new Uint8Array(40), -1, 20);
+    b.input(new Uint8Array(40), Number.NaN, 4);
+    expect(b.stats().malformed).toBe(m0 + 3);
+    expect(b.stats().checksumErrors).toBe(0);
+    expect(a.stats().checksumErrors).toBe(0);
+  });
+});

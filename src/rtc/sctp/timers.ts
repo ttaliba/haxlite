@@ -21,8 +21,12 @@ export class TimerSlot {
   constructor(readonly fire: () => void) {}
 }
 
-/** Fire up to this early (Node's millisecond timers may run up to ~1 ms early; the association re-checks). */
-const EARLY_MS = 0.5;
+/**
+ * Slots due by this margin fire. 0: associations use a whole-millisecond
+ * clock, so a slot fired before its deadline would only re-queue itself
+ * (an early Node timer just re-arms instead).
+ */
+const EARLY_MS = 0;
 
 class SharedTimers {
   private heap: TimerSlot[] = [];
