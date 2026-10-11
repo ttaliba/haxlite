@@ -163,8 +163,8 @@ Tiempos medidos (`RTC_INTEROP_REPORT`):
 | mensajes enviados por el servidor al abrirse el canal 0, por canal `ro/ru/uu` | 3 / 0 / 0 | 1 / 1 / 1 |
 
 La entrada ronda 1 s porque Chromium no da por terminada la recolección ICE en este entorno y
-el cliente oficial espera su tope de 1000 ms antes de mandar la oferta; el resto (≈ 50 ms en
-loopback) es ICE + DTLS + SCTP.
+el cliente oficial espera su tope de 1000 ms antes de mandar la oferta; el resto (≈ 50 ms con
+haxlite-rtc, ≈ 80 ms con node-datachannel, en loopback) es señalización + ICE + DTLS + SCTP.
 
 ### 5.2 Firefox, Safari y móviles: pendiente
 
@@ -198,8 +198,7 @@ channels (no se piden cámara ni micrófono).
   haxlite-rtc abre los tres a la vez (la asociación SCTP es una sola).
 - **`uu` con ráfagas grandes**: 10 × 20 KB seguidos por `uu` (sin retransmisión) pierden 2–4
   mensajes con node-datachannel en loopback (en eth0 llegaron todos); haxlite-rtc los entrega
-  todos. HaxBall solo
-  manda mensajes pequeños por `uu`.
+  todos. HaxBall solo manda mensajes pequeños por `uu`.
 - **`cleanup()` de node-datachannel**: al apagar el servidor tras las pruebas con pérdida se
   registró `cleanup timeout (possible deadlock)` (no rompe la prueba, pero es el riesgo descrito
   en §1).
