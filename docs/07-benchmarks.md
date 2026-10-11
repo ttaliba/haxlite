@@ -557,3 +557,109 @@ HAXLITE_BENCH_VARIANTS='{"base":{"dist":"…"},"new":{"dist":"…"}}' \
   node … bench/net/run.ts game --impl haxlite:base,haxlite:new --n 4,20 --eld 0 --out bench/results/lite-game.json
 node … bench/net/run.ts game --impl haxlite:new --n 20 --reps 2 --eld 0 --host-node-args "--v8-pool-size=1"
 ```
+
+## Pasada de ligereza — red (`src/net`, `src/edge`)
+
+Objetivo: bajar el coste de WebRTC/red del host y del edge sin cambios visibles para el cliente
+oficial (mismos canales, mismos mensajes, mismo orden). Cada cambio se midió A/B en la misma
+máquina (4 vCPU, compartida con otro ingeniero: todas las corridas serializadas con
+`flock /tmp/haxlite-bench.lock`), con builds compilados el mismo momento que solo difieren en
+`src/net` + `src/edge` (base = commit `2ce0ae7`, resto del árbol idéntico). Herramientas nuevas:
+
+* `bench/net/natives.mjs`: solo WebRTC. N pares node-datachannel en un proceso hijo contra
+  `LocalPeerLink` de haxlite, con la carga de una partida haxlite (input de 6 B por cliente cada
+  60–250 ms reenviado a los N por `ru`, heartbeat de 8 B a los N por `uu` cada 7 frames, sonda de
+  RTT). Reproduce el perfil del host con 20 clientes (20,5 % CPU; JS 7,3 / RTC worker 8,8 / juice
+  3,9) en 15 s en vez de 2,5 min. Flags `--mux`, `--sctp`, `--logger`, `--dist`, `--rtc`.
+* `bench/net/run.ts` acepta variantes `--impl haxlite:<nombre>` definidas en
+  `HAXLITE_BENCH_VARIANTS` (`{"<nombre>": {dist, transport, sctp, logger}}`) y ahora reporta
+  hilos y fds del host.
+* `scripts/edge-latency.ts`: `--src <dist>` (build a medir), `--loss <pct>` (descarta ese % de
+  los paquetes UDP **solo** entre edge 127.0.0.2 y túnel del host 127.0.0.3 con una regla
+  `nftables numgen random`; el tráfico de los jugadores no se toca), `--edge-webrtc`, `--edge-opts`.
+
+### Hilos y sockets nativos (node-datachannel 0.33.4 / libdatachannel 0.24)
+
+Contados en `/proc/<pid>/task` y `/proc/<pid>/fd`:
+
+| momento | hilos | fds | detalle |
+|---|---:|---:|---|
+| Node vacío | 7 | 21 | |
+| `import 'node-datachannel'` | 11 | 21 | +4 `libuv-worker` |
+| 1.ª PeerConnection | 19 | 26 | +4 `RTC worker` (pool = `hardware_concurrency`, mín. 4), `RTC poll`, `SCTP iterator`, `SCTP timer`, `juice poll` |
+| cada PeerConnection más | +0 | **+1** | un socket UDP por conexión |
+| … con `enableIceUdpMux` | +0 | +0 | un solo socket (`juice mux`) para todas |
+| tras cerrar todas | 18 | 23 | **los hilos siguen vivos** |
+| tras `cleanup()` | 11 | 21 | |
+
+Los hilos no crecen por jugador; el tamaño del pool no es configurable (node-datachannel no lo
+expone). Con 20 jugadores el host tenía 48 fds; con mux, 27.
+
+### Resultados
+
+| cambio | medición | antes | después |
+|---|---|---:|---:|
+| **mux UDP por defecto en el host** (`rtc.enableIceUdpMux: true`) | `natives.mjs` N = 20, 5 × 15 s: CPU % | 20,81 (19,5–22,0) | **19,53** (19,0–20,4) |
+| | ídem: hilo ICE / CPU de sistema | 3,93 / 9,56 | 3,33 / 8,69 |
+| | fds del proceso con 20 jugadores | 47–48 | **26–27** |
+| | `run.ts game` N = 20, 3 × 30 s (build final completo) | 20,30 (18,8–20,6) | **18,70** (18,3–20,0) |
+| | ídem: RSS medio (MB) | 85,7 | 82,8 |
+| **sin barrido de 1 Hz en vacío** (`HostTransport` lo arma solo con negociaciones/peers/cierres diferidos) | `run.ts idle`, 2 × 120 s: CPU % (ms de CPU/min) | 0,028 (16,9) | **0,009 (5,5)** |
+| **liberación de hilos nativos en vacío** (`setWebRtcIdleRelease`, 15 s tras cerrar la última PeerConnection) | proceso que ya usó WebRTC, 0 conexiones, 20 s: CPU % | 0,632 (`SCTP timer` 0,45: usrsctp despierta cada 10 ms) | **0,004** |
+| | hilos | 18 | 11 |
+| **`node:http(s)` por `require`** (la fachada ESM evalúa los getters `WebSocket/CloseEvent/MessageEvent` y carga undici) | `import` de `net/index.js` / `edge/index.js`, mediana de 15 (ms) | 123 / 120 | **90 / 92** |
+| **carriles `ro` en el túnel del edge** (16 canales ordenados por `slot % 16`) | 17 jugadores, 2 % de pérdida en el túnel, 2 × 40 s: RTT `ro` media / p99 (ms) | 2,79 · 2,31 / 37,3 · 36,9 | **2,09 · 2,02 / 26,8 · 24,7** |
+| | ídem con 5 % de pérdida: media / p99 | 4,94 · 4,80 / 40,9 · 53,2 | **3,24 · 3,34** / 46,4 · 43,0 |
+| | RTT `uu` (control) media, 2 % / 5 % | 1,73 · 1,53 / 1,82 · 1,77 | 1,65 · 1,60 / 1,60 · 1,52 |
+
+* Mux: el ahorro está en el hilo `juice` (un `recvfrom` sobre un socket en vez de `poll` sobre N)
+  y en el kernel. Con 9 jugadores la diferencia ya no se distingue del ruido (edge-latency
+  directo: 8,9 % ↔ 8,4–9,2 %). srflx/STUN funciona igual con mux (probado con un STUN local que
+  devuelve una dirección mapeada falsa: cada conexión recibe su candidato srflx). Choca con una
+  dirección por jugador ("canary" de docs/08 §3): para eso `rtc: { enableIceUdpMux: false }`.
+* Carriles `ro`: los clientes oficiales mandan **todos** sus eventos (inputs incluidos) por `ro`,
+  así que con un único canal `ro` en el túnel una pérdida frenaba los inputs de todos los
+  jugadores hasta la retransmisión. La mitad del exceso de RTT medio desaparece; el p99 restante
+  lo dominan las pérdidas de los propios paquetes de la sonda (inevitables, igual que en directo).
+  Sin pérdida no cambia ni la latencia ni la CPU (2 × 4 corridas: edge 19,2 % ↔ 19,2 %).
+* Idle release: la teardown es la misma de `shutdownWebRtc()` (espera a que todas las
+  PeerConnection confirmen el cierre y mantiene referenciados los DataChannel huérfanos). Llamada
+  **justo** después de cerrar, `cleanup()` de libdatachannel se bloqueó 1 vez en ~10 corridas de
+  los tests 10 s ("cleanup timeout (possible deadlock)"); con 2 s de espera, 0 de 58 en dos
+  corridas completas de test/net + test/edge + test/api. Por eso la espera por defecto es 15 s y,
+  si `cleanup()` falla igualmente, haxlite conserva todos los wrappers y desactiva la liberación
+  automática para el resto del proceso (nunca deja wrappers colectables).
+
+**Camino de envío (análisis, sin cambio):** `sendMessageBinary` copia el `Uint8Array` a un
+`std::vector` y, **en el hilo JS**, hace SCTP + cifrado DTLS + `sendto()` (≈ 20 µs por envío con
+20 jugadores): de ahí que el hilo JS esté dominado por llamadas nativas (§5.2). En JS no hay copia
+por destinatario (la misma vista va a los N; con edge, un único multicast), el `try/catch` por envío
+no cuesta nada en V8 y no hay `Buffer.from` por envío. Agrupar mensajes no es posible: el cliente
+oficial espera cada evento/heartbeat como mensaje DC propio. **Recepción:** node-datachannel crea
+un `Buffer` por mensaje (copia inevitable); se quitaron dos closures y un array de argumentos
+por mensaje (`guard1`, `onMessage` sin `safely`/`callUser`). Con ~150 mensajes entrantes/s
+frente a ~3 000 envíos/s no se distingue en CPU (`natives.mjs`: 20,81 → 19,50 %, dentro del
+ruido); se mantiene porque no tiene coste.
+
+**Descartado (medido):**
+
+| experimento | resultado |
+|---|---|
+| `initLogger('Fatal')` | 20,70 % vs 20,81 %: sin efecto (sin logger, libjuice ya no formatea logs) |
+| `setSctpSettings({ delayedSackTime: 200 })` | 21,36 % vs 20,81 %: peor (el host recibe pocos mensajes; los SACK que pesan son los de los clientes) |
+| demás `setSctpSettings` (buffers, `maxChunksOnQueue`, ventana inicial, control de congestión) | no aplican a ~10–20 msg/s de < 100 B por conexión; no expuestos: RTO mín., intervalo de heartbeat SCTP |
+| tamaño del pool de hilos | no expuesto por node-datachannel 0.33 (fijo en `hardware_concurrency`); los hilos ociosos no gastan CPU |
+| mux UDP en el **edge** | 3 × 30 s, 17 jugadores: CPU del edge 17,0 % → 18,1 % (**+6 %**) y RTT +0,1–0,2 ms: queda desactivado por defecto |
+| agrupar mensajes en el túnel del edge | a 130 inputs/s casi nunca llegan dos en el mismo turno del event loop; las difusiones ya van en un multicast |
+
+Comandos (además de los de §2.5):
+
+```sh
+D=node_modules/.cache/haxlite-bench-net            # builds A/B (tsc de una copia de src/)
+flock /tmp/haxlite-bench.lock node bench/net/natives.mjs --n 20 --seconds 15 --dist $D/base/dist [--mux 1]
+HAXLITE_BENCH_VARIANTS='{"base":{"dist":"'$D'/base/dist"},"net":{"dist":"'$D'/final/dist"}}' \
+  flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+  bench/net/run.ts game --impl haxlite:base,haxlite:net --n 20 --reps 3 --warmup 10 --window 30
+flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./scripts/ts-resolve.mjs \
+  scripts/edge-latency.ts --src $D/final/dist --players 16 --seconds 40 --modes edge --loss 2 [--edge-opts '{"roLanes":false}']
+```

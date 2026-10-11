@@ -10,10 +10,11 @@
  * {@link UdpImpairProxy}: the server's candidate is then replaced by the
  * proxy's in the answer and the browser's candidates are not forwarded.
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import http from 'node:http';
 import { stripTypeScriptTypes } from 'node:module';
 import type { AddressInfo } from 'node:net';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { PeerLink } from '../../../src/net/peer-backend.js';
 import { createBackend, type BackendHandle, type BackendKind } from './backends.js';
@@ -37,6 +38,8 @@ export interface InteropServerOptions {
   idleTimeoutMs?: number;
   /** Log signaling/peer events. */
   verbose?: boolean;
+  /** Directory of client.js/wire.ts (default: next to this module; needed when bundled). */
+  assetsDir?: string;
 }
 
 export interface CloseInfo {
@@ -198,6 +201,7 @@ export class InteropServer {
       answerWaitMs: o.answerWaitMs ?? 500,
       idleTimeoutMs: o.idleTimeoutMs ?? 30_000,
       verbose: o.verbose ?? false,
+      assetsDir: o.assetsDir ?? fileURLToPath(HARNESS_DIR),
     };
   }
 
@@ -213,8 +217,11 @@ export class InteropServer {
 
   private async init(): Promise<void> {
     this.handle = await createBackend(this.opts.backend, { address: this.opts.address, idleTimeoutMs: this.opts.idleTimeoutMs });
-    const wire = stripTypeScriptTypes(readFileSync(new URL('wire.ts', HARNESS_DIR), 'utf8'));
-    const client = readFileSync(new URL('client.js', HARNESS_DIR), 'utf8');
+    const dir = pathToFileURL(this.opts.assetsDir.endsWith('/') ? this.opts.assetsDir : this.opts.assetsDir + '/');
+    // a pre-stripped wire.js (benchmarks) avoids loading Node's TypeScript stripper here
+    const wireJs = new URL('wire.js', dir);
+    const wire = existsSync(wireJs) ? readFileSync(wireJs, 'utf8') : stripTypeScriptTypes(readFileSync(new URL('wire.ts', dir), 'utf8'));
+    const client = readFileSync(new URL('client.js', dir), 'utf8');
     this.http = http.createServer((req, res) => {
       const path = (req.url ?? '/').split('?')[0];
       const js = (body: string) => {
@@ -228,7 +235,7 @@ export class InteropServer {
       else if (path === '/wire.js') js(wire);
       else if (path === '/selftest.html' || path === '/selftest.js') {
         try {
-          const f = readFileSync(new URL('..' + path, HARNESS_DIR), 'utf8');
+          const f = readFileSync(new URL('..' + path, dir), 'utf8');
           res.writeHead(200, { 'content-type': path.endsWith('.js') ? 'text/javascript' : 'text/html; charset=utf-8' });
           res.end(f);
         } catch {

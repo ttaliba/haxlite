@@ -1,6 +1,9 @@
 // WebRTC server process under test for bench/rtc/run.ts (forked; IPC).
 //
-//   node --experimental-transform-types --import ./bench/ts-resolve.mjs bench/rtc/server-proc.ts <ndc|rtc> <address>
+//   node <bundle>/server-proc.mjs <ndc|rtc> <address> <harness assets dir>
+//
+// run.ts bundles this file with rolldown first (plain JS in the measured
+// process: no TypeScript loader in its memory/CPU), runtime deps external.
 //
 // Runs the interop harness server in `bench` app mode: HaxBall-like host
 // traffic (pong on uu, input → event broadcast to everyone on ru, 50 ms
@@ -11,13 +14,13 @@
 import { InteropServer } from '../../test/rtc-interop/harness/server.js';
 import type { BackendKind } from '../../test/rtc-interop/harness/backends.js';
 
-const [kind, address] = process.argv.slice(2) as [BackendKind, string];
+const [kind, address, assetsDir] = process.argv.slice(2) as [BackendKind, string, string | undefined];
 const send = (m: unknown) => process.send?.(m);
 process.on('uncaughtException', (e) => send({ type: 'error', message: String((e as Error)?.stack ?? e) }));
 process.on('unhandledRejection', (e) => send({ type: 'error', message: String((e as Error)?.stack ?? e) }));
 process.on('disconnect', () => process.exit(0));
 
-const srv = await InteropServer.start({ backend: kind, address: address ?? '127.0.0.1', app: 'bench' });
+const srv = await InteropServer.start({ backend: kind, address: address ?? '127.0.0.1', app: 'bench', ...(assetsDir ? { assetsDir } : null) });
 process.on('message', (m: { cmd: string }) => {
   if (m.cmd === 'mem') {
     send({ type: 'mem', ...process.memoryUsage(), peers: srv.openPeers().length, errors: srv.errors.length, backend: srv.handle.stats() });

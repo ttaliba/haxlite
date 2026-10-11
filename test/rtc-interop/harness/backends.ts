@@ -6,13 +6,13 @@
  *  * `ndc`: {@link LocalPeerBackend} (node-datachannel / libdatachannel), the
  *    reference implementation used by haxlite today.
  *  * `rtc`: haxlite-rtc `RtcEndpoint` (src/rtc), through {@link RtcPeerBackend}
- *    below (an adapter written against the src/rtc/README.md contract; the
+ *    below (an adapter over the src/rtc/README.md contract; the
  *    real `peerBackend: 'rtc'` wiring will live in src/net).
  */
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { LocalPeerBackend, type PeerBackend, type PeerLink, type PeerLinkEvents } from '../../../src/net/peer-backend.js';
-import { shutdownWebRtc } from '../../../src/net/webrtc.js';
+import type { PeerBackend, PeerLink, PeerLinkEvents } from '../../../src/net/peer-backend.js';
+import type { RtcEndpoint, RtcSession } from '../../../src/rtc/index.js';
 
 export type BackendKind = 'ndc' | 'rtc';
 
@@ -43,8 +43,14 @@ export function rtcAvailable(): boolean {
   return existsSync(fileURLToPath(RTC_INDEX)) && existsSync(fileURLToPath(SCTP_INDEX));
 }
 
+/**
+ * Each backend is imported lazily so a process only loads the stack it
+ * measures (the benchmark compares their memory/threads).
+ */
 export async function createBackend(kind: BackendKind, o: BackendOptions): Promise<BackendHandle> {
   if (kind === 'ndc') {
+    const { LocalPeerBackend } = await import('../../../src/net/peer-backend.js');
+    const { shutdownWebRtc } = await import('../../../src/net/webrtc.js');
     const backend = new LocalPeerBackend({ rtc: { iceServers: [], bindAddress: o.address, maxMessageSize: 262144 } });
     return {
       kind,
@@ -55,7 +61,7 @@ export async function createBackend(kind: BackendKind, o: BackendOptions): Promi
       stats: () => null,
     };
   }
-  const mod = (await import(RTC_INDEX.href)) as RtcModule;
+  const mod = await import('../../../src/rtc/index.js');
   const ep = await mod.RtcEndpoint.listen({
     port: o.port ?? 0,
     address: o.address,
@@ -73,29 +79,6 @@ export async function createBackend(kind: BackendKind, o: BackendOptions): Promi
 
 // ---------------------------------------------------------------- haxlite-rtc adapter
 
-/** Structural view of src/rtc (README contract); avoids a static import while it is being built. */
-interface RtcModule {
-  RtcEndpoint: { listen(o: Record<string, unknown>): Promise<RtcEndpointLike> };
-}
-interface RtcEndpointLike {
-  createSession(offerSdp: string): RtcSessionLike;
-  close(): Promise<void>;
-  stats(): unknown;
-}
-interface RtcSessionLike {
-  readonly answerSdp: string;
-  readonly localCandidates: string[];
-  readonly mid: string;
-  addRemoteCandidate(candidate: string): void;
-  onOpen?: () => void;
-  onClose?: (reason: string) => void;
-  onMessage?: (channelId: number, data: Uint8Array) => void;
-  send(channelId: number, data: Uint8Array): boolean;
-  readonly remoteAddress: { address: string; port: number } | null;
-  readonly state: string;
-  close(): void;
-}
-
 /** `PeerBackend` over one haxlite-rtc `RtcEndpoint` (all peers on one UDP port). */
 export class RtcPeerBackend implements PeerBackend {
   readonly kind = 'rtc';
@@ -104,7 +87,7 @@ export class RtcPeerBackend implements PeerBackend {
   /** Close reason of each session, by peer id (diagnostics for the tests). */
   readonly closeReasons = new Map<number, string>();
 
-  constructor(private readonly ep: RtcEndpointLike) {}
+  constructor(private readonly ep: RtcEndpoint) {}
 
   start(h: { onReady(): void }): void {
     h.onReady();
@@ -112,7 +95,7 @@ export class RtcPeerBackend implements PeerBackend {
   stop(): void {}
 
   createPeer(id: number, offerSdp: string, ev: PeerLinkEvents): PeerLink {
-    const s = this.ep.createSession(offerSdp);
+    const s: RtcSession = this.ep.createSession(offerSdp);
     let events: PeerLinkEvents | null = ev;
     const reasons = this.closeReasons;
     s.onOpen = () => {

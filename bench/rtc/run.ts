@@ -4,8 +4,8 @@
 //     --import ./bench/ts-resolve.mjs bench/rtc/run.ts [--backends ndc,rtc] [--peers 1,10,30] \
 //     [--seconds 30] [--warmup 5] [--input-hz 8] [--per-page 10] [--out bench/results/rtc.json]
 //
-// For each backend × peer count: forks bench/rtc/server-proc.ts (the measured
-// process), connects N PeerConnections from headless Chromium (10 per page by
+// For each backend × peer count: forks bench/rtc/server-proc.ts, bundled to
+// plain JS with rolldown (the measured process; it loads only its backend), connects N PeerConnections from headless Chromium (10 per page by
 // default, each one a transcription of the official client, see
 // test/rtc-interop/harness/client.js) and runs HaxBall-like traffic (docs/04):
 //   client: input on ro at --input-hz (Poisson; the official client sends an
@@ -17,10 +17,12 @@
 // p50/p99 in the browser: ping RTT (uu), input→own-event RTT (ro → ru) and
 // heartbeat one-way delay (same clock on both ends).
 import { fork, type ChildProcess } from 'node:child_process';
-import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { stripTypeScriptTypes } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Browser } from 'playwright-core';
+import { build } from 'rolldown';
 import { rtcAvailable, type BackendKind } from '../../test/rtc-interop/harness/backends.js';
 import { chromiumVersion, launchChromium, openHarnessPage } from '../../test/rtc-interop/harness/browser.js';
 import { summarize } from '../../test/rtc-interop/harness/wire.js';
@@ -70,10 +72,35 @@ interface Server {
   errors: string[];
 }
 
+/** Bundles server-proc.ts (+ harness + src/net or src/rtc chunks) into plain ESM, runtime deps external. */
+async function bundleServer(): Promise<string> {
+  const out = path.join(ROOT, 'node_modules/.cache/haxlite-bench-rtc');
+  rmSync(out, { recursive: true, force: true });
+  const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as { dependencies?: Record<string, string> };
+  const deps = Object.keys(pkg.dependencies ?? {});
+  await build({
+    input: { 'server-proc': path.join(ROOT, 'bench/rtc/server-proc.ts') },
+    platform: 'node',
+    resolve: { extensionAlias: { '.js': ['.ts', '.js'] } },
+    external: (id) => id.startsWith('node:') || deps.some((d) => id === d || id.startsWith(`${d}/`)),
+    logLevel: 'warn',
+    output: { dir: out, format: 'esm', entryFileNames: '[name].mjs', chunkFileNames: 'chunk-[hash].mjs' },
+  });
+  // page assets: client.js as is, wire.ts pre-stripped (the server then never loads the TS stripper)
+  const assets = path.join(out, 'assets');
+  mkdirSync(assets, { recursive: true });
+  const harness = path.join(ROOT, 'test/rtc-interop/harness');
+  copyFileSync(path.join(harness, 'client.js'), path.join(assets, 'client.js'));
+  writeFileSync(path.join(assets, 'wire.js'), stripTypeScriptTypes(readFileSync(path.join(harness, 'wire.ts'), 'utf8')));
+  return path.join(out, 'server-proc.mjs');
+}
+const SERVER_BUNDLE = await bundleServer();
+const ASSETS = path.join(path.dirname(SERVER_BUNDLE), 'assets');
+
 async function startServer(kind: BackendKind): Promise<Server> {
-  const child = fork(path.join(ROOT, 'bench/rtc/server-proc.ts'), [kind, ADDRESS], {
+  const child = fork(SERVER_BUNDLE, [kind, ADDRESS, ASSETS], {
     cwd: ROOT,
-    execArgv: ['--experimental-transform-types', '--no-warnings', '--expose-gc', '--import', './bench/ts-resolve.mjs'],
+    execArgv: ['--no-warnings', '--expose-gc'],
     stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
   });
   const errors: string[] = [];
