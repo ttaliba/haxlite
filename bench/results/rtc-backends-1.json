@@ -1,0 +1,294 @@
+{
+ "chromium": "141.0.7390.37",
+ "seconds": 30,
+ "inputHz": 8,
+ "perPage": 10,
+ "date": "2026-10-11T01:09:32.489Z",
+ "results": [
+  {
+   "backend": "ndc",
+   "peers": 1,
+   "connected": 1,
+   "closedDuringRun": 0,
+   "cpuPct": 1.6,
+   "threadsIdle": 11,
+   "threads": 19,
+   "rssIdleMb": 74.4,
+   "rssMb": 78.2,
+   "rssMaxMb": 80.4,
+   "heapUsedMb": 8.5,
+   "fdsIdle": 23,
+   "fds": 28,
+   "latency": {
+    "ping": {
+     "n": 29,
+     "p50": 1.400146484375,
+     "p90": 1.800048828125,
+     "p99": 2.2001953125,
+     "max": 2.2001953125
+    },
+    "input": {
+     "n": 235,
+     "p50": 1.400146484375,
+     "p90": 1.7001953125,
+     "p99": 3.10009765625,
+     "max": 7.39990234375
+    },
+    "oneWay": {
+     "n": 202,
+     "p50": 0.763916015625,
+     "p90": 0.968994140625,
+     "p99": 3.73828125,
+     "max": 4.399658203125
+    }
+   },
+   "serverErrors": 0,
+   "backendStats": null
+  },
+  {
+   "backend": "rtc",
+   "peers": 1,
+   "connected": 1,
+   "closedDuringRun": 0,
+   "cpuPct": 1.5,
+   "threadsIdle": 7,
+   "threads": 7,
+   "rssIdleMb": 71.5,
+   "rssMb": 72.1,
+   "rssMaxMb": 74.3,
+   "heapUsedMb": 9.9,
+   "fdsIdle": 24,
+   "fds": 24,
+   "latency": {
+    "ping": {
+     "n": 29,
+     "p50": 1.39990234375,
+     "p90": 1.699951171875,
+     "p99": 2.10009765625,
+     "max": 2.10009765625
+    },
+    "input": {
+     "n": 241,
+     "p50": 1.39990234375,
+     "p90": 1.7001953125,
+     "p99": 5.10009765625,
+     "max": 6.199951171875
+    },
+    "oneWay": {
+     "n": 200,
+     "p50": 1.0419921875,
+     "p90": 1.311279296875,
+     "p99": 2.165283203125,
+     "max": 2.822265625
+    }
+   },
+   "serverErrors": 0,
+   "backendStats": {
+    "packetsIn": 517,
+    "packetsOut": 564,
+    "bytesIn": 43910,
+    "bytesOut": 56478,
+    "stunAuthenticated": 17,
+    "stunRejected": 0,
+    "dtlsUnknownSource": 0,
+    "unknownPackets": 0,
+    "handshakesCompleted": 1,
+    "handshakesFailed": 0,
+    "dtlsReplayed": 0,
+    "dtlsBadRecords": 0,
+    "sessions": 1,
+    "open": 1
+   }
+  },
+  {
+   "backend": "ndc",
+   "peers": 10,
+   "connected": 10,
+   "closedDuringRun": 0,
+   "cpuPct": 9.8,
+   "threadsIdle": 11,
+   "threads": 19,
+   "rssIdleMb": 73.8,
+   "rssMb": 81.9,
+   "rssMaxMb": 83.7,
+   "heapUsedMb": 9.2,
+   "fdsIdle": 23,
+   "fds": 37,
+   "latency": {
+    "ping": {
+     "n": 291,
+     "p50": 1.199951171875,
+     "p90": 1.699951171875,
+     "p99": 5,
+     "max": 5.7998046875
+    },
+    "input": {
+     "n": 2409,
+     "p50": 1.300048828125,
+     "p90": 2,
+     "p99": 5.60009765625,
+     "max": 234.800048828125
+    },
+    "oneWay": {
+     "n": 2015,
+     "p50": 0.7041015625,
+     "p90": 1.11474609375,
+     "p99": 3.24462890625,
+     "max": 92.28076171875
+    }
+   },
+   "serverErrors": 0,
+   "backendStats": null
+  },
+  {
+   "backend": "rtc",
+   "peers": 10,
+   "connected": 10,
+   "closedDuringRun": 0,
+   "cpuPct": 7,
+   "threadsIdle": 7,
+   "threads": 7,
+   "rssIdleMb": 70.3,
+   "rssMb": 79.9,
+   "rssMaxMb": 80.6,
+   "heapUsedMb": 11.5,
+   "fdsIdle": 24,
+   "fds": 24,
+   "latency": {
+    "ping": {
+     "n": 291,
+     "p50": 1.099853515625,
+     "p90": 1.599853515625,
+     "p99": 2.5,
+     "max": 2.699951171875
+    },
+    "input": {
+     "n": 2460,
+     "p50": 1.5,
+     "p90": 2.10009765625,
+     "p99": 4,
+     "max": 9.5
+    },
+    "oneWay": {
+     "n": 2010,
+     "p50": 0.93359375,
+     "p90": 1.2919921875,
+     "p99": 2.895751953125,
+     "max": 4
+    }
+   },
+   "serverErrors": 0,
+   "backendStats": {
+    "packetsIn": 18538,
+    "packetsOut": 31694,
+    "bytesIn": 1310926,
+    "bytesOut": 3093924,
+    "stunAuthenticated": 170,
+    "stunRejected": 0,
+    "dtlsUnknownSource": 0,
+    "unknownPackets": 0,
+    "handshakesCompleted": 10,
+    "handshakesFailed": 0,
+    "dtlsReplayed": 0,
+    "dtlsBadRecords": 0,
+    "sessions": 10,
+    "open": 10
+   }
+  },
+  {
+   "backend": "ndc",
+   "peers": 30,
+   "connected": 30,
+   "closedDuringRun": 0,
+   "cpuPct": 48.7,
+   "threadsIdle": 11,
+   "threads": 19,
+   "rssIdleMb": 79,
+   "rssMb": 90.9,
+   "rssMaxMb": 94,
+   "heapUsedMb": 9.5,
+   "fdsIdle": 23,
+   "fds": 57,
+   "latency": {
+    "ping": {
+     "n": 870,
+     "p50": 1.599853515625,
+     "p90": 4.2001953125,
+     "p99": 10.199951171875,
+     "max": 14.699951171875
+    },
+    "input": {
+     "n": 7263,
+     "p50": 2.400146484375,
+     "p90": 5.199951171875,
+     "p99": 11.699951171875,
+     "max": 41.7001953125
+    },
+    "oneWay": {
+     "n": 6030,
+     "p50": 1.481201171875,
+     "p90": 2.940185546875,
+     "p99": 6.027099609375,
+     "max": 12.096923828125
+    }
+   },
+   "serverErrors": 0,
+   "backendStats": null
+  },
+  {
+   "backend": "rtc",
+   "peers": 30,
+   "connected": 30,
+   "closedDuringRun": 0,
+   "cpuPct": 25,
+   "threadsIdle": 7,
+   "threads": 7,
+   "rssIdleMb": 71.6,
+   "rssMb": 82.8,
+   "rssMaxMb": 82.9,
+   "heapUsedMb": 13.9,
+   "fdsIdle": 24,
+   "fds": 25,
+   "latency": {
+    "ping": {
+     "n": 872,
+     "p50": 1,
+     "p90": 2.800048828125,
+     "p99": 7.400146484375,
+     "max": 13.699951171875
+    },
+    "input": {
+     "n": 7135,
+     "p50": 2.300048828125,
+     "p90": 4.199951171875,
+     "p99": 8.2998046875,
+     "max": 21.900146484375
+    },
+    "oneWay": {
+     "n": 6070,
+     "p50": 1.4306640625,
+     "p90": 2.6943359375,
+     "p99": 4.943603515625,
+     "max": 7.172119140625
+    }
+   },
+   "serverErrors": 0,
+   "backendStats": {
+    "packetsIn": 137415,
+    "packetsOut": 257635,
+    "bytesIn": 9234745,
+    "bytesOut": 25043432,
+    "stunAuthenticated": 510,
+    "stunRejected": 0,
+    "dtlsUnknownSource": 0,
+    "unknownPackets": 0,
+    "handshakesCompleted": 30,
+    "handshakesFailed": 0,
+    "dtlsReplayed": 0,
+    "dtlsBadRecords": 0,
+    "sessions": 30,
+    "open": 30
+   }
+  }
+ ]
+}

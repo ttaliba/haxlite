@@ -621,7 +621,8 @@ expone). Con 20 jugadores el host tenía 48 fds; con mux, 27.
   así que con un único canal `ro` en el túnel una pérdida frenaba los inputs de todos los
   jugadores hasta la retransmisión. La mitad del exceso de RTT medio desaparece; el p99 restante
   lo dominan las pérdidas de los propios paquetes de la sonda (inevitables, igual que en directo).
-  Sin pérdida no cambia ni la latencia ni la CPU (2 × 4 corridas: edge 19,2 % ↔ 19,2 %).
+  Sin pérdida no cuesta nada: 9 jugadores, 3 × 20 s intercaladas, CPU host / edge (%) base
+  4,86 / 10,06, final 4,72 / 9,68, final sin carriles 4,64 / 9,83; RTT `ro` p50 1,58 / 1,44 / 1,53 ms.
 * Idle release: la teardown es la misma de `shutdownWebRtc()` (espera a que todas las
   PeerConnection confirmen el cierre y mantiene referenciados los DataChannel huérfanos). Llamada
   **justo** después de cerrar, `cleanup()` de libdatachannel se bloqueó 1 vez en ~10 corridas de

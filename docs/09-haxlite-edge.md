@@ -422,3 +422,25 @@ Lectura:
 * **CPU del host:** baja, porque el host ya no hace DTLS/SCTP por jugador (una sola conexión con
   el edge) y las difusiones salen una vez (multicast). El costo se traslada al edge, que es
   donde están los recursos.
+
+### 7.1 Pasada de ligereza (red) y pérdida en el túnel
+
+Detalle y comandos en [07 «Pasada de ligereza — red»](07-benchmarks.md#pasada-de-ligereza--red-srcnet-srcedge).
+
+* **Pérdida en el tramo host↔edge** (`--loss`, regla nftables solo sobre el UDP 127.0.0.2↔127.0.0.3;
+  17 jugadores, 2 × 40 s por configuración):
+
+  | pérdida | RTT `ro` media (ms): 1 canal `ro` → carriles | RTT `ro` p99 (ms) | RTT `uu` media (ms) |
+  |---|---|---|---|
+  | 2 % | 2,79 · 2,31 → **2,09 · 2,02** | 37,3 · 36,9 → 26,8 · 24,7 | 1,73 · 1,53 → 1,65 · 1,60 |
+  | 5 % | 4,94 · 4,80 → **3,24 · 3,34** | 40,9 · 53,2 → 46,4 · 43,0 | 1,82 · 1,77 → 1,60 · 1,52 |
+
+  El exceso medio de `ro` sobre `uu` baja a la mitad; el p99 lo siguen dominando las pérdidas de
+  los propios paquetes de la sonda.
+* **Sin pérdida** (9 jugadores, 3 × 20 s intercaladas, mediana): CPU host 4,86 → 4,72 %, CPU edge
+  10,06 → 9,68 % (1,12 → 1,08 %/jugador, dentro del ruido), RTT `ro` p50 1,58 → 1,44 ms. Los
+  carriles no cuestan CPU (sin carriles: 4,64 / 9,83 %).
+* **`enableIceUdpMux` en el edge**: 17 jugadores, 3 × 30 s: CPU edge 17,0 → 18,1 % y RTT +0,1–0,2 ms;
+  queda desactivado por defecto (en el host directo sí ahorra, ver docs/07).
+* En vacío el edge no despierta: keep-alive y barrido solo con sesiones/negociaciones, y los hilos
+  nativos se liberan 15 s después de la última PeerConnection.

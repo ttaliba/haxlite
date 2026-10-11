@@ -28,21 +28,22 @@ const T = new Int32Array(8 * 256);
  * `0xffffffff` (as int: `-1`) and finish with {@link crc32cFinish}.
  */
 export function crc32cUpdate(crc: number, buf: Uint8Array, start: number, end: number): number {
-  let i = start;
+  let i = start | 0;
   let c = crc | 0;
-  const end8 = end - 8;
+  const end8 = (end - 8) | 0;
+  // int32-only arithmetic (| / >> with masks) keeps V8 on its fast path.
   while (i <= end8) {
     const lo = c ^ (buf[i] | (buf[i + 1] << 8) | (buf[i + 2] << 16) | (buf[i + 3] << 24));
     c =
-      T[1792 + (lo & 0xff)] ^
-      T[1536 + ((lo >>> 8) & 0xff)] ^
-      T[1280 + ((lo >>> 16) & 0xff)] ^
-      T[1024 + (lo >>> 24)] ^
-      T[768 + buf[i + 4]] ^
-      T[512 + buf[i + 5]] ^
-      T[256 + buf[i + 6]] ^
+      T[1792 | (lo & 0xff)] ^
+      T[1536 | ((lo >> 8) & 0xff)] ^
+      T[1280 | ((lo >> 16) & 0xff)] ^
+      T[1024 | ((lo >> 24) & 0xff)] ^
+      T[768 | buf[i + 4]] ^
+      T[512 | buf[i + 5]] ^
+      T[256 | buf[i + 6]] ^
       T[buf[i + 7]];
-    i += 8;
+    i = (i + 8) | 0;
   }
   while (i < end) c = T[(c ^ buf[i++]) & 0xff] ^ (c >>> 8);
   return c;

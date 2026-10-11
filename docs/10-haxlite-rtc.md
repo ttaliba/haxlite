@@ -209,7 +209,67 @@ channels (no se piden cámara ni micrófono).
 
 ## 6. Benchmarks (`bench/rtc/`)
 
-BENCH_PLACEHOLDER
+Peers reales: Chromium 141 headless (10 PeerConnections por página, cada una con el cliente de
+§4.1) contra el servidor del banco en modo `bench`, en un proceso aparte que es el que se mide.
+Ese proceso se empaqueta antes con rolldown a JS plano (sin cargador de TypeScript) y solo carga
+el backend que se mide.
+
+Tráfico tipo HaxBall (doc 04): cada cliente manda un *input* por `ro` a 8 Hz de media (Poisson:
+el cliente oficial solo lo manda cuando cambia) y un ping por `uu` cada 1 s; el servidor
+reenvía cada input a **todos** los peers por `ru` (como `jd` del host oficial), contesta los
+pings por `uu` y manda un *heartbeat* por `uu` a cada peer cada ≥ 7 frames (≈ 117 ms) desde un
+tick de 50 ms. Mensajes de 13–31 B. Con N peers el servidor envía ≈ 8·N² + 9,6·N mensajes/s
+(N = 30: ≈ 7 500/s) y recibe ≈ 9·N/s.
+
+Métricas del proceso servidor: CPU = (utime + stime de todos los hilos) / tiempo de pared, en %
+de **un** núcleo; hilos = `/proc/<pid>/task`; RSS (media de la ventana); heap V8 usado; fds
+abiertos (`/proc/<pid>/fd`). Latencias medidas en el navegador: RTT del ping (`uu`), RTT
+input → su propio evento (`ro` → `ru`, la latencia que siente un jugador) y retardo en un
+sentido de los heartbeats (mismo reloj de pared en ambos extremos). Ventana de 30 s tras 5 s
+de calentamiento; dos repeticiones (`bench/results/rtc-backends-1.json`, `-2.json`); se dan
+ambas cuando difieren. VM de 4 vCPU compartida con Chromium (que corre en las mismas CPUs).
+
+| backend | peers | CPU % | hilos (reposo → carga) | RSS MB (reposo → carga) | heap MB | fds (reposo → carga) |
+|---|---:|---:|---:|---:|---:|---:|
+| node-datachannel | 1 | 1,6 / 1,3 | 11 → 19 | 74 → 78 | 8,5 | 23 → 28 |
+| **haxlite-rtc** | 1 | 1,5 / 1,5 | **7 → 7** | 72 → 72 | 9,9 | **24 → 24** |
+| node-datachannel | 10 | 9,8 / 9,9 | 11 → 19 | 74 → 82 | 9,2 | 23 → 37 |
+| **haxlite-rtc** | 10 | **7,0 / 7,1** | **7 → 7** | 70 → 80 | 11,5 | **24 → 24** |
+| node-datachannel | 30 | 48,7 / 47,5 | 11 → 19 | 79 → 91 | 9,5–10 | 23 → 57 |
+| **haxlite-rtc** | 30 | **25,0 / 26,1** | **7 → 7** | 72 → 83 | 13,9–15,1 | **24 → 25** |
+
+| backend | peers | ping RTT p50 / p99 ms | input → evento p50 / p99 ms | heartbeat 1 vía p50 / p99 ms |
+|---|---:|---:|---:|---:|
+| node-datachannel | 1 | 1,2–1,4 / 2,2 | 1,2–1,4 / 3,1–4,7 | 0,8 / 3,0–3,7 |
+| haxlite-rtc | 1 | 1,4 / 1,9–2,1 | 1,4–1,5 / 2,4–5,1 | 1,0–1,2 / 2,2–2,8 |
+| node-datachannel | 10 | 1,2 / 3,9–5,0 | 1,3–1,4 / 5,2–5,6 | 0,7–0,8 / 3,2–4,2 |
+| haxlite-rtc | 10 | 1,1 / 2,5–3,8 | 1,5–1,6 / 3,8–4,0 | 0,8–0,9 / 2,3–2,9 |
+| node-datachannel | 30 | 1,5–1,6 / 10,1–10,2 | 2,2–2,4 / 11,7–13,6 | 1,4–1,5 / 5,5–6,0 |
+| haxlite-rtc | 30 | 1,0–1,1 / 7,4–13,1 | 2,3–2,5 / 8,3–14,0 | 1,4–1,6 / 4,9–8,2 |
+
+Lectura:
+
+- **CPU**: con 30 peers y ≈ 7 500 mensajes/s de salida, haxlite-rtc gasta **la mitad** que
+  node-datachannel (25–26 % frente a 47–49 % de un núcleo); con 10 peers, un 28 % menos; con 1
+  peer, igual (lo domina el resto del proceso).
+- **Hilos y fds**: haxlite-rtc no crea ninguno: 7 hilos (los de Node) y los mismos fds con 0 o
+  30 peers (un socket UDP compartido). node-datachannel pasa a 19 hilos con el primer peer y abre
+  ~1 fd por peer (un socket UDP por PeerConnection).
+- **Memoria**: RSS parecido; el heap de V8 es algo mayor con haxlite-rtc (+5 MB con 30 peers)
+  porque el estado DTLS/SCTP vive en JS, mientras que el de libdatachannel está fuera del heap
+  (dentro del RSS).
+- **Latencia**: equivalente; las medianas están en 1–2,5 ms en ambos. Los p99 con 30 peers
+  (5–14 ms) varían entre repeticiones y los dominan el planificador y Chromium compitiendo por
+  las mismas 4 CPU, no el backend.
+
+Reproducir (siempre con el cerrojo compartido de benchmarks de la VM):
+
+```sh
+flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings \
+  --import ./bench/ts-resolve.mjs bench/rtc/run.ts \
+  [--backends ndc,rtc] [--peers 1,10,30] [--seconds 30] [--warmup 5] [--input-hz 8] \
+  [--per-page 10] [--out bench/results/rtc-backends.json]
+```
 
 ## 7. Limitaciones
 
