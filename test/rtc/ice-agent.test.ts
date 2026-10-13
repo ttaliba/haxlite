@@ -8,6 +8,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import dgram, { type Socket } from 'node:dgram';
+import type { UdpIo } from '../../src/rtc/udp.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { RtcEndpoint, rawDataLayer, type RtcSession } from '../../src/rtc/index.js';
 import { formatFingerprint } from '../../src/rtc/sdp.js';
@@ -175,7 +176,7 @@ describe('gathering helpers', () => {
     const sock = await udp();
     try {
       const g = new Gatherer(
-        { sockets: [{ sock, family: 4, bindAddress: '127.0.0.1' }], send: () => {}, now: () => Date.now(), register: () => {}, unregister: () => {} },
+        { sockets: [{ sock: sock as unknown as UdpIo /* identity only */, family: 4, bindAddress: '127.0.0.1' }], send: () => {}, now: () => Date.now(), register: () => {}, unregister: () => {} },
         { port: sock.address().port, stunServers: [{ host: 'stun.invalid', port: 3478 }], policy: 'all', timeoutMs: 200, lookup: () => new Promise(() => {}) },
       );
       const t0 = Date.now();

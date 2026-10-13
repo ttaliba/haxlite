@@ -24,7 +24,7 @@
  */
 import { lookup } from 'node:dns';
 import { randomBytes } from 'node:crypto';
-import type { Socket } from 'node:dgram';
+import type { UdpIo } from './udp.js';
 import { isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { STUN_HEADER, StunAttr, StunType, findAttr, readXorAddress, type StunMessage } from './stun.js';
@@ -223,7 +223,7 @@ export function hasGlobalIpv6(): boolean {
 // ---------------------------------------------------------------- STUN transactions
 
 /** Response to a STUN request we sent (the endpoint routes Binding responses by transaction id). */
-export type TxnHandler = (m: StunMessage, sock: Socket, address: string, port: number) => void;
+export type TxnHandler = (m: StunMessage, sock: UdpIo, address: string, port: number) => void;
 
 export interface TxnTable {
   register(txid: string, h: TxnHandler): void;
@@ -273,9 +273,9 @@ export function mappedAddress(m: StunMessage): { address: string; port: number }
 
 export interface GathererHost extends TxnTable {
   /** Bound sockets with their family and bind address. */
-  readonly sockets: readonly { sock: Socket; family: 4 | 6; bindAddress: string }[];
+  readonly sockets: readonly { sock: UdpIo; family: 4 | 6; bindAddress: string }[];
   /** Sends a datagram (IP literal destination). */
-  send(sock: Socket, buf: Buffer, address: string, port: number): void;
+  send(sock: UdpIo, buf: Buffer, address: string, port: number): void;
   now(): number;
 }
 
@@ -440,7 +440,7 @@ export class Gatherer {
   }
 
   /** One Binding request with retransmissions; `done(null)` on timeout. */
-  private query(sock: Socket, address: string, port: number, done: (r: { address: string; port: number } | null) => void): void {
+  private query(sock: UdpIo, address: string, port: number, done: (r: { address: string; port: number } | null) => void): void {
     const req = bareBindingRequest();
     const key = txidKey(req);
     let over = false;

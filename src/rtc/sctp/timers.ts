@@ -73,11 +73,12 @@ class SharedTimers {
       this.down(i);
       this.up(last.index);
     }
-    if (this.n === 0 && this.timer !== null && !this.running) {
-      clearTimeout(this.timer);
-      this.timer = null;
-      this.armedAt = Infinity;
-    }
+    // An emptied heap keeps its armed Node timer: in a game every SACK that
+    // acks everything clears T3 and the next send queues it again, so
+    // clearing here would build a new Timeout (~150 B + async-hooks ids) per
+    // empty → non-empty transition (~100/s with 20 peers). The stale timer
+    // (unref'd) fires once at most, finds nothing due and is not re-armed;
+    // a deadline queued meanwhile at or after it just rides on it.
   }
 
   /** Queued slots (tests/diagnostics). */

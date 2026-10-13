@@ -37,7 +37,7 @@
  *   retries it later. A peer that implements RFC 8445 converges; an ICE-lite
  *   peer (never a HaxBall client) cannot connect.
  */
-import type { Socket } from 'node:dgram';
+import type { UdpIo } from './udp.js';
 import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { classifyIp, policyAllows, candidatePriority, sameIp, txidKey, TYPE_PREF, type CandidatePolicy, type TxnHandler, type TxnTable, type AddressClass } from './gather.js';
@@ -58,14 +58,14 @@ const CONSENT_MIN_MS = 4000;
 const CONSENT_JITTER_MS = 2000;
 
 export interface BoundSocket {
-  sock: Socket;
+  sock: UdpIo;
   family: 4 | 6;
   bindAddress: string;
 }
 
 export interface IceSchedulerOptions {
   /** Sends one datagram to an IP literal (synchronous, counted by the endpoint). */
-  send(sock: Socket, buf: Buffer, address: string, port: number): void;
+  send(sock: UdpIo, buf: Buffer, address: string, port: number): void;
   now(): number;
   sockets: readonly BoundSocket[];
   /** Candidate policy of the endpoint (bounds the check destinations). */
@@ -125,7 +125,7 @@ export class IceScheduler implements TxnTable {
   }
 
   /** A Binding success/error response: routed to its transaction. False when none matches. */
-  onResponse(m: StunMessage, sock: Socket, address: string, port: number): boolean {
+  onResponse(m: StunMessage, sock: UdpIo, address: string, port: number): boolean {
     const h = this.txns.get(txidKey(m.buf));
     if (h === undefined) return false;
     h(m, sock, address, port);
@@ -138,7 +138,7 @@ export class IceScheduler implements TxnTable {
    * announce (loopback, LAN…) unless it is the class of our own addresses,
    * or unreachable from the bound address (loopback ⇄ non-loopback).
    */
-  socketFor(address: string): Socket | null {
+  socketFor(address: string): UdpIo | null {
     const fam = isIP(address);
     if (fam === 0) return null;
     const cls = classifyIp(address);
@@ -214,7 +214,7 @@ export interface IceAgentOwner {
   /** The remote ICE password (key of the MESSAGE-INTEGRITY of our checks and of their responses). */
   readonly remoteKey: Buffer;
   /** One of our checks on (sock, address, port) succeeded: the pair is valid (DTLS may flow there). */
-  onCheckSucceeded(sock: Socket, address: string, port: number): void;
+  onCheckSucceeded(sock: UdpIo, address: string, port: number): void;
   /** One of our consent checks on the selected pair was answered (RFC 7675). */
   onConsent(): void;
 }
@@ -225,7 +225,7 @@ const SUCCEEDED = 2;
 const FAILED = 3;
 
 interface Pair {
-  sock: Socket;
+  sock: UdpIo;
   address: string;
   port: number;
   remotePriority: number;
@@ -306,7 +306,7 @@ export class IceAgent {
    * answered by the session. Learns a peer-reflexive remote candidate and
    * queues a triggered check unless the pair already succeeded.
    */
-  onRequest(sock: Socket, address: string, port: number, priority: number): void {
+  onRequest(sock: UdpIo, address: string, port: number, priority: number): void {
     if (this.closed) return;
     let p = this.find(sock, address, port);
     if (p === null) {
@@ -416,7 +416,7 @@ export class IceAgent {
     this.s.unregister(tx.key);
   }
 
-  private onCheckResponse(p: Pair, tx: Transaction, m: StunMessage, sock: Socket, address: string, port: number): void {
+  private onCheckResponse(p: Pair, tx: Transaction, m: StunMessage, sock: UdpIo, address: string, port: number): void {
     if (this.closed || p.tx !== tx) return;
     // authenticate first: a forged response must not end the transaction
     if (!checkFingerprint(m) || !checkIntegrity(m, this.owner.remoteKey)) return;
@@ -451,7 +451,7 @@ export class IceAgent {
    * request on the selected pair every 5 s ± 20 %; an authenticated,
    * symmetric success refreshes consent (`owner.onConsent`).
    */
-  consentTick(now: number, sock: Socket | null, address: string, port: number): void {
+  consentTick(now: number, sock: UdpIo | null, address: string, port: number): void {
     if (this.closed || this.checking || sock === null || now < this.nextConsentAt) return;
     this.nextConsentAt = now + CONSENT_MIN_MS + Math.random() * CONSENT_JITTER_MS;
     if (this.consentKey !== null) this.s.unregister(this.consentKey); // unanswered: forget it
@@ -494,12 +494,12 @@ export class IceAgent {
     return this.pairs.map((p) => ({ address: p.address, port: p.port, state: names[p.state]!, sent: p.sent }));
   }
 
-  private find(sock: Socket, address: string, port: number): Pair | null {
+  private find(sock: UdpIo, address: string, port: number): Pair | null {
     for (const p of this.pairs) if (p.port === port && p.sock === sock && sameIp(p.address, address)) return p;
     return null;
   }
 
-  private insert(sock: Socket, address: string, port: number, remotePriority: number): Pair {
+  private insert(sock: UdpIo, address: string, port: number, remotePriority: number): Pair {
     const p: Pair = { sock, address, port, remotePriority, prio: pairPriority(remotePriority), state: WAITING, sent: 0, triggered: false, tx: null };
     let i = 0;
     while (i < this.pairs.length && this.pairs[i]!.prio >= p.prio) i++;

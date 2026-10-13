@@ -767,6 +767,74 @@ jugador (≈ 4 datagramas/s de ida y vuelta con 20 jugadores, frente a ≈ 4 100
 búsqueda en ≤ 16 pares por Binding recibido. (La máquina tenía carga ajena: «foreign» 3–45 %; las
 recolecciones de GC por minuto variaron 48–88 entre repeticiones sin patrón por variante.)
 
+### 6.6 Pasada E/S UDP (`node:dgram`)
+
+Perfil de asignaciones del host (N = 20, paquete minificado, incluye lo ya recolectado):
+**1,37 MB/s**, de los que `dgram.send` eran 0,69 (por datagrama: lista de búferes, cierre de la
+continuación del `lookup`, array de *rest args* de `defaultTriggerAsyncIdScope` y un `SendWrap`
+con tres propiedades, ~260 B × 2 600/s), la recepción 0,54 (0,44 creados en C++ por
+`UDPWrap::OnRecv` —`ArrayBuffer` + `Buffer` + objeto `rinfo` + la cadena de la dirección, ~290 B ×
+1 500/s— y 0,1 en el `onMessage` JS de dgram: `rinfo.size` y el `emit`) y ~0,15 el resto.
+
+Cambios:
+
+- **`src/rtc/udp.ts` (`UdpIo`)**: el endpoint habla con el `UDPWrap` del socket como lo hace
+  dgram, `handle.send(req, list, 1, port, ip, false)`, con **un** `SendWrap` y **una** lista
+  reutilizados. El éxito síncrono (`uv_udp_try_send`, devuelve longitud + 1) no retiene nada; solo
+  si libuv encola el envío (EAGAIN, devuelve 0) el lado C++ adopta `req` (que mantiene vivo el
+  búfer) y se crea un par nuevo (y el endpoint cambia su búfer de sellado, como antes). El
+  constructor de `SendWrap` no es público: se toma del `req` que dgram pasa al handle en el primer
+  envío. En recepción, `handle.onmessage` (lo que llama `OnRecv`) apunta directo al endpoint. Todo
+  con detección de forma: si los internos no son los esperados se usa `socket.send()` /
+  `'message'` como antes (`test/rtc/udp.test.ts` cubre ambos caminos y EAGAIN con un handle falso).
+- **Montículo de temporizadores SCTP**: vaciarse ya no cancela el `Timeout` de Node (cada SACK que
+  confirma todo vacía T3 y el siguiente envío lo vuelve a poner: ~100 `Timeout` nuevos por
+  segundo); el temporizador viejo dispara como mucho una vez y no se rearma.
+
+Resultado: **1,37 → 0,58 MB/s** de basura; el 75 % de lo que queda es lo que crea `OnRecv` en C++
+por cada datagrama recibido (no evitable desde JS), ~0,02 MB/s la lectura de reloj por paquete
+SCTP recibido (`performance.now()` devuelve un HeapNumber creado en C++) y el resto es del juego,
+de Node (temporizadores) y del propio arnés.
+
+Host completo, misma sesión, `flock`, intercalado, 3 × 30 s, mediana [mín–máx] («antes» = paquete
+de `4bdca83`; heap en MB decimales, `bench/net/run.ts` con la variante `bundle`):
+
+| escenario | métrica | `rtc` antes | **`rtc` después** | `ndc` |
+|---|---|---:|---:|---:|
+| N = 20 | CPU % | 7,55 [7,46–8,01] | **7,11** [7,09–7,16] | 15,26 [14,20–15,44] |
+| | GC/min | 50 [50–94] | 46 [42–46] | **12** [8–12] |
+| | GC ms/min | 29,6 [22,4–31,6] | 19,5 [15,0–26,0] | **4,2** [2,8–8,0] |
+| | heap MB | 11,83 | 11,31 | **9,81** |
+| | lag p99 ms | 1,12 [1,09–1,44] | 1,28 [1,05–1,40] | 1,08 [1,03–1,22] |
+| 10 salas × 4 | CPU % | 8,78 | 8,85 | 19,64 |
+| | GC/min · ms/min | 42 · 17,3 | 54 · 19,2 | **28 · 11,1** |
+| | heap MB | 13,01 | 12,53 | **10,98** |
+| | lag p99 ms | 1,08 | **1,00** | 1,02 |
+
+(La máquina estaba compartida: `ndc` dio 15 % de CPU frente a 11,9 en el benchmark rápido.) En
+una tanda anterior (solo `UdpIo`, sin el cambio de temporizadores) el mismo A/B dio GC 52 → 44/min, 26,0 → 14,1 ms/min, lag p99 1,06 / 1,10 /
+1,06 (antes / después / `ndc`).
+
+Lectura y límites:
+
+- **El número de GC apenas baja aunque la basura cae a menos de la mitad.** V8 encoge el espacio
+  joven a su mínimo (semiespacio de 1 MB, ~0,8 MB útiles por recolección) cuando la tasa de
+  asignación baja de 1 MB/s (`Heap::ShouldResizeNewSpace`, `kLowAllocationThroughput`) y lo deja
+  crecer por encima: con 1,37 MB/s el espacio joven estaba a veces agrandado (de ahí los 50 / 94
+  GC/min bimodales de antes), con 0,58 MB/s queda en el mínimo. Por debajo de 1 MB/s el número de
+  GC es ≈ tasa / 0,8 MB: el suelo de **~33 GC/min** lo pone `OnRecv` (0,44 MB/s a 1 500
+  datagramas/s, casi todos SACK de los clientes, que confirman cada 2 paquetes) y no se puede
+  bajar sin un addon nativo (o `--min-semi-space-size`, que es del proceso, no de la biblioteca).
+  `ndc` asigna ≈ 0,16 MB/s porque libdatachannel hace la red fuera del heap.
+- **Heap**: −0,5 MB (espacio joven más pequeño). Los ~1,5 MB que quedan sobre `ndc` son, según
+  instantáneas de heap al final de la ventana (12,1 frente a 10,3 MB), **código** (+1,15 MB:
+  código optimizado, *bytecode*, *feedback* de la pila DTLS/SCTP/ChaCha en JS) y los envoltorios
+  de los *typed arrays* por sesión (+0,1 MB); el estado nativo de `ndc` no cuenta en el heap.
+- **Lag p99**: empate dentro del ruido (rangos solapados, en ambas tandas). El perfil de CPU del
+  hilo JS con N = 20: el 42 % del tiempo ocupado es la llamada `sendmsg` (~7,5 µs por datagrama en
+  loopback, que incluye la entrega al receptor); un *input* reenviado a 20 peers son ~0,15 ms de
+  llamadas al sistema en el mismo turno. Lo demás (ChaCha, SCTP, juego) es < 2 % por función.
+
 ## 7. Limitaciones
 
 - **Sin TURN** (§2.1): con el host tras un NAT simétrico **y** el jugador también, no hay camino

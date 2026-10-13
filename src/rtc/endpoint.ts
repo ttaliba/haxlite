@@ -18,6 +18,14 @@ import { resolveSuites } from './dtls/crypto.js';
 import type { RtcSession, SctpFactory } from './types.js';
 import { Gatherer, classifyIp, hasGlobalIpv6, stunServers, type AddressClass, type CandidatePolicy, type IceServerInput } from './gather.js';
 import { IceScheduler, type BoundSocket, type IceStats } from './ice-agent.js';
+import { UdpIo } from './udp.js';
+
+/** A socket bound by {@link RtcEndpoint.listen}, before the endpoint wraps it. */
+interface RawBound {
+  sock: Socket;
+  family: 4 | 6;
+  bindAddress: string;
+}
 
 export interface RtcEndpointOptions {
   /** UDP port (default 0 = ephemeral). With two families both sockets use the same port. */
@@ -159,6 +167,7 @@ export class RtcEndpoint {
   /** Bound port. */
   readonly port: number;
   private readonly sockets: Socket[];
+  private readonly ios: UdpIo[];
   private readonly opts: RtcEndpointOptions;
   private readonly bound: BoundSocket[];
   private readonly gatherer: Gatherer;
@@ -197,11 +206,19 @@ export class RtcEndpoint {
     stunResponses: 0,
   };
 
-  private constructor(opts: RtcEndpointOptions, bound: BoundSocket[], port: number, certificate: RtcCertificate, dataLayer: SctpFactory) {
+  private constructor(opts: RtcEndpointOptions, raw: RawBound[], port: number, certificate: RtcCertificate, dataLayer: SctpFactory) {
     this.opts = opts;
+    this.sockets = raw.map((b) => b.sock);
+    const onError = (err: Error) => {
+      // ICMP errors etc.: never fatal for a shared UDP socket
+      console.error('[haxlite/rtc] socket error:', err.message);
+    };
+    this.ios = this.sockets.map((sock) => {
+      const io: UdpIo = new UdpIo(sock, (msg, rinfo) => this.onPacket(io, msg, rinfo), onError);
+      return io;
+    });
+    const bound: BoundSocket[] = raw.map((b, i) => ({ sock: this.ios[i]!, family: b.family, bindAddress: b.bindAddress }));
     this.bound = bound;
-    this.sockets = bound.map((b) => b.sock);
-    const sockets = this.sockets;
     this.port = port;
     this.certificate = certificate;
     this.idleTimeoutMs = opts.idleTimeoutMs ?? 30_000;
@@ -211,11 +228,12 @@ export class RtcEndpoint {
     const counters = this.counters;
     const policy: CandidatePolicy = opts.candidatePolicy ?? 'public';
     // STUN requests we originate (checks, consent, gathering): rare, outside the data path
-    const rawSend = (sock: Socket, buf: Buffer, address: string, port: number) => {
+    const rawSend = (sock: UdpIo, buf: Buffer, address: string, port: number) => {
       counters.packetsOut++;
       counters.bytesOut += buf.length;
+      if (this.closed) return;
       try {
-        sock.send(buf, port, address);
+        sock.send(buf, port, address); // never a shared scratch: a queued send may keep `buf`
       } catch {
         /* socket closed */
       }
@@ -246,22 +264,22 @@ export class RtcEndpoint {
       sendTo: (dest, buf, length = buf.length) => {
         counters.packetsOut++;
         counters.bytesOut += length;
-        const sock = dest.sock;
+        if (this.closed) return;
         const scratch = buf === this.sendScratch;
         let out = buf;
         if (length !== buf.length) {
           if (scratch && length <= VIEW_CACHE_MAX) out = this.sendViews[length] ??= buf.subarray(0, length);
           else out = buf.subarray(0, length);
         }
+        let sent: boolean;
         try {
-          // synchronous (literalLookup): dgram tries the send right away
-          sock.send(out, dest.port, dest.address);
+          sent = dest.sock.send(out, dest.port, dest.address);
         } catch {
           /* socket closed */
           return;
         }
         // EAGAIN: libuv queued the datagram and still references `buf`: never reuse it
-        if (scratch && sock.getSendQueueCount() !== 0) this.replaceScratch(buf.length);
+        if (scratch && !sent) this.replaceScratch(buf.length);
       },
       sendBuffer: (size) => {
         if (this.sendScratch.length < size) this.replaceScratch(Math.min(Math.max(size, 2 * this.sendScratch.length), DtlsServer.MAX_RECORD));
@@ -277,13 +295,6 @@ export class RtcEndpoint {
       ice: this.iceLite ? null : this.ice,
     };
     this.gatherer.start();
-    for (const sock of sockets) {
-      sock.on('message', (msg: Buffer, rinfo: RemoteInfo) => this.onPacket(sock, msg, rinfo));
-      sock.on('error', (err) => {
-        // ICMP errors etc.: never fatal for a shared UDP socket
-        console.error('[haxlite/rtc] socket error:', err.message);
-      });
-    }
   }
 
   /** Binds the socket(s). */
@@ -310,7 +321,7 @@ export class RtcEndpoint {
     }
     const bufSize = opts.socketBufferSize ?? 4 << 20;
     let port = opts.port ?? 0;
-    const bound: BoundSocket[] = [];
+    const bound: RawBound[] = [];
     const dataLayer = opts.dataLayer ?? defaultDataLayer;
     // the key pair is generated on the thread pool while the socket binds
     const certificatePromise: Promise<RtcCertificate> =
@@ -421,7 +432,7 @@ export class RtcEndpoint {
 
   // ------------------------------------------------------------ demux
 
-  private onPacket(sock: Socket, msg: Buffer, rinfo: RemoteInfo): void {
+  private onPacket(sock: UdpIo, msg: Buffer, rinfo: RemoteInfo): void {
     const c = this.counters;
     c.packetsIn++;
     c.bytesIn += msg.length;
@@ -444,7 +455,7 @@ export class RtcEndpoint {
     c.unknownPackets++;
   }
 
-  private onStun(sock: Socket, msg: Buffer, rinfo: RemoteInfo): void {
+  private onStun(sock: UdpIo, msg: Buffer, rinfo: RemoteInfo): void {
     const m = this.stunScratch;
     const c = this.counters;
     if (!parseStun(msg, m)) {
@@ -518,7 +529,8 @@ export class RtcEndpoint {
     if (this.sweepTimer !== null || this.closed) return;
     const t = setInterval(() => {
       const now = Date.now();
-      for (const s of this.byUfrag.values()) s.checkTimers(now, this.handshakeTimeoutMs, this.idleTimeoutMs);
+      // forEach: no iterator result objects
+      this.byUfrag.forEach((s) => s.checkTimers(now, this.handshakeTimeoutMs, this.idleTimeoutMs));
       if (this.byUfrag.size === 0 && this.sweepTimer !== null) {
         clearInterval(this.sweepTimer);
         this.sweepTimer = null;

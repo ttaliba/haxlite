@@ -5,7 +5,7 @@
  * {@link RtcEndpoint} (endpoint.ts), which owns the socket(s) and the
  * demultiplexing maps.
  */
-import type { Socket } from 'node:dgram';
+import type { UdpIo } from './udp.js';
 import { DtlsServer } from './dtls/server.js';
 import type { OfferInfo } from './sdp.js';
 import { parseCandidate, type ParsedCandidate } from './sdp.js';
@@ -18,7 +18,7 @@ import type { GatherWaiter } from './gather.js';
 /** A transport address that passed an authenticated Binding request for a session. */
 export interface ValidatedAddress {
   session: RtcSessionImpl;
-  sock: Socket;
+  sock: UdpIo;
   address: string;
   port: number;
   /** `address|port` (bound into the DTLS cookie). */
@@ -176,7 +176,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
   }
 
   /** Our check on (sock, address, port) succeeded (full ICE): DTLS may come from / go to there. */
-  onCheckSucceeded(sock: Socket, address: string, port: number): void {
+  onCheckSucceeded(sock: UdpIo, address: string, port: number): void {
     if (this.state === 'closed') return;
     const v = this.validate(sock, address, port);
     if (this.nominated === null && this.dest === null) this.dest = v;
@@ -195,7 +195,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
    * already parsed it into `m`). Validates and answers it.
    * Returns false when it was rejected (not authenticated / malformed).
    */
-  handleBinding(m: StunMessage, sock: Socket, address: string, port: number): boolean {
+  handleBinding(m: StunMessage, sock: UdpIo, address: string, port: number): boolean {
     if (this.state === 'closed') return false;
     // USERNAME = "ourUfrag:theirUfrag" exactly
     const want = this.expectedUsername;
@@ -229,7 +229,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
   }
 
   /** Marks (sock, address, port) valid for this session and claims its 5-tuple for the DTLS demux. */
-  private validate(sock: Socket, address: string, port: number): ValidatedAddress {
+  private validate(sock: UdpIo, address: string, port: number): ValidatedAddress {
     let v = this.findValidated(sock, address, port);
     if (v === null) {
       v = { session: this, sock, address, port, key: `${address}|${port}` };
@@ -245,11 +245,11 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
     return v;
   }
 
-  private tempDest(sock: Socket, address: string, port: number): ValidatedAddress {
+  private tempDest(sock: UdpIo, address: string, port: number): ValidatedAddress {
     return { session: this, sock, address, port, key: '' };
   }
 
-  private findValidated(sock: Socket, address: string, port: number): ValidatedAddress | null {
+  private findValidated(sock: UdpIo, address: string, port: number): ValidatedAddress | null {
     for (const v of this.validated) if (v.port === port && v.address === address && v.sock === sock) return v;
     return null;
   }
