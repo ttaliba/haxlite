@@ -40,6 +40,13 @@ export interface FakeRoom {
   info: RoomInfo | null;
   roomInfoMessages: number;
   keepAlives: number;
+  /** WS pings received from the host. */
+  pings: number;
+  /**
+   * Simulates a blackholed TCP link: while true the master ignores everything
+   * the host sends (no pongs, no message handling) but keeps the socket open.
+   */
+  blackholed: boolean;
   requireRecaptcha: boolean;
   readonly peers: Map<number, FakeClient>;
 }
@@ -82,6 +89,14 @@ export class FakeMaster {
    * exactly what clients receive (e.g. that no host address leaks).
    */
   clientMessages: { peerId: number; type: number; payload: Uint8Array }[] | null = null;
+  /**
+   * When true, host WS upgrades (`/host`) are accepted at the TCP level but
+   * never answered (simulates a stalled handshake). Stalled sockets are
+   * counted in {@link stalledUpgrades} and destroyed on {@link close}.
+   */
+  stallHostUpgrades = false;
+  stalledUpgrades = 0;
+  private readonly stalled = new Set<import('node:stream').Duplex>();
 
   private readonly server: http.Server;
   private readonly wss: WebSocketServer;
@@ -94,8 +109,16 @@ export class FakeMaster {
   private constructor(opts: FakeMasterOptions) {
     this.opts = opts;
     this.server = http.createServer((req, res) => this.onHttp(req, res));
-    this.wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+    // autoPong off: pongs are sent by hand so a room can be "blackholed".
+    this.wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, autoPong: false });
     this.server.on('upgrade', (req, socket, head) => {
+      if (this.stallHostUpgrades && (req.url ?? '').startsWith('/host')) {
+        this.stalledUpgrades++;
+        this.stalled.add(socket);
+        socket.on('close', () => this.stalled.delete(socket));
+        socket.on('error', () => {});
+        return;
+      }
       this.wss.handleUpgrade(req, socket, head, (ws) => this.onWs(ws, req));
     });
   }
@@ -133,6 +156,7 @@ export class FakeMaster {
 
   async close(): Promise<void> {
     for (const c of this.wss.clients) c.terminate();
+    for (const s of this.stalled) s.destroy();
     this.wss.close();
     this.server.closeAllConnections();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
@@ -198,6 +222,7 @@ export class FakeMaster {
     const origin = req.headers.origin;
     this.upgrades.push({ path: url.pathname, origin });
     ws.binaryType = 'nodebuffer';
+    if (url.pathname !== '/host') ws.on('ping', (data) => ws.pong(data));
     if (url.pathname === '/host') this.onHostWs(ws, url, origin);
     else if (url.pathname === '/client') this.onClientWs(ws, url, req);
     else ws.close(4001);
@@ -222,6 +247,8 @@ export class FakeMaster {
       info: null,
       roomInfoMessages: 0,
       keepAlives: 0,
+      pings: 0,
+      blackholed: false,
       requireRecaptcha: false,
       peers: new Map(),
     };
@@ -239,7 +266,13 @@ export class FakeMaster {
     this.roomWaiters = [];
     for (const w of waiters) w(room);
 
+    ws.on('ping', (data: Buffer) => {
+      if (room.blackholed) return;
+      room.pings++;
+      ws.pong(data);
+    });
     ws.on('message', (data: Buffer) => {
+      if (room.blackholed) return;
       const msg = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
       if (msg.length === 0) return;
       const r = new Reader(msg);

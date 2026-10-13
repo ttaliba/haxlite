@@ -8,6 +8,13 @@
  * payloads are raw-deflated. Reconnects after 10–60 s unless closed with 4001,
  * reusing the latest token received in message 6.
  *
+ * Liveness (haxlite addition): the WS upgrade has a handshake timeout, and
+ * every keep-alive tick also sends a WS ping; if nothing (pong or message)
+ * arrived since the previous tick the socket is considered dead (blackholed
+ * TCP) and goes through the normal reconnect path. No extra timers: it rides
+ * on the existing 40 s keep-alive interval, so a dead link is detected in
+ * 40–80 s instead of whenever the kernel gives up on the TCP connection.
+ *
  * This class only frames/deframes; admission control and WebRTC live in
  * `transport.ts`.
  */
@@ -45,7 +52,10 @@ export interface HostSignalingOptions extends MasterHttpOptions {
   wsHeaders?: Record<string, string>;
   /** Reconnect on unexpected close (default true, like the official host). */
   reconnect?: boolean;
+  /** Keep-alive period (message 8 + WS ping liveness check). Default 40 s. */
   keepAliveMs?: number;
+  /** WS upgrade timeout (default 15 s); on expiry the normal reconnect path runs. */
+  handshakeTimeoutMs?: number;
   roomInfoThrottleMs?: number;
   recaptchaDebounceMs?: number;
   reconnectMinMs?: number;
@@ -91,6 +101,8 @@ export class HostSignaling {
   private recaptchaTimer: NodeJS.Timeout | null = null;
 
   private keepAliveTimer: NodeJS.Timeout | null = null;
+  /** Something (message/pong) was received since the last keep-alive tick. */
+  private alive = true;
   private reconnectTimer: NodeJS.Timeout | null = null;
 
   private readonly w = new Writer(256);
@@ -245,7 +257,11 @@ export class HostSignaling {
     const headers: Record<string, string> = { ...this.opts.wsHeaders };
     const origin = this.opts.origin === undefined ? DEFAULT_WS_ORIGIN : this.opts.origin;
     if (origin !== null) headers['Origin'] = origin;
-    const wsOpts: WebSocket.ClientOptions = { headers, perMessageDeflate: false };
+    const wsOpts: WebSocket.ClientOptions = {
+      headers,
+      perMessageDeflate: false,
+      handshakeTimeout: this.opts.handshakeTimeoutMs ?? NetDefaults.signalingHandshakeTimeoutMs,
+    };
     if (this.opts.agent) wsOpts.agent = this.opts.agent as http.Agent;
     const ws = new WebSocket(`${base}?token=${session.token}`, wsOpts);
     ws.binaryType = 'nodebuffer';
@@ -255,35 +271,59 @@ export class HostSignaling {
       this.onOpen();
     });
     ws.on('message', (data: Buffer, isBinary: boolean) => {
-      if (this.ws !== ws || !isBinary) return;
+      if (this.ws !== ws) return;
+      this.alive = true;
+      if (!isBinary) return;
       this.onMessage(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+    });
+    ws.on('pong', () => {
+      if (this.ws === ws) this.alive = true;
     });
     ws.on('close', (code: number) => {
       if (this.ws !== ws) return;
       this.ws = null;
       this.lost(code, code !== MasterCloseCode.RoomClosed);
     });
-    ws.on('error', (err: Error) => {
-      if (this.ws !== ws) return;
-      this.handlers.onError?.(err);
-      this.ws = null;
-      ws.removeAllListeners();
-      ws.on('error', () => {});
-      ws.terminate();
-      this.lost(1006, true);
-    });
+    ws.on('error', (err: Error) => this.fail(ws, err));
+  }
+
+  /** Socket error or dead link: drop it and go through the reconnect path. */
+  private fail(ws: WebSocket, err: Error): void {
+    if (this.ws !== ws) return;
+    this.handlers.onError?.(err);
+    this.ws = null;
+    ws.removeAllListeners();
+    ws.on('error', () => {});
+    ws.terminate();
+    this.lost(1006, true);
   }
 
   /** `Aa.bh`. */
   private onOpen(): void {
     if (this.roomInfo !== null) this.sendRoomInfo();
     if (this.requireRecaptcha) this.sendRequireRecaptcha();
-    this.keepAliveTimer = setInterval(() => {
-      const w = this.w.reset();
-      w.u8(HostToMaster.KeepAlive);
-      this.send(w.copyBytes());
-    }, this.opts.keepAliveMs ?? NetDefaults.keepAliveMs);
+    this.alive = true;
+    this.keepAliveTimer = setInterval(() => this.keepAlive(), this.opts.keepAliveMs ?? NetDefaults.keepAliveMs);
     this.handlers.onOpen?.();
+  }
+
+  /** `Aa.Yh` (message 8) + liveness check: no pong/message for a whole period => dead link. */
+  private keepAlive(): void {
+    const ws = this.ws;
+    if (ws === null || ws.readyState !== WebSocket.OPEN) return;
+    if (!this.alive) {
+      this.fail(ws, new Error('master signaling: no response to keep-alive (dead connection)'));
+      return;
+    }
+    this.alive = false;
+    const w = this.w.reset();
+    w.u8(HostToMaster.KeepAlive);
+    ws.send(w.copyBytes());
+    try {
+      ws.ping();
+    } catch {
+      /* closing */
+    }
   }
 
   /** `Aa.Gd`. */

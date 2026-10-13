@@ -106,6 +106,60 @@ describe('HostSignaling', () => {
     expect(master.rooms.size).toBe(0);
   });
 
+  it('liveness: keep-alive ticks ping the master; a blackholed link reconnects via the normal path', async () => {
+    let roomP = master.waitForRoom();
+    const disconnects: { code: number; willReconnect: boolean }[] = [];
+    const errors: Error[] = [];
+    const s = new HostSignaling(
+      { token: 'thr1.live', masterUrl: master.httpBase, keepAliveMs: 40, reconnectMinMs: 20, reconnectRangeMs: 0 },
+      { onDisconnect: (d) => disconnects.push(d), onError: (e) => errors.push(e) },
+    );
+    stops.push(() => s.stop());
+    s.start();
+    const r1 = await roomP;
+    // healthy link: pings answered, no disconnect across several periods
+    await until(() => r1.pings >= 3 && r1.keepAlives >= 3);
+    expect(disconnects).toEqual([]);
+    expect(s.isOpen).toBe(true);
+
+    // blackhole: the TCP connection stays up but nothing comes back
+    roomP = master.waitForRoom();
+    const t0 = Date.now();
+    r1.blackholed = true;
+    const r2 = await roomP;
+    expect(Date.now() - t0).toBeLessThan(1000); // ≤ 2 periods + reconnect delay
+    expect(disconnects).toEqual([{ code: 1006, willReconnect: true }]);
+    expect(errors.some((e) => /keep-alive/.test(e.message))).toBe(true);
+    expect(r2.headlessToken).toBe('thr1.live-r');
+    await until(() => r1.ws.readyState === r1.ws.CLOSED); // the host dropped the dead socket
+    await until(() => r2.pings >= 1);
+  });
+
+  it('a stalled WS handshake times out and reconnects', async () => {
+    const m = await FakeMaster.start();
+    try {
+      m.stallHostUpgrades = true;
+      const disconnects: { code: number; willReconnect: boolean }[] = [];
+      const s = new HostSignaling(
+        { token: 'thr1.hs', masterUrl: m.httpBase, handshakeTimeoutMs: 100, reconnectMinMs: 20, reconnectRangeMs: 0 },
+        { onDisconnect: (d) => disconnects.push(d), onError: () => {} },
+      );
+      stops.push(() => s.stop());
+      s.start();
+      await until(() => disconnects.length >= 1, 2000);
+      expect(disconnects[0]).toEqual({ code: 1006, willReconnect: true });
+      // retried on its own; once the master answers again, the room registers
+      const roomP = m.waitForRoom();
+      m.stallHostUpgrades = false;
+      await roomP;
+      expect(m.stalledUpgrades).toBeGreaterThanOrEqual(1);
+      await until(() => s.isOpen);
+      s.stop();
+    } finally {
+      await m.close();
+    }
+  });
+
   it('invalid token -> onRecaptcha; useRecaptchaToken retries with rcr', async () => {
     const before = master.hostRequests.length;
     let sitekey: string | null = null;

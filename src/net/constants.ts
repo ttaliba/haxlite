@@ -78,6 +78,11 @@ export const ClientSignal = {
 export const NetDefaults = {
   /** Host keep-alive (`setInterval(Yh, 4e4)`). */
   keepAliveMs: 40_000,
+  /**
+   * haxlite: max time for the master WS upgrade (TCP + TLS + HTTP 101). The
+   * official host relies on the browser's (long) defaults.
+   */
+  signalingHandshakeTimeoutMs: 15_000,
   /** RoomInfo batching window after a send (`setTimeout(…, 1e4)` in `Aa.ae`). */
   roomInfoThrottleMs: 10_000,
   /** Debounce of the "require captcha" flag (`Aa.$d`). */
