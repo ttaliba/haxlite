@@ -101,19 +101,19 @@ describe('examples', () => {
       const syncs: Any[] = [];
       for (const c of clients) c.room.onPlayerSyncChange = (id: number, v: boolean) => syncs.push([c.name, id, v]);
       // both spawn in the Cafeteria (left): each sees the Electrical fog (disc 2), not the Cafeteria one
-      await waitFor(() => clients.every((c) => at(c, 2)[0] === 200 && at(c, 1)[1] === 5000), 10_000, 'initial fog');
+      await waitFor(() => clients.every((c) => at(c, 2)[0] === 10040 && at(c, 1)[1] === 50000), 10_000, 'initial fog');
       // alice walks right into Electrical: her fog flips, bob's does not
       alice.room.setKeyState(8);
-      await waitFor(() => at(alice, 1)[0] === -200 && at(alice, 2)[1] === 5000, 10_000, 'alice fog flipped');
+      await waitFor(() => at(alice, 1)[0] === -10040 && at(alice, 2)[1] === 50000, 10_000, 'alice fog flipped');
       alice.room.setKeyState(0);
-      expect(at(bob, 2)).toEqual([200, 0]);
-      expect(at(bob, 1)).toEqual([0, 5000]);
+      expect(at(bob, 2)).toEqual([10040, 0]);
+      expect(at(bob, 1)).toEqual([0, 50000]);
       // she reaches the task marker: lit only for her, private prompt only for her
       const steer = setInterval(() => {
         const me = alice.room.getPlayer(alice.room.currentPlayerId)?.disc?.pos;
         if (!me) return;
-        const dx = 280 - me.x;
-        const dy = -80 - me.y;
+        const dx = 175 - me.x;
+        const dy = -50 - me.y;
         alice.room.setKeyState((dy < -10 ? 1 : dy > 10 ? 2 : 0) | (dx < -10 ? 4 : dx > 10 ? 8 : 0));
       }, 50);
       await waitFor(() => disc(alice, 3)?.color === 0xffd700, 10_000, 'task marker lit').finally(() => clearInterval(steer));

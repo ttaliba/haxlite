@@ -453,11 +453,34 @@ Por tanto **los discos de estadio se dibujan encima de los jugadores**: un disco
 Límites:
 
 - solo hay círculos: segmentos, planos y fondo no se pueden cambiar por jugador, y el estadio es global;
-- las flechas de borde delatan a los jugadores fuera de la cámara (se dibujan antes que los discos, pero en el borde de la pantalla);
+- las flechas de borde pueden delatar a jugadores fuera de la cámara (ver abajo);
 - cada cambio llega con ≈ 1 RTT + *heartbeat*, porque `SetDiscProperties` no se predice;
 - seguir al jugador cuadro a cuadro (un cono de visión pegado a él) cuesta un evento por frame y por jugador: es viable por habitación o zona, no por píxel;
 - cada actualización manda además un no-op de 20 bytes a cada otro cliente. Las actualizaciones de varios jugadores en la misma tanda comparten ranura (`HostRoom.batchPrivate`; la fachada `HBInit` agrupa las llamadas consecutivas);
 - los espectadores y la grabación `.hbr2` ven el mundo de la sala.
+
+**Flechas de borde del cliente oficial** (`game-min.js` `0349dd60`, `wr`/`Jk`/`Kk`; verificado con el cliente real en Chromium, `scripts/among-us-screenshots.ts`, capturas en `docs/img/among-us/`):
+
+- `wr` llama a `Jk` para el disco 0 (balón, en su color de disco) y para **cada jugador con disco** (`null != e.I`): rojos y azules, compañeros o rivales, y también el propio. Los espectadores no tienen disco, así que no tienen flecha.
+- `Jk(pos, color, ancho, alto)` recorta la posición del disco al rectángulo de la vista reducido 25 unidades por lado (`±(ancho/2 − 25)`, `±(alto/2 − 25)` alrededor de la cámara). Si el centro del disco queda a **más de 30 unidades** de ese punto (`900 < dx² + dy²`), dibuja allí un triángulo de 15 × 14 que apunta al disco, con sombra `rgba(0,0,0,0.5)`. Es decir: solo hay flecha si el centro está más de ~5 unidades fuera de la pantalla.
+- El color es el del **equipo** (`e.fa.S`): constantes `0xE56E56` (rojo) y `0x5689E5` (azul). `setTeamColors` no lo cambia. El radio, el color y la visibilidad del disco del jugador no importan: con `radius: 0` la flecha sigue (`05-…png`).
+- No hay ajuste de sala ni de cliente para quitarlas. `show_indicators` solo controla el icono de "escribiendo" del chat.
+- Tamaño de la vista en unidades del mundo, con el área de juego de W × H px CSS (el ajuste "Viewport Mode" del cliente, `view_mode`, que el jugador también cambia **en partida con las teclas 0–7**):
+  - Dynamic (por defecto): ≈ 610 · W/H de ancho y 610 · (H − 35 − chat)/H de alto.
+  - Restricted 840x410: el lienzo, como mucho 840 × 410.
+  - Full z× (1, 1,25 … 2,5): W/z × (H − 35 − chat)/z.
+  - `maxViewWidth` del estadio (si > 0) solo **reduce** el ancho visible (acerca la cámara). Nunca lo amplía.
+- Cámara (`As`/`Go`): sigue al balón (punto medio balón-jugador, con el jugador dentro de la vista) o al jugador con `cameraFollow: "player"`. Después se limita a `±(width − ancho/2)` usando el `width`/`height` del estadio, y **si la vista es más ancha que `2·width` se queda en x = 0** (lo mismo en y).
+- Se dibujan **antes** que los discos de estadio, en coordenadas del mundo: un disco de estadio opaco tapa una flecha igual que tapa a un jugador.
+
+**Cómo evitar que delaten posiciones** (comprobado en el cliente real):
+
+1. **Que el mapa quepa en la pantalla** (sirve): `width`/`height` del estadio iguales a la mitad del mapa y centros de disco dentro de la vista. La cámara queda centrada, nadie está fuera de cámara y no se dibuja ninguna flecha. Con el ejemplo (centros en ±245 × ±115, hace falta una vista de 480 × 230) no hay flechas en Dynamic, Restricted ni en Full 1x–2x con un área de 1000 × 700 (`01`–`03`, `06`).
+2. **Niebla como semiplano** (refuerzo): un disco de radio 10000 cuyo borde pasa por la puerta tapa todo lo que hay más allá, también fuera del mapa. Si el jugador acerca la cámara y el mapa ya no cabe, la flecha hacia la sala con niebla cae en el borde de la pantalla y queda **debajo** de la niebla mientras ese borde esté pasada la puerta (`07`). Con la cámara contra la pared del fondo, eso se cumple si el ancho visible es ≥ `width + puerta + 25` (325 unidades en el ejemplo): Full 2,5x a partir de ~815 px de ancho.
+3. **Espectadores** (sirve, pero solo para quien ya no juega): un jugador "muerto" movido a espectadores no tiene disco ni flecha.
+4. **Propiedades del disco del jugador** (no sirve): son globales y la flecha no mira radio ni color.
+
+Límite honesto: la sala no conoce ni controla el zoom del cliente. Con zoom fuerte en una ventana estrecha (Full 2,5x a 800 px, `08`) el borde de la pantalla cae en el pasillo y las flechas de los jugadores ocultos asoman. `04` muestra el problema original: mapa más grande que la vista y niebla circular.
 
 **Lo que no necesita ninguna divergencia** (camino recomendado para las interacciones de tarea):
 
