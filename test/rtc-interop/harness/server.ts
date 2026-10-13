@@ -17,6 +17,7 @@ import type { AddressInfo } from 'node:net';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { PeerLink } from '../../../src/net/peer-backend.js';
+import { preferDtlsServer } from '../../../src/net/ice.js';
 import { createBackend, type BackendHandle, type BackendKind } from './backends.js';
 import { UdpImpairProxy, type ImpairOptions } from './udp-proxy.js';
 import { HEADER, Kind, makeMsg, now, Recorder } from './wire.js';
@@ -295,7 +296,7 @@ export class InteropServer {
         this.peers.set(tag, p);
         let answerSdp = '';
         try {
-          p.link = this.handle.backend.createPeer(id, m.sdp ?? '', {
+          p.link = this.handle.backend.createPeer(id, preferDtlsServer(m.sdp ?? ''), {
             onLocalDescription: (sdp) => (answerSdp = sdp),
             onLocalCandidate: (candidate, mid) => {
               if (!answered) localCands.push({ candidate, mid });
