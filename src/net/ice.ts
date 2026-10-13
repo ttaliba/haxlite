@@ -55,6 +55,25 @@ export function sdpMids(sdp: string): string[] {
   return mids;
 }
 
+/**
+ * Makes the host the DTLS **server** (`a=setup:passive` in its answer) by
+ * presenting the client's `a=setup:actpass` offer as `a=setup:active` to the
+ * local WebRTC stack. The client still sees a valid exchange (actpass offer,
+ * passive answer → the client is DTLS client, RFC 5763 §5).
+ *
+ * Why: libdatachannel answering an actpass offer picks `active` and sends its
+ * ClientHello the instant ICE connects, which over a fast path happens
+ * *before* the answer reaches the client through the master; the client drops
+ * it and OpenSSL retransmits only after its 1 s initial DTLS timeout, so every
+ * join paid ≈ +1 s (docs/07). As DTLS server the host just waits for the
+ * client's ClientHello, sent once the client has the answer. Browsers and
+ * libdatachannel clients both accept a passive answer (haxlite-rtc always
+ * answers passive; an edge gets the rewritten offer too).
+ */
+export function preferDtlsServer(offerSdp: string): string {
+  return offerSdp.indexOf('a=setup:actpass') >= 0 ? offerSdp.replace(/a=setup:actpass/g, 'a=setup:active') : offerSdp;
+}
+
 /** Strips the `a=` prefix libdatachannel may put on candidate lines. */
 export function candidateLine(c: string): string {
   return c.startsWith('a=') ? c.slice(2) : c;

@@ -45,6 +45,7 @@ import {
   filterCandidate,
   filterSdp,
   parseCandidate,
+  preferDtlsServer,
   sdpMids,
   srflxAddress,
   toNativeIceServers,
@@ -237,6 +238,14 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   maxPendingNegotiations?: number;
   channelOpenTimeoutMs?: number;
   peerIdleTimeoutMs?: number;
+  /**
+   * Max wait for local ICE gathering before sending the answer. Default 50 ms
+   * (official: 500, `ub.li`). Host candidates are ready within a few ms; what
+   * arrives later (srflx when STUN is slow or unreachable, TURN relay) is
+   * trickled after the answer exactly like the official host does after its
+   * 500 ms, so the long wait only delayed joins (+450 ms whenever a STUN
+   * server does not answer).
+   */
   answerIceWaitMs?: number;
   reverseIceDelayMs?: number;
   /** Room link prefix (default `https://www.haxball.com/play?c=`). */
@@ -288,6 +297,8 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
 
 /** See {@link HostTransportOptions.challengeDelayMs}. */
 const DEFAULT_CHALLENGE_DELAY_MS = 40;
+/** See {@link HostTransportOptions.answerIceWaitMs} (official {@link NetDefaults.answerIceWaitMs}). */
+const DEFAULT_ANSWER_ICE_WAIT_MS = 50;
 
 export class HostTransport {
   readonly bans: BanList;
@@ -791,7 +802,7 @@ export class HostTransport {
     };
     let link: PeerLink;
     try {
-      link = this.backend.createPeer(peer.id, offer.sdp, events);
+      link = this.backend.createPeer(peer.id, preferDtlsServer(offer.sdp), events);
     } catch (err) {
       this.reportError(err);
       this.failNegotiation(peer, 'pc create error');
@@ -824,7 +835,7 @@ export class HostTransport {
     else {
       peer.timer = setTimeout(
         () => this.safely(() => this.sendAnswer(peer)),
-        this.opts.answerIceWaitMs ?? NetDefaults.answerIceWaitMs,
+        this.opts.answerIceWaitMs ?? DEFAULT_ANSWER_ICE_WAIT_MS,
       );
     }
   }
@@ -849,7 +860,7 @@ export class HostTransport {
     else if (peer.answerSent) this.sendEnd(peer);
   }
 
-  /** `Aa.Zh` (after `ub.li`: gathering complete or 500 ms). */
+  /** `Aa.Zh` (after `ub.li`: gathering complete or `answerIceWaitMs`). */
   private sendAnswer(peer: Peer): void {
     if (peer.timer !== null) clearTimeout(peer.timer);
     peer.timer = null;
