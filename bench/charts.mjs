@@ -1,5 +1,6 @@
 // Generates benchmark chart cards (HTML/SVG) and screenshots each one as a PNG.
-// Usage: node bench/charts.mjs docs/img/benchmark [bench/results/quick]   (needs the Playwright Chromium in /opt/pw-browsers)
+// Usage: node bench/charts.mjs docs/img/benchmark [bench/results/quick] [rtc,off,nh]   (needs the Playwright Chromium in /opt/pw-browsers)
+// The third argument picks the libraries shown (keys of LIBS; default: all four).
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 const require = createRequire('/home/user/rev-eng-haxball/package.json');
@@ -14,7 +15,8 @@ const LIBS = [
   { key: 'ndc', name: 'haxlite + node-datachannel', color: '#eb6834' },
   { key: 'off', name: 'haxball.js (oficial)', color: '#1baf7a' },
   { key: 'nh', name: 'node-haxball', color: '#eda100' },
-];
+].filter((l) => process.argv[4] === undefined || process.argv[4].split(',').includes(l.key));
+const HAS_NDC = LIBS.some((l) => l.key === 'ndc');
 const fmt = (v, d) => v.toLocaleString('es-AR', { minimumFractionDigits: d, maximumFractionDigits: d });
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
 
@@ -150,7 +152,13 @@ cards.push(card({
     hpanel({ title: 'Lag del event loop p99', sub: 'ms (un frame del juego = 16,7 ms)', values: game('eldP99'), decimals: 2, unit: ' ms' }),
     hpanel({ title: 'Pausas de GC', sub: 'por minuto', values: game('gcPerMin'), decimals: 0 }),
   ].join('')}</div>`,
-  note: `El WebRTC propio hace menos GC que haxball.js y node-haxball y menos memoria JS; haxlite + node-datachannel hace aún menos porque su red vive en código nativo (la basura que queda en el propio la crea el módulo UDP de Node por cada paquete recibido). Lag p99 entre ${fmt(Math.min(...Object.values(game('eldP99'))), 2)} y ${fmt(Math.max(...Object.values(game('eldP99'))), 2)} ms en los cuatro: muy por debajo de un frame.`,
+  note: (() => {
+    const lag = Object.entries(game('eldP99')).filter(([k]) => LIBS.some((l) => l.key === k)).map(([, v]) => v);
+    const range = `Lag p99 entre ${fmt(Math.min(...lag), 2)} y ${fmt(Math.max(...lag), 2)} ms en todos: muy por debajo de un frame.`;
+    return HAS_NDC
+      ? `El WebRTC propio hace menos GC que haxball.js y node-haxball y usa menos memoria JS; haxlite + node-datachannel hace aún menos porque su red vive en código nativo (la basura que queda en el propio la crea el módulo UDP de Node por cada paquete recibido). ${range}`
+      : `haxlite hace <b>${pct(game('gcMsPerMin').rtc, game('gcMsPerMin').off)} % menos tiempo de GC</b> que haxball.js y usa menos memoria JS que los otros dos. ${range}`;
+  })(),
 }));
 
 cards.push(card({
@@ -176,20 +184,25 @@ cards.push(card({
   ].join('')}</div>`,
   note: (() => {
     const st = startup('processStartToLinkMs');
-    const gain = Math.round(Math.min(st.off, st.nh) - Math.max(st.rtc, st.ndc));
-    return `haxlite no tiene timers con la sala vacía. Las dos variantes de haxlite empatan en reposo y arrancan ~${gain} ms antes que las otras.`;
+    const gain = Math.round(Math.min(st.off, st.nh) - (HAS_NDC ? Math.max(st.rtc, st.ndc) : st.rtc));
+    return HAS_NDC
+      ? `haxlite no tiene timers con la sala vacía. Las dos variantes de haxlite empatan en reposo y arrancan ~${gain} ms antes que las otras.`
+      : `haxlite no tiene timers con la sala vacía (cero despertares propios) y arranca ~${gain} ms antes que las otras.`;
   })(),
 }));
 
 const stack = [
-  ['haxball.js 5.1.0', '@webrtc-node/webrtc 0.2.1', 'libdatachannel (master, ~0.24.5) · libjuice 1.7.2 · OpenSSL 1.1.1w · usrsctp', '18 hilos con jugadores · 1 socket UDP por jugador', 'Cualquier red, también detrás de NAT'],
-  ['node-haxball 2.3.1', 'node-datachannel 0.25.0 (copia propia)', 'libdatachannel 0.22.2 · libjuice 1.5.7 · OpenSSL 1.1.1w · usrsctp', '15 hilos · 1 socket UDP por jugador', 'Cualquier red'],
-  ['haxlite + node-datachannel', 'node-datachannel 0.33.4', 'libdatachannel 0.24.5 · libjuice 1.7.2 · OpenSSL 1.1.1w · usrsctp', '19 hilos (se liberan con la sala vacía) · 1 socket UDP para todos', 'Cualquier red'],
-  ['haxlite + WebRTC propio', 'ninguno: haxlite-rtc (TypeScript)', 'ICE completo (STUN, comprobaciones propias), DTLS 1.2 (ChaCha20-Poly1305 en JS) y SCTP propios', '0 hilos nativos · 1 socket UDP para todas las salas', 'Cualquier red, también detrás de NAT (sin TURN)'],
+  ['off', 'haxball.js 5.1.0', '@webrtc-node/webrtc 0.2.1', 'libdatachannel (master, ~0.24.5) · libjuice 1.7.2 · OpenSSL 1.1.1w · usrsctp', '18 hilos con jugadores · 1 socket UDP por jugador', 'Cualquier red, también detrás de NAT'],
+  ['nh', 'node-haxball 2.3.1', 'node-datachannel 0.25.0 (copia propia)', 'libdatachannel 0.22.2 · libjuice 1.5.7 · OpenSSL 1.1.1w · usrsctp', '15 hilos · 1 socket UDP por jugador', 'Cualquier red'],
+  ['ndc', 'haxlite + node-datachannel', 'node-datachannel 0.33.4', 'libdatachannel 0.24.5 · libjuice 1.7.2 · OpenSSL 1.1.1w · usrsctp', '19 hilos (se liberan con la sala vacía) · 1 socket UDP para todos', 'Cualquier red'],
+  ['rtc', 'haxlite + WebRTC propio', 'ninguno: haxlite-rtc (TypeScript)', 'ICE completo (STUN, comprobaciones propias), DTLS 1.2 (ChaCha20-Poly1305 en JS) y SCTP propios', '0 hilos nativos · 1 socket UDP para todas las salas', 'Cualquier red, también detrás de NAT (sin TURN)'],
 ];
-cards.push(`<section class="card wide" id="stack"><header><h1>Qué WebRTC usa cada librería</h1><p>Los tres primeros usan por dentro <b>la misma librería nativa</b> (libdatachannel) en distintas versiones; haxlite puede usar la suya propia</p></header>
+cards.push(`<section class="card wide" id="stack"><header><h1>Qué WebRTC usa cada librería</h1><p>${HAS_NDC ? 'Los tres primeros usan por dentro <b>la misma librería nativa</b> (libdatachannel) en distintas versiones; haxlite puede usar la suya propia' : 'haxball.js y node-haxball usan por dentro <b>la misma librería nativa</b> (libdatachannel) en distintas versiones; haxlite usa la suya propia, sin código nativo'}</p></header>
 <table><thead><tr><th>Librería</th><th>Paquete WebRTC</th><th>Por dentro (ICE · DTLS · SCTP)</th><th>Hilos y sockets</th><th>Dónde funciona</th></tr></thead><tbody>
-${stack.map((r, i) => `<tr><td><span class="sw" style="background:${LIBS[[2, 3, 1, 0][i]].color}"></span><b>${esc(r[0])}</b></td>${r.slice(1).map((c) => `<td>${esc(c)}</td>`).join('')}</tr>`).join('')}
+${stack
+  .filter((r) => LIBS.some((l) => l.key === r[0]))
+  .map((r) => `<tr><td><span class="sw" style="background:${LIBS.find((l) => l.key === r[0]).color}"></span><b>${esc(r[1])}</b></td>${r.slice(2).map((c) => `<td>${esc(c)}</td>`).join('')}</tr>`)
+  .join('')}
 </tbody></table><div class="src">Versiones verificadas en node_modules y en los binarios .node · Benchmark haxlite · ${RUN_DATE}</div></section>`);
 
 const html = `<!doctype html><html><head><meta charset="utf-8"><style>
