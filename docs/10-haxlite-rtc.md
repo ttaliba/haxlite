@@ -3,8 +3,9 @@
 > **Qué es.** Una pila WebRTC mínima (`src/rtc/`), escrita en TypeScript sin addons nativos
 > (`node:dgram` + `node:crypto`), que hace **solo** lo que un host de HaxBall necesita: aceptar la
 > oferta de un navegador y mover bytes por los tres data channels pre‑negociados del cliente
-> oficial (`ro`, `ru`, `uu`). Sustituye a node-datachannel/libdatachannel en servidores con IP
-> pública (haxlite Edge, hosts dedicados).
+> oficial (`ro`, `ru`, `uu`). Sustituye a node-datachannel/libdatachannel: en servidores con IP
+> pública (haxlite Edge, hosts dedicados) y, desde que es un agente **ICE completo** con
+> recolección STUN (§2.1), también **detrás de NAT** sin configurar nada.
 >
 > Este documento cubre el diseño (resumen de `src/rtc/README.md` y de la cabecera de
 > `src/rtc/sctp/association.ts`), el **banco de interoperabilidad con navegadores reales**
@@ -36,20 +37,23 @@ sesiones, sin hilos extra, y los errores de un peer quedan dentro de su sesión.
 
 ```
 UDP socket (uno por familia, compartido por todas las sesiones)
- └─ demux (RFC 7983, primer byte): 0–3 STUN → sesión por ufrag del USERNAME
+ └─ demux (RFC 7983, primer byte): 0–3 STUN → peticiones: sesión por ufrag del USERNAME
+                                              respuestas: transacción propia (checks, consentimiento, STUN)
                                    20–63 DTLS → sesión por dirección remota (validada por ICE)
-     └─ RtcSession: ICE-lite (stun.ts) → servidor DTLS 1.2 (dtls/) → SctpAssociation (sctp/)
+     └─ RtcSession: ICE (stun.ts, ice-agent.ts) → servidor DTLS 1.2 (dtls/) → SctpAssociation (sctp/)
+ Gatherer (gather.ts, uno por endpoint): candidatos host + srflx por STUN desde el mismo socket
 ```
 
-El navegador es **siempre** quien ofrece y el **cliente DTLS**; haxlite-rtc es un extremo
-**ICE‑lite**, **servidor DTLS 1.2** y **SCTP** con los tres canales pre‑negociados del cliente
+El navegador es **siempre** quien ofrece y el **cliente DTLS**; haxlite-rtc es un agente **ICE
+completo en rol controlado** (o ICE‑lite con `iceLite: true`), **servidor DTLS 1.2** y **SCTP** con los tres canales pre‑negociados del cliente
 oficial (`ro` id 0 fiable y ordenado, `ru` id 1 fiable y desordenado, `uu` id 2 con
 `maxRetransmits: 0`, sin DCEP).
 
 | Capa | Qué hace | Detalles |
 |---|---|---|
-| SDP (`sdp.ts`) | Lee la oferta, escribe la respuesta | `a=ice-lite`, `a=setup:passive`, candidatos `host` solo de `publicAddresses`, `a=end-of-candidates`, `a=max-message-size:262144` |
-| ICE‑lite (`stun.ts`, `session.ts`) | Responde Binding requests; nunca envía comprobaciones | USERNAME `nuestroUfrag:suyoUfrag`, MESSAGE‑INTEGRITY (HMAC‑SHA1) y FINGERPRINT obligatorios, rol *controlling* del navegador. Cada origen autenticado queda *validado*; USE‑CANDIDATE nomina. Consentimiento: si no llega ningún Binding autenticado en `idleTimeoutMs` (30 s) se cierra. Cambio de NAT solo con un Binding autenticado nuevo |
+| SDP (`sdp.ts`) | Lee la oferta, escribe la respuesta | `a=setup:passive`, los candidatos del endpoint (host + srflx; con `iceLite`, `a=ice-lite` y solo `host` de `publicAddresses`), `a=end-of-candidates` si la recolección terminó, `a=max-message-size:262144` |
+| Recolección (`gather.ts`) | Candidatos locales, por endpoint | `host`: direcciones de las interfaces del socket filtradas por la política (o `publicAddresses` tal cual); `srflx`: Binding STUN a cada `iceServers` desde el socket compartido, con `raddr 0.0.0.0 rport 0`. Resultado cacheado `gatherRefreshMs` (60 s); las sesiones creadas durante una ronda reciben el resto por trickle (§2.1) |
+| ICE (`stun.ts`, `session.ts`, `ice-agent.ts`) | Responde Binding requests **y envía las suyas** | USERNAME `nuestroUfrag:suyoUfrag`, MESSAGE‑INTEGRITY (HMAC‑SHA1) y FINGERPRINT obligatorios, rol *controlling* del navegador. Cada origen autenticado queda *validado* (y es un candidato prflx con *triggered check*); USE‑CANDIDATE nomina. Checks propios a cada candidato remoto (oferta + trickle) con ICE‑CONTROLLED, validación simétrica, retransmisión acotada. Consentimiento: checks propios cada 5 s ± 20 % (RFC 7675) además de los del navegador; sin ninguno respondido/recibido en `idleTimeoutMs` (30 s) se cierra. Cambio de NAT solo con un Binding autenticado nuevo |
 | DTLS 1.2 (`dtls/`) | Servidor DTLS (RFC 6347) | Cookie HMAC (HelloVerifyRequest) antes de guardar estado; preferencia `ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (AEAD en JS puro, sin asignaciones, cifra/descifra en el sitio: `dtls/chacha.ts`, §6.3), luego AES_128_GCM y AES_256_GCM (`node:crypto`), configurable con `cipherSuites`; x25519 / P‑256; *extended master secret* obligatorio; certificado del cliente obligatorio y comparado (tiempo constante) con el `a=fingerprint` de la oferta; CertificateVerify comprobado; ventana anti‑replay de 64; retransmisión 1 s → 8 s; fragmentación y reensamblado; `close_notify`. Un Chromium que ofrece DTLS 1.3 recibe un ServerHello 1.2 y conecta |
 | SCTP (`sctp/association.ts`) | Asociación SCTP sobre DTLS | RFC 9260, PR‑SCTP (RFC 3758) para `uu`, *stream reset* (RFC 6525) para cerrar canales, *zero checksum* (RFC 9653). Cookie de estado HMAC (INIT sin estado). Sin Nagle: un `send` sale en el acto si las ventanas lo permiten; los envíos hechos dentro de `onMessage` se agrupan en un paquete junto con el SACK. Un solo temporizador por asociación. Ruta caliente sin asignaciones (arena FIFO de bytes, anillos tipados indexados por TSN); `input` nunca lanza |
 | Certificado (`cert.ts`) | ECDSA P‑256 autofirmado | Codificador DER mínimo |
@@ -57,9 +61,13 @@ oficial (`ro` id 0 fiable y ordenado, `ru` id 1 fiable y desordenado, `uu` id 2 
 API pública (`src/rtc/index.ts`):
 
 ```ts
-const ep = await RtcEndpoint.listen({ port: 40000, publicAddresses: ['203.0.113.7'] });
+const ep = await RtcEndpoint.listen({ port: 40000, iceServers: ['stun:stun.l.google.com:19302'] });
+//   o, con IP pública fija: { port: 40000, publicAddresses: ['203.0.113.7'] }  (iceLite: true = modo anterior)
 const s = ep.createSession(offerSdp);      // lanza RtcSdpError si la oferta no sirve
-s.answerSdp; s.localCandidates; s.mid;     // respuesta completa (ya trae los candidatos)
+s.answerSdp; s.localCandidates; s.mid;     // respuesta con los candidatos conocidos
+s.gatheringComplete;                       // false mientras corre una ronda STUN: el resto llega por
+s.onLocalCandidate = (c) => {}; s.onGatheringComplete = () => {};   // … trickle (mandar al navegador)
+s.addRemoteCandidate('candidate:…');       // candidatos del navegador: destino de nuestros checks
 s.onOpen = () => {}; s.onMessage = (canal, bytes) => {}; s.onClose = (motivo) => {};
 s.onChannelClose = (canal) => {};          // el navegador cerró un canal (reset de stream)
 s.send(0, bytes); s.close(); await ep.close();
@@ -67,6 +75,109 @@ s.send(0, bytes); s.close(); await ep.close();
 
 Motivos de `onClose`: `remote-close`, `timeout` (consentimiento ICE), `handshake-timeout`,
 `dtls-alert:<n>`, `dtls-error:<qué>`, `sctp:<motivo>`, `endpoint-closed`.
+
+### 2.1 ICE completo detrás de NAT (`ice-agent.ts`, `gather.ts`)
+
+Hasta esta pasada haxlite-rtc era ICE‑lite: solo anunciaba `publicAddresses` y contestaba los
+Binding del navegador. Detrás de un NAT doméstico o de nube eso no funciona: el NAT descarta los
+checks del navegador hacia el puerto público porque el host nunca mandó nada a esa dirección
+(filtrado dependiente de la dirección, el caso común), y el host ni siquiera sabe su IP pública.
+Ahora, por defecto, es un agente ICE completo (RFC 8445) en **rol controlado** (el navegador ofrece
+y es *controlling*, §6.1.1):
+
+**Candidatos locales (por endpoint, no por sesión).** Todas las sesiones comparten un socket por
+familia, así que la recolección se hace una vez por endpoint:
+
+* `host`: con `publicAddresses`, esas direcciones tal cual (como antes); si no, las direcciones de
+  las interfaces del socket (todas las de la familia si el *bind* es comodín, si no la dirección de
+  *bind*) filtradas por `candidatePolicy` (= `iceCandidatePolicy` del transporte, por defecto
+  `'public'`: nunca se anuncian loopback, RFC 1918, CGNAT, ULA ni link‑local — doc 08). IPv6 se usa
+  si la máquina tiene una IPv6 global (socket `udp6` además del `udp4`); link‑local nunca.
+* `srflx`: un Binding STUN sin autenticar (RFC 8489) desde el propio socket compartido a cada
+  servidor STUN de `iceServers` (resueltos con DNS, A y AAAA), retransmitido a 0, 250 y 750 ms,
+  abandonado a los 1,5 s. La XOR‑MAPPED‑ADDRESS es la dirección pública del socket en el NAT: es la
+  **autodetección de la IP pública** que antes faltaba. Se escribe con `raddr 0.0.0.0 rport 0` (no
+  se filtra la base privada), y se omite si coincide con un candidato host (IP pública sin NAT).
+* Una ronda arranca al escuchar. Una sesión nueva usa el resultado si tiene menos de
+  `gatherRefreshMs` (60 s); si no, dispara otra ronda, y la sesión se crea con lo conocido y
+  `gatheringComplete = false`: lo nuevo llega por `onLocalCandidate` y luego `onGatheringComplete`.
+  El backend lo traduce a los eventos de siempre, y `HostTransport` hace con ello lo mismo que con
+  node-datachannel: espera ≤ 500 ms para la respuesta y manda el resto por trickle. Con resultado
+  fresco, la respuesta sale en el acto como antes. Sin servidores STUN no hay rondas.
+
+**Lista de comprobaciones (por sesión).** Cada candidato remoto (líneas `a=candidate` de la oferta y
+trickle por `addRemoteCandidate`; solo UDP, componente 1, literales IP: un nombre mDNS `*.local` no se
+puede resolver y se ignora, igual que en libdatachannel) da **un** par: todos los candidatos locales
+comparten el socket de su familia, así que tras la poda de RFC 8445 §6.1.2.4 (srflx → su base)
+cada candidato remoto queda en un solo par (socket, remoto). Prioridad de par §6.1.2.3 con G = remoto
+y D = nosotros; con un solo componente y un solo flujo de datos todos los pares arrancan *Waiting*
+(sin *frozen*). Un check: Binding con USERNAME `suyoUfrag:nuestroUfrag`, MESSAGE‑INTEGRITY con la
+contraseña del navegador, PRIORITY de prflx (tipo 110), ICE‑CONTROLLED + desempate, FINGERPRINT. Un
+check nuevo por sesión cada `Ta` = 20 ms, retransmisión con RTO 200 ms doblando (5 envíos; fallo a
+los 6,2 s). La respuesta se autentica antes de nada (una respuesta falsificada no cierra la
+transacción) y tiene que venir de la misma dirección y puerto al mismo socket (§7.2.5.2.1, si no el
+par falla). Un éxito **valida** el par: el demux acepta DTLS de ahí. Cada Binding autenticado del
+navegador desde un origen nuevo crea un candidato prflx (§7.3.1.3) y todo Binding en un par que aún
+no tuvo éxito encola un *triggered check* (§7.3.1.4). En cuanto el DTLS conecta se dejan de iniciar
+checks ordinarios (los *triggered* y el consentimiento siguen).
+
+Así se abre el NAT: el host recibe los candidatos del navegador por la señalización **antes** de
+mandar la respuesta, su primer check sale por el NAT hacia el srflx del navegador y crea la entrada
+que deja pasar los checks del navegador hacia nuestro srflx; si el NAT del host es simétrico (el
+srflx no sirve a nadie), el navegador ve llegar nuestro check desde la dirección real, la aprende
+como prflx y conecta por ella.
+
+**Consentimiento (RFC 7675).** Con la sesión abierta, un Binding propio al par elegido cada 5 s ± 20 %
+(desde el barrido de 1 Hz del endpoint: sin temporizadores nuevos); una respuesta autenticada y
+simétrica renueva el consentimiento igual que un Binding recibido. Sin ninguno de los dos en
+`idleTimeoutMs` (30 s) la sesión se cierra (`timeout`).
+
+**Coste.** El temporizador de ritmo (20 ms) solo existe mientras alguna sesión tiene checks
+pendientes; en régimen quedan el Binding de consentimiento cada ~5 s por jugador (y su respuesta) y,
+por cada Binding del navegador, una búsqueda en ≤ 16 pares. La ruta DTLS/SCTP no cambia (§6.5).
+
+**Seguridad.**
+
+* Solo se mandan checks a direcciones de la oferta o del trickle (señalización autenticada por el
+  maestro) o a orígenes que ya mandaron un Binding autenticado; nunca a direcciones arbitrarias.
+* **Amplificación acotada**: ≤ 16 pares por sesión, ≤ 15 envíos por par, ≤ 120 por sesión (≈ 100 B
+  cada uno) y un presupuesto global de 300 checks/s (ráfaga 150) por endpoint; además las ofertas
+  pasan antes por la admisión de `HostTransport` (≤ 16 negociaciones, `joinRateLimit`).
+* **Destinos permitidos**: una dirección pública siempre; loopback, LAN/CGNAT/ULA o link‑local solo
+  si la política (`candidatePolicy`) permitiría anunciarla o si es la clase de nuestras propias
+  direcciones (`publicAddresses`, dirección de *bind*). Con la política por defecto una oferta
+  manipulada no puede hacer que el host sondee su LAN o sus servicios de loopback; multicast,
+  `0.0.0.0`, puerto 0, TCP y mDNS se descartan siempre (`stats().ice.remoteIgnored`).
+* MESSAGE‑INTEGRITY y FINGERPRINT en todo; las respuestas STUN de la recolección deben venir del
+  servidor y puerto preguntados.
+* Privacidad (doc 08): igual que `ndc` con la misma `iceCandidatePolicy`; los srflx nunca llevan la
+  dirección privada. Como con node-datachannel, el jugador ve la IP pública del host: para ocultarla
+  sigue haciendo falta el Edge (doc 09).
+
+**Desviaciones deliberadas de RFC 8445.**
+
+* *Nominación*: un Binding con USE‑CANDIDATE mueve el par elegido en el acto (como hacía ICE‑lite),
+  sin esperar a que nuestro check en ese par tenga éxito: el navegador (*controlling*) solo nomina
+  pares cuyo check propio ya funcionó, lo que prueba los dos sentidos. Igual se manda el *triggered
+  check*.
+* *Conflicto de rol*: nunca pasamos a *controlling*. Un Binding con ICE‑CONTROLLED recibe 487 sea cual
+  sea el desempate (el otro pasa a *controlling*, §7.2.5.1) y un 487 a un check nuestro solo lo
+  reintenta. Converge con cualquier agente RFC 8445; un par ICE‑lite (ningún cliente de HaxBall lo
+  es) no podría conectar.
+
+**TURN (RFC 8656): no implementado; diseño previsto.** Coste/beneficio: ni el cliente oficial (solo
+`stun.l.google.com`) ni `ndc` con la configuración por defecto usan TURN, así que la paridad con
+node-datachannel no lo necesita; solo ayudaría cuando el host está tras un NAT simétrico **y** el
+jugador también (ningún lado puede aprender un prflx útil del otro). Implementarlo toca la ruta de
+envío (cada datagrama a un par *relay* lleva una cabecera ChannelData de 4 B), por eso quedó fuera de
+esta pasada. Diseño: una asignación (Allocate con credenciales de largo plazo, REALM/NONCE, Refresh
+antes de `LIFETIME`) **por endpoint** desde el mismo socket, que da un candidato `relay` compartido
+por todas las sesiones; por jugador, CreatePermission para la IP de cada candidato remoto y
+ChannelBind para el par elegido (Send/Data indications mientras tanto); en el demux, el rango
+64–79 de RFC 7983 (ChannelData) y las Data indications del servidor TURN se desenvuelven y se vuelven
+a demultiplexar como STUN/DTLS con la dirección del par como origen; `ValidatedAddress` lleva una
+marca `relay` y `sendTo` antepone la cabecera solo en ese caso (sin coste para los pares directos).
+Las entradas `turn:`/`turns:` de `iceServers` se ignoran hoy.
 
 ## 3. Cómo activarlo: `peerBackend: 'rtc'`
 
@@ -87,9 +198,13 @@ new HostTransport({ token, peerBackend: 'rtc', rtcEndpoint: { port: 40000, publi
 
 | opción | por defecto | qué es |
 |---|---|---|
-| `publicAddresses` | IPs **públicas** de las interfaces (`os.networkInterfaces()` clasificadas con `classifyAddress`) | las **únicas** direcciones que se escriben en el SDP (candidatos `host`). Sin ninguna (NAT, nube con NAT 1:1 tipo AWS/GCP) `HBInit` rechaza / `new HostTransport` lanza con un mensaje que pide configurarla. El maestro **no** informa al host de su IP pública (el protocolo no la transmite; `api/geo` solo da país/coordenadas), así que no hay autodetección por el maestro |
+| `publicAddresses` | — (ICE completo: interfaces + STUN) | candidatos `host` anunciados tal cual en lugar de las direcciones de las interfaces. Útil con un NAT 1:1 cuyo IP público STUN no ve, o para no depender de STUN (con `publicAddresses` y sin `iceServers` propios no se consulta STUN). Con `iceLite` son las **únicas** direcciones del SDP; por defecto, las IPs públicas de las interfaces, y sin ninguna `HBInit` rechaza / `new HostTransport` lanza |
+| `iceLite` | `false` | modo anterior: `a=ice-lite`, sin recolección ni checks propios (el servidor tiene que ser alcanzable directamente) |
+| `iceServers` | los de `HostTransport.iceServers` (por defecto `stun:stun.l.google.com:19302`, como `ndc`); `[]` si hay `publicAddresses` | servidores STUN para los candidatos srflx (cadenas `stun:host:puerto`, objetos de node-datachannel o `RTCIceServer`). Las entradas TURN se ignoran (§2.1) |
+| `iceCandidatePolicy` | la de `HostTransport.iceCandidatePolicy`, si no `'public'` | qué direcciones de interfaz se anuncian y a qué clases de dirección remota se mandan checks (§2.1). No se aplica a `publicAddresses` |
+| `gatherRefreshMs` | 60 000 | antigüedad máxima del resultado STUN para una sesión nueva (si no, nueva ronda y trickle) |
 | `port` | 0 (efímero) | puerto UDP único para todos los jugadores |
-| `address` | comodín de cada familia de `publicAddresses` | dirección de *bind* |
+| `address` | comodín de cada familia de `publicAddresses` (sin ellas: `0.0.0.0`, y `::` si hay IPv6 global) | dirección de *bind* |
 | `publicPort` | el puerto real | puerto anunciado si un NAT 1:1 lo traduce |
 | `idleTimeoutMs` / `handshakeTimeoutMs` / `maxSessions` | 30 s / 20 s / 10 000 | del endpoint; las de `HostTransport` (10 s de apertura, 10 s de inactividad, 16 negociaciones, `maxPlayers`) actúan antes |
 | `certificate` | uno por proceso (`RtcCertificate.processDefault()`, clave generada en el *thread pool*) | certificado DTLS |
@@ -104,10 +219,12 @@ Qué cambia y qué no respecto a node-datachannel (`'ndc'`, por defecto):
   hook `onJoinRequest`, límite por IP) **antes** de crear ninguna sesión, desafío, handshake ECDSA,
   límite de flood, inactividad de 10 s, kicks/bans (el aviso de kick se entrega antes del cierre),
   códigos de cierre, `Peer.remoteAddress` (aquí: origen de los STUN autenticados del jugador).
-* **`iceCandidatePolicy`, `iceServers`, `portRange`, `rtc` (node-datachannel)** se ignoran: el
-  backend es `prefiltered` y solo anuncia `publicAddresses`.
-* La respuesta sale **sin la espera de 500 ms** de recolección (el SDP ya trae los candidatos y
-  `a=end-of-candidates`).
+* **`iceServers` e `iceCandidatePolicy`** del transporte son los valores por defecto de los de `rtc`
+  (el backend es `prefiltered`: el endpoint aplica la política a sus candidatos); `portRange` y `rtc`
+  (node-datachannel) se ignoran.
+* La respuesta sale **sin la espera de 500 ms** cuando el resultado STUN está fresco (el SDP ya trae
+  los candidatos y `a=end-of-candidates`); si hay una ronda en curso, como con `ndc`: ≤ 500 ms y el
+  resto por trickle.
 * **Arranque perezoso**, como `ndc` (que carga node-datachannel con el primer peer): la sala se
   anuncia al maestro en el acto y los módulos rtc, el socket y el certificado se preparan con la
   primera oferta, con `whenListening()` (HBInit lo llama al recibir el enlace y resuelve cuando el
@@ -128,9 +245,11 @@ Qué cambia y qué no respecto a node-datachannel (`'ndc'`, por defecto):
 * node-datachannel ya **no se carga** si no se usa (`src/net/webrtc.ts` lo importa al crear la
   primera PeerConnection): un proceso solo-`rtc` no tiene hilos nativos de WebRTC.
 
-**Recomendación**: `rtc` en servidores con IP pública (dedicados, VPS, edge); `ndc` en hosts detrás
-de NAT sin edge. El valor por defecto sigue siendo `ndc` (el único que funciona sin configurar en
-cualquier red); `rtc` exige `publicAddresses` alcanzables y el puerto UDP abierto.
+**Recomendación**: `rtc` funciona ahora en las mismas situaciones que `ndc` (IP pública, NAT 1:1,
+NAT doméstico o de nube con filtrado dependiente de dirección/puerto, NAT simétrico del lado del host,
+doble NAT con hole punching; §4.4) con la mitad de CPU. Lo único que `ndc` puede y `rtc` no es usar un
+servidor TURN configurado a mano (§2.1). El valor por defecto sigue siendo `ndc` (ver la propuesta en
+§7); en servidores con IP pública `publicAddresses` + puerto fijo sigue siendo lo más simple.
 
 ## 4. Banco de interoperabilidad con navegadores reales (`test/rtc-interop/`)
 
@@ -146,6 +265,7 @@ cualquier red); `rtc` exige `publicAddresses` alcanzables y el puerto UDP abiert
 | `harness/browser.ts` | Lanza el Chromium preinstalado de Playwright (`/opt/pw-browsers/chromium-1194`, `executablePath` explícito; `playwright-core` fijado a **1.56.1**, la versión cuyo `browsers.json` nombra ese build). Nunca descarga navegadores |
 | `suite.ts`, `ndc.interop.ts`, `rtc.interop.ts` | Escenarios (§4.2) para cada backend × condición de red |
 | `udp-proxy.test.ts` | Pruebas rápidas del proxy (corren en `npm test`) |
+| `nat.interop.ts` + `test/rtc/nat-sim.ts` | Servidor **detrás de un NAT simulado** (§4.4) |
 | `selftest.html`, `manual-server.ts` | Prueba manual para cualquier navegador (§5.2) |
 
 ### 4.2 Escenarios
@@ -238,6 +358,34 @@ contraseña y apagado se comportan igual. `test/net/rtc-backend.test.ts` cubre l
 (configuración, candidatos anunciados, cierre de un canal, kick + ban, endpoint sin
 temporizadores en reposo). En el proyecto `rtc` el proceso hijo del test de apagado comprueba que
 node-datachannel nunca se cargó.
+
+### 4.4 Detrás de NAT (simulado en espacio de usuario)
+
+La VM no tiene `ip` (sin veth ni netns configurables) y tocar iptables del host compartido no es
+opción, así que el NAT se simula con sockets UDP (`test/rtc/nat-sim.ts`, `UdpNat`): el servidor
+escucha **solo en 127.0.0.1**, no anuncia ningún candidato host (la política `'public'` descarta
+loopback) y solo sale al exterior a través de **alias**: por cada dirección exterior R el NAT tiene un
+socket interior alias(R); lo que el servidor manda a alias(R) sale por el socket exterior de su
+*mapping* (en la IP no loopback de la VM, el lado «público») hacia R, y lo que llega a ese socket
+exterior desde R' se entrega al servidor desde alias(R') **solo si la regla de filtrado lo permite**.
+Las pruebas reescriben los candidatos remotos que aprende el servidor (oferta, trickle, dirección del
+STUN) a sus alias: ese es el «enrutado» por el NAT; los sockets del servidor se comportan exactamente
+como tras un NAT real. *Mapping* RFC 4787 independiente del extremo o dependiente de dirección(+puerto)
+(simétrico); filtrado independiente, dependiente de dirección o de dirección+puerto (por defecto, el
+más estricto habitual). Un servidor STUN mínimo (`FakeStunServer`) en el lado público da el srflx.
+
+| prueba | cliente | resultado |
+|---|---|---|
+| `test/rtc/nat.test.ts` (en `npm test`) | libdatachannel (node-datachannel) | ✅ NAT de puerto restringido: un solo candidato (srflx = IP:puerto exterior del NAT, `raddr 0.0.0.0`), checks propios, datos ida y vuelta · ✅ NAT simétrico (el cliente aprende nuestro prflx) · ✅ **ambos lados** tras NAT de puerto restringido (hole punching doble) · ✅ consentimiento: nuestros checks de consentimiento respondidos · ✅ **control**: sin los candidatos del cliente (= sin checks) no conecta y el NAT cuenta los checks del cliente descartados |
+| `test/net/rtc-nat.test.ts` (en `npm test`) | **3 clientes node-haxball** por el FakeMaster contra `HostTransport` `peerBackend: 'rtc'` sin `publicAddresses` | ✅ los tres entran, canales abiertos, `stats().ice.checksSucceeded ≥ 3` |
+| `test/rtc-interop/nat.interop.ts` (`npm run test:interop`) | Chromium 141 (cliente transcrito del oficial) | ✅ rtc con host mDNS + srflx del navegador · ✅ rtc con host IP revelada sin STUN · ✅ rtc tras NAT simétrico · ✅ **control**: rtc sin candidatos remotos → falla · ✅ **control**: rtc `iceLite` → falla · ✅ **referencia**: `ndc` (libjuice) tras el mismo NAT conecta igual |
+
+En todos los casos que conectan el servidor ve al jugador en un alias del NAT (todo pasó por él) y la
+entrada tarda lo mismo que sin NAT (un único check propio basta: llega antes de que el navegador
+tenga la respuesta). Las pruebas unitarias (`test/rtc/ice-agent.test.ts`) cubren formato de los
+checks, retransmisión y abandono, respuestas falsificadas y no simétricas, 487, *triggered checks* y
+prflx, destinos prohibidos (LAN, loopback, multicast, mDNS, TCP, puerto 0), topes de pares y envíos,
+recolección (trickle a sesiones creadas durante una ronda, STUN caído, refresco) e ICE‑lite sin checks.
 
 ## 5. Matriz de interoperabilidad
 
@@ -598,11 +746,36 @@ Reproducir: `HAXLITE_BENCH_VARIANTS` con `dist` de cada build (ver la cabecera d
 `bench/net/host-proc.mjs`) y `bench/net/run.ts startup|game|rooms`; diagnóstico con
 `HOST_ALLOC_PROFILE=<f>.heapprofile` y `HOST_HEAP_SNAPSHOT=<f>.heapsnapshot`.
 
+### 6.5 ICE completo: coste en régimen
+
+A/B intercalado con `bench/net/run.ts game --n 20 --reps 3 --warmup 10 --window 30` (bajo
+`flock /tmp/haxlite-bench.lock`, 20 clientes node-haxball, `rtcEndpoint` en 127.0.0.1 con
+`publicAddresses`, es decir sin STUN), tres variantes compiladas módulo a módulo
+(`HAXLITE_BENCH_VARIANTS`): `base` = commit anterior (ICE‑lite), `ice` = esta pasada con ICE completo
+(por defecto), `lite` = esta pasada con `iceLite: true`.
+
+| variante | CPU proceso (3 reps) | media | hilo JS | heap | lag p99 | UDP entrada/salida |
+|---|---|---:|---:|---:|---:|---:|
+| `base` (ICE‑lite, antes) | 6,99 / 7,25 / 7,17 % | 7,14 % | 6,60–6,80 % | 14,0 MB | 1,08–1,16 ms | ≈ 1 510 / 2 590 /s |
+| `ice` (ICE completo) | 7,16 / 7,36 / 7,07 % | 7,20 % | 6,67–6,92 % | 12,3 MB | 1,05–1,08 ms | ≈ 1 510 / 2 590 /s |
+| `lite` (esta pasada, `iceLite`) | 7,12 / 7,42 / 7,03 % | 7,19 % | 6,66–7,03 % | 12,2–14,3 MB | 1,04–1,14 ms | ≈ 1 510 / 2 590 /s |
+
+La diferencia `base` → `ice` (+0,06 puntos, +0,8 %) es menor que la dispersión entre repeticiones
+(± 0,15) y la misma que `base` → `lite`, que no envía ningún check: no hay regresión medible en la
+ruta de régimen. Lo que añade ICE completo en régimen es un Binding de consentimiento cada ~5 s por
+jugador (≈ 4 datagramas/s de ida y vuelta con 20 jugadores, frente a ≈ 4 100/s de juego) y una
+búsqueda en ≤ 16 pares por Binding recibido. (La máquina tenía carga ajena: «foreign» 3–45 %; las
+recolecciones de GC por minuto variaron 48–88 entre repeticiones sin patrón por variante.)
+
 ## 7. Limitaciones
 
-- **Solo IP pública** (o NAT 1:1): ICE‑lite no hace comprobaciones ni reúne candidatos
-  srflx/relay, así que el servidor tiene que ser alcanzable directamente. Detrás de NAT doméstico
-  sigue haciendo falta node-datachannel (o el Edge).
+- **Sin TURN** (§2.1): con el host tras un NAT simétrico **y** el jugador también, no hay camino
+  (node-datachannel tampoco lo tiene con la configuración por defecto, sin servidor TURN). Con
+  `iceLite: true` vuelve a hacer falta IP pública o NAT 1:1.
+- **Candidatos mDNS** (`*.local`) del navegador no se resuelven (tampoco en libdatachannel): con un
+  jugador que solo ofrece mDNS y no tiene STUN, conecta solo si sus checks nos alcanzan (prflx).
+- Las interfaces se leen al escuchar (un cambio de IP local no se ve hasta reiniciar el endpoint);
+  la IP pública por STUN se refresca a los 60 s, al crear una sesión.
 - **Solo data channels pre‑negociados** `ro`/`ru`/`uu`; sin audio/vídeo, sin DCEP (un
   `DATA_CHANNEL_OPEN` del navegador se rechaza con reset de stream), sin renegociación.
 - **El navegador siempre ofrece** y es cliente DTLS; haxlite-rtc no puede iniciar conexiones.
@@ -615,5 +788,15 @@ Reproducir: `HAXLITE_BENCH_VARIANTS` con `dist` de cada build (ver la cabecera d
   (§6.3), y no se puede evitar sin un addon nativo.
 - **Interoperabilidad verificada solo con Chromium 141** (§5). Firefox, Safari y móviles están
   pendientes (§5.2). IPv6 no se pudo probar en esta VM.
-- Sin autodetección de la IP pública vía el maestro (el protocolo no la da): `publicAddresses`
-  explícitas salvo que una interfaz tenga IP pública.
+- La IP pública se autodetecta por STUN (el maestro no la da: el protocolo no la transmite).
+
+**Propuesta (no aplicada) sobre el `peerBackend` por defecto.** Con ICE completo `rtc` cubre lo que
+cubre `ndc` sin TURN, conecta igual de rápido y gasta la mitad de CPU (§6). A favor de cambiar el
+defecto a `'rtc'`: interoperabilidad verificada con Chromium 141 y libdatachannel (node-haxball) en
+todas las condiciones del banco (§5) y tras NAT simulado de puerto restringido, simétrico y doble
+(§4.4), y node-datachannel deja de cargarse (sin hilos nativos ni riesgo de SIGABRT/SIGSEGV, §1). En
+contra, por ahora: Firefox/Safari/móviles sin probar (§5.2), IPv6 sin probar en esta VM, NAT
+**reales** (CGNAT de operadoras, routers domésticos con *hairpinning* raro, firewalls que limitan UDP)
+sin probar fuera del simulador, y sin TURN para quien lo configure. Recomendación: cambiarlo tras
+una prueba de campo con jugadores reales detrás de un NAT doméstico (y Firefox), dejando
+`peerBackend: 'ndc'` como salida.
