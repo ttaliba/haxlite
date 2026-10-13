@@ -143,6 +143,7 @@ export class Peer {
   /** @internal */ localSdp: string | null = null;
   /** @internal */ readonly localCandidates: IceCandidateInit[] = [];
   /** @internal candidates received while 'validating' */ queuedRemote: IceCandidateInit[] = [];
+  /** @internal remote candidates accepted so far (capped by MAX_REMOTE_CANDIDATES) */ remoteCandidates = 0;
   /** @internal */ mids: string[] = [];
 
   constructor(offer: SignalingOffer, srflxIps: string[], now: number) {
@@ -151,6 +152,7 @@ export class Peer {
     this.ip = offer.ip;
     this.srflxIps = srflxIps;
     this.reverse = offer.reverse;
+    this.remoteCandidates = offer.candidates.length;
     this.createdAt = now;
     this.lastMessageAt = now;
   }
@@ -296,6 +298,8 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
 
 /** See {@link HostTransportOptions.challengeDelayMs}. */
 const DEFAULT_CHALLENGE_DELAY_MS = 40;
+/** Remote ICE candidates accepted per negotiation (the edge has the same cap, `EdgeLimits.maxRemoteCandidates`). */
+const MAX_REMOTE_CANDIDATES = 32;
 /** See {@link HostTransportOptions.answerIceWaitMs} (official {@link NetDefaults.answerIceWaitMs}). */
 const DEFAULT_ANSWER_ICE_WAIT_MS = NetDefaults.answerIceWaitMs;
 
@@ -675,7 +679,7 @@ export class HostTransport {
           this.reject(offer, RejectCode.Banned, 'banned srflx');
           return;
         }
-        srflx.push(ip);
+        if (srflx.length < MAX_REMOTE_CANDIDATES && srflx.indexOf(ip) < 0) srflx.push(ip);
       }
     }
     if (this.joinLimiter !== null) this.ensureSweep(); // prunes the limiter's buckets
@@ -817,7 +821,8 @@ export class HostTransport {
       return;
     }
     peer.link = link;
-    for (const c of offer.candidates) this.addRemoteCandidate(peer, c);
+    const n = Math.min(offer.candidates.length, MAX_REMOTE_CANDIDATES);
+    for (let i = 0; i < n; i++) this.addRemoteCandidate(peer, offer.candidates[i]!);
     for (const c of peer.queuedRemote) this.addRemoteCandidate(peer, c);
     peer.queuedRemote = [];
   }
@@ -905,6 +910,8 @@ export class HostTransport {
   private handleRemoteCandidate(peerId: number, c: IceCandidateInit): void {
     const peer = this.pending.get(peerId);
     if (peer === undefined) return;
+    // a real client trickles a handful; the rest would only grow per-peer state and native ICE work
+    if (++peer.remoteCandidates > MAX_REMOTE_CANDIDATES) return;
     const ip = srflxAddress(c);
     if (ip !== null) {
       if (peer.srflxIps.indexOf(ip) < 0) peer.srflxIps.push(ip);
@@ -925,8 +932,10 @@ export class HostTransport {
       // unresolvable (e.g. mDNS) or malformed candidates are ignored like `.catch(function(){})`
       link.addRemoteCandidate(candidateLine(c.candidate), mid);
     };
-    if (peer.reverse) setTimeout(() => this.safely(apply), this.opts.reverseIceDelayMs ?? NetDefaults.reverseIceDelayMs);
-    else apply();
+    if (peer.reverse) {
+      // harmless once the peer is gone (link null): unref'd so it never keeps a stopped host alive
+      setTimeout(() => this.safely(apply), this.opts.reverseIceDelayMs ?? NetDefaults.reverseIceDelayMs).unref();
+    } else apply();
   }
 
   /** `la.Rd`: negotiation failed (timeout, channel closed/message before open, PC failed). */
@@ -1168,7 +1177,10 @@ export class HostTransport {
     }
     const openTimeout = this.opts.channelOpenTimeoutMs ?? NetDefaults.channelOpenTimeoutMs;
     for (const p of this.pending.values()) {
-      if (p.state === 'negotiating' && now - p.createdAt >= openTimeout) this.failNegotiation(p, 'channel open timeout');
+      if (now - p.createdAt < openTimeout) continue;
+      if (p.state === 'negotiating') this.failNegotiation(p, 'channel open timeout');
+      // an onJoinRequest hook that never settles must not hold a negotiation slot forever (late decisions are ignored)
+      else if (p.state === 'validating') this.failNegotiation(p, 'join request timeout');
     }
     const idle = this.opts.peerIdleTimeoutMs ?? NetDefaults.peerIdleTimeoutMs;
     const conns = this.connected;

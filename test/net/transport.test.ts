@@ -131,6 +131,48 @@ describe('admission at signaling time (no WebRTC)', () => {
   });
 });
 
+describe('stuck negotiations and candidate flooding', () => {
+  it('an onJoinRequest hook that never settles times out and frees the slot', async () => {
+    const { roomId, t } = await startHost({ channelOpenTimeoutMs: 300, onJoinRequest: () => new Promise<boolean>(() => {}) });
+    const c = join(roomId, { signalingOnly: true });
+    await withTimeout(
+      (async () => {
+        while (t.pendingCount < 1) await new Promise((r) => setTimeout(r, 10));
+      })(),
+      5000,
+      'pending',
+    );
+    await withTimeout(
+      (async () => {
+        while (t.pendingCount > 0) await new Promise((r) => setTimeout(r, 20));
+      })(),
+      5000,
+      'validating timeout',
+    );
+    c.close();
+  });
+
+  it('caps the remote candidates recorded per negotiation', async () => {
+    let release!: () => void;
+    const { roomId, t } = await startHost({ onJoinRequest: () => new Promise<boolean>((r) => (release = () => r(false))) });
+    const many = Array.from({ length: 100 }, (_, i) => srflx(`192.0.2.${i + 1}`));
+    const c = join(roomId, { signalingOnly: true, extraCandidates: many });
+    await withTimeout(
+      (async () => {
+        while (t.pendingCount < 1) await new Promise((r) => setTimeout(r, 10));
+      })(),
+      5000,
+      'pending',
+    );
+    await new Promise((r) => setTimeout(r, 200)); // let every trickled candidate arrive
+    const peer = [...(t as unknown as { pending: Map<number, { srflxIps: string[]; queuedRemote: unknown[] }> }).pending.values()][0]!;
+    expect(peer.srflxIps.length).toBeLessThanOrEqual(32);
+    expect(peer.queuedRemote.length).toBeLessThanOrEqual(32);
+    release();
+    c.close();
+  });
+});
+
 describe('handshake and identity', () => {
   it('verified auth, join info, srflx/candidates recorded, messages delivered per channel', async () => {
     const { roomId, t } = await startHost();
