@@ -26,33 +26,17 @@
  *
  * Without `HAXBALL_CLIENT_DIR` (or without Chromium) the suite is skipped.
  */
-import { existsSync, readFileSync } from 'node:fs';
-import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { WebSocket as NodeWebSocket } from 'ws';
-import type { Browser, BrowserContext, Page } from 'playwright-core';
+import type { Browser, Page } from 'playwright-core';
 import { FakeMaster } from '../fake-master/index.js';
 import { HBInit, type PlayerObject, type RoomObject } from '../../src/api/index.js';
 import { EventType } from '../../src/protocol.js';
 import { shutdownWebRtc } from '../../src/net/index.js';
 import { chromiumAvailable, launchChromium } from './harness/browser.js';
+import { officialClientAvailable, officialContext, openRoomLink } from './harness/official-client.js';
 
 const CLIENT_DIR = process.env.HAXBALL_CLIENT_DIR ?? '';
-const AVAILABLE = CLIENT_DIR !== '' && existsSync(path.join(CLIENT_DIR, 'game-min.js')) && chromiumAvailable();
-/** Where the official site serves the client (`play` embeds `<STATIC>/game.html` in an iframe). */
-const STATIC = '/H4mQWPXF/__cache_static__/g/';
-
-const TYPES: Record<string, string> = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'application/javascript',
-  '.css': 'text/css',
-  '.png': 'image/png',
-  '.json': 'application/json',
-  '.woff': 'font/woff',
-  '.woff2': 'font/woff2',
-  '.ttf': 'font/ttf',
-  '.svg': 'image/svg+xml',
-};
+const AVAILABLE = officialClientAvailable(CLIENT_DIR) && chromiumAvailable();
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -64,86 +48,6 @@ async function until<T>(f: () => T | null | undefined | false, ms: number, what:
     if (performance.now() - t0 > ms) throw new Error(`timeout: ${what}`);
     await sleep(20);
   }
-}
-
-/** A browser context where www.haxball.com / p2p.haxball.com are this test's FakeMaster + client files. */
-async function officialContext(browser: Browser, master: FakeMaster, log: string[]): Promise<BrowserContext> {
-  const ctx = await browser.newContext();
-  // page-side code as strings: this file is type-checked without the DOM lib
-  await ctx.addInitScript({
-    content: "try { if (location.hostname === 'www.haxball.com') localStorage.setItem('player_name', 'Officer'); } catch (e) {}",
-  });
-  await ctx.route('**/*', async (route) => {
-    const req = route.request();
-    const url = new URL(req.url());
-    if (url.hostname !== 'www.haxball.com') {
-      log.push(`stub ${url.hostname}${url.pathname}`);
-      await route.fulfill({ status: url.hostname === 'fonts.googleapis.com' ? 200 : 404, contentType: 'text/css', body: '' });
-      return;
-    }
-    if (url.pathname.startsWith('/rs/')) {
-      const r = await fetch(master.httpBase + url.pathname.slice(4) + url.search, {
-        method: req.method(),
-        headers: { 'content-type': req.headers()['content-type'] ?? 'application/x-www-form-urlencoded' },
-        ...(req.method() === 'POST' ? { body: req.postData() ?? '' } : null),
-      });
-      log.push(`master ${req.method()} ${url.pathname} ${r.status}`);
-      await route.fulfill({
-        status: r.status,
-        headers: { 'content-type': r.headers.get('content-type') ?? 'application/octet-stream', 'access-control-allow-origin': '*' },
-        body: Buffer.from(await r.arrayBuffer()),
-      });
-      return;
-    }
-    if (url.pathname === '/play') {
-      // the client refuses to start outside an iframe (`window.self != window.top`): a minimal
-      // top page like haxball.com/play (ours, not the official markup) embedding game.html
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/html; charset=utf-8',
-        body: `<!DOCTYPE html><html><body style="margin:0"><iframe src="${STATIC}game.html" style="width:1000px;height:700px;border:0"></iframe></body></html>`,
-      });
-      return;
-    }
-    if (url.pathname.startsWith(STATIC)) {
-      const rel = path.normalize(decodeURIComponent(url.pathname.slice(STATIC.length)));
-      const file = path.join(CLIENT_DIR, rel);
-      if (!rel.startsWith('..') && existsSync(file)) {
-        await route.fulfill({ status: 200, contentType: TYPES[path.extname(file)] ?? 'application/octet-stream', body: readFileSync(file) });
-        return;
-      }
-    }
-    log.push(`404 ${url.pathname}`);
-    await route.fulfill({ status: 404, body: '' });
-  });
-  await ctx.routeWebSocket(/^wss:\/\/p2p\.haxball\.com\//, (ws) => {
-    const u = new URL(ws.url());
-    log.push(`ws ${u.pathname}`);
-    const up = new NodeWebSocket(master.wsBase + u.pathname.slice(1) + u.search, { headers: { origin: 'https://www.haxball.com' } });
-    up.binaryType = 'nodebuffer';
-    const queue: (string | Buffer)[] = [];
-    ws.onMessage((m) => {
-      if (up.readyState === NodeWebSocket.OPEN) up.send(m);
-      else queue.push(m);
-    });
-    up.on('open', () => {
-      for (const m of queue.splice(0)) up.send(m);
-    });
-    up.on('message', (data: Buffer, isBinary: boolean) => ws.send(isBinary ? data : data.toString('utf8')));
-    up.on('close', (code) => {
-      log.push(`ws closed by master ${code}`);
-      void ws.close({ code: code === 1000 || (code >= 3000 && code <= 4999) ? code : 1000 }).catch(() => {});
-    });
-    up.on('error', () => {});
-    ws.onClose((code) => {
-      try {
-        up.close(code === 1000 || (code !== undefined && code >= 3000 && code <= 4999) ? code : 1000);
-      } catch {
-        /* gone */
-      }
-    });
-  });
-  return ctx;
 }
 
 let master: FakeMaster;
@@ -180,7 +84,7 @@ describe.skipIf(!AVAILABLE)('official HaxBall web client (game-min.js) in Chromi
           transport: { iceCandidatePolicy: 'all' },
         },
       });
-      const ctx = await officialContext(browser, master, log);
+      const ctx = await officialContext(browser, master, CLIENT_DIR, log);
       let page: Page | null = null;
       try {
         const joins: PlayerObject[] = [];
@@ -210,12 +114,7 @@ describe.skipIf(!AVAILABLE)('official HaxBall web client (game-min.js) in Chromi
         page.on('console', (m) => log.push(`console.${m.type()} ${m.text()}`));
         const t0 = performance.now();
         // like a shared room link: https://www.haxball.com/play?c=<id> (the game reads window.top's ?c=)
-        await page.goto(`https://www.haxball.com/play?c=${roomId}`);
-        const frame = (await (await page.waitForSelector('iframe')).contentFrame())!;
-        // the official client always starts with "Choose nickname" (prefilled from localStorage)
-        await frame.waitForSelector('.choose-nickname-view input[data-hook=input]', { timeout: 15_000 });
-        await frame.fill('.choose-nickname-view input[data-hook=input]', 'Officer');
-        await frame.click('.choose-nickname-view button[data-hook=ok]');
+        const frame = await openRoomLink(page, roomId, 'Officer');
         let player: PlayerObject;
         try {
           player = await until(() => joins[0], 30_000, 'official client join');
