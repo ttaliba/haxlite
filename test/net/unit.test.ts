@@ -325,6 +325,38 @@ describe('auth', () => {
     expect(await verifyAuthBlob(await createAuthBlob(again, challenge), challenge)).toBe(id.x);
     await expect(identityFromKey('idkey.a.b')).rejects.toThrow('Invalid id format');
   });
+
+  it('auth is the canonical base64url of x: non-canonical encodings of the same key cannot dodge an auth ban', async () => {
+    const { ua } = officialNet();
+    const id = await generateIdentity();
+    const challenge = createChallenge();
+    const B64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    expect(id.x).toMatch(/^[A-Za-z0-9_-]{43}$/); // 32 bytes -> 43 chars, 2 spare bits
+    const last = B64URL.indexOf(id.x[42]!);
+    const variants = [
+      id.x.slice(0, 42) + B64URL[last ^ 1], // non-zero trailing bits (same bytes)
+      id.x.slice(0, 42) + B64URL[last ^ 3],
+      `${id.x.replace(/-/g, '+').replace(/_/g, '/')}=`, // standard base64 + padding
+      `${id.x}=`,
+      ` ${id.x}`,
+    ];
+    for (const x of variants) {
+      const blob = await createAuthBlob({ ...id, x }, challenge);
+      // WebCrypto accepts it as the same key (the official host would return `x` verbatim)...
+      let official: string | undefined;
+      try {
+        official = await ua.ri(blob, challenge);
+      } catch {
+        official = undefined;
+      }
+      if (official !== undefined) expect(official).toBe(x);
+      // ...but haxlite always reports the canonical string.
+      expect(await verifyAuthBlob(blob, challenge)).toBe(id.x);
+    }
+    // A different key still yields a different auth.
+    const other = await generateIdentity();
+    expect(await verifyAuthBlob(await createAuthBlob(other, challenge), challenge)).toBe(other.x);
+  });
 });
 
 describe('handshake framing', () => {

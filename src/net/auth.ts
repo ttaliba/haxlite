@@ -13,7 +13,8 @@
  * ```
  *
  * The host (`ua.ri`) checks that the challenge matches byte for byte, imports
- * `{kty:'EC', crv:'P-256', x, y}` and verifies; success => `auth = x`.
+ * `{kty:'EC', crv:'P-256', x, y}` and verifies; success => `auth = x`
+ * (haxlite: the canonical base64url re-encoding of x, see `verifyAuthBlob`).
  * Verification failure => `auth = null` but the player still joins (policy
  * `allowNullAuth`, default true for parity).
  */
@@ -60,7 +61,17 @@ export async function verifyAuthBlob(blob: Uint8Array, challenge: Uint8Array): P
   );
   const ok = await subtle.verify(SIGN_ALGORITHM, key, signature as Uint8Array<ArrayBuffer>, signed as Uint8Array<ArrayBuffer>);
   if (!ok) throw new Error('invalid signature');
-  return x;
+  // `auth` is the canonical base64url of the key's x coordinate, NOT the string
+  // the client sent: WebCrypto's JWK import is lenient (standard base64 `+/=`,
+  // non-zero trailing bits in the last char, embedded whitespace...), so one
+  // key could otherwise yield many distinct `auth` strings and dodge auth bans.
+  // Re-exporting gives exactly the coordinate that was verified. Official
+  // clients generate their key with `exportKey('jwk')`, which is already
+  // canonical, so for them this equals `x` (parity with the official host /
+  // node-haxball, which return `x` verbatim).
+  const canonical = (await subtle.exportKey('jwk', key)).x;
+  if (!canonical) throw new Error('invalid key');
+  return canonical;
 }
 
 // ------------------------------------------------------------------ client side (tools/tests)
