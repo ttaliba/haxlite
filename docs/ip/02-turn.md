@@ -128,7 +128,7 @@ Verificado en el código: `src/net/ice.ts`, `src/net/transport.ts`, y libdatacha
    - Los pares relay solo se forman con candidatos de la misma familia. Como la relay es IPv4, un jugador sin srflx IPv4 no tiene ningún par relay posible.
 5. Allocation con lifetime de 10 min, refrescada cada 9 min con la **misma** credencial.
    - En haxlite, `iceServers` es `readonly` y se resuelve una vez en el constructor (`transport.ts:297`). No hay forma de renovar credenciales sin reiniciar el transport.
-6. haxlite envía la answer a los 500 ms (`answerIceWaitMs`) y después hace *trickle* del candidato relay. Bien.
+6. haxlite envía la answer con el primer candidato permitido (como mucho `answerIceWaitMs` = 500 ms, igual que el oficial) y después hace *trickle* del candidato relay. Bien.
    - El cliente oficial da 4 s para conectar (10 s en "reverse connection", con 2,5 s de retraso al aplicar candidatos). Ver `docs/01-red-y-salas.md`.
 
 ---

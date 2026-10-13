@@ -17,7 +17,8 @@
  *   known connection id are bounded);
  * * a tunnel that sends nothing authenticated for `idleTimeoutMs` is closed.
  */
-import dgram, { type RemoteInfo, type Socket } from 'node:dgram';
+import type { RemoteInfo, Socket } from 'node:dgram';
+import { createRequire } from 'node:module';
 import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { TokenBucket } from '../net/rate-limit.js';
@@ -69,6 +70,8 @@ function bindSocket(address: string, port: number): Promise<Socket> {
   const fam = isIP(address);
   if (fam === 0) throw new Error(`tunnel bind address must be an IP literal (${address})`);
   return new Promise((resolve, reject) => {
+    // loaded on first use: importing the package must not load node:dgram
+    const dgram = createRequire(import.meta.url)('node:dgram') as typeof import('node:dgram');
     const sock = dgram.createSocket({ type: fam === 6 ? 'udp6' : 'udp4', reuseAddr: false });
     const onError = (err: Error) => {
       sock.close();

@@ -1,0 +1,26 @@
+{
+ "reps": 15,
+ "nodeArgs": [],
+ "median": {
+  "base": {
+   "processToImport": 53.6,
+   "importMs": 90.1,
+   "hbinitToLinkMs": 29,
+   "processToLinkMs": 172.5,
+   "cpuMs": 241.1,
+   "rssMB": 68,
+   "heapMB": 8.2,
+   "cjsModules": 13
+  },
+  "cur": {
+   "processToImport": 55.8,
+   "importMs": 54.6,
+   "hbinitToLinkMs": 24.8,
+   "processToLinkMs": 135.4,
+   "cpuMs": 145.8,
+   "rssMB": 58.9,
+   "heapMB": 7.5,
+   "cjsModules": 14
+  }
+ }
+}

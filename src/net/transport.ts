@@ -237,6 +237,14 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   maxPendingNegotiations?: number;
   channelOpenTimeoutMs?: number;
   peerIdleTimeoutMs?: number;
+  /**
+   * Max wait for local ICE gathering before sending the answer (default 500
+   * ms, official `ub.li`). Backends with `answerOnFirstCandidate`
+   * (node-datachannel) answer as soon as one candidate passes
+   * `iceCandidatePolicy` and trickle the rest, so this is only the fallback
+   * when no allowed candidate shows up (e.g. an unreachable STUN server behind
+   * NAT with the `'public'` policy).
+   */
   answerIceWaitMs?: number;
   reverseIceDelayMs?: number;
   /** Room link prefix (default `https://www.haxball.com/play?c=`). */
@@ -288,6 +296,8 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
 
 /** See {@link HostTransportOptions.challengeDelayMs}. */
 const DEFAULT_CHALLENGE_DELAY_MS = 40;
+/** See {@link HostTransportOptions.answerIceWaitMs} (official {@link NetDefaults.answerIceWaitMs}). */
+const DEFAULT_ANSWER_ICE_WAIT_MS = NetDefaults.answerIceWaitMs;
 
 export class HostTransport {
   readonly bans: BanList;
@@ -832,7 +842,7 @@ export class HostTransport {
     else {
       peer.timer = setTimeout(
         () => this.safely(() => this.sendAnswer(peer)),
-        this.opts.answerIceWaitMs ?? NetDefaults.answerIceWaitMs,
+        this.opts.answerIceWaitMs ?? DEFAULT_ANSWER_ICE_WAIT_MS,
       );
     }
   }
@@ -874,7 +884,7 @@ export class HostTransport {
     else if (peer.answerSent) this.sendEnd(peer);
   }
 
-  /** `Aa.Zh` (after `ub.li`: gathering complete or 500 ms). */
+  /** `Aa.Zh` (after `ub.li`: gathering complete or `answerIceWaitMs`). */
   private sendAnswer(peer: Peer): void {
     if (peer.timer !== null) clearTimeout(peer.timer);
     peer.timer = null;

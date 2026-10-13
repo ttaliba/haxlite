@@ -137,7 +137,7 @@ decide el master, lo razonable es que **la oferta no llegue al host** hasta reso
 | 4 | — | rate limit por IP (`joinRateLimit`) | No |
 | 5 | `Oe` = `Wa.Xg`: llena 4100, versión 4103, contraseña 4101 | idem | No |
 | 6 | — | `onJoinRequest` (async) con `ip`, `srflxIps`, `candidateAddresses`, `password`, `reverse` | No |
-| 7 | crear PC, answer, esperar ICE ≤500 ms, **enviar answer** | idem (`answerIceWaitMs`) | **SÍ** |
+| 7 | crear PC, answer, esperar ICE ≤500 ms, **enviar answer** | idem, pero con node-datachannel la answer sale con el primer candidato permitido (`answerIceWaitMs` = 500 ms solo si no hay ninguno) | **SÍ** |
 | 8 | canal 0 abierto: sala llena → cierre | idem | Sí |
 | 9 | challenge → firma → `auth` | idem (+ `allowNullAuth:false`) | Sí |
 | 10 | ban por `auth`, script `onPlayerJoin` (kicks por nombre, etc.) | idem | Sí |

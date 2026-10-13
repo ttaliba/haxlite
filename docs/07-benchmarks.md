@@ -1027,4 +1027,69 @@ HAXLITE_BENCH_VARIANTS='{"base":{"dist":"'$D'/hx-ab/base"},"new":{"dist":"'$N'"}
   "cc0":{"dist":"'$N'","sctp":{"congestionControlModule":0}},"sack50":{"dist":"'$N'","sctp":{"delayedSackTime":50}}}' \
   flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
   bench/net/run.ts game --impl haxlite:base,haxlite:new,haxlite:cc0,haxlite:sack50 --n 20 --reps 3 --warmup 10 --window 30
+
+## Pasada del núcleo (entrada, arranque, heap; `src/net/transport`, build)
+
+Partida con 20 clientes `ndc`, 3 × 30 s intercaladas en la misma sesión
+(`bench/results/core-pass-game.json`; «antes» = `4bdca83`, los dos con el `dist` por módulos) y
+arranque, 15 repeticiones intercaladas (`bench/results/core-pass-startup.json`, paquete
+minificado; solo medianas). Mediana [mín–máx]:
+
+| | antes | después |
+|---|---:|---:|
+| entrada `Room.join` → `onOpen`, p50 de los 20 clientes (ms) | 2 058 [2 057–2 058] | **1 111** [1 110–1 114] |
+| entrada p90 (ms) | 2 133 [2 122–2 139] | **1 188** [1 182–1 195] |
+| heap usado medio (MB) | 10,0 [10,0–10,0] | **9,6** [9,6–9,6] |
+| RSS medio (MB) | 82,5 [81,3–82,6] | **78,7** [78,6–78,7] |
+| CPU % · lag p99 (ms) · GC ms/min | 14,7 · 1,08 · 4,5 | 14,9 · 1,15 · 4,2 (ruido) |
+| arranque: inicio → link (ms) · import (ms) | 172 · 90 | **135 · 55** |
+| arranque: CPU hasta el link (ms) · RSS · heap (MB) | 241 · 68,0 · 8,2 | **146 · 58,9 · 7,5** |
+
+(Los valores absolutos del arranque son de una máquina con carga ajena; vale la comparación,
+intercalada.)
+
+* **Entrada (−0,95 s).** Línea de tiempo con libdatachannel en el host: la oferta del cliente
+  llega a ~1 000 ms (el cliente espera su propia recolección ICE), la answer salía a +500 ms
+  (`answerIceWaitMs`, STUN inalcanzable) y el canal 0 abría **1 s después** de que ICE conectara:
+  libdatachannel, al responder una oferta `a=setup:actpass`, elegía el rol DTLS **activo** y
+  mandaba el ClientHello en cuanto ICE conectaba, antes de que la answer llegara al cliente por el
+  maestro; el cliente lo descartaba y OpenSSL lo reenviaba al vencer su temporizador inicial de
+  1 s. La corrección es la de la pasada `ndc` de arriba (`passiveDtlsOffer` en
+  `LocalPeerLink`, `src/net/peer-backend.ts`; esta pasada llegó por su cuenta a la misma, que se
+  unificó en una sola): el host responde `passive` (servidor DTLS, como haxlite-rtc) y espera el
+  ClientHello que el cliente manda cuando ya tiene la answer. La answer sale con el primer
+  candidato permitido (`answerOnFirstCandidate`), con `answerIceWaitMs` = 500 ms solo como
+  respaldo. Probado con node-haxball (todas las suites) y con el cliente oficial en Chromium
+  (`test:interop`: `official-client` y `ndc` en loopback, pérdida y DTLS 1.3). Lo que queda (~1,05 s) es la espera de recolección del propio cliente más el
+  `challengeDelayMs` de 40 ms.
+* **Arranque (−37 ms, −95 ms de CPU, −9 MB de RSS).** `ws` es CommonJS tras un envoltorio ESM:
+  importarlo desde ESM hace pasar cjs-module-lexer (WASM) por sus módulos; ahora se carga con
+  `createRequire` (`src/net/ws.ts`). `node:fs` se toma con `require` (su fachada ESM evalúa
+  `fs.promises`: fs/promises, readline…) y `node:dgram`/`node:dns` solo se cargan al usar el túnel
+  UDP del edge. Importar el paquete carga 81 módulos internos de Node en vez de 89.
+* **Heap (−0,4 MB).** Además de lo anterior, el build emite solo ASCII: V8 guarda el fuente de
+  cada módulo en el heap y una sola elipsis en un mensaje hacía que el chunk principal (93 KB) se
+  guardara en UTF‑16 (182 KB).
+
+Diagnóstico, sin cambio de código:
+
+* **Hilo JS con `ndc`**: en el perfil de CPU de la ventana, el código de haxlite (secuenciador,
+  física, transporte) suma ~0,3 % de un núcleo; ~3 % son llamadas nativas de node-datachannel
+  (≈ 10 µs por `sendMessageBinary`, estimado de ~3 % entre ~2 900 envíos/s; 20 envíos por cada
+  input difundido). El lag p99 lo dominan esas
+  ráfagas de envíos nativos; diferirlas a otra fase del bucle no lo reduce (el temporizador del
+  monitor espera lo mismo).
+* **GC**: ~0,2 MB/s asignados en la ventana. Del núcleo, en régimen: el objeto evento de cada
+  input (64 B) y los `Timeout` del reloj compartido (~7 KB/s). La física no asigna en régimen
+  (`stepWorld` 1,5 B/tick con TurboFan); en los primeros segundos de partida sí, mientras V8 la
+  desoptimiza por ramas aún no vistas. El resto: `ArrayBuffer`s de node-datachannel por mensaje
+  recibido (~40 KB/s) y el envoltorio `(...args)` de los callbacks de `src/net/webrtc.ts`
+  (~12 KB/s).
+
+```sh
+flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+  bench/startup/run.ts 15 base=<bundle antes>/index.js cur=<bundle después>/index.js
+HAXLITE_BENCH_VARIANTS='{"base":{"dist":"<dist antes>"},"cur":{"dist":"<dist después>"}}' \
+  flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+  bench/net/run.ts game --impl haxlite:base,haxlite:cur --n 20 --reps 3 --warmup 10 --window 30
 ```
