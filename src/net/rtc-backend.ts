@@ -1,28 +1,34 @@
 /**
  * `peerBackend: 'rtc'`: player connections terminated by haxlite-rtc
- * (`src/rtc`, pure TypeScript ICE-lite + DTLS 1.2 + SCTP) in this process,
+ * (`src/rtc`, pure TypeScript ICE + DTLS 1.2 + SCTP) in this process,
  * every player on **one UDP port**, no native addon, no extra threads.
  *
- * ICE-lite never gathers candidates: the answer only carries the configured
- * {@link RtcBackendOptions.publicAddresses} (host candidates), so the server
- * must be directly reachable there — a public IP on an interface, or a 1:1
- * NAT that forwards the UDP port (cloud VMs: set `publicAddresses` to the
- * elastic/public IP and open the port). Hosts behind a home NAT keep using
- * node-datachannel (`'ndc'`, STUN srflx candidates) or a haxlite Edge.
+ * ICE (src/rtc/ice-agent.ts, gather.ts): by default a full ICE agent in the
+ * controlled role — host candidates from the interfaces (filtered by
+ * `iceCandidatePolicy`) or the configured {@link RtcBackendOptions.publicAddresses},
+ * server-reflexive candidates from the STUN servers (`iceServers`, default the
+ * same as `ndc`), and our own connectivity checks towards the player's
+ * candidates so that a home/cloud NAT in front of the host opens a pinhole:
+ * it works behind NAT without configuration, like node-datachannel.
+ * `iceLite: true` restores the original ICE-lite mode (only `publicAddresses`,
+ * no checks: the server must be directly reachable).
  *
  * Everything protocol-related stays in {@link HostTransport} (admission
  * before any session exists, answer timing, challenge, flood, idle timeouts,
  * bans by conn/srflx IP, kicks). Differences from node-datachannel that the
  * transport sees:
  *
- * * the answer SDP is complete at once (candidates included,
- *   `a=end-of-candidates`): `onLocalDescription`, the candidates and
- *   `onGatheringComplete` are all delivered inside `createPeer`, so the answer
- *   goes out without the 500 ms gathering wait;
+ * * the answer SDP carries every candidate known at once: `onLocalDescription`,
+ *   the candidates and (when no STUN round is running: the srflx result is
+ *   cached per endpoint for `gatherRefreshMs`) `onGatheringComplete` are all
+ *   delivered inside `createPeer`, so the answer goes out without the 500 ms
+ *   gathering wait; while a STUN round runs, the srflx candidates and
+ *   `onGatheringComplete` follow asynchronously (≤ 1.5 s, like `ndc`);
  * * the three channels open together when the SCTP association comes up
  *   (one `onChannelOpen` per channel, in order 0, 1, 2);
- * * `prefiltered`: the host's `iceCandidatePolicy` is not applied — the
- *   configured public addresses are the only ones ever announced;
+ * * `prefiltered`: the endpoint applies `iceCandidatePolicy` itself (srflx
+ *   candidates always carry `raddr 0.0.0.0 rport 0`); explicit
+ *   `publicAddresses` are announced as given;
  * * the selected-pair address given with channel 0 is the source address of
  *   the browser's authenticated STUN checks (its NAT's public address);
  * * **bundling**: the first `send` to a peer corks its SCTP association;
@@ -45,7 +51,8 @@ import { networkInterfaces } from 'node:os';
 import { isIP } from 'node:net';
 import type { RtcCertificate, RtcEndpoint, RtcEndpointStats, RtcSession, SharedEndpointLease } from '../rtc/index.js';
 import { freezeSctpClock, thawSctpClock } from '../rtc/sctp/clock.js';
-import { classifyAddress } from './ice.js';
+import { classifyAddress, type IceCandidatePolicy, type IceServerConfig } from './ice.js';
+import { DEFAULT_ICE_SERVERS } from './constants.js';
 import type { PeerBackend, PeerLink, PeerLinkEvents } from './peer-backend.js';
 
 export interface RtcBackendOptions {
@@ -57,12 +64,35 @@ export interface RtcBackendOptions {
   /** Bind address (default: the wildcard of each family in `publicAddresses`). */
   address?: string;
   /**
-   * IP literals advertised to players — the only addresses ever written in
-   * SDP. Default: every non-internal interface address classified `public`
-   * (see `classifyAddress`); if there is none (NAT, cloud 1:1 NAT) the
-   * transport refuses to start and this must be set explicitly.
+   * IP literals advertised to players as host candidates (instead of the
+   * interface addresses). Full ICE: optional (server-reflexive candidates are
+   * gathered anyway when `iceServers` apply); set it for a 1:1 NAT whose public
+   * IP STUN cannot see, or to skip STUN (then `iceServers` defaults to none).
+   * ICE-lite: the only addresses ever written in SDP; default every
+   * non-internal interface address classified `public`, and the transport
+   * refuses to start when there is none.
    */
   publicAddresses?: readonly string[];
+  /**
+   * ICE-lite mode (the original haxlite-rtc behaviour): no gathering, no
+   * connectivity checks, `a=ice-lite`. Default false (full ICE, works behind NAT).
+   */
+  iceLite?: boolean;
+  /**
+   * STUN servers for server-reflexive candidates. Default: `[]` when
+   * `publicAddresses` is set, else the transport's `iceServers`
+   * (default `stun:stun.l.google.com:19302`, as for `ndc`). TURN entries are
+   * ignored (relay not implemented, see docs/10).
+   */
+  iceServers?: readonly IceServerConfig[];
+  /**
+   * Which interface addresses are announced and which remote address classes
+   * may receive our checks (default: the transport's `iceCandidatePolicy`,
+   * else `'public'`). Not applied to explicit `publicAddresses`.
+   */
+  iceCandidatePolicy?: IceCandidatePolicy;
+  /** Re-query the STUN servers at a new session when the last result is older (default 60 000 ms). */
+  gatherRefreshMs?: number;
   /** Advertised port when a 1:1 NAT maps a different one (default: the bound port). */
   publicPort?: number;
   /** DTLS certificate (default: {@link certificateFile}, else one ECDSA P-256 key per process, generated off-thread). */
@@ -107,7 +137,7 @@ export function detectPublicAddresses(): string[] {
   return out;
 }
 
-/** Resolves {@link RtcBackendOptions.publicAddresses} (explicit or detected). Throws when none. */
+/** Resolves {@link RtcBackendOptions.publicAddresses} (explicit or detected) for ICE-lite. Throws when none. */
 export function resolvePublicAddresses(o: RtcBackendOptions): string[] {
   if (o.publicAddresses !== undefined) {
     const list = [...o.publicAddresses];
@@ -120,9 +150,9 @@ export function resolvePublicAddresses(o: RtcBackendOptions): string[] {
   const found = detectPublicAddresses();
   if (found.length === 0) {
     throw new Error(
-      "peerBackend 'rtc' needs a publicly reachable address: no interface has a public IP, so set " +
+      "peerBackend 'rtc' with iceLite needs a publicly reachable address: no interface has a public IP, so set " +
         "rtc.publicAddresses (e.g. ['203.0.113.7'], the public IP of a 1:1 NAT with the UDP port forwarded), " +
-        "or use peerBackend 'ndc' (works behind NAT) or a haxlite Edge",
+        'or drop iceLite (full ICE works behind NAT)',
     );
   }
   return found;
@@ -201,7 +231,10 @@ export class RtcPeerBackend implements PeerBackend {
   private ep: RtcEndpoint | null = null;
   private readonly owned: boolean;
   private readonly opts: RtcBackendOptions;
-  private readonly publicAddresses: string[];
+  /** Explicit (or, for ICE-lite, detected) public addresses; undefined: full ICE gathers. */
+  private readonly publicAddresses: string[] | undefined;
+  private readonly iceServers: readonly IceServerConfig[];
+  private readonly policy: IceCandidatePolicy;
   /** start() generation: a listen that completes after stop() is discarded. */
   private generation = 0;
   private readonly links = new Set<RtcPeerLink>();
@@ -217,15 +250,23 @@ export class RtcPeerBackend implements PeerBackend {
   /** Offers accepted while {@link starting}, answered once the endpoint listens. */
   private readonly deferred = new Set<DeferredRtcPeerLink>();
 
-  constructor(opts: RtcBackendOptions = {}) {
+  /**
+   * @param defaults the transport's `iceServers` / `iceCandidatePolicy`
+   *   (used when `opts` does not set its own).
+   */
+  constructor(opts: RtcBackendOptions = {}, defaults: { iceServers?: readonly IceServerConfig[]; iceCandidatePolicy?: IceCandidatePolicy } = {}) {
     this.opts = opts;
     this.owned = opts.endpoint === undefined;
+    this.policy = opts.iceCandidatePolicy ?? defaults.iceCandidatePolicy ?? 'public';
     if (opts.endpoint !== undefined) {
       this.ep = opts.endpoint;
       this.publicAddresses = [];
+      this.iceServers = [];
     } else {
-      // fail fast (synchronously: HostTransport/HBInit construction) on a missing public address
-      this.publicAddresses = resolvePublicAddresses(opts);
+      // fail fast (synchronously: HostTransport/HBInit construction) on bad / missing (lite) public addresses
+      this.publicAddresses = opts.iceLite === true || opts.publicAddresses !== undefined ? resolvePublicAddresses(opts) : undefined;
+      this.iceServers =
+        opts.iceLite === true ? [] : (opts.iceServers ?? (opts.publicAddresses !== undefined ? [] : (defaults.iceServers ?? DEFAULT_ICE_SERVERS)));
     }
   }
 
@@ -278,7 +319,11 @@ export class RtcPeerBackend implements PeerBackend {
     const o = this.opts;
     const epOpts = {
       port: o.port ?? 0,
-      publicAddresses: this.publicAddresses,
+      ...(this.publicAddresses !== undefined ? { publicAddresses: this.publicAddresses } : null),
+      ...(o.iceLite === true ? { iceLite: true } : null),
+      ...(this.iceServers.length > 0 ? { iceServers: this.iceServers } : null),
+      ...(this.policy !== 'public' ? { candidatePolicy: this.policy } : null),
+      ...(o.gatherRefreshMs !== undefined ? { gatherRefreshMs: o.gatherRefreshMs } : null),
       ...(o.address !== undefined ? { address: o.address } : null),
       ...(o.publicPort !== undefined ? { publicPort: o.publicPort } : null),
       ...(o.certificate !== undefined ? { certificate: o.certificate } : null),
@@ -385,7 +430,8 @@ export class RtcPeerBackend implements PeerBackend {
     this.links.add(link);
     ev.onLocalDescription(s.answerSdp);
     if (!link.closed) for (const c of s.localCandidates) ev.onLocalCandidate(c, s.mid);
-    if (!link.closed) ev.onGatheringComplete();
+    // srflx candidates of a running STUN round follow through the session callbacks (RtcPeerLink)
+    if (!link.closed && s.gatheringComplete) ev.onGatheringComplete();
     return link;
   }
 }
@@ -475,6 +521,9 @@ class RtcPeerLink implements PeerLink {
     };
     // the browser closed one channel (dc.close() → stream reset), like node-datachannel's DataChannel `closed`
     s.onChannelClose = (ch) => this.ev?.onChannelClosed(ch);
+    // trickle: candidates found by a STUN round still running when the answer was built
+    s.onLocalCandidate = (c) => this.ev?.onLocalCandidate(c, s.mid);
+    s.onGatheringComplete = () => this.ev?.onGatheringComplete();
     s.onClose = (reason) => {
       const e = this.ev;
       this.release();

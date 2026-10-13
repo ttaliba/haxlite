@@ -196,8 +196,15 @@ describe('RtcEndpoint ICE-lite', () => {
     const ips = new Set(s.answerSdp.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g));
     expect(ips).toEqual(new Set(['0.0.0.0', '203.0.113.9']));
     expect(s.localCandidates).toEqual([`candidate:1 1 udp 2130706431 203.0.113.9 ${ep.port} typ host generation 0`]);
-    expect(s.answerSdp).toContain('a=ice-lite');
+    // full ICE by default (no a=ice-lite); iceLite: true restores the lite answer
+    expect(s.answerSdp).not.toContain('a=ice-lite');
+    expect(s.answerSdp).toContain('a=end-of-candidates');
     expect(s.answerSdp).toContain(`a=fingerprint:sha-256 ${formatFingerprint(ep.certificate.fingerprint)}`);
+    await ep.close();
+    ep = await RtcEndpoint.listen({ address: '127.0.0.1', publicAddresses: ['203.0.113.9'], iceLite: true, dataLayer: rawDataLayer });
+    const lite = ep.createSession(offerSdp(cert.sha256));
+    expect(lite.answerSdp).toContain('a=ice-lite');
+    expect(lite.localCandidates).toEqual([`candidate:1 1 udp 2130706431 203.0.113.9 ${ep.port} typ host generation 0`]);
   });
 
   it('binds the wildcard of the public family when no address is given', async () => {
@@ -226,6 +233,7 @@ describe('RtcEndpoint ICE-lite', () => {
   it('validates options', async () => {
     await expect(RtcEndpoint.listen({ publicAddresses: [] })).rejects.toThrow();
     await expect(RtcEndpoint.listen({ publicAddresses: ['example.com'], dataLayer: rawDataLayer })).rejects.toThrow();
+    await expect(RtcEndpoint.listen({ iceLite: true, dataLayer: rawDataLayer })).rejects.toThrow(/iceLite/);
   });
 });
 

@@ -20,6 +20,14 @@ import type { PeerLink } from '../../../src/net/peer-backend.js';
 import { createBackend, type BackendHandle, type BackendKind } from './backends.js';
 import { UdpImpairProxy, type ImpairOptions } from './udp-proxy.js';
 import { HEADER, Kind, makeMsg, now, Recorder } from './wire.js';
+import type { RtcEndpointOptions } from '../../../src/rtc/index.js';
+import type { RtcConfig } from 'node-datachannel';
+
+/** What the harness needs from a NAT simulator (test/rtc/nat-sim.ts `UdpNat`). */
+export interface CandidateRouter {
+  /** The candidate as the server must use it (its NAT alias), or null when unusable. */
+  rewriteCandidate(line: string): Promise<string | null>;
+}
 
 export interface InteropServerOptions {
   backend: BackendKind;
@@ -40,6 +48,18 @@ export interface InteropServerOptions {
   verbose?: boolean;
   /** Directory of client.js/wire.ts (default: next to this module; needed when bundled). */
   assetsDir?: string;
+  /** haxlite-rtc endpoint overrides (e.g. no publicAddresses + iceServers for full ICE behind a NAT). */
+  rtc?: Partial<RtcEndpointOptions>;
+  /** node-datachannel config overrides (e.g. iceServers). */
+  ndc?: Partial<RtcConfig>;
+  /**
+   * The server sits behind a NAT: the browser's candidates are handed to the
+   * backend rewritten by this router (= routed through the NAT), and only the
+   * server's srflx candidates are sent to the browser.
+   */
+  nat?: CandidateRouter | null;
+  /** Forward the browser's candidates to the server (default true; false: the server never learns them). */
+  forwardRemoteCandidates?: boolean;
 }
 
 export interface CloseInfo {
@@ -178,7 +198,12 @@ function rewriteCand(line: string, address: string, port: number): string {
 export class InteropServer {
   readonly peers = new Map<string, ServerPeer>();
   readonly errors: string[] = [];
-  readonly opts: Required<Omit<InteropServerOptions, 'impair'>> & { impair: ImpairOptions | null };
+  readonly opts: Required<Omit<InteropServerOptions, 'impair' | 'rtc' | 'ndc' | 'nat'>> & {
+    impair: ImpairOptions | null;
+    rtc: Partial<RtcEndpointOptions> | undefined;
+    ndc: Partial<RtcConfig> | undefined;
+    nat: CandidateRouter | null;
+  };
   private http!: http.Server;
   private wss!: WebSocketServer;
   private nextId = 1;
@@ -202,6 +227,10 @@ export class InteropServer {
       idleTimeoutMs: o.idleTimeoutMs ?? 30_000,
       verbose: o.verbose ?? false,
       assetsDir: o.assetsDir ?? fileURLToPath(HARNESS_DIR),
+      rtc: o.rtc,
+      ndc: o.ndc,
+      nat: o.nat ?? null,
+      forwardRemoteCandidates: o.forwardRemoteCandidates ?? true,
     };
   }
 
@@ -216,7 +245,12 @@ export class InteropServer {
   }
 
   private async init(): Promise<void> {
-    this.handle = await createBackend(this.opts.backend, { address: this.opts.address, idleTimeoutMs: this.opts.idleTimeoutMs });
+    this.handle = await createBackend(this.opts.backend, {
+      address: this.opts.address,
+      idleTimeoutMs: this.opts.idleTimeoutMs,
+      ...(this.opts.rtc !== undefined ? { rtc: this.opts.rtc } : null),
+      ...(this.opts.ndc !== undefined ? { ndc: this.opts.ndc } : null),
+    });
     const dir = pathToFileURL(this.opts.assetsDir.endsWith('/') ? this.opts.assetsDir : this.opts.assetsDir + '/');
     // a pre-stripped wire.js (benchmarks) avoids loading Node's TypeScript stripper here
     const wireJs = new URL('wire.js', dir);
@@ -267,7 +301,15 @@ export class InteropServer {
     const o = this.opts;
     const keep = (line: string): boolean => {
       const c = parseCand(line);
-      return c !== null && c.address === o.address && c.transport === 'udp';
+      if (c === null || c.transport !== 'udp') return false;
+      // behind a NAT only the server-reflexive candidates are reachable from the browser
+      return o.nat !== null ? / typ srflx/.test(line) : c.address === o.address;
+    };
+    // the browser's candidates as the server sees them (through its NAT, if any)
+    const addRemote = (link: PeerLink | null, c: { candidate: string; sdpMid?: string }) => {
+      if (link === null || !o.forwardRemoteCandidates || o.impair !== null) return;
+      if (o.nat === null) return link.addRemoteCandidate(c.candidate, c.sdpMid ?? '0');
+      void o.nat.rewriteCandidate(c.candidate).then((r) => r !== null && link.addRemoteCandidate(r, c.sdpMid ?? '0'));
     };
     const toJson = (c: { candidate: string; mid: string }) => ({
       candidate: c.candidate.startsWith('a=') ? c.candidate.slice(2) : c.candidate,
@@ -329,7 +371,7 @@ export class InteropServer {
           return;
         }
         this.wakePeerWaiters(tag);
-        if (o.impair === null) for (const c of m.cands ?? []) p.link?.addRemoteCandidate(c.candidate, c.sdpMid ?? '0');
+        for (const c of m.cands ?? []) addRemote(p.link, c);
         void (async () => {
           await Promise.race([gatheredP, new Promise((r) => setTimeout(r, o.answerWaitMs))]);
           let cands = localCands.filter((c) => keep(c.candidate));
@@ -354,8 +396,8 @@ export class InteropServer {
           this.log('answer', tag, cands.map((c) => c.candidate));
           send({ t: 'answer', sdp, cands: cands.map(toJson) });
         })();
-      } else if (m.t === 'cand' && peer !== null && o.impair === null && m.c != null) {
-        peer.link?.addRemoteCandidate(m.c.candidate, m.c.sdpMid ?? '0');
+      } else if (m.t === 'cand' && peer !== null && m.c != null) {
+        addRemote(peer.link, m.c);
       }
     });
     ws.on('error', () => {});

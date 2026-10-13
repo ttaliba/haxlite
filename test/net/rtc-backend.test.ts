@@ -88,6 +88,9 @@ describe("peerBackend: 'rtc' configuration", () => {
       expect((err as Error).message).toMatch(/publicAddresses/);
     }
     if (detected !== null) expect(detected.length).toBeGreaterThan(0);
+    // full ICE (default) needs no public address: STUN / our checks handle NAT; ICE-lite still insists
+    expect(() => new HostTransport({ ...base, peerBackend: 'rtc' })).not.toThrow();
+    if (detected === null) expect(() => new HostTransport({ ...base, peerBackend: 'rtc', rtcEndpoint: { iceLite: true } })).toThrow(/iceLite/);
   });
 
   it('rooms with the same settings share one endpoint (one UDP socket); the last one closes it', async () => {
@@ -123,8 +126,9 @@ describe("peerBackend: 'rtc' configuration", () => {
 });
 
 describe("peerBackend: 'rtc' with a libdatachannel client", () => {
-  it('answer announces exactly the configured address/port (ICE-lite); client joins; remote address is the STUN source', async () => {
-    const { t, roomId, backend } = await startHost({ iceCandidatePolicy: () => false /* ignored by rtc */ });
+  it('answer announces exactly the configured address/port (full ICE); client joins; remote address is the STUN source', async () => {
+    // explicit publicAddresses bypass the candidate policy (and STUN: iceServers default to none)
+    const { t, roomId, backend } = await startHost({ iceCandidatePolicy: () => false });
     expect(backend.kind).toBe('rtc');
     expect(backend.prefiltered).toBe(true);
     const j = nextJoin(t);
@@ -132,7 +136,7 @@ describe("peerBackend: 'rtc' with a libdatachannel client", () => {
     const { peer, info } = await j;
     await c.whenOpen();
     const sdp = c.answerSdp!;
-    expect(sdp).toMatch(/a=ice-lite/);
+    expect(sdp).not.toMatch(/a=ice-lite/);
     const lines = [...sdp.split('\r\n').filter((l) => l.startsWith('a=candidate:')).map((l) => l.slice(2)), ...c.answerCandidates.map((x) => x.candidate)];
     expect(lines.length).toBeGreaterThan(0);
     for (const l of lines) {

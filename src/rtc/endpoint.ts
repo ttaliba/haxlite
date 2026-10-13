@@ -1,28 +1,56 @@
 /**
  * The UDP endpoint: one socket per address family shared by every session,
- * demultiplexed per RFC 7983 (first byte 0–3 STUN, 20–63 DTLS) — STUN by
- * the USERNAME's ufrag, DTLS by the remote transport address once ICE has
- * authenticated it.
+ * demultiplexed per RFC 7983 (first byte 0–3 STUN, 20–63 DTLS) — STUN
+ * requests by the USERNAME's ufrag, STUN responses by transaction id (our
+ * connectivity/consent checks and STUN gathering, ice-agent.ts / gather.ts),
+ * DTLS by the remote transport address once ICE has authenticated it.
  */
 import dgram, { type RemoteInfo, type Socket } from 'node:dgram';
 import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { RtcCertificate } from './cert.js';
-import { buildAnswer, hostCandidates, parseOffer, type HostCandidate } from './sdp.js';
+import { buildAnswer, parseOffer } from './sdp.js';
 import { RtcSessionImpl, type SessionHost, type ValidatedAddress } from './session.js';
 import { StunMessage, StunType, parseStun } from './stun.js';
 import { SctpAssociation } from './sctp/index.js';
 import { DtlsServer } from './dtls/server.js';
 import { resolveSuites } from './dtls/crypto.js';
 import type { RtcSession, SctpFactory } from './types.js';
+import { Gatherer, classifyIp, hasGlobalIpv6, stunServers, type AddressClass, type CandidatePolicy, type IceServerInput } from './gather.js';
+import { IceScheduler, type BoundSocket, type IceStats } from './ice-agent.js';
 
 export interface RtcEndpointOptions {
   /** UDP port (default 0 = ephemeral). With two families both sockets use the same port. */
   port?: number;
   /** Bind address (default: the wildcard of each family present in {@link publicAddresses}). */
   address?: string;
-  /** IP literals advertised as host candidates — the only addresses ever written in SDP. */
-  publicAddresses: string[];
+  /**
+   * IP literals advertised as host candidates. ICE-lite: required, the only
+   * addresses ever written in SDP. Full ICE (default): optional — when set
+   * they replace the interface addresses as host candidates; server-reflexive
+   * candidates from {@link iceServers} are added either way.
+   */
+  publicAddresses?: string[];
+  /**
+   * ICE-lite (the original behaviour): `a=ice-lite`, only host candidates
+   * from {@link publicAddresses}, no connectivity checks, no gathering.
+   * Default false: full ICE agent in the controlled role (ice-agent.ts).
+   */
+  iceLite?: boolean;
+  /**
+   * STUN servers for server-reflexive candidates (URL strings like
+   * `stun:stun.l.google.com:19302`, node-datachannel or `RTCIceServer`
+   * objects). Default none. TURN entries are ignored (not implemented).
+   */
+  iceServers?: readonly IceServerInput[];
+  /**
+   * Which interface addresses become host candidates, and which remote
+   * address classes may receive our checks (default `'public'`; see
+   * `CandidatePolicy` in gather.ts). Not applied to {@link publicAddresses}.
+   */
+  candidatePolicy?: CandidatePolicy;
+  /** Re-query the STUN servers at a new session when the last result is older than this (default 60 000 ms). */
+  gatherRefreshMs?: number;
   /** Advertised port when a 1:1 NAT maps a different one (default: the bound port). */
   publicPort?: number;
   /** DTLS identity (default: {@link certificateFile} if set, else the process-wide {@link RtcCertificate.processDefault}). */
@@ -71,6 +99,12 @@ export interface RtcEndpointStats {
   /** DTLS records dropped by sessions (replayed / not authenticated), live + closed. */
   dtlsReplayed: number;
   dtlsBadRecords: number;
+  /** STUN responses to our own requests (checks, consent, gathering). */
+  stunResponses: number;
+  /** Full-ICE counters (all zero with ICE-lite). */
+  ice: IceStats;
+  /** Our addresses as seen by the STUN servers in the last gathering round (`ip:port`). */
+  reflexive: string[];
 }
 
 const ICE_ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -126,8 +160,10 @@ export class RtcEndpoint {
   readonly port: number;
   private readonly sockets: Socket[];
   private readonly opts: RtcEndpointOptions;
-  private readonly candidates: HostCandidate[];
-  private readonly candidateLines: string[];
+  private readonly bound: BoundSocket[];
+  private readonly gatherer: Gatherer;
+  private readonly ice: IceScheduler;
+  private readonly iceLite: boolean;
   private readonly byUfrag = new Map<string, RtcSessionImpl>();
   /** remote address → remote port → validated address (DTLS demux). */
   private readonly byAddress = new Map<string, Map<number, ValidatedAddress>>();
@@ -158,20 +194,48 @@ export class RtcEndpoint {
     handshakesFailed: 0,
     dtlsReplayed: 0,
     dtlsBadRecords: 0,
+    stunResponses: 0,
   };
 
-  private constructor(opts: RtcEndpointOptions, sockets: Socket[], port: number, certificate: RtcCertificate, dataLayer: SctpFactory) {
+  private constructor(opts: RtcEndpointOptions, bound: BoundSocket[], port: number, certificate: RtcCertificate, dataLayer: SctpFactory) {
     this.opts = opts;
-    this.sockets = sockets;
+    this.bound = bound;
+    this.sockets = bound.map((b) => b.sock);
+    const sockets = this.sockets;
     this.port = port;
     this.certificate = certificate;
     this.idleTimeoutMs = opts.idleTimeoutMs ?? 30_000;
     this.handshakeTimeoutMs = opts.handshakeTimeoutMs ?? 20_000;
     this.maxSessions = opts.maxSessions ?? 10_000;
-    const advertisedPort = opts.publicPort ?? port;
-    this.candidates = opts.publicAddresses.map((address) => ({ address, port: advertisedPort }));
-    this.candidateLines = hostCandidates(this.candidates);
+    this.iceLite = opts.iceLite === true;
     const counters = this.counters;
+    const policy: CandidatePolicy = opts.candidatePolicy ?? 'public';
+    // STUN requests we originate (checks, consent, gathering): rare, outside the data path
+    const rawSend = (sock: Socket, buf: Buffer, address: string, port: number) => {
+      counters.packetsOut++;
+      counters.bytesOut += buf.length;
+      try {
+        sock.send(buf, port, address);
+      } catch {
+        /* socket closed */
+      }
+    };
+    const now = () => Date.now();
+    const ownClasses = new Set<AddressClass>();
+    for (const a of opts.publicAddresses ?? []) ownClasses.add(classifyIp(a));
+    for (const b of bound) if (b.bindAddress !== '0.0.0.0' && b.bindAddress !== '::') ownClasses.add(classifyIp(b.bindAddress));
+    this.ice = new IceScheduler({ send: rawSend, now, sockets: bound, policy, ownClasses: [...ownClasses] });
+    this.gatherer = new Gatherer(
+      { sockets: bound, send: rawSend, now, register: (k, h) => this.ice.register(k, h), unregister: (k) => this.ice.unregister(k) },
+      {
+        ...(opts.publicAddresses !== undefined ? { publicAddresses: opts.publicAddresses } : null),
+        ...(opts.publicPort !== undefined ? { publicPort: opts.publicPort } : null),
+        port,
+        stunServers: this.iceLite ? [] : stunServers(opts.iceServers),
+        policy,
+        ...(opts.gatherRefreshMs !== undefined ? { refreshMs: opts.gatherRefreshMs } : null),
+      },
+    );
     this.host = {
       certificate,
       dataLayer,
@@ -209,8 +273,10 @@ export class RtcEndpoint {
         if (ok) counters.handshakesCompleted++;
         else counters.handshakesFailed++;
       },
-      now: () => Date.now(),
+      now,
+      ice: this.iceLite ? null : this.ice,
     };
+    this.gatherer.start();
     for (const sock of sockets) {
       sock.on('message', (msg: Buffer, rinfo: RemoteInfo) => this.onPacket(sock, msg, rinfo));
       sock.on('error', (err) => {
@@ -223,12 +289,28 @@ export class RtcEndpoint {
   /** Binds the socket(s). */
   static async listen(opts: RtcEndpointOptions): Promise<RtcEndpoint> {
     const pubs = opts.publicAddresses;
-    if (!Array.isArray(pubs) || pubs.length === 0) throw new Error('RtcEndpoint: publicAddresses is required');
-    for (const a of pubs) if (isIP(a) === 0) throw new Error(`RtcEndpoint: publicAddresses must be IP literals (${a})`);
-    const families = new Set(pubs.map((a) => isIP(a)));
+    const lite = opts.iceLite === true;
+    if (pubs !== undefined) {
+      if (!Array.isArray(pubs) || pubs.length === 0) throw new Error('RtcEndpoint: publicAddresses is empty');
+      for (const a of pubs) if (isIP(a) === 0) throw new Error(`RtcEndpoint: publicAddresses must be IP literals (${a})`);
+    } else if (lite) {
+      throw new Error('RtcEndpoint: publicAddresses is required with iceLite');
+    }
+    // families to bind: those of the public addresses, else of the bind address, else IPv4 (+ IPv6 when routable)
+    let families: Set<number>;
+    let optional6 = false;
+    if (pubs !== undefined) families = new Set(pubs.map((a) => isIP(a)));
+    else if (opts.address !== undefined) families = new Set(opts.address === '::' ? [6, 4] : [isIP(opts.address)]);
+    else {
+      families = new Set([4]);
+      if (hasGlobalIpv6()) {
+        families.add(6);
+        optional6 = true;
+      }
+    }
     const bufSize = opts.socketBufferSize ?? 4 << 20;
     let port = opts.port ?? 0;
-    const sockets: Socket[] = [];
+    const bound: BoundSocket[] = [];
     const dataLayer = opts.dataLayer ?? defaultDataLayer;
     // the key pair is generated on the thread pool while the socket binds
     const certificatePromise: Promise<RtcCertificate> =
@@ -248,32 +330,36 @@ export class RtcEndpoint {
           }
         }
         const sock = await bindSocket(fam === 4 ? 'udp4' : 'udp6', opts.address, port, bufSize);
+        bound.push({ sock, family: fam === 4 ? 4 : 6, bindAddress: opts.address });
         if (fam === 6 && opts.address === '::' && families.has(4)) {
           // '::' explicitly given with IPv4 public addresses: also bind udp4 on the same port
-          sockets.push(sock);
           port = sock.address().port;
-          sockets.push(await bindSocket('udp4', '0.0.0.0', port, bufSize));
-        } else {
-          sockets.push(sock);
+          bound.push({ sock: await bindSocket('udp4', '0.0.0.0', port, bufSize), family: 4, bindAddress: '0.0.0.0' });
         }
       } else {
-        if (families.has(4)) sockets.push(await bindSocket('udp4', '0.0.0.0', port, bufSize));
-        if (sockets.length > 0) port = sockets[0]!.address().port;
-        if (families.has(6)) sockets.push(await bindSocket('udp6', '::', port, bufSize));
+        if (families.has(4)) bound.push({ sock: await bindSocket('udp4', '0.0.0.0', port, bufSize), family: 4, bindAddress: '0.0.0.0' });
+        if (bound.length > 0) port = bound[0]!.sock.address().port;
+        if (families.has(6)) {
+          try {
+            bound.push({ sock: await bindSocket('udp6', '::', port, bufSize), family: 6, bindAddress: '::' });
+          } catch (err) {
+            if (!optional6) throw err; // auto-detected IPv6 that cannot be bound: IPv4 only
+          }
+        }
       }
     } catch (err) {
-      for (const s of sockets) s.close();
+      for (const s of bound) s.sock.close();
       throw err;
     }
-    port = sockets[0]!.address().port;
+    port = bound[0]!.sock.address().port;
     let certificate: RtcCertificate;
     try {
       certificate = await certificatePromise;
     } catch (err) {
-      for (const s of sockets) s.close();
+      for (const s of bound) s.sock.close();
       throw err;
     }
-    return new RtcEndpoint(opts, sockets, port, certificate, dataLayer);
+    return new RtcEndpoint(opts, bound, port, certificate, dataLayer);
   }
 
   private replaceScratch(size: number): void {
@@ -281,9 +367,24 @@ export class RtcEndpoint {
     this.sendViews = [];
   }
 
-  /** Our candidate lines (no `a=`), identical for every session. */
+  /** Our candidate lines (no `a=`) known now (host + server-reflexive), identical for every new session. */
   get localCandidates(): string[] {
-    return this.candidateLines.slice();
+    return this.gatherer.candidateLines();
+  }
+
+  /** Resolves when no STUN gathering round is running (tests / diagnostics). */
+  whenGathered(): Promise<void> {
+    return this.gatherer.whenIdle();
+  }
+
+  /** Our public addresses as reported by the STUN servers in the last round, [] if none. */
+  get reflexiveAddresses(): { address: string; port: number }[] {
+    return this.gatherer.mapped.slice();
+  }
+
+  /** The bound sockets (family and bind address). */
+  get boundAddresses(): { family: 4 | 6; address: string }[] {
+    return this.bound.map((b) => ({ family: b.family, address: b.bindAddress }));
   }
 
   /** Creates the session for a browser offer. Throws RtcSdpError on an unusable offer. */
@@ -294,17 +395,25 @@ export class RtcEndpoint {
     let ufrag = randomIceString(8);
     while (this.byUfrag.has(ufrag)) ufrag = randomIceString(8);
     const pwd = randomIceString(24);
+    const g = this.gatherer.forSession();
     const answer = buildAnswer({
       offer,
       iceUfrag: ufrag,
       icePwd: pwd,
       fingerprint: this.certificate.fingerprint,
-      candidates: this.candidates,
+      candidates: [],
+      candidateLines: g.lines,
+      iceLite: this.iceLite,
+      endOfCandidates: g.complete,
       sctpPort: this.host.sctpPort,
       maxMessageSize: this.host.maxMessageSize,
       sessionId: String(BigInt.asUintN(62, randomBytes(8).readBigUInt64BE())),
     });
-    const s = new RtcSessionImpl(this.host, offer, ufrag, pwd, answer, this.candidateLines.slice());
+    const s = new RtcSessionImpl(this.host, offer, ufrag, pwd, answer, g.lines);
+    if (!g.complete) {
+      s.gatheringComplete = false;
+      this.gatherer.wait(s);
+    }
     this.byUfrag.set(ufrag, s);
     this.armSweep();
     return s;
@@ -338,8 +447,18 @@ export class RtcEndpoint {
   private onStun(sock: Socket, msg: Buffer, rinfo: RemoteInfo): void {
     const m = this.stunScratch;
     const c = this.counters;
-    if (!parseStun(msg, m) || m.type !== StunType.BindingRequest || m.usernameOffset < 0) {
-      // indications/responses are not for a lite agent; garbage is dropped silently
+    if (!parseStun(msg, m)) {
+      c.stunRejected++;
+      return;
+    }
+    if (m.type === StunType.BindingSuccess || m.type === StunType.BindingError) {
+      // a response to one of our requests (connectivity/consent check, gathering), by transaction id
+      if (this.ice.onResponse(m, sock, rinfo.address, rinfo.port)) c.stunResponses++;
+      else c.stunRejected++;
+      return;
+    }
+    if (m.type !== StunType.BindingRequest || m.usernameOffset < 0) {
+      // indications are dropped silently, anything else counts as rejected
       if (m.type !== StunType.BindingIndication) c.stunRejected++;
       return;
     }
@@ -379,6 +498,7 @@ export class RtcEndpoint {
 
   private unregister(s: RtcSessionImpl): void {
     if (this.byUfrag.get(s.localUfrag) === s) this.byUfrag.delete(s.localUfrag);
+    this.gatherer.forget(s);
     for (const v of s.validated) {
       const ports = this.byAddress.get(v.address);
       if (ports !== undefined && ports.get(v.port) === v) {
@@ -420,7 +540,15 @@ export class RtcEndpoint {
       replayed += d.replayed;
       bad += d.bad;
     }
-    return { ...this.counters, sessions: this.byUfrag.size, open, dtlsReplayed: replayed, dtlsBadRecords: bad };
+    return {
+      ...this.counters,
+      sessions: this.byUfrag.size,
+      open,
+      dtlsReplayed: replayed,
+      dtlsBadRecords: bad,
+      ice: { ...this.ice.stats },
+      reflexive: this.gatherer.mapped.map((a) => (isIP(a.address) === 6 ? `[${a.address}]:${a.port}` : `${a.address}:${a.port}`)),
+    };
   }
 
   /** Closes every session (onClose('endpoint-closed')) and the socket(s). */
@@ -428,6 +556,8 @@ export class RtcEndpoint {
     if (this.closed) return;
     this.closed = true;
     for (const s of [...this.byUfrag.values()]) s.terminate('endpoint-closed');
+    this.gatherer.close();
+    this.ice.close();
     if (this.sweepTimer !== null) clearInterval(this.sweepTimer);
     this.sweepTimer = null;
     await Promise.all(this.sockets.map((s) => new Promise<void>((r) => s.close(() => r()))));

@@ -1,12 +1,18 @@
 # src/rtc — haxlite-rtc
 
-Minimal pure-TypeScript WebRTC **data-channel** stack for servers with a public IP (haxlite
-Edge, dedicated hosts). Replaces node-datachannel/libdatachannel there. No native addons:
+Minimal pure-TypeScript WebRTC **data-channel** stack for HaxBall hosts (haxlite Edge,
+dedicated hosts, and hosts behind NAT: full ICE with STUN gathering). Replaces
+node-datachannel/libdatachannel there. No native addons:
 `node:dgram` + `node:crypto` only (Node ≥ 22).
 
 Scope (HaxBall needs nothing else): the browser is always the **offerer** and the DTLS
 **client**; we are an **ICE-lite**, **DTLS 1.2 server**, **SCTP** endpoint with the three
 pre-negotiated channels of the official client (`ro` id 0, `ru` id 1, `uu` id 2, no DCEP).
+
+ICE: by default a **full agent in the controlled role** (`ice-agent.ts`: our own connectivity
+checks to the remote candidates, triggered checks, prflx, RFC 7675 consent) with host + srflx
+candidates gathered once per endpoint (`gather.ts`, STUN from the shared socket). `iceLite: true`
+keeps the original ICE-lite behaviour. See docs/10 §2.1.
 
 ```
 UDP socket (one per family, shared by all sessions)
@@ -26,7 +32,11 @@ import { RtcEndpoint, RtcCertificate, acquireSharedEndpoint } from './rtc/index.
 const ep = await RtcEndpoint.listen({
   port: 40000,                    // default 0 (ephemeral)
   address: '0.0.0.0',             // bind address; default: wildcard of the family of publicAddresses
-  publicAddresses: ['203.0.113.7'], // the ONLY addresses ever put in SDP/candidates (IP literals, v4 and/or v6)
+  publicAddresses: ['203.0.113.7'], // optional (full ICE): host candidates instead of the interfaces; required with iceLite
+  iceServers: ['stun:stun.l.google.com:19302'], // srflx gathering (default none; TURN entries ignored)
+  candidatePolicy: 'public',      // interface addresses announced / remote classes checked ('public' | 'private' | 'all' | fn)
+  iceLite: false,                 // true: a=ice-lite, no checks, no gathering
+  gatherRefreshMs: 60_000,        // srflx result reused for this long
   publicPort: 40000,              // optional: advertised port when a 1:1 NAT maps it (default: bound port)
   certificate: RtcCertificate.generate(), // optional; default: RtcCertificate.processDefault() (one per process, keygen off-thread)
   certificateFile: '/var/lib/haxlite/dtls.pem', // optional: load/persist the identity (RtcCertificate.loadOrCreate)
@@ -37,10 +47,11 @@ const ep = await RtcEndpoint.listen({
 });
 
 const s = ep.createSession(offerSdp);   // throws RtcSdpError on an unusable offer
-s.answerSdp;            // complete answer (a=ice-lite, candidates included, a=end-of-candidates)
+s.answerSdp;            // answer with the known candidates (a=end-of-candidates once gathering is complete)
 s.localCandidates;      // ['candidate:1 1 udp 2130706431 203.0.113.7 40000 typ host', …] (no "a=")
 s.mid;                  // mid of the data m-line (for trickle signaling)
-s.addRemoteCandidate('candidate:…');  // optional hint only (ICE-lite: peer-reflexive is normal)
+s.addRemoteCandidate('candidate:…');  // full ICE: our checks go there (ICE-lite: hint only)
+s.gatheringComplete;    // false while a STUN round runs: rest via s.onLocalCandidate / s.onGatheringComplete
 s.onOpen = () => {};    // DTLS connected + SCTP association up (channels 0/1/2 usable)
 s.onMessage = (channelId, data) => {}; // data: Uint8Array, the receiver may keep it
 s.onClose = (reason) => {};            // once; never called after a local close()

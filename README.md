@@ -20,7 +20,7 @@ Todo sale de leer el código, que en ambos casos está minificado; no se captur�
 | 07 | [Benchmarks](docs/07-benchmarks.md) | CPU, memoria, GC y lag: haxlite vs host oficial vs node-haxball. **Comparativa unificada** (misma sesión, 20 clientes): CPU oficial 13,5 % · node-haxball 15,1 % · haxlite + ndc 12,0 % · haxlite + rtc 7,8 %, y qué WebRTC usa cada uno |
 | 08 | [Ocultar y proteger la IP](docs/08-ocultar-ip.md) | Por qué se ve la IP, fuga de relay-only en libjuice, Cloudflare TURN, anti-DDoS, firewall `haxguard`, IP por jugador |
 | 09 | [haxlite Edge](docs/09-haxlite-edge.md) | Gateway WebRTC que oculta la IP del host: arquitectura, despliegue (TLS, systemd, firewall), seguridad, configuración y overhead medido |
-| 10 | [haxlite-rtc](docs/10-haxlite-rtc.md) | WebRTC propio en TypeScript (ICE‑lite, DTLS, SCTP): `peerBackend: 'rtc'`, interoperabilidad con Chromium y con el cliente oficial real, benchmarks |
+| 10 | [haxlite-rtc](docs/10-haxlite-rtc.md) | WebRTC propio en TypeScript (ICE completo con STUN, DTLS, SCTP): `peerBackend: 'rtc'`, funciona tras NAT, interoperabilidad con Chromium y con el cliente oficial real, benchmarks |
 
 ## haxlite: uso
 
@@ -112,7 +112,7 @@ room.haxlite.getPlayerConnection(id); // { auth, conn, ip, srflxIps, ping }
 | `haxlite.onBeforeOperation(ev, byId, frame)` | ve cada evento de cliente (después del filtro de chat) antes de aplicarlo: `false` lo descarta, puede modificarlo, lanzar expulsa al emisor. Se llama también para cada input: debe ser barato |
 | `haxlite.onRecaptcha` / `useRecaptchaToken(r)` | el maestro pide captcha (token caducado al reconectar): se recibe la `sitekey` y se reintenta con la respuesta |
 | `haxlite.stop()` / `close()` | cierra temporizadores, señalización y conexiones; con la última sala del proceso libera node-datachannel para que Node termine solo (`shutdownWebRtcOnLastStop`) |
-| `haxlite.peerBackend: 'rtc'`, `haxlite.rtc: { port, publicAddresses }` | jugadores sobre haxlite-rtc (TypeScript puro, un puerto UDP, sin hilos nativos, −35 % de CPU con 20 jugadores) en servidores con **IP pública**; por defecto `'ndc'` (node-datachannel, funciona tras NAT). `haxlite.rtcPort`, `haxlite.rtcStats()`. Ver [docs/10 §3](docs/10-haxlite-rtc.md) |
+| `haxlite.peerBackend: 'rtc'`, `haxlite.rtc: { port, publicAddresses, iceLite }` | jugadores sobre haxlite-rtc (TypeScript puro, un puerto UDP, sin hilos nativos, −35 % de CPU con 20 jugadores); ICE completo con STUN, funciona también tras NAT sin configurar (`publicAddresses` opcional). Por defecto `'ndc'` (node-datachannel). `haxlite.rtcPort`, `haxlite.rtcStats()`. Ver [docs/10 §3](docs/10-haxlite-rtc.md) |
 | `haxlite.setMaxPlayers(n)`, `haxlite.roomLink`, `haxlite.frame`, `haxlite.onError` | utilidades |
 | `haxlite.host`, `haxlite.transport` | el motor (`HostRoom`) y el transporte (`HostTransport`) para usos avanzados |
 
