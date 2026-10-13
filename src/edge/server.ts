@@ -21,12 +21,13 @@ import type { IncomingMessage, Server as HttpServer, ServerResponse } from 'node
 import type { Server as HttpsServer } from 'node:https';
 import { createRequire } from 'node:module';
 // CJS require on purpose: the ESM facade of node:http(s) evaluates the lazy
-// `WebSocket`/`CloseEvent`/`MessageEvent` getters, loading undici (~35 ms of startup).
+// `WebSocket`/`CloseEvent`/`MessageEvent` getters, loading undici (~35 ms of startup);
+// the one of node:fs evaluates `fs.promises` (fs/promises, readline…: ~10 ms).
 const require = createRequire(import.meta.url);
 const http = require('node:http') as typeof import('node:http');
 const https = require('node:https') as typeof import('node:https');
+const { readFileSync } = require('node:fs') as typeof import('node:fs');
 import { randomBytes } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer, WebSocket, type RawData } from '../net/ws.js';

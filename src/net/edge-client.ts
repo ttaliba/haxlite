@@ -16,8 +16,8 @@
  * the tunnel is re-established with backoff; joins are refused (4104)
  * meanwhile.
  */
-import dgram from 'node:dgram';
-import { lookup } from 'node:dns/promises';
+import type dgram from 'node:dgram';
+import { createRequire } from 'node:module';
 import { isIP } from 'node:net';
 import { WebSocket, type ClientOptions, type RawData } from './ws.js';
 import { Reader, Writer } from '../codec/index.js';
@@ -808,9 +808,15 @@ class TunnelSession {
     const secrets = deriveTunnelSecrets(x25519Shared(x.privateKey, edgePub), this.backend.secret, this.nonce!, x.publicKey, edgePub, connId);
     void (async () => {
       const bindFamily = o.bindAddress !== undefined ? isIP(o.bindAddress) : 0;
-      const target = isIP(host) !== 0 ? { address: host, family: isIP(host) } : await lookup(host, { family: bindFamily === 0 ? undefined : bindFamily });
+      // node:dgram / node:dns are loaded on first use (only edge rooms need them)
+      const req = createRequire(import.meta.url);
+      const target =
+        isIP(host) !== 0
+          ? { address: host, family: isIP(host) }
+          : await (req('node:dns') as typeof import('node:dns')).promises.lookup(host, { family: bindFamily === 0 ? undefined : bindFamily });
+      const dgramMod = req('node:dgram') as typeof dgram;
       if (this.phase !== Phase.DataPlane) return;
-      const sock = dgram.createSocket({ type: target.family === 6 ? 'udp6' : 'udp4' });
+      const sock = dgramMod.createSocket({ type: target.family === 6 ? 'udp6' : 'udp4' });
       this.udpSock = sock;
       sock.on('error', (err) => this.backend.log(`tunnel udp: ${err.message}`));
       await new Promise<void>((resolve, reject) => {

@@ -17,7 +17,10 @@
  * ```
  */
 import { randomBytes } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+// CJS require on purpose: the ESM facade of node:fs evaluates the lazy `fs.promises`
+// getter (fs/promises, readline, fs streams…: ~10 ms of startup for every user of the package).
+const { readFileSync } = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
 import type { EdgeKeyConfig, EdgeLimitsOptions, EdgePlayerBackendKind, EdgeServerOptions, EdgeTunnelOptions, EdgeWebRtcOptions } from './server.js';
 
 export interface EdgeConfigFile {
