@@ -187,6 +187,16 @@ export class Sequencer {
   private readonly viewIds = new Set<number>();
   /** Called when a view is dropped because its world became identical to the room's again. */
   onViewConverged: ((playerId: number) => void) | null = null;
+  /**
+   * Per-view variants of sequenced events: called for each view when an
+   * event is sequenced (client or host event); a non-null result is what
+   * that viewer receives (same frame/order; the hook sets its byId) and what its world applies
+   * instead of `ev`. Used to strip the kick bit of a player hidden from the
+   * viewer (haxlite hidden players).
+   */
+  viewVariant: ((ev: RoomEvent, viewerId: number) => RoomEvent | null) | null = null;
+  /** Variants of the sequenced events that have them (see {@link viewVariant}). */
+  private readonly variants = new WeakMap<RoomEvent, Map<number, RoomEvent>>();
 
   private depth = 0;
   private readonly out = new Writer(256);
@@ -318,9 +328,10 @@ export class Sequencer {
   /** Sequenced events reach every view unchanged: apply them to each view's world too. */
   private applyToViews(ev: RoomEvent): void {
     const views = this.views;
+    const variants = this.variants.get(ev);
     for (let i = 0; i < views.length; i++) {
       try {
-        ev.apply(views[i]!.rs);
+        (variants?.get(views[i]!.playerId) ?? ev).apply(views[i]!.rs);
       } catch (err) {
         this.reportError(err);
       }
@@ -380,12 +391,54 @@ export class Sequencer {
     }
   }
 
+  /** `ev` was sequenced with a variant for `playerId` ({@link viewVariant}). */
+  hasVariant(ev: RoomEvent, playerId: number): boolean {
+    return this.variants.get(ev)?.has(playerId) === true;
+  }
+
+  /** A queued event still carries a variant for `playerId` (its view must live until it is applied). */
+  private hasPendingVariant(playerId: number): boolean {
+    const list = this.queue;
+    for (let i = 0; i < list.length; i++) if (this.variants.get(list[i]!)?.has(playerId) === true) return true;
+    return false;
+  }
+
+  /** Per-view variants of `ev` ({@link viewVariant}), registered for its application; null if none. */
+  private makeVariants(ev: RoomEvent): Map<number, RoomEvent> | null {
+    const hook = this.viewVariant;
+    if (hook === null || this.views.length === 0) return null;
+    let variants: Map<number, RoomEvent> | null = null;
+    const views = this.views;
+    for (let i = 0; i < views.length; i++) {
+      const id = views[i]!.playerId;
+      const alt = hook(ev, id);
+      if (alt !== null) (variants ??= new Map()).set(id, alt);
+    }
+    if (variants !== null) this.variants.set(ev, variants);
+    return variants;
+  }
+
+  /** Sends a sequenced event to everyone; viewers with a variant get theirs (same frame/order, their own byId). */
+  private sendSequenced(ev: RoomEvent, variants: Map<number, RoomEvent> | null): void {
+    if (variants === null) {
+      this.broadcastEvent(ev, Channel.ReliableUnordered);
+      return;
+    }
+    this.broadcastEvent(ev, Channel.ReliableUnordered, new Set(variants.keys()));
+    for (const [id, alt] of variants) {
+      alt.frame = ev.frame;
+      alt.order = ev.order;
+      alt.clientSeq = ev.clientSeq;
+      this.sendEvent(id, alt, Channel.ReliableUnordered);
+    }
+  }
+
   /** Drops every view whose world is byte-identical to the room's again ({@link onViewConverged}). */
   dropConvergedViews(): void {
     const views = this.views;
     for (let i = views.length - 1; i >= 0; i--) {
       const v = views[i]!;
-      if (!sameRoomState(v.rs, this.rs)) continue;
+      if (this.hasPendingVariant(v.playerId) || !sameRoomState(v.rs, this.rs)) continue;
       views.splice(i, 1);
       this.viewIds.delete(v.playerId);
       const cb = this.onViewConverged;
@@ -403,26 +456,29 @@ export class Sequencer {
    * A private slot: ONE sequenced host event at the current frame whose
    * content differs per client. Each viewer in `perViewer` (it must have a
    * view) gets its own event, applied to its world at this exact point;
-   * every other client gets a no-op (SetDiscProperties with an empty mask).
-   * Frame, order and event counters are identical for everyone, so
-   * heartbeats and completeness checks are unaffected. The room's own state
-   * is not touched (like CheckConsistency, the slot only takes an order).
+   * every other client gets `shared`, by default a no-op (SetDiscProperties
+   * with an empty mask) that the room does not apply (like CheckConsistency,
+   * the slot only takes an order). A non-null `shared` is a real room event:
+   * applied to the room, to every view not in `perViewer` and reported to
+   * {@link onEventApplied}, like any host event. Frame, order and event
+   * counters are identical for everyone, so heartbeats and completeness
+   * checks are unaffected. Per-viewer events keep their `byId` (0 for host
+   * events; a SendInput variant carries the player's id).
    */
-  privateSlot(perViewer: ReadonlyMap<number, RoomEvent>): void {
+  privateSlot(perViewer: ReadonlyMap<number, RoomEvent>, shared: RoomEvent | null = null): void {
     const frame = this.frame;
     const order = this.eventsInFrame++;
-    const noop = SetDiscPropertiesEvent.create(0, false, {});
-    noop.frame = frame;
-    noop.order = order;
-    noop.byId = 0;
-    noop.clientSeq = 0;
+    const out = shared ?? SetDiscPropertiesEvent.create(0, false, {});
+    out.frame = frame;
+    out.order = order;
+    out.byId = 0;
+    out.clientSeq = 0;
     const skip = new Set<number>();
     for (const [playerId, ev] of perViewer) {
       const v = this.getView(playerId);
       if (v === null) continue;
       ev.frame = frame;
       ev.order = order;
-      ev.byId = 0;
       ev.clientSeq = 0;
       try {
         ev.apply(v.rs);
@@ -432,8 +488,56 @@ export class Sequencer {
       skip.add(playerId);
       this.sendEvent(playerId, ev, Channel.ReliableUnordered);
     }
-    this.broadcastEvent(noop, Channel.ReliableUnordered, skip);
+    if (shared !== null) {
+      this.depth++;
+      try {
+        try {
+          shared.apply(this.rs);
+        } catch (err) {
+          this.reportError(err);
+        }
+        const views = this.views;
+        for (let i = 0; i < views.length; i++) {
+          const v = views[i]!;
+          if (skip.has(v.playerId)) continue;
+          try {
+            shared.apply(v.rs);
+          } catch (err) {
+            this.reportError(err);
+          }
+        }
+        if (this.onEventApplied !== null) this.onEventApplied(shared);
+      } finally {
+        this.depth--;
+      }
+    }
+    this.broadcastEvent(out, Channel.ReliableUnordered, skip);
     this.heartbeat();
+  }
+
+  /**
+   * A private slot at a FUTURE frame (`frame` > current; otherwise
+   * {@link privateSlot}): a queued no-op whose per-viewer variants are sent
+   * now and applied to those viewers' worlds when the frame comes, after the
+   * events already queued for it.
+   */
+  privateSlotAt(frame: number, perViewer: ReadonlyMap<number, RoomEvent>): void {
+    if (frame <= this.frame) {
+      this.privateSlot(perViewer);
+      return;
+    }
+    const noop = SetDiscPropertiesEvent.create(0, false, {});
+    noop.frame = frame;
+    noop.order = 0;
+    noop.byId = 0;
+    noop.clientSeq = 0;
+    this.insert(noop);
+    const variants = new Map<number, RoomEvent>();
+    for (const [playerId, ev] of perViewer) {
+      if (this.getView(playerId) !== null) variants.set(playerId, ev);
+    }
+    if (variants.size > 0) this.variants.set(noop, variants);
+    this.sendSequenced(noop, variants.size > 0 ? variants : null);
   }
 
   private reportError(err: unknown): void {
@@ -452,9 +556,10 @@ export class Sequencer {
     ev.clientSeq = 0;
     ev.order = 0;
     ev.frame = ev.meta.delay ? this.frame + this.inputDelayFrames + this.handicapFrames : this.frame;
+    const variants = this.makeVariants(ev);
     this.submit(ev);
     this.heartbeat();
-    if (this.sink.hasConnections()) this.broadcastEvent(ev, Channel.ReliableUnordered);
+    if (this.sink.hasConnections()) this.sendSequenced(ev, variants);
   }
 
   /**
@@ -520,8 +625,9 @@ export class Sequencer {
     if (!ev.validate(this.rs)) return null;
     const hook = this.onBeforeOperation;
     if (hook !== null && hook(ev, client.playerId, requested) === false) return null;
+    const variants = this.makeVariants(ev);
     this.submit(ev);
-    this.broadcastEvent(ev, Channel.ReliableUnordered);
+    this.sendSequenced(ev, variants);
     return ev;
   }
 

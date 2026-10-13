@@ -404,6 +404,28 @@ export interface HaxliteRoomExtensions {
   clearDiscOverrides(viewerId: number): void;
   /** A disc as `viewerId` currently sees it (its private world, else the room's). */
   getDiscPropertiesFor(viewerId: number, discIndex: number): DiscPropertiesObject | null;
+  /**
+   * Hidden players: makes player `playerId` completely invisible to
+   * `viewerId` only (no disc, name, avatar or off-screen arrow in the
+   * official client) while it keeps playing normally for everyone else.
+   * In the viewer's world the disc gets position NaN and cGroup 0; the host
+   * simulates that world and sends it its own CheckConsistency hash, so
+   * nobody desyncs. Re-hidden automatically after a respawn (kick-off reset,
+   * team change). What the hidden player does to other discs in the room is
+   * copied to the viewer's world (shared SetDiscProperties, float32).
+   * Deferred like the official setters; errors go to `onError`. Pairs end
+   * with the game and when either player leaves. Not a security boundary:
+   * the room state still reaches every client. docs/04 §7.4.
+   */
+  hidePlayerFor(viewerId: number, playerId: number): void;
+  /** Undoes {@link hidePlayerFor}: the viewer gets the player's real disc back (deferred). */
+  showPlayerFor(viewerId: number, playerId: number): void;
+  /** `hidden ? hidePlayerFor : showPlayerFor`. */
+  setPlayerHiddenFor(viewerId: number, playerId: number, hidden: boolean): void;
+  /** True while `playerId` is hidden from `viewerId` (after the deferred call ran). */
+  isPlayerHiddenFor(viewerId: number, playerId: number): boolean;
+  /** Ids of the players hidden from `viewerId`. */
+  getHiddenPlayersFor(viewerId: number): number[];
   /** True while `viewerId` has a private world (overrides applied and not yet converged). */
   hasPrivateView(viewerId: number): boolean;
   /** A private view ended because the viewer's world became identical to the room's again. */

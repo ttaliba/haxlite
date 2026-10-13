@@ -22,7 +22,7 @@
  */
 import { Reader, Writer } from '../codec/index.js';
 import type { HostTransport, JoinInfo, Peer, PeerCloseReason } from '../net/index.js';
-import { Channel, ClientMsg, TICKS_PER_MS, TeamId } from '../protocol.js';
+import { Channel, ClientMsg, EventType, TICKS_PER_MS, TeamId } from '../protocol.js';
 import {
   JoinRoomEvent,
   KickBanPlayerEvent,
@@ -31,6 +31,7 @@ import {
   ReorderPlayersEvent,
   SendAnnouncementEvent,
   SendChatEvent,
+  SendInputEvent,
   SetDiscPropertiesEvent,
   SetGamePlayLimitEvent,
   SetHeadlessAvatarEvent,
@@ -203,6 +204,34 @@ function discProperties(d: Disc | null): DiscProperties | null {
   };
 }
 
+const DISC_FIELDS = Object.keys(DiscProp) as DiscPropName[];
+
+/** SendInput of `playerId` without the kick bit (what a viewer that hides it receives). */
+function stripKick(playerId: number, input: number): SendInputEvent {
+  const e = SendInputEvent.create(input & ~16);
+  e.byId = playerId;
+  return e;
+}
+
+/** SetDiscProperties mask of the fields where `a` and `b` differ (floats by Object.is, ints as serialized). */
+function discDiffMask(a: Disc, b: Disc): number {
+  let m = 0;
+  if (!Object.is(a.x, b.x)) m |= 1;
+  if (!Object.is(a.y, b.y)) m |= 2;
+  if (!Object.is(a.xspeed, b.xspeed)) m |= 4;
+  if (!Object.is(a.yspeed, b.yspeed)) m |= 8;
+  if (!Object.is(a.xgravity, b.xgravity)) m |= 16;
+  if (!Object.is(a.ygravity, b.ygravity)) m |= 32;
+  if (!Object.is(a.radius, b.radius)) m |= 64;
+  if (!Object.is(a.bCoef, b.bCoef)) m |= 128;
+  if (!Object.is(a.invMass, b.invMass)) m |= 256;
+  if (!Object.is(a.damping, b.damping)) m |= 512;
+  if (a.color >>> 0 !== b.color >>> 0) m |= 1024;
+  if ((a.cMask | 0) !== (b.cMask | 0)) m |= 2048;
+  if ((a.cGroup | 0) !== (b.cGroup | 0)) m |= 4096;
+  return m;
+}
+
 function teamOf(v: number): TeamId {
   return v === 1 ? TeamId.Red : v === 2 ? TeamId.Blue : TeamId.Spectators;
 }
@@ -242,6 +271,12 @@ export class HostRoom {
   /** Private disc updates waiting for the next flush (batched into shared slots). */
   private readonly pendingPrivate: { viewerId: number; ev: SetDiscPropertiesEvent; force: boolean; restore: boolean }[] = [];
   private privateFlushQueued = false;
+  /** Per viewer: ids of the players hidden from it ({@link setPlayerHiddenFor}). */
+  private readonly hiddenFor = new Map<number, Set<number>>();
+  /** The game the hidden pairs belong to (they end with it). */
+  private hiddenGame: RoomState['gameState'] = null;
+  /** Viewers whose world is kept equal to the room's except for what they hide or override. */
+  private readonly reconciling = new Set<number>();
   private readonly flushPrivateFn = (): void => this.flushPrivate();
 
   private readonly now: () => number;
@@ -313,6 +348,14 @@ export class HostRoom {
       this.discOverrides.delete(id);
       const cb = this.onPrivateViewEnd;
       if (cb !== null) this.callUser(() => cb(id));
+    };
+    // hidden players never kick in the viewer's world: some clients (node-haxball 2.3.1:
+    // `!(dist - r - r >= 4)`) would kick from a NaN position and turn the ball into NaN
+    this.sequencer.viewVariant = (ev, viewerId) => {
+      if (ev.type !== EventType.SendInput || this.hiddenFor.size === 0) return null;
+      const input = (ev as SendInputEvent).input;
+      if ((input & 16) === 0 || this.hiddenFor.get(viewerId)?.has(ev.byId) !== true) return null;
+      return stripKick(ev.byId, input);
     };
     this.sequencer.onEventApplied = (ev) => {
       // official `Ab`: the recorder serializes the event right after `apply`
@@ -754,6 +797,168 @@ export class HostRoom {
     if (slots.length > 0 && pending.some((p) => p.restore)) seq.dropConvergedViews();
   }
 
+  // ---------------------------------------------------------------- hidden players (haxlite)
+
+  /**
+   * Hides player `playerId` from `viewerId` only (haxlite; docs/04 §7.4,
+   * "Jugadores ocultos"). In the viewer's world the player's disc gets
+   * position NaN and cGroup 0. The official client then draws no disc, no
+   * name, no avatar and no off-screen arrow for it: every canvas call with a
+   * NaN coordinate is ignored and `900 < NaN` is false. The disc touches
+   * nothing in that world. Everyone else, the player included, plays the
+   * normal game. The host simulates the viewer's world (private view) and
+   * re-hides the disc whenever it is respawned (kick-off reset, team change,
+   * new disc). Whatever the hidden player changes in the room (pushing a
+   * disc, kicking the ball) is copied into the viewer's world with a shared
+   * SetDiscProperties: the room's values rounded to float32, for everyone.
+   * `hidden = false` shows it again the same way; the private view ends once
+   * both worlds are identical. Hidden pairs end with the game (stop or new
+   * game) and when either player leaves. Errors go to {@link onError}.
+   */
+  setPlayerHiddenFor(viewerId: number, playerId: number, hidden: boolean): void {
+    this.run(() => {
+      const where = `${hidden ? 'hidePlayerFor' : 'showPlayerFor'}(${viewerId}, ${playerId})`;
+      if (!hidden) {
+        const set = this.hiddenFor.get(viewerId);
+        if (set === undefined || !set.delete(playerId)) return;
+        if (set.size === 0) this.hiddenFor.delete(viewerId);
+        this.catchUp();
+        this.syncHidden();
+        return;
+      }
+      this.catchUp();
+      const gs = this.state.gameState;
+      if (gs === null) throw new Error(`${where}: no game running`);
+      const c = this.connections.get(viewerId);
+      if (c === undefined || !c.ready || c.closed) throw new Error(`${where}: viewer is not a connected player`);
+      if (getPlayer(this.state, playerId) === null) throw new Error(`${where}: no such player`);
+      if (viewerId === playerId) throw new Error(`${where}: a player can't be hidden from itself`);
+      if (this.hiddenGame !== gs) {
+        this.hiddenFor.clear();
+        this.hiddenGame = gs;
+      }
+      let set = this.hiddenFor.get(viewerId);
+      if (set === undefined) this.hiddenFor.set(viewerId, (set = new Set()));
+      if (set.has(playerId)) return;
+      set.add(playerId);
+      this.reconciling.add(viewerId);
+      this.syncHidden();
+    });
+  }
+
+  /** True while `playerId` is hidden from `viewerId` ({@link setPlayerHiddenFor}). */
+  isPlayerHiddenFor(viewerId: number, playerId: number): boolean {
+    return this.hiddenFor.get(viewerId)?.has(playerId) === true;
+  }
+
+  /** Ids of the players hidden from `viewerId`. */
+  getHiddenPlayersFor(viewerId: number): number[] {
+    return [...(this.hiddenFor.get(viewerId) ?? [])];
+  }
+
+  private readonly syncHiddenFn = (): void => this.syncHidden();
+
+  /**
+   * Makes the hidden pairs true in the viewers' worlds at the current point
+   * of the sequence (no frame is stepped in between):
+   *  1. re-hides a disc that is visible again (new disc, kick-off reset, a
+   *     global SetDiscProperties);
+   *  2. copies into each reconciling viewer's world every disc that differs
+   *     from the room's, except the ones that viewer hides or overrides.
+   */
+  private syncHidden(): void {
+    const gs = this.state.gameState;
+    if (gs === null || gs !== this.hiddenGame) {
+      // the game ended (or a new one started): the pairs end with it
+      this.hiddenFor.clear();
+      this.hiddenGame = null;
+      if (gs === null) this.reconciling.clear();
+    }
+    const seq = this.sequencer;
+    // 1. hide: position NaN + cGroup 0 in the viewer's world; k-th update of each viewer in slot k
+    const slots: Map<number, RoomEvent>[] = [];
+    for (const [viewerId, set] of this.hiddenFor) {
+      const c = this.connections.get(viewerId);
+      if (c === undefined || !c.ready || c.closed) {
+        this.hiddenFor.delete(viewerId);
+        continue;
+      }
+      let k = 0;
+      for (const pid of set) {
+        if (getPlayer(this.state, pid) === null) {
+          set.delete(pid);
+          continue;
+        }
+        const own = seq.getView(viewerId)?.rs ?? this.state;
+        const pl = getPlayer(own, pid);
+        const d = pl?.disc;
+        if (d == null) continue;
+        if (d.x !== d.x && d.y !== d.y && d.cGroup === 0 && (pl!.input & 16) === 0) continue;
+        seq.ensureView(viewerId);
+        this.reconciling.add(viewerId);
+        (slots[k++] ??= new Map()).set(viewerId, SetDiscPropertiesEvent.create(pid, true, { x: NaN, y: NaN, cGroup: 0 }));
+        // no kick in the viewer's world (isKicking is cleared when the input has no kick bit)
+        if ((pl!.input & 16) !== 0) (slots[k++] ??= new Map()).set(viewerId, stripKick(pid, pl!.input));
+        // inputs with kick already sent unchanged, applied later: strip right after each one
+        const late = seq.queue.filter(
+          (q) => q.type === EventType.SendInput && q.byId === pid && ((q as SendInputEvent).input & 16) !== 0 && !seq.hasVariant(q, viewerId),
+        );
+        for (const q of late) seq.privateSlotAt(q.frame, new Map([[viewerId, stripKick(pid, (q as SendInputEvent).input)]]));
+      }
+      if (set.size === 0) this.hiddenFor.delete(viewerId);
+    }
+    for (const slot of slots) seq.privateSlot(slot);
+    if (gs === null || this.reconciling.size === 0) return;
+
+    // 2. reconcile: a disc that differs from the room's gets the room's values (f32) in every
+    //    world that does not hide / override it; those get a no-op in the same slot
+    let fix: number[] | null = null;
+    for (const viewerId of this.reconciling) {
+      const v = seq.getView(viewerId);
+      if (v === null) {
+        if (!this.hiddenFor.has(viewerId)) this.reconciling.delete(viewerId);
+        continue;
+      }
+      const a = gs.world.discs;
+      const b = v.rs.gameState?.world.discs;
+      if (b === undefined || b.length !== a.length) continue;
+      for (let i = 0; i < a.length; i++) {
+        if (fix?.includes(i) || this.excludedFor(viewerId, i)) continue;
+        if (discDiffMask(a[i]!, b[i]!) !== 0) (fix ??= []).push(i);
+      }
+    }
+    if (fix === null) return;
+    for (const i of fix) {
+      const room = gs.world.discs[i]!;
+      let mask = 0;
+      const keep = new Map<number, RoomEvent>();
+      for (const v of seq.views) {
+        if (this.excludedFor(v.playerId, i)) {
+          keep.set(v.playerId, SetDiscPropertiesEvent.create(0, false, {}));
+          continue;
+        }
+        const d = v.rs.gameState?.world.discs[i];
+        if (d !== undefined) mask |= discDiffMask(room, d);
+      }
+      const props: DiscPropsInput = {};
+      for (const name of DISC_FIELDS) if ((mask & (1 << DiscProp[name])) !== 0) props[name] = room[name];
+      seq.privateSlot(keep, SetDiscPropertiesEvent.create(i, false, props));
+    }
+  }
+
+  /** Disc `index` of the viewer's world is hidden or overridden for it (left out of reconciling). */
+  private excludedFor(viewerId: number, index: number): boolean {
+    if (this.discOverrides.get(viewerId)?.has(index) === true) return true;
+    const set = this.hiddenFor.get(viewerId);
+    if (set === undefined) return false;
+    const v = this.sequencer.getView(viewerId);
+    if (v === null) return false;
+    const d = v.rs.gameState?.world.discs[index];
+    if (d === undefined) return false;
+    for (const pid of set) if (getPlayer(v.rs, pid)?.disc === d) return true;
+    return false;
+  }
+
   // ================================================================ queries
 
   /** Players in list order (live model objects; do not mutate). */
@@ -824,6 +1029,7 @@ export class HostRoom {
         this.flushing = false;
       }
     }
+    if ((this.hiddenFor.size > 0 || this.reconciling.size > 0) && !this.sequencer.busy) this.invoke(this.syncHiddenFn);
     this.schedule();
   }
 
@@ -863,7 +1069,13 @@ export class HostRoom {
   private catchUp(): void {
     const seq = this.sequencer;
     const n = this.targetFrame() - seq.frame;
-    if (n > 0) seq.advance(n);
+    if (this.hiddenFor.size > 0 || this.reconciling.size > 0) {
+      // hidden players: re-hide / reconcile after every frame (a kick-off reset respawns discs)
+      for (let i = 0; i < n; i++) {
+        seq.advance(1);
+        this.syncHidden();
+      }
+    } else if (n > 0) seq.advance(n);
     seq.periodic(this.hbFrames, this.csFrames);
   }
 
@@ -1016,6 +1228,8 @@ export class HostRoom {
     if (this.connections.get(c.playerId) === c) this.connections.delete(c.playerId);
     this.sequencer.dropView(c.playerId);
     this.discOverrides.delete(c.playerId);
+    this.hiddenFor.delete(c.playerId);
+    this.reconciling.delete(c.playerId);
     const i = this.ready.indexOf(c);
     if (i >= 0) this.ready.splice(i, 1);
     this.updatePingTimer();

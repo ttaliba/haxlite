@@ -485,6 +485,24 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     getDiscPropertiesFor(viewerId: number, discIndex: number) {
       return host.getDiscPropertiesFor(viewerId, discIndex);
     },
+    setPlayerHiddenFor(viewerId: number, playerId: number, hidden: boolean) {
+      const v = castInt(viewerId, 0);
+      const p = castInt(playerId, 0);
+      const h = hidden === true;
+      defer(() => host.setPlayerHiddenFor(v, p, h));
+    },
+    hidePlayerFor(viewerId: number, playerId: number) {
+      this.setPlayerHiddenFor(viewerId, playerId, true);
+    },
+    showPlayerFor(viewerId: number, playerId: number) {
+      this.setPlayerHiddenFor(viewerId, playerId, false);
+    },
+    isPlayerHiddenFor(viewerId: number, playerId: number) {
+      return host.isPlayerHiddenFor(viewerId, playerId);
+    },
+    getHiddenPlayersFor(viewerId: number) {
+      return host.getHiddenPlayersFor(viewerId);
+    },
     hasPrivateView(viewerId: number) {
       return host.hasPrivateView(viewerId);
     },
