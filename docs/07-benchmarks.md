@@ -941,3 +941,90 @@ flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings 
 flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
   bench/rtc/sctp-host-alloc.ts [--no-bundle] [--const-clock]
 ```
+
+## Pasada `ndc`: perillas de node-datachannel y latencia de entrada
+
+Objetivo: exprimir el backend por defecto (`peerBackend: 'ndc'`, node-datachannel 0.33.4 /
+libdatachannel 0.24.5). Partida con 20 clientes node-haxball, `run.ts game --n 20 --reps 3
+--warmup 10 --window 30`, todo bajo `flock /tmp/haxlite-bench.lock`, variantes intercaladas en
+la misma sesión (`HAXLITE_BENCH_VARIANTS`: `base` = build `tsc` del commit `4bdca83`, `new` =
+este cambio; las perillas nativas se prueban sobre `new`). Mediana (mín–máx). La máquina estaba
+compartida con otras sesiones (CPU ajena 3–95 % en la primera tanda, ≤ 16 % en la segunda): los
+valores absolutos de CPU no son comparables con la tabla unificada, solo entre filas de una tanda.
+
+### Dónde se iban los ~2 s de entrada
+
+Línea de tiempo de una entrada (cliente node-haxball, host en loopback, *probe* con marcas en cada
+callback de la PeerConnection):
+
+| t (ms) | antes | después |
+|---:|---|---|
+| 0 → ~1 005 | cliente: sala, WS, oferta (su propia espera de recolección) | igual (no depende del host) |
+| ~1 006 | host crea la PC; ICE `connected` casi al instante (el cliente responde los checks aunque aún no tenga la respuesta) | igual |
+| | libdatachannel responde `a=setup:active` y manda su **ClientHello DTLS en cuanto ICE conecta**: el cliente todavía no tiene la respuesta y lo descarta | el host responde `a=setup:passive` y espera el ClientHello del cliente |
+| ~1 506 | respuesta enviada: espera de recolección `answerIceWaitMs` = 500 ms (el STUN por defecto no responde en la máquina de pruebas) | respuesta a los ~1 ms, con el primer candidato permitido; el resto por *trickle* |
+| ~2 006 | retransmisión DTLS de OpenSSL (temporizador inicial de **1 s** desde el primer ClientHello) → DTLS + SCTP | DTLS + SCTP ~10 ms después de la respuesta |
+| +40 | desafío (`challengeDelayMs`, se mantiene: los clientes libdatachannel descartan mensajes que llegan antes de que abran sus tres canales) | igual |
+
+Cambios (solo el camino `ndc`: `src/net/peer-backend.ts` y la negociación de `transport.ts`
+condicionada a la nueva propiedad `PeerBackend.answerOnFirstCandidate`):
+
+* **El host es servidor DTLS**: `LocalPeerLink` presenta la oferta `a=setup:actpass` como
+  `a=setup:active`, así libdatachannel responde `passive` (lo que cualquier pila acepta para una
+  oferta `actpass`, RFC 8842 §5.3). Elimina la carrera del ClientHello temprano y, con ella, la
+  espera de la retransmisión de 1 s. Por sí solo (probe, 2 entradas): ≈ 2,06 → 1,56–1,60 s. También lo usa el edge
+  (`src/edge/players.ts` crea `LocalPeerLink`).
+* **Respuesta con el primer candidato permitido** por `iceCandidatePolicy` (en el siguiente turno
+  de temporizador, para que entre la ráfaga de candidatos del mismo turno) en vez de esperar a
+  que termine la recolección o 500 ms; los candidatos posteriores (srflx) van por *trickle* como ya
+  hacía el host oficial con los tardíos. Tras NAT con la política `'public'` el primer candidato
+  permitido es el srflx, así que allí no cambia nada; sin candidatos permitidos sigue el límite de
+  `answerIceWaitMs`. Sin el cambio DTLS no sirve de nada (sigue mandando la retransmisión de 1 s).
+
+| variante | entrada p50 (ms) | entrada p90 (ms) | CPU % | hilo JS / resto | despertares/s | lag p99 (ms) |
+|---|---:|---:|---:|---:|---:|---:|
+| `base` | 2 059 (2 059–2 060) | 2 079 (2 068–2 084) | 14,32 (13,93–15,84) | 5,23 / 9,10 | 4 069 | 1,15 |
+| **`new`** | **1 061 (1 060–1 064)** | **1 079 (1 079–1 080)** | 14,12 (14,02–15,69) | 5,26 / 9,13 | 4 138 | 1,09 |
+
+La entrada queda igual que con `rtc` (≈ 1,06 s); lo que resta es casi todo del cliente (~1 s
+antes de mandar la oferta) más los 40 ms del desafío. Interoperabilidad: `npm run test:interop`
+con `RTC_INTEROP_BACKENDS=ndc` (Chromium: loopback4, eth4, lossy, dtls13) 36/36; el cliente
+oficial real no se pudo correr (sin `HAXBALL_CLIENT_DIR` en esta máquina).
+
+### Perillas nativas medidas (sin efecto)
+
+| variante | CPU % | hilo JS / resto | despertares/s | lag p99 (ms) |
+|---|---:|---:|---:|---:|
+| `new` (tanda 1) | 14,12 (14,02–15,69) | 5,26 / 9,13 | 4 138 | 1,09 |
+| `setSctpSettings({ congestionControlModule: 0 })` (RFC 2581 en vez de H‑TCP) | 14,91 (14,23–15,22) | 5,43 / 9,53 | 4 071 | 1,10 |
+| `setSctpSettings({ delayedSackTime: 50 })` | 14,94 (14,58–15,73) | 5,37 / 9,53 | 4 141 | 1,14 |
+| `new` (tanda 2) | 14,61 (14,47–15,09) | 5,20 / 9,40 | 4 037 | 1,01 |
+| `setSctpSettings({ delayedSackTime: 10 })` | 14,68 (14,08–15,07) | 5,23 / 9,46 | 4 016 | 1,06 |
+| `rtc: { mtu: 1200 }` | 14,98 (14,88–15,11) | 5,26 / 9,73 | 4 095 | 1,09 |
+| `setSctpSettings({ initialCongestionWindow: 4 })` | 14,45 (14,42–14,55) | 5,13 / 9,26 | 3 987 | 1,03 |
+
+Todas dentro del ruido (los rangos se solapan con `new` de su tanda): no se adopta ninguna.
+Además:
+
+* **Tamaño del pool de hilos**: node-datachannel 0.33.4 solo exporta `initLogger`, `cleanup`,
+  `preload`, `setSctpSettings` y `getLibraryVersion`; libdatachannel crea
+  `max(hardware_concurrency, 4)` `RTC worker`, así que en una máquina de 4 núcleos ya está en el
+  mínimo: con `taskset -c 0` siguen siendo 4 (19 hilos). RTO mínimo, intervalo de heartbeat SCTP
+  y Nagle (`SCTP_NODELAY`) no están expuestos.
+* **Versión**: 0.33.4 es la última publicada (`npm view node-datachannel versions`, 12‑09‑2026);
+  no hay actualización posible.
+* **Camino de mensajes**: sin cambios posibles desde JS (ver «Pasada de ligereza — red»):
+  `sendMessageBinary` ya recibe la vista sin `Buffer.from`, cada evento debe ser un mensaje DC
+  propio y la copia a `Buffer` en recepción la hace el *binding*. `iceTransportPolicy`,
+  `maxMessageSize`, canales ordenados/no ordenados y `disableAutoNegotiation` (ya forzado) no
+  afectan a la CPU o los fija el protocolo del cliente oficial.
+
+```sh
+npm run bench:build
+npx tsc -p tsconfig.build.json --outDir node_modules/.cache/hx-ab/base --declaration false --sourceMap false  # en el commit base
+D=$PWD/node_modules/.cache; N=$D/haxlite-bench/dist
+HAXLITE_BENCH_VARIANTS='{"base":{"dist":"'$D'/hx-ab/base"},"new":{"dist":"'$N'"},
+  "cc0":{"dist":"'$N'","sctp":{"congestionControlModule":0}},"sack50":{"dist":"'$N'","sctp":{"delayedSackTime":50}}}' \
+  flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+  bench/net/run.ts game --impl haxlite:base,haxlite:new,haxlite:cc0,haxlite:sack50 --n 20 --reps 3 --warmup 10 --window 30
+```
