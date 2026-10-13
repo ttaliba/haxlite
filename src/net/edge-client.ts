@@ -19,7 +19,7 @@
 import dgram from 'node:dgram';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
-import WebSocket, { type ClientOptions, type RawData } from 'ws';
+import { WebSocket, type ClientOptions, type RawData } from './ws.js';
 import { Reader, Writer } from '../codec/index.js';
 import { CHANNELS } from './constants.js';
 import { candidateLine, toNativeIceServers, type IceServerConfig } from './ice.js';

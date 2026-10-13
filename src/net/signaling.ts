@@ -11,7 +11,7 @@
  * This class only frames/deframes; admission control and WebRTC live in
  * `transport.ts`.
  */
-import WebSocket from 'ws';
+import { WebSocket, type ClientOptions } from './ws.js';
 import type http from 'node:http';
 import { Reader, Writer, deflateRaw, inflateRaw } from '../codec/index.js';
 import { DEFAULT_WS_ORIGIN, HostToMaster, MasterCloseCode, MasterToHost, NetDefaults } from './constants.js';
@@ -245,7 +245,7 @@ export class HostSignaling {
     const headers: Record<string, string> = { ...this.opts.wsHeaders };
     const origin = this.opts.origin === undefined ? DEFAULT_WS_ORIGIN : this.opts.origin;
     if (origin !== null) headers['Origin'] = origin;
-    const wsOpts: WebSocket.ClientOptions = { headers, perMessageDeflate: false };
+    const wsOpts: ClientOptions = { headers, perMessageDeflate: false };
     if (this.opts.agent) wsOpts.agent = this.opts.agent as http.Agent;
     const ws = new WebSocket(`${base}?token=${session.token}`, wsOpts);
     ws.binaryType = 'nodebuffer';

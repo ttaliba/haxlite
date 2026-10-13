@@ -29,7 +29,7 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import type { Duplex } from 'node:stream';
-import { WebSocketServer, WebSocket, type RawData } from 'ws';
+import { WebSocketServer, WebSocket, type RawData } from '../net/ws.js';
 import type { RtcConfig } from 'node-datachannel';
 import { Reader, Writer } from '../codec/index.js';
 import { DEFAULT_ICE_SERVERS, NetDefaults } from '../net/constants.js';
