@@ -69,7 +69,7 @@ export class UdpIo {
     if (h !== null && typeof h.onmessage === 'function') {
       h.onmessage = (nread, _handle, buf, rinfo) => {
         if (nread < 0 || buf === undefined || rinfo === undefined) {
-          // the rare recvmsg error: let dgram's own path report it
+          // the rare recvmsg error: reported like dgram does, as an 'error' event
           (sock as unknown as { emit(e: string, err: Error): void }).emit('error', new Error(`recvmsg failed (${nread})`));
           return;
         }

@@ -68,4 +68,53 @@ describe('UdpIo (direct UDPWrap send/receive)', () => {
     a.close();
     expect(() => io.send(Buffer.from('y'), b.address().port, '127.0.0.1')).not.toThrow();
   });
+
+  it('makes a fresh SendWrap when libuv queues a send (EAGAIN) and falls back to dgram on surprises', () => {
+    // fake socket shaped like node:dgram's (state under a 'state symbol' key)
+    class FakeReq {
+      list?: Uint8Array[];
+    }
+    const calls: { req: FakeReq; list: Uint8Array[] }[] = [];
+    let result: unknown = 6;
+    const handle = {
+      onmessage: () => {},
+      send(req: FakeReq, list: Uint8Array[]) {
+        calls.push({ req, list });
+        return result;
+      },
+    };
+    let dgramSends = 0;
+    const sock = {
+      [Symbol('state symbol')]: { handle },
+      on() {},
+      send(buf: Uint8Array) {
+        dgramSends++;
+        handle.send(new FakeReq(), [buf]);
+      },
+      getSendQueueCount: () => 0,
+    } as unknown as Socket;
+    const io = new UdpIo(sock, () => {}, () => {});
+    const b = Buffer.from('hello');
+    expect(io.send(b, 1, '127.0.0.1')).toBe(true); // through dgram: captures FakeReq
+    expect(io.send(b, 1, '127.0.0.1')).toBe(true); // direct, synchronous
+    const r1 = calls[1]!.req;
+    expect(r1).toBeInstanceOf(FakeReq);
+    expect(r1.list).toBe(calls[1]!.list);
+    expect(io.send(b, 1, '127.0.0.1')).toBe(true);
+    expect(calls[2]!.req).toBe(r1); // reused
+    result = 0; // queued: req/list now belong to the pending send
+    expect(io.send(b, 1, '127.0.0.1')).toBe(false);
+    expect(calls[3]!.req).toBe(r1);
+    expect(r1.list![0]).toBe(b);
+    result = 6;
+    expect(io.send(b, 1, '127.0.0.1')).toBe(true);
+    expect(calls[4]!.req).not.toBe(r1);
+    expect(calls[4]!.list).not.toBe(calls[3]!.list);
+    expect(io.directSends).toBe(4);
+    result = undefined; // unknown shape: back to dgram for good (this datagram is not resent)
+    io.send(b, 1, '127.0.0.1');
+    io.send(b, 1, '127.0.0.1');
+    expect(dgramSends).toBe(2);
+    expect(io.directSends).toBe(4);
+  });
 });
