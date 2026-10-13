@@ -163,3 +163,7 @@ Los clientes oficiales se adaptan a ambos ajustes sin cambios, porque el host le
 ## Aviso
 
 Esto es documentación con fines educativos y de interoperabilidad. El script oficial es "© Mario Carbajal – All rights reserved". node-haxball incluye funciones que permiten abusar del juego (jugadores falsos, speedhack, etc.). El doc 05 comenta los riesgos.
+
+## Licencia
+
+MIT, ver [LICENSE](LICENSE).
