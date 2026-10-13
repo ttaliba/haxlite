@@ -143,6 +143,7 @@ export class Peer {
   /** @internal */ localSdp: string | null = null;
   /** @internal */ readonly localCandidates: IceCandidateInit[] = [];
   /** @internal candidates received while 'validating' */ queuedRemote: IceCandidateInit[] = [];
+  /** @internal when a deferred close started (see CLOSE_LINGER_MS) */ closedAt = 0;
   /** @internal remote candidates accepted so far (capped by MAX_REMOTE_CANDIDATES) */ remoteCandidates = 0;
   /** @internal */ mids: string[] = [];
 
@@ -298,6 +299,8 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
 
 /** See {@link HostTransportOptions.challengeDelayMs}. */
 const DEFAULT_CHALLENGE_DELAY_MS = 40;
+/** Minimum time between a deferred close (kick) and the native close, so the notice is delivered first. */
+const CLOSE_LINGER_MS = 500;
 /** Remote ICE candidates accepted per negotiation (the edge has the same cap, `EdgeLimits.maxRemoteCandidates`). */
 const MAX_REMOTE_CANDIDATES = 32;
 /** See {@link HostTransportOptions.answerIceWaitMs} (official {@link NetDefaults.answerIceWaitMs}). */
@@ -1145,6 +1148,7 @@ export class HostTransport {
       if (ji >= 0) this.joined.splice(ji, 1);
     }
     if (deferNative && this.running) {
+      peer.closedAt = performance.now();
       this.deferredDestroy.push(peer);
       this.ensureSweep();
     } else this.destroyNative(peer);
@@ -1171,9 +1175,16 @@ export class HostTransport {
   /** Housekeeping: negotiation timeouts (`la.gi`), idle peers (`Ya`), deferred closes. */
   private sweep(): void {
     const now = performance.now();
-    if (this.deferredDestroy.length > 0) {
-      for (const p of this.deferredDestroy) this.destroyNative(p);
-      this.deferredDestroy.length = 0;
+    const dd = this.deferredDestroy;
+    if (dd.length > 0) {
+      // linger so the last message (kick notice) leaves before the native close, even on a fast sweep
+      let keep = 0;
+      for (let i = 0; i < dd.length; i++) {
+        const p = dd[i]!;
+        if (now - p.closedAt >= CLOSE_LINGER_MS) this.destroyNative(p);
+        else dd[keep++] = p;
+      }
+      dd.length = keep;
     }
     const openTimeout = this.opts.channelOpenTimeoutMs ?? NetDefaults.channelOpenTimeoutMs;
     for (const p of this.pending.values()) {
