@@ -40,6 +40,8 @@ export interface SessionHost {
   readonly suites: readonly number[] | undefined;
   /** Registers `dest` in the 5-tuple map (stealing it from another session if needed). */
   bindAddress(dest: ValidatedAddress): void;
+  /** Releases `dest`'s 5-tuple from the DTLS demux if it still points at `dest`. */
+  unbindAddress(dest: ValidatedAddress): void;
   /** Removes the session from every map. */
   unregister(session: RtcSessionImpl): void;
   /** Handshake/session outcome counters. */
@@ -236,7 +238,12 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
       if (this.validated.length >= MAX_VALIDATED) {
         // keep the nominated one, drop the oldest other
         const idx = this.validated.findIndex((x) => x !== this.nominated);
-        this.validated.splice(idx < 0 ? 0 : idx, 1);
+        const [old] = this.validated.splice(idx < 0 ? 0 : idx, 1);
+        // its 5-tuple must not keep routing DTLS here (nor keep this session reachable after close)
+        if (old !== undefined) {
+          this.host.unbindAddress(old);
+          if (this.dest === old) this.dest = null;
+        }
       }
       this.validated.push(v);
     }

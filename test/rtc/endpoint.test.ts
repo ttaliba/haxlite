@@ -182,6 +182,27 @@ describe('RtcEndpoint ICE-lite', () => {
     expect(session.remoteAddress?.port).toBe(b.address().port);
   });
 
+  it('evicted validated addresses leave the DTLS demux (no leak, no routing to stale 5-tuples)', async () => {
+    const { ep, session, creds } = await setup();
+    const clients: Socket[] = [];
+    for (let i = 0; i < 12; i++) {
+      // more source ports than a session keeps validated (MAX_VALIDATED = 8)
+      const c = await client();
+      clients.push(c);
+      c.send(binding(creds), ep.port, '127.0.0.1');
+      expect(await nextMessage(c)).not.toBeNull();
+    }
+    const demux = (ep as unknown as { byAddress: Map<string, Map<number, unknown>> }).byAddress;
+    expect(demux.get('127.0.0.1')?.size).toBe(8);
+    // DTLS from the first (evicted) port is no longer routed to the session
+    const before = ep.stats().dtlsUnknownSource;
+    clients[0]!.send(Buffer.from('16fefd000000000000000000000000', 'hex'), ep.port, '127.0.0.1');
+    await sleep(50);
+    expect(ep.stats().dtlsUnknownSource).toBe(before + 1);
+    session.close();
+    expect(demux.size).toBe(0);
+  });
+
   it('closes sessions that never connect (handshake timeout)', async () => {
     const { session } = await setup({ handshakeTimeoutMs: 300 });
     const reason = await new Promise<string>((r) => (session.onClose = r));

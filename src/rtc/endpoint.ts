@@ -286,6 +286,7 @@ export class RtcEndpoint {
         return this.sendScratch;
       },
       bindAddress: (v) => this.bindAddress(v),
+      unbindAddress: (v) => this.unbindAddress(v),
       unregister: (s) => this.unregister(s),
       countHandshake: (ok) => {
         if (ok) counters.handshakesCompleted++;
@@ -507,16 +508,19 @@ export class RtcEndpoint {
     if (prev !== undefined && prev.session !== v.session) prev.session.forgetAddress(prev);
   }
 
+  /** Releases v's 5-tuple from the DTLS demux if v still owns it. */
+  private unbindAddress(v: ValidatedAddress): void {
+    const ports = this.byAddress.get(v.address);
+    if (ports !== undefined && ports.get(v.port) === v) {
+      ports.delete(v.port);
+      if (ports.size === 0) this.byAddress.delete(v.address);
+    }
+  }
+
   private unregister(s: RtcSessionImpl): void {
     if (this.byUfrag.get(s.localUfrag) === s) this.byUfrag.delete(s.localUfrag);
     this.gatherer.forget(s);
-    for (const v of s.validated) {
-      const ports = this.byAddress.get(v.address);
-      if (ports !== undefined && ports.get(v.port) === v) {
-        ports.delete(v.port);
-        if (ports.size === 0) this.byAddress.delete(v.address);
-      }
-    }
+    for (const v of s.validated) this.unbindAddress(v);
     const d = s.dtlsDrops;
     this.counters.dtlsReplayed += d.replayed;
     this.counters.dtlsBadRecords += d.bad;
