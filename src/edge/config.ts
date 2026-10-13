@@ -48,7 +48,7 @@ export function parseKeyList(text: string): EdgeKeyConfig[] {
     const line = raw.trim();
     if (line.length === 0 || line.startsWith('#')) continue;
     const i = line.indexOf(':');
-    if (i <= 0) throw new Error(`bad key entry "${line.slice(0, 20)}…" (expected id:secret)`);
+    if (i <= 0) throw new Error(`bad key entry "${line.slice(0, 20)}..." (expected id:secret)`);
     out.push({ id: line.slice(0, i), secret: line.slice(i + 1) });
   }
   return out;

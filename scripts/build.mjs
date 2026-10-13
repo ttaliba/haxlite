@@ -7,7 +7,7 @@
 //
 //   node scripts/build.mjs [--out <dir>]      (default: dist)
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'rolldown';
@@ -32,6 +32,25 @@ await build({
   logLevel: 'warn',
   output: { dir: out, format: 'esm', entryFileNames: '[name].js', chunkFileNames: 'chunk-[hash].js', minify: !process.argv.includes('--no-minify') },
 });
+
+// ASCII-only output: V8 keeps every module's source text in the heap, and one
+// non-Latin-1 character (e.g. an ellipsis in a message) makes it store the whole
+// file as a two-byte string (2x memory). \uXXXX escapes mean the same in
+// strings, templates, regexps and identifiers.
+function asciiOnly(dir) {
+  for (const name of readdirSync(dir)) {
+    const file = path.join(dir, name);
+    if (statSync(file).isDirectory()) asciiOnly(file);
+    else if (name.endsWith('.js')) {
+      const code = readFileSync(file, 'utf8');
+      // eslint-disable-next-line no-control-regex
+      if (/[^\x00-\x7f]/.test(code)) {
+        writeFileSync(file, code.replace(/[^\x00-\x7f]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`));
+      }
+    }
+  }
+}
+asciiOnly(out);
 
 // keep tsc's declarations next to the bundle
 function copyDts(from, to) {
