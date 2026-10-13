@@ -90,8 +90,8 @@ function earlySendDelay(PeerConnection, delayMs = 40) {
 /**
  * A/B variants (diagnostics, src/net tuning): impl `haxlite:<name>` — built-in
  * `haxlite:rtc` (peerBackend 'rtc') and `haxlite:ndc`, or from
- * `HAXLITE_BENCH_VARIANTS` = JSON `{ "<name>": { dist?, transport?, sctp?, logger? } }`:
- * another compiled build (path relative to the repo), extra HostTransport
+ * `HAXLITE_BENCH_VARIANTS` = JSON `{ "<name>": { dist?, bundle?, transport?, sctp?, logger? } }`:
+ * another compiled build (path relative to the repo; `bundle`: a `scripts/build.mjs --out` dir), extra HostTransport
  * options, node-datachannel `setSctpSettings(…)` and `initLogger(level)`.
  */
 /** Built-in variants (overridable through HAXLITE_BENCH_VARIANTS). */
@@ -120,7 +120,8 @@ async function haxliteFactory() {
   }
   // Default: the shipped package bundle (minified, `npm run bench:build`), i.e. what users run.
   // A variant with an explicit `dist` (per-module tsc build) is loaded module by module.
-  const bundle = path.resolve(ROOT, 'node_modules/.cache/haxlite-bench/bundle/index.js');
+  // A variant `bundle` (directory of another `scripts/build.mjs --out` build) is loaded instead (A/B of bundles).
+  const bundle = path.resolve(ROOT, variant.bundle ?? 'node_modules/.cache/haxlite-bench/bundle', 'index.js');
   const { HostRoom, createHostRoomState, HostTransport } =
     !variant.dist && existsSync(bundle)
       ? await import(pathToFileURL(bundle).href)
