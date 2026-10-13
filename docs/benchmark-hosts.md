@@ -1,8 +1,43 @@
 # Benchmark: hosts de HaxBall en Node.js
 
-## Resultado actual (benchmark rápido, tras la pasada de GC y memoria)
+## Resultado actual (tanda unificada del 13-10-2026, tras la pasada «puntero en todo»)
 
-Misma sesión, las 4 opciones intercaladas, 3 repeticiones, ventanas de 30 s (sala vacía: 60 s), arranque con 10 repeticiones; haxlite medido con el **paquete minificado** publicado. Mediana [mín–máx]. Datos: `bench/results/quick-*.json` · `sh bench/net/quick.sh` · imágenes en `docs/img/benchmark/`.
+Misma sesión, las cuatro opciones **intercaladas** en cada repetición, 3 repeticiones de 60 s tras 15 s de calentamiento (sala vacía: 3 × 120 s; arranque: 10 repeticiones), haxlite medido con el **paquete minificado** publicado (commit `de3f879`). Mediana [mín–máx]. Máquina: 4 vCPU Xeon a **2,10 GHz** (más lenta que la de las tandas anteriores: los valores absolutos de CPU suben para todos; comparar solo dentro de esta tabla). Datos: `bench/results/unified-*.json` · `sh bench/net/unified.sh` · `node bench/net/report.mjs --unified` · imágenes en `docs/img/benchmark/` (`node bench/charts.mjs docs/img/benchmark bench/results/unified`).
+
+| métrica | haxball.js (oficial) | node-haxball | haxlite + ndc | **haxlite + rtc** |
+|---|---:|---:|---:|---:|
+| **20 jugadores** · CPU % | 16,88 [16,67–17,13] | 18,35 [18,28–18,50] | 14,96 [14,76–16,15] | **7,12** [6,97–7,15] |
+| RSS MB · heap MB | 91,4 · 12,5 | 92,5 · 16,1 | 77,6 · **8,9** | **67,0** · 10,6 |
+| GC ms/min · pausas/min | 55,6 · 97 | 53,8 · 98 | **3,4 · 8** | 15,8 · 42 |
+| lag p99 ms | 1,14 | 1,22 | 1,21 | **1,13** |
+| hilos · fds · despertares/s | 18 · 46 · 4 199 | 15 · 48 · 4 260 | 19 · 27 · 4 060 | **11 · 25 · 481** |
+| entrada p50 ms (Room.join → onOpen) | 2 059 | 2 141 | **1 062** | **1 063** |
+| **10 jugadores** · CPU % | 7,68 | 8,70 | 7,01 | **3,80** |
+| **4 jugadores** · CPU % | 3,98 | 4,55 | 3,71 | **2,39** |
+| **10 salas × 4** · CPU % | 26,11 | 25,46 | 19,97 | **8,67** |
+| RSS MB · heap MB | 103,4 · 17,8 | 103,2 · 18,5 | 85,1 · **10,0** | **70,4** · 12,0 |
+| GC ms/min · fds | 119,5 · 75 | 66,7 · 77 | **8,5** · 36 | 18,6 · **34** |
+| **Sala vacía** · CPU % | 0,387 | 0,766 | **0,011** | **0,012** |
+| despertares/s · RSS MB | 20,6 · 69,0 | 81,3 · 71,1 | **0,3 · 57,5** | **0,3** · 58,9 |
+| **Arranque** proceso → link ms | 196 | 204 | **112** | **112** |
+| RSS al link MB | 77,9 | 73,7 | **59,1** | **59,1** |
+
+**Lectura:**
+
+* **haxlite (cualquiera de los dos backends) gana a haxball.js y a node-haxball en todas las métricas** de la tabla. La única fila donde no hay un ganador claro es el lag p99 (1,13–1,22 ms en los cuatro, rangos solapados: ruido, y 15 veces por debajo de un frame de 16,7 ms); con 4 clientes rtc queda 0,04 ms por encima (1,03 frente a 0,98–0,99), también dentro del ruido.
+* **haxlite + rtc** es el más barato con jugadores: −58 % de CPU frente al oficial y −61 % frente a node-haxball con 20 jugadores; −67 % y −66 % con 10 salas. 0 hilos nativos, ~9× menos despertares.
+* **Entrada a la sala en la mitad de tiempo** con los dos backends (≈ 1,06 s frente a ≈ 2,06 s): el host es servidor DTLS y la answer sale con el primer candidato (docs/07, «Pasada `ndc`»). El segundo restante es del propio cliente.
+* **Arranque ~85 ms antes y ~15–19 MB menos de RSS** que los otros dos (carga de `ws` sin el lexer CJS, menos módulos internos de Node, bundle ASCII).
+* Entre los dos backends de haxlite: `ndc` sigue con menos GC y heap (su red vive en código nativo, fuera del heap); `rtc` gana en todo lo demás. El GC que queda en rtc lo crea el binding UDP de Node por cada datagrama recibido (≈ 0,44 MB/s con 20 jugadores) y no se puede quitar desde JS (docs/10 §6.6).
+* **rtc ya funciona detrás de NAT** (ICE completo con STUN y comprobaciones propias; docs/10 §2.1, §4.4). Sin TURN.
+
+Cambios de esta pasada (frente a la tabla rápida anterior, que sigue abajo como histórico): ICE completo en rtc; E/S UDP sin basura por envío (`src/rtc/udp.ts`) y temporizadores SCTP sin `Timeout` nuevos; entrada −1 s en ndc; arranque −37 ms y −9 MB; certificado DTLS síncrono (sin hilos del thread pool en una sala vacía, medido después de esta tabla: 11 → 7 hilos en reposo); arreglos de seguridad y robustez (bans por `auth` canónico, fuga de direcciones validadas en rtc, negociaciones colgadas, candidatos remotos acotados, vida del WebSocket del maestro, aviso de kick antes del cierre).
+
+---
+
+## Resultado rápido anterior (11-10-2026, tras la pasada de GC; histórico)
+
+Misma sesión, las 4 opciones intercaladas, 3 repeticiones, ventanas de 30 s (sala vacía: 60 s), arranque con 10 repeticiones; haxlite medido con el **paquete minificado** publicado. Mediana [mín–máx]. Datos: `bench/results/quick-*.json` · `sh bench/net/quick.sh`. Las imágenes de `docs/img/benchmark/` ya corresponden a la tanda unificada de arriba.
 
 | métrica | haxball.js (oficial) | node-haxball | haxlite + ndc | **haxlite + rtc** |
 |---|---:|---:|---:|---:|

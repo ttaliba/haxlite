@@ -91,7 +91,7 @@ function hpanel({ title, sub, values, decimals, unit = '', width = 530, best = '
 }
 
 function card({ id, title, sub, body, note }) {
-  return `<section class="card" id="${id}"><header><h1>${esc(title)}</h1><p>${sub}</p></header>${legend()}${body}${note ? `<footer>${note}</footer>` : ''}<div class="src">Benchmark haxlite · 11-10-2026 · misma máquina y sesión (4 vCPU, Node 22) · mediana de 3 repeticiones intercaladas · clientes reales en procesos aparte · paquete minificado</div></section>`;
+  return `<section class="card" id="${id}"><header><h1>${esc(title)}</h1><p>${sub}</p></header>${legend()}${body}${note ? `<footer>${note}</footer>` : ''}<div class="src">Benchmark haxlite · ${RUN_DATE} · misma máquina y sesión (4 vCPU, Node 22) · mediana de 3 repeticiones intercaladas · clientes reales en procesos aparte · paquete minificado</div></section>`;
 }
 
 
@@ -105,6 +105,10 @@ function load(name) {
   for (const c of j.configs) out[IMPL[c.label.split(' ')[0]]] = c.summary;
   return (metric, scale = 1) => Object.fromEntries(Object.entries(out).map(([k, s]) => [k, s[metric].median * scale]));
 }
+const RUN_DATE = (() => {
+  const d = new Date(JSON.parse(readFileSync(`${RES}-game.json`, 'utf8')).info.date);
+  return `${String(d.getUTCDate()).padStart(2, '0')}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${d.getUTCFullYear()}`;
+})();
 const game = load('game'), rooms = load('rooms'), idle = load('idle'), startup = load('startup');
 const pct = (a, b) => Math.round((1 - a / b) * 100);
 const cg = game('cpuPct'), cr = rooms('cpuPct');
@@ -146,7 +150,7 @@ cards.push(card({
     hpanel({ title: 'Lag del event loop p99', sub: 'ms (un frame del juego = 16,7 ms)', values: game('eldP99'), decimals: 2, unit: ' ms' }),
     hpanel({ title: 'Pausas de GC', sub: 'por minuto', values: game('gcPerMin'), decimals: 0 }),
   ].join('')}</div>`,
-  note: 'El WebRTC propio gasta menos tiempo en GC que haxball.js y node-haxball, pero más que haxlite + node-datachannel: el resto de la basura la crea el propio módulo UDP de Node por cada paquete. El lag p99 queda entre 1,2 y 1,7 ms en los cuatro: muy por debajo de un frame.',
+  note: `El WebRTC propio hace menos GC que haxball.js y node-haxball y menos memoria JS; haxlite + node-datachannel hace aún menos porque su red vive en código nativo (la basura que queda en el propio la crea el módulo UDP de Node por cada paquete recibido). Lag p99 entre ${fmt(Math.min(...Object.values(game('eldP99'))), 2)} y ${fmt(Math.max(...Object.values(game('eldP99'))), 2)} ms en los cuatro: muy por debajo de un frame.`,
 }));
 
 cards.push(card({
@@ -167,22 +171,26 @@ cards.push(card({
   sub: 'Costo de tener la sala abierta esperando gente, y tiempo hasta tener el link · <b>menos es mejor</b>',
   body: `<div class="grid three">${[
     hpanel({ title: 'CPU con la sala vacía', sub: '% de un núcleo', values: idle('cpuPct'), decimals: 2, unit: ' %', width: 340 }),
-    hpanel({ title: 'Despertares/s con la sala vacía', sub: 'haxlite: 0,2 = solo el medidor', values: idle('wakeupsPerS'), decimals: 1, width: 340 }),
+    hpanel({ title: 'Despertares/s con la sala vacía', sub: 'haxlite: ~0,3 = solo el medidor', values: idle('wakeupsPerS'), decimals: 1, width: 340 }),
     hpanel({ title: 'Arranque hasta el link', sub: 'ms desde que inicia el proceso', values: startup('processStartToLinkMs'), decimals: 0, unit: ' ms', width: 340 }),
   ].join('')}</div>`,
-  note: 'haxlite no tiene timers con la sala vacía. Las dos variantes de haxlite empatan en reposo y arrancan ~40 ms antes que las otras.',
+  note: (() => {
+    const st = startup('processStartToLinkMs');
+    const gain = Math.round(Math.min(st.off, st.nh) - Math.max(st.rtc, st.ndc));
+    return `haxlite no tiene timers con la sala vacía. Las dos variantes de haxlite empatan en reposo y arrancan ~${gain} ms antes que las otras.`;
+  })(),
 }));
 
 const stack = [
   ['haxball.js 5.1.0', '@webrtc-node/webrtc 0.2.1', 'libdatachannel (master, ~0.24.5) · libjuice 1.7.2 · OpenSSL 1.1.1w · usrsctp', '18 hilos con jugadores · 1 socket UDP por jugador', 'Cualquier red, también detrás de NAT'],
   ['node-haxball 2.3.1', 'node-datachannel 0.25.0 (copia propia)', 'libdatachannel 0.22.2 · libjuice 1.5.7 · OpenSSL 1.1.1w · usrsctp', '15 hilos · 1 socket UDP por jugador', 'Cualquier red'],
   ['haxlite + node-datachannel', 'node-datachannel 0.33.4', 'libdatachannel 0.24.5 · libjuice 1.7.2 · OpenSSL 1.1.1w · usrsctp', '19 hilos (se liberan con la sala vacía) · 1 socket UDP para todos', 'Cualquier red'],
-  ['haxlite + WebRTC propio', 'ninguno: haxlite-rtc (TypeScript)', 'ICE-lite, DTLS 1.2 (ChaCha20-Poly1305 en JS) y SCTP propios', '0 hilos nativos · 1 socket UDP para todas las salas', 'Servidor con IP pública (dedicado, VPS) o detrás del edge'],
+  ['haxlite + WebRTC propio', 'ninguno: haxlite-rtc (TypeScript)', 'ICE completo (STUN, comprobaciones propias), DTLS 1.2 (ChaCha20-Poly1305 en JS) y SCTP propios', '0 hilos nativos · 1 socket UDP para todas las salas', 'Cualquier red, también detrás de NAT (sin TURN)'],
 ];
 cards.push(`<section class="card wide" id="stack"><header><h1>Qué WebRTC usa cada librería</h1><p>Los tres primeros usan por dentro <b>la misma librería nativa</b> (libdatachannel) en distintas versiones; haxlite puede usar la suya propia</p></header>
 <table><thead><tr><th>Librería</th><th>Paquete WebRTC</th><th>Por dentro (ICE · DTLS · SCTP)</th><th>Hilos y sockets</th><th>Dónde funciona</th></tr></thead><tbody>
 ${stack.map((r, i) => `<tr><td><span class="sw" style="background:${LIBS[[2, 3, 1, 0][i]].color}"></span><b>${esc(r[0])}</b></td>${r.slice(1).map((c) => `<td>${esc(c)}</td>`).join('')}</tr>`).join('')}
-</tbody></table><div class="src">Versiones verificadas en node_modules y en los binarios .node · Benchmark haxlite · 11-10-2026</div></section>`);
+</tbody></table><div class="src">Versiones verificadas en node_modules y en los binarios .node · Benchmark haxlite · ${RUN_DATE}</div></section>`);
 
 const html = `<!doctype html><html><head><meta charset="utf-8"><style>
 *{box-sizing:border-box} body{margin:0;background:#e9e8e4;font-family:Inter,system-ui,sans-serif;color:${C.ink};-webkit-font-smoothing:antialiased}
