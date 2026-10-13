@@ -201,13 +201,15 @@ export class RtcCertificate {
   }
 
   /**
-   * The process-wide default certificate: generated once (asynchronously) and
-   * shared by every endpoint that is not given one. WebRTC authenticates it
+   * The process-wide default certificate: generated once and shared by every
+   * endpoint that is not given one. Generated synchronously (P-256 keygen +
+   * one signature ≈ 1 ms): the async variant would start the four libuv
+   * thread-pool threads of an otherwise idle room just for this. WebRTC authenticates it
    * only through the SDP fingerprint of each answer, so sharing it between
    * rooms reveals nothing a player could not already see.
    */
   static processDefault(): Promise<RtcCertificate> {
-    const p = (processDefault ??= RtcCertificate.generateAsync());
+    const p = (processDefault ??= new Promise<RtcCertificate>((resolve) => resolve(RtcCertificate.generate())));
     p.catch(() => {
       if (processDefault === p) processDefault = null; // retry next time
     });
