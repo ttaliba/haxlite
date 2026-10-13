@@ -50,7 +50,11 @@ export function sharedEndpointKey(o: RtcEndpointOptions): string {
   return JSON.stringify([
     o.port ?? 0,
     o.address ?? null,
-    [...o.publicAddresses],
+    o.publicAddresses !== undefined ? [...o.publicAddresses] : null,
+    o.iceLite === true,
+    o.iceServers ?? null,
+    typeof o.candidatePolicy === 'function' ? idOf(o.candidatePolicy) : (o.candidatePolicy ?? null),
+    o.gatherRefreshMs ?? null,
     o.publicPort ?? null,
     o.certificate !== undefined ? Buffer.from(o.certificate.fingerprint).toString('hex') : null,
     o.certificateFile ?? null,

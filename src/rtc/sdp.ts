@@ -3,9 +3,10 @@
  * RFC 8841 SCTP-over-DTLS, RFC 8839 ICE attributes, RFC 8122 fingerprints).
  *
  * We parse just what an answerer needs from a browser offer and write a
- * minimal answer: ICE-lite, one m=application line, `a=setup:passive`, our
- * certificate fingerprint and host candidates for the configured public
- * addresses only.
+ * minimal answer: one m=application line, `a=setup:passive`, our
+ * certificate fingerprint and our candidates (ICE-lite: host candidates for
+ * the configured public addresses only; full ICE: the gatherer's host and
+ * server-reflexive candidates, see gather.ts).
  */
 import { isIP } from 'node:net';
 
@@ -187,6 +188,15 @@ export interface AnswerParams {
   /** sha-256 digest of our certificate. */
   fingerprint: Uint8Array;
   candidates: readonly HostCandidate[];
+  /**
+   * Candidate lines (no `a=`) written instead of host candidates for
+   * {@link candidates} (full ICE: host + srflx from the gatherer).
+   */
+  candidateLines?: readonly string[];
+  /** Write `a=ice-lite` (default true). */
+  iceLite?: boolean;
+  /** Write `a=end-of-candidates` (default true; false while gathering is still running). */
+  endOfCandidates?: boolean;
   sctpPort: number;
   maxMessageSize: number;
   /** o= session id (decimal digits). */
@@ -196,7 +206,11 @@ export interface AnswerParams {
 /** The answer (CRLF line endings, trailing CRLF). */
 export function buildAnswer(p: AnswerParams): string {
   const o = p.offer;
-  const first = p.candidates[0];
+  let first: HostCandidate | undefined = p.candidates[0];
+  if (p.candidateLines !== undefined) {
+    const c = p.candidateLines.length > 0 ? parseCandidate(p.candidateLines[0]!) : null;
+    first = c === null ? undefined : { address: c.address, port: c.port };
+  }
   const v6 = first !== undefined && isIP(first.address) === 6;
   const cLine = first === undefined ? 'c=IN IP4 0.0.0.0' : `c=IN ${v6 ? 'IP6' : 'IP4'} ${first.address}`;
   const lines = [
@@ -206,7 +220,8 @@ export function buildAnswer(p: AnswerParams): string {
     't=0 0',
   ];
   if (o.bundle !== null && o.bundle.includes(o.mid)) lines.push(`a=group:BUNDLE ${o.mid}`);
-  lines.push('a=ice-lite', 'a=msid-semantic: WMS');
+  if (p.iceLite !== false) lines.push('a=ice-lite');
+  lines.push('a=msid-semantic: WMS');
   lines.push(
     `m=application ${first === undefined ? 9 : first.port} UDP/DTLS/SCTP webrtc-datachannel`,
     cLine,
@@ -218,8 +233,8 @@ export function buildAnswer(p: AnswerParams): string {
     `a=sctp-port:${p.sctpPort}`,
     `a=max-message-size:${p.maxMessageSize}`,
   );
-  for (const c of hostCandidates(p.candidates)) lines.push(`a=${c}`);
-  lines.push('a=end-of-candidates');
+  for (const c of p.candidateLines ?? hostCandidates(p.candidates)) lines.push(`a=${c}`);
+  if (p.endOfCandidates !== false) lines.push('a=end-of-candidates');
   return lines.join('\r\n') + '\r\n';
 }
 

@@ -275,11 +275,11 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
    * Where player connections are terminated when there is no `edge`:
    * `'ndc'` (default) node-datachannel/libdatachannel — full ICE with STUN,
    * works behind NAT; `'rtc'` haxlite-rtc (`src/rtc`) — pure TypeScript
-   * ICE-lite/DTLS/SCTP, every player on one UDP port, no native threads, about
-   * half the CPU per player, but the host must be directly reachable at
-   * {@link RtcBackendOptions.publicAddresses} (public IP or 1:1 NAT). With
-   * `'rtc'`, `iceServers`, `iceCandidatePolicy`, `portRange` and `rtc` are
-   * ignored (see {@link rtcEndpoint}). See docs/10.
+   * ICE/DTLS/SCTP, every player on one UDP port, no native threads, about
+   * half the CPU per player; also full ICE with STUN by default (works behind
+   * NAT), or ICE-lite with `rtcEndpoint.iceLite`. With `'rtc'`, `iceServers`
+   * and `iceCandidatePolicy` are the defaults of {@link rtcEndpoint}'s own;
+   * `portRange` and `rtc` are ignored. See docs/10.
    */
   peerBackend?: 'ndc' | 'rtc';
   /** `peerBackend: 'rtc'` settings: UDP `port`, bind `address`, `publicAddresses`, timeouts… */
@@ -352,7 +352,12 @@ export class HostTransport {
     this.opts = opts;
     if (opts.backend != null) this.backend = opts.backend;
     else if (opts.edge != null) this.backend = new EdgePeerBackend(opts.edge);
-    else if (opts.peerBackend === 'rtc') this.backend = new RtcPeerBackend(opts.rtcEndpoint ?? {});
+    else if (opts.peerBackend === 'rtc') {
+      this.backend = new RtcPeerBackend(opts.rtcEndpoint ?? {}, {
+        ...(opts.iceServers !== undefined ? { iceServers: opts.iceServers } : null),
+        ...(opts.iceCandidatePolicy !== undefined ? { iceCandidatePolicy: opts.iceCandidatePolicy } : null),
+      });
+    }
     else {
       if (opts.peerBackend !== undefined && opts.peerBackend !== 'ndc') {
         throw new TypeError(`peerBackend must be 'ndc' or 'rtc' (got ${JSON.stringify(opts.peerBackend)})`);

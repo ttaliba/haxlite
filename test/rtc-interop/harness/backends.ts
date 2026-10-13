@@ -12,7 +12,8 @@
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type { PeerBackend, PeerLink, PeerLinkEvents } from '../../../src/net/peer-backend.js';
-import type { RtcEndpoint, RtcSession } from '../../../src/rtc/index.js';
+import type { RtcEndpoint, RtcEndpointOptions, RtcSession } from '../../../src/rtc/index.js';
+import type { RtcConfig } from 'node-datachannel';
 
 export type BackendKind = 'ndc' | 'rtc';
 
@@ -32,6 +33,10 @@ export interface BackendOptions {
   port?: number;
   /** haxlite-rtc: ICE consent idle timeout (ms). */
   idleTimeoutMs?: number;
+  /** haxlite-rtc endpoint overrides. */
+  rtc?: Partial<RtcEndpointOptions>;
+  /** node-datachannel config overrides. */
+  ndc?: Partial<RtcConfig>;
 }
 
 const RTC_INDEX = new URL('../../../src/rtc/index.ts', import.meta.url);
@@ -51,7 +56,7 @@ export async function createBackend(kind: BackendKind, o: BackendOptions): Promi
   if (kind === 'ndc') {
     const { LocalPeerBackend } = await import('../../../src/net/peer-backend.js');
     const { shutdownWebRtc } = await import('../../../src/net/webrtc.js');
-    const backend = new LocalPeerBackend({ rtc: { iceServers: [], bindAddress: o.address, maxMessageSize: 262144 } });
+    const backend = new LocalPeerBackend({ rtc: { iceServers: [], bindAddress: o.address, maxMessageSize: 262144, ...o.ndc } });
     return {
       kind,
       backend,
@@ -67,7 +72,9 @@ export async function createBackend(kind: BackendKind, o: BackendOptions): Promi
     address: o.address,
     publicAddresses: [o.address],
     ...(o.idleTimeoutMs !== undefined ? { idleTimeoutMs: o.idleTimeoutMs } : null),
+    ...o.rtc,
   });
+  await ep.whenGathered();
   const backend = new RtcPeerBackend(ep);
   return {
     kind,
@@ -112,7 +119,11 @@ export class RtcPeerBackend implements PeerBackend {
     };
     ev.onLocalDescription(s.answerSdp);
     for (const c of s.localCandidates) ev.onLocalCandidate(c, s.mid);
-    ev.onGatheringComplete();
+    if (s.gatheringComplete) ev.onGatheringComplete();
+    else {
+      s.onLocalCandidate = (c) => events?.onLocalCandidate(c, s.mid);
+      s.onGatheringComplete = () => events?.onGatheringComplete();
+    }
     return {
       addRemoteCandidate: (c) => {
         try {

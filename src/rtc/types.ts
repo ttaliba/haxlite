@@ -78,14 +78,29 @@ export interface RemoteAddress {
 
 /** One browser peer (created from its offer by `RtcEndpoint.createSession`). */
 export interface RtcSession {
-  /** The SDP answer (complete, includes our candidates and a=end-of-candidates). */
+  /** The SDP answer (includes our candidates; a=end-of-candidates when {@link gatheringComplete}). */
   readonly answerSdp: string;
   /** Our candidate lines, without the `a=` prefix. */
   readonly localCandidates: string[];
   /** mid of the data m-line (for trickle signaling of {@link localCandidates}). */
   readonly mid: string;
-  /** Remote trickle candidate (with or without `a=`). Only a hint: ICE-lite answers peer-reflexive sources too. */
+  /**
+   * Remote candidate (with or without `a=`), from signaling. Full ICE: our
+   * connectivity checks are sent to it (UDP, IP literals, address classes
+   * allowed by the candidate policy). ICE-lite: only a hint (peer-reflexive
+   * sources are answered anyway).
+   */
   addRemoteCandidate(candidate: string): void;
+  /**
+   * False while the endpoint is still gathering server-reflexive candidates
+   * (STUN): the rest arrive through {@link onLocalCandidate}, then
+   * {@link onGatheringComplete}. The answer then has no `a=end-of-candidates`.
+   */
+  readonly gatheringComplete: boolean;
+  /** A local candidate found after the answer was built (trickle it to the peer). */
+  onLocalCandidate?: (candidate: string) => void;
+  /** Every local candidate is known (only called when {@link gatheringComplete} was false). */
+  onGatheringComplete?: () => void;
   onOpen?: () => void;
   onClose?: (reason: string) => void;
   /**
