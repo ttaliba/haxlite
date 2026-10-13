@@ -269,7 +269,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     initResolve = initReject = null;
     if (err === null) res?.(room);
     else {
-      void stop();
+      stop().catch(reportError);
       rej?.(err);
     }
   };
