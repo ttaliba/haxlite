@@ -87,41 +87,80 @@ describe('examples', () => {
     }
   });
 
-  it('among-us-vision.mjs: per-player fog and task marker, no desync', async () => {
+  it('among-us-vision.mjs: per-player fog, hidden players and ghosts, task marker, no desync', async () => {
     const opts = { masterUrl: env.master.httpBase, iceServers: [], transport: { iceCandidatePolicy: 'all' }, checksumIntervalFrames: 30 };
     const r = run('among-us-vision.mjs', { HAXLITE_OPTIONS: JSON.stringify(opts) });
     const clients: Client[] = [];
     const disc = (c: Client, i: number): Any => c.room.gameState?.physicsState?.discs?.[i] ?? null;
     const at = (c: Client, i: number) => [disc(c, i)?.pos.x, disc(c, i)?.pos.y];
+    /** Player `id` as `c` sees it: null (no disc), 'hidden' (NaN) or [x, y]. */
+    const sees = (c: Client, id: number): Any => {
+      const d = c.room.getPlayer(id)?.disc;
+      return d == null ? null : Number.isNaN(d.pos.x) && Number.isNaN(d.pos.y) ? 'hidden' : [d.pos.x, d.pos.y];
+    };
+    const visible = (c: Client, id: number) => Array.isArray(sees(c, id));
+    const steer = (c: Client, target: () => { x: number; y: number }, done: () => boolean, what: string) => {
+      const t = setInterval(() => {
+        const me = c.room.getPlayer(c.room.currentPlayerId)?.disc?.pos;
+        if (!me) return;
+        const to = target();
+        const dx = to.x - me.x;
+        const dy = to.y - me.y;
+        c.room.setKeyState((dy < -10 ? 1 : dy > 10 ? 2 : 0) | (dx < -10 ? 4 : dx > 10 ? 8 : 0));
+      }, 50);
+      return waitFor(done, 10_000, what).finally(() => {
+        clearInterval(t);
+        c.room.setKeyState(0);
+      });
+    };
     try {
       const roomId = await r.roomId;
       const alice = await join(env, roomId, 'alice');
       const bob = await join(env, roomId, 'bob');
-      clients.push(alice, bob);
+      const carol = await join(env, roomId, 'carol');
+      clients.push(alice, bob, carol);
+      const [A, B, C] = clients.map((c) => c.room.currentPlayerId as number) as [number, number, number];
       const syncs: Any[] = [];
       for (const c of clients) c.room.onPlayerSyncChange = (id: number, v: boolean) => syncs.push([c.name, id, v]);
-      // both spawn in the Cafeteria (left): each sees the Electrical fog (disc 2), not the Cafeteria one
+      // all spawn in the Cafeteria (left): each sees the Electrical fog (disc 2), not the Cafeteria one, and everyone
       await waitFor(() => clients.every((c) => at(c, 2)[0] === 10040 && at(c, 1)[1] === 50000), 10_000, 'initial fog');
-      // alice walks right into Electrical: her fog flips, bob's does not
-      alice.room.setKeyState(8);
-      await waitFor(() => at(alice, 1)[0] === -10040 && at(alice, 2)[1] === 50000, 10_000, 'alice fog flipped');
-      alice.room.setKeyState(0);
+      await sleep(300);
+      for (const c of clients) for (const id of [A, B, C]) expect(visible(c, id)).toBe(true);
+
+      // alice walks right into Electrical: her fog flips, she and the others stop seeing each other
+      await steer(alice, () => ({ x: 200, y: 0 }), () => at(alice, 1)[0] === -10040 && at(alice, 2)[1] === 50000, 'alice fog flipped');
       expect(at(bob, 2)).toEqual([10040, 0]);
       expect(at(bob, 1)).toEqual([0, 50000]);
+      await waitFor(
+        () => sees(bob, A) === 'hidden' && sees(carol, A) === 'hidden' && sees(alice, B) === 'hidden' && sees(alice, C) === 'hidden',
+        5000,
+        'alice hidden',
+      );
+      expect(visible(bob, C) && visible(carol, B)).toBe(true);
+
       // she reaches the task marker: lit only for her, private prompt only for her
-      const steer = setInterval(() => {
-        const me = alice.room.getPlayer(alice.room.currentPlayerId)?.disc?.pos;
-        if (!me) return;
-        const dx = 175 - me.x;
-        const dy = -50 - me.y;
-        alice.room.setKeyState((dy < -10 ? 1 : dy > 10 ? 2 : 0) | (dx < -10 ? 4 : dx > 10 ? 8 : 0));
-      }, 50);
-      await waitFor(() => disc(alice, 3)?.color === 0xffd700, 10_000, 'task marker lit').finally(() => clearInterval(steer));
-      alice.room.setKeyState(0);
+      await steer(alice, () => ({ x: 175, y: -50 }), () => disc(alice, 3)?.color === 0xffd700, 'task marker lit');
       expect(disc(bob, 3).color).toBe(0x555555);
       // the prompt is a msg 6 on another channel: no ordering with the sequenced marker update
       await waitFor(() => alice.announcements.includes('Task: fix wiring - stay here 3 s'), 5000, 'private prompt');
       expect(bob.announcements).not.toContain('Task: fix wiring - stay here 3 s');
+
+      // carol kills bob: bob becomes a ghost, invisible to the living; he sees everyone (no fog)
+      const bobAt = () => carol.room.getPlayer(B).disc.pos;
+      const carolAt = () => carol.room.getPlayer(C).disc.pos;
+      await steer(carol, bobAt, () => Math.hypot(carolAt().x - bobAt().x, carolAt().y - bobAt().y) < 45, 'carol next to bob');
+      carol.room.sendChat('!kill');
+      await waitFor(() => sees(carol, B) === 'hidden' && sees(alice, B) === 'hidden', 5000, 'bob hidden from the living');
+      await waitFor(() => visible(bob, A) && visible(bob, C) && at(bob, 1)[1] === 50000 && at(bob, 2)[1] === 50000, 5000, 'the ghost sees all');
+      expect(carol.announcements).toContain('You killed bob');
+      expect(bob.announcements).toContain('You are a ghost: only other ghosts can see you');
+      expect(alice.chats.some(([, m]) => m === '!kill')).toBe(false);
+      // bob walks through the wall into Electrical (ghosts are c0: walls don't stop them), still hidden
+      await steer(bob, () => ({ x: 120, y: 90 }), () => (bob.room.getPlayer(B)?.disc?.pos.x ?? 0) > 60, 'ghost through the wall');
+      await sleep(200);
+      expect(sees(alice, B)).toBe('hidden');
+      expect(sees(carol, B)).toBe('hidden');
+
       await sleep(1200); // >= one CheckConsistency round with private worlds
       expect(syncs).toEqual([]);
       expect(await interrupt(r)).toBe(0);

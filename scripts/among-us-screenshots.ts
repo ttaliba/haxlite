@@ -21,6 +21,10 @@
 //   PROPS='{"B":{"radius":0}}'   extra setPlayerDiscProperties per player
 //   SPECTATE=C                   move these players to spectators after placing
 //   WAIT=1500                    ms after placing the discs
+//   NAMES=A,B,C                  players (one official client each)
+//   KILL=C>B,A>D                 "!kill" as C (next to B), then as A: the victims become ghosts
+//   KEYS='{"B":"ArrowRight,KeyX"}'  keys held in a tab during WAIT (SETTLE=ms after release)
+//   CHECKSUM=600                 CheckConsistency interval (frames); the script reports SetPlayerSync events
 //
 // The client files are HaxBall's (all rights reserved) and are NOT in this
 // repository (docs/10 §4.3).
@@ -33,6 +37,7 @@ import { FakeMaster } from '../test/fake-master/index.js';
 import { chromiumAvailable, launchChromium } from '../test/rtc-interop/harness/browser.js';
 import { officialClientAvailable, officialContext, openRoomLink } from '../test/rtc-interop/harness/official-client.js';
 import type { RoomObject } from '../src/api/index.js';
+import { EventType } from '../src/protocol.js';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const CLIENT_DIR = process.env.HAXBALL_CLIENT_DIR ?? '';
@@ -50,6 +55,13 @@ const POS: Record<string, [number, number]> = { A: [-160, 40], B: [120, 70], C: 
 const ONLY = (process.env.ONLY ?? 'A,B,C').split(',');
 const PROPS: Record<string, object> = JSON.parse(process.env.PROPS ?? '{}');
 const SPECTATE = (process.env.SPECTATE ?? '').split(',').filter(Boolean);
+const NAMES = (process.env.NAMES ?? 'A,B,C').split(',');
+/** "killer>victim" pairs: the example's "!kill" command, run as the killer after placing. */
+const KILL = (process.env.KILL ?? '').split(',').filter(Boolean).map((k) => k.split('>') as [string, string]);
+/** Keys held in a player's tab while waiting (e.g. the hidden player moving and kicking). */
+const KEYS: Record<string, string[]> = Object.fromEntries(
+  Object.entries(JSON.parse(process.env.KEYS ?? '{}') as Record<string, string>).map(([k, v]) => [k, v.split(',')]),
+);
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // `import 'haxlite'` (the example) → a shim over src/api that keeps the room for us
@@ -65,9 +77,26 @@ register(hook, { data: shim });
 
 const master = await FakeMaster.start();
 process.env.HAXBALL_TOKEN = 'thr1.test';
-process.env.HAXLITE_OPTIONS = JSON.stringify({ masterUrl: master.httpBase, iceServers: [], transport: { iceCandidatePolicy: 'all' } });
+process.env.HAXLITE_OPTIONS = JSON.stringify({
+  masterUrl: master.httpBase,
+  iceServers: [],
+  transport: { iceCandidatePolicy: 'all' },
+  checksumIntervalFrames: Number(process.env.CHECKSUM ?? 600),
+});
 await import(pathToFileURL(EXAMPLE).href);
 const room = (globalThis as unknown as { __amongUsRoom: RoomObject }).__amongUsRoom;
+// desync evidence: SetPlayerSync events (a client whose checksum differed) and CheckConsistency rounds
+let syncEvents = 0;
+let checks = 0;
+room.haxlite.host.onEventApplied = (ev) => {
+  if (ev.type === EventType.SetPlayerSync) syncEvents++;
+};
+const seq = room.haxlite.host.sequencer;
+const checksum = seq.checksum.bind(seq);
+seq.checksum = () => {
+  if (seq.views.length > 0) checks++;
+  checksum();
+};
 for (let i = 0; room.haxlite.roomLink === null && i < 200; i++) await sleep(50);
 const roomId = room.haxlite.roomLink!.split('c=')[1]!.split('&')[0]!;
 
@@ -75,7 +104,7 @@ const browser = await launchChromium();
 const log: string[] = [];
 const tabs: { name: string; page: Page; frame: Frame }[] = [];
 try {
-  for (const name of ['A', 'B', 'C']) {
+  for (const name of NAMES) {
     const ctx = await officialContext(browser, master, CLIENT_DIR, log, {
       nickname: name,
       viewMode: VIEW_MODE,
@@ -100,7 +129,22 @@ try {
   await sleep(500);
   place();
   for (const p of room.getPlayerList()) if (SPECTATE.includes(p.name)) room.setPlayerTeam(p.id, 0);
+  const byName = (n: string) => room.getPlayerList().find((p) => p.name === n)!;
+  for (const [killer, victim] of KILL) {
+    room.onPlayerChat?.(byName(killer), '!kill');
+    console.log(`${killer} !kill (next to ${victim})`);
+  }
+  const held: [Page, string][] = [];
+  for (const t of tabs) {
+    for (const k of KEYS[t.name] ?? []) {
+      await t.frame.evaluate('document.activeElement && document.activeElement.blur && document.activeElement.blur()');
+      await t.page.keyboard.down(k);
+      held.push([t.page, k]);
+    }
+  }
   await sleep(Number(process.env.WAIT ?? 1500)); // C: task prompt + lit marker ("Task done!" after 3 s)
+  for (const [page, k] of held) await page.keyboard.up(k);
+  if (held.length > 0) await sleep(Number(process.env.SETTLE ?? 0));
   mkdirSync(OUT, { recursive: true });
   for (const t of tabs) {
     if (!ONLY.includes(t.name)) continue;
@@ -109,7 +153,14 @@ try {
     await t.page.screenshot({ path: file });
     console.log(`wrote ${path.relative(ROOT, file)}`);
   }
-  for (const p of room.getPlayerList()) console.log(`${p.name}: ${JSON.stringify(p.position)}`);
+  for (const p of room.getPlayerList()) {
+    const hidden = room.haxlite.getHiddenPlayersFor(p.id).map((id) => room.getPlayer(id)?.name);
+    console.log(`${p.name}: ${JSON.stringify(p.position)} hides [${hidden.join(',')}]`);
+  }
+  const desync = room.haxlite.host.state.players.filter((p) => p.desync).map((p) => p.name);
+  let notices = 0;
+  for (const t of tabs) notices += ((await t.frame.content()).match(/desynchronized/g) ?? []).length;
+  console.log(`checksum rounds with private views: ${checks}, SetPlayerSync events: ${syncEvents}, desync flags: [${desync.join(',')}], "desynchronized" notices: ${notices}`);
 } finally {
   await browser.close();
   await room.haxlite.stop();
