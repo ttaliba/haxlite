@@ -17,12 +17,14 @@
  */
 import { Reader, Writer, deflateRaw } from '../codec/index.js';
 import { TokenBucket } from '../net/rate-limit.js';
-import { Channel, HostMsg, INPUT_DELAY_FRAMES, MAX_EVENT_FRAME_LEAD } from '../protocol.js';
+import { Channel, EventType, HostMsg, INPUT_DELAY_FRAMES, MAX_EVENT_FRAME_LEAD } from '../protocol.js';
 import {
   CheckConsistencyEvent,
   EVENT_META,
+  SetDiscPropertiesEvent,
   checkClientSender,
   createEvent,
+  readRoomState,
   stepRoom,
   writeEvent,
   writeEventFrame,
@@ -87,9 +89,12 @@ export class ProtocolViolation extends Error {
 export interface SequencerSink {
   /**
    * Sends `data` to every client that already received its snapshot (official
-   * `jd`: connections with `dd`). `data` is only valid during the call.
+   * `jd`: connections with `dd`), except the player ids in `skip` (non-null
+   * only while private views exist). `data` is only valid during the call.
    */
-  broadcast(data: Uint8Array, channel: number): void;
+  broadcast(data: Uint8Array, channel: number, skip?: ReadonlySet<number> | null): void;
+  /** Sends `data` to one ready client (private views). `data` is only valid during the call. */
+  sendTo?(playerId: number, data: Uint8Array, channel: number): void;
   /** Official `Ha.length > 0`: some connection exists (joined or still handshaking). */
   hasConnections(): boolean;
 }
@@ -106,6 +111,42 @@ export type BeforeOperationHook = (ev: RoomEvent, byId: number, requestedFrame: 
 export interface SequencerOptions {
   /** Input delay `Sb` in frames (official 2). */
   inputDelayFrames?: number;
+}
+
+/**
+ * A client whose world differs from the room's (haxlite private views):
+ * `rs` is an exact copy of that client's simulation, fed the same event
+ * stream it receives (with its private events) and stepped in lockstep with
+ * the room, so its CheckConsistency can carry the hash of ITS world.
+ */
+export class ViewerWorld {
+  readonly playerId: number;
+  readonly rs: RoomState;
+
+  constructor(playerId: number, rs: RoomState) {
+    this.playerId = playerId;
+    this.rs = rs;
+  }
+}
+
+/** Exact copy of a room state (the join snapshot's serialization round trip). */
+export function cloneRoomState(rs: RoomState): RoomState {
+  const w = new Writer(4096);
+  writeRoomState(w, rs);
+  return readRoomState(new Reader(w.finish()));
+}
+
+/** Byte equality of the serialized states (= same world, same checksum). */
+export function sameRoomState(a: RoomState, b: RoomState): boolean {
+  const wa = new Writer(4096);
+  writeRoomState(wa, a);
+  const wb = new Writer(4096);
+  writeRoomState(wb, b);
+  const x = wa.finish();
+  const y = wb.finish();
+  if (x.length !== y.length) return false;
+  for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+  return true;
 }
 
 export class Sequencer {
@@ -136,6 +177,16 @@ export class Sequencer {
   onBeforeOperation: BeforeOperationHook | null = null;
   /** Exceptions thrown by room hooks while applying events or stepping (they never abort the loop). */
   onError: ((err: unknown) => void) | null = null;
+
+  /**
+   * Private views (clients whose world differs from the room's), in creation
+   * order. Empty in normal operation: every path below checks the length first.
+   */
+  readonly views: ViewerWorld[] = [];
+  /** Player ids of {@link views} (the `skip` set of broadcasts that have per-view variants). */
+  private readonly viewIds = new Set<number>();
+  /** Called when a view is dropped because its world became identical to the room's again. */
+  onViewConverged: ((playerId: number) => void) | null = null;
 
   private depth = 0;
   private readonly out = new Writer(256);
@@ -169,7 +220,7 @@ export class Sequencer {
     this.depth++;
     try {
       while (e < n) {
-        if (rs.gameState === null && this.onFrameStepped === null) {
+        if (rs.gameState === null && this.onFrameStepped === null && (this.views.length === 0 || this.viewsIdle())) {
           const next = c < count ? list[c]!.frame : Infinity;
           if (next > this.frame) {
             const skip = Math.min(next - this.frame, n - e);
@@ -192,6 +243,7 @@ export class Sequencer {
         } catch (err) {
           this.reportError(err);
         }
+        if (this.views.length > 0) this.stepViews();
         this.eventCounter += this.eventsInFrame;
         this.eventsInFrame = 0;
         this.frame++;
@@ -256,8 +308,132 @@ export class Sequencer {
     } catch (err) {
       this.reportError(err);
     }
+    if (this.views.length > 0) this.applyToViews(ev);
     if (this.onEventApplied !== null) this.onEventApplied(ev);
     this.eventsInFrame++;
+  }
+
+  // ================================================================ private views (haxlite)
+
+  /** Sequenced events reach every view unchanged: apply them to each view's world too. */
+  private applyToViews(ev: RoomEvent): void {
+    const views = this.views;
+    for (let i = 0; i < views.length; i++) {
+      try {
+        ev.apply(views[i]!.rs);
+      } catch (err) {
+        this.reportError(err);
+      }
+    }
+    // StopGame / StartGame / SetStadium normally make the worlds identical again
+    const t = ev.type;
+    if (t === EventType.StopGame || t === EventType.StartGame || t === EventType.SetStadium) this.dropConvergedViews();
+  }
+
+  private stepViews(): void {
+    const views = this.views;
+    for (let i = 0; i < views.length; i++) {
+      try {
+        stepRoom(views[i]!.rs);
+      } catch (err) {
+        this.reportError(err);
+      }
+    }
+  }
+
+  private viewsIdle(): boolean {
+    const views = this.views;
+    for (let i = 0; i < views.length; i++) if (views[i]!.rs.gameState !== null) return false;
+    return true;
+  }
+
+  /** The view of `playerId`, or null. */
+  getView(playerId: number): ViewerWorld | null {
+    const views = this.views;
+    for (let i = 0; i < views.length; i++) if (views[i]!.playerId === playerId) return views[i]!;
+    return null;
+  }
+
+  /**
+   * Starts tracking `playerId`'s world separately: a copy of the room state
+   * at the current point of the sequence. Every queued event was already
+   * sent to that client unchanged, so the copy applies the same ones.
+   */
+  ensureView(playerId: number): ViewerWorld {
+    let v = this.getView(playerId);
+    if (v === null) {
+      v = new ViewerWorld(playerId, cloneRoomState(this.rs));
+      this.views.push(v);
+      this.viewIds.add(playerId);
+    }
+    return v;
+  }
+
+  /** Forgets a view (its client left). */
+  dropView(playerId: number): void {
+    const views = this.views;
+    for (let i = 0; i < views.length; i++) {
+      if (views[i]!.playerId !== playerId) continue;
+      views.splice(i, 1);
+      this.viewIds.delete(playerId);
+      return;
+    }
+  }
+
+  /** Drops every view whose world is byte-identical to the room's again ({@link onViewConverged}). */
+  dropConvergedViews(): void {
+    const views = this.views;
+    for (let i = views.length - 1; i >= 0; i--) {
+      const v = views[i]!;
+      if (!sameRoomState(v.rs, this.rs)) continue;
+      views.splice(i, 1);
+      this.viewIds.delete(v.playerId);
+      const cb = this.onViewConverged;
+      if (cb !== null) {
+        try {
+          cb(v.playerId);
+        } catch (err) {
+          this.reportError(err);
+        }
+      }
+    }
+  }
+
+  /**
+   * A private slot: ONE sequenced host event at the current frame whose
+   * content differs per client. Each viewer in `perViewer` (it must have a
+   * view) gets its own event, applied to its world at this exact point;
+   * every other client gets a no-op (SetDiscProperties with an empty mask).
+   * Frame, order and event counters are identical for everyone, so
+   * heartbeats and completeness checks are unaffected. The room's own state
+   * is not touched (like CheckConsistency, the slot only takes an order).
+   */
+  privateSlot(perViewer: ReadonlyMap<number, RoomEvent>): void {
+    const frame = this.frame;
+    const order = this.eventsInFrame++;
+    const noop = SetDiscPropertiesEvent.create(0, false, {});
+    noop.frame = frame;
+    noop.order = order;
+    noop.byId = 0;
+    noop.clientSeq = 0;
+    const skip = new Set<number>();
+    for (const [playerId, ev] of perViewer) {
+      const v = this.getView(playerId);
+      if (v === null) continue;
+      ev.frame = frame;
+      ev.order = order;
+      ev.byId = 0;
+      ev.clientSeq = 0;
+      try {
+        ev.apply(v.rs);
+      } catch (err) {
+        this.reportError(err);
+      }
+      skip.add(playerId);
+      this.sendEvent(playerId, ev, Channel.ReliableUnordered);
+    }
+    this.broadcastEvent(noop, Channel.ReliableUnordered, skip);
+    this.heartbeat();
   }
 
   private reportError(err: unknown): void {
@@ -368,12 +544,28 @@ export class Sequencer {
   checksum(): void {
     this.lastChecksumFrame = this.frame;
     if (!this.sink.hasConnections()) return;
+    if (this.views.length > 0) this.dropConvergedViews();
     const ev = CheckConsistencyEvent.create(this.rs);
     ev.frame = this.frame;
     ev.order = this.eventsInFrame++;
     ev.byId = 0;
     ev.clientSeq = 0;
-    this.broadcastEvent(ev, Channel.ReliableOrdered);
+    const views = this.views;
+    if (views.length === 0) {
+      this.broadcastEvent(ev, Channel.ReliableOrdered);
+      return;
+    }
+    // same frame/order for everyone; a private view gets the hash of ITS world
+    this.broadcastEvent(ev, Channel.ReliableOrdered, this.viewIds);
+    for (let i = 0; i < views.length; i++) {
+      const v = views[i]!;
+      const own = CheckConsistencyEvent.create(v.rs);
+      own.frame = ev.frame;
+      own.order = ev.order;
+      own.byId = 0;
+      own.clientSeq = 0;
+      this.sendEvent(v.playerId, own, Channel.ReliableOrdered);
+    }
   }
 
   /**
@@ -411,11 +603,19 @@ export class Sequencer {
   }
 
   /** Message 2 `[2] EventFrame` (official `Nd` + `rf`), broadcast on `channel`. */
-  private broadcastEvent(ev: RoomEvent, channel: number): void {
+  private broadcastEvent(ev: RoomEvent, channel: number, skip: ReadonlySet<number> | null = null): void {
     const w = this.out.reset();
     w.u8(HostMsg.Event);
     writeEventFrame(w, ev);
-    this.sink.broadcast(w.finishShared(), channel);
+    this.sink.broadcast(w.finishShared(), channel, skip);
+  }
+
+  /** Message 2 to one client (private views). */
+  private sendEvent(playerId: number, ev: RoomEvent, channel: number): void {
+    const w = this.out.reset();
+    w.u8(HostMsg.Event);
+    writeEventFrame(w, ev);
+    this.sink.sendTo?.(playerId, w.finishShared(), channel);
   }
 }
 

@@ -43,6 +43,7 @@ import {
   StartGameEvent,
   StopGameEvent,
   TeamColors,
+  DiscProp,
   createRoomState,
   getPlayer,
   Player,
@@ -229,6 +230,19 @@ export class HostRoom {
   onError: ((err: unknown) => void) | null = null;
   /** Every event applied to the room, in order, with its frame (official `Ab`; recorder/tests). */
   onEventApplied: ((ev: RoomEvent) => void) | null = null;
+  /**
+   * A private view ended because the viewer's world became identical to the
+   * room's again (game stop/start, stadium change, kick-off reset,
+   * {@link clearDiscOverrides}…). Not called when the viewer leaves.
+   */
+  onPrivateViewEnd: ((viewerId: number) => void) | null = null;
+
+  /** Per viewer: disc index -> SetDiscProperties mask of the fields it overrode (for clearDiscOverrides). */
+  private readonly discOverrides = new Map<number, Map<number, number>>();
+  /** Private disc updates waiting for the next flush (batched into shared slots). */
+  private readonly pendingPrivate: { viewerId: number; ev: SetDiscPropertiesEvent; force: boolean; restore: boolean }[] = [];
+  private privateFlushQueued = false;
+  private readonly flushPrivateFn = (): void => this.flushPrivate();
 
   private readonly now: () => number;
   private readonly startTime: number;
@@ -277,13 +291,29 @@ export class HostRoom {
     this.pingIntervalMs = opts.pingIntervalMs ?? HostDefaults.pingIntervalMs;
     const sink: SequencerSink = {
       // one tunnel message for everyone when the players are behind a haxlite Edge
-      broadcast: (data, channel) => this.transport.broadcastTo(this.ready, channel, data),
+      broadcast: (data, channel, skip) => {
+        if (skip == null || skip.size === 0) {
+          this.transport.broadcastTo(this.ready, channel, data);
+          return;
+        }
+        const list = this.ready.filter((c) => !skip.has(c.playerId));
+        this.transport.broadcastTo(list, channel, data);
+      },
+      sendTo: (playerId, data, channel) => {
+        const c = this.connections.get(playerId);
+        if (c !== undefined && c.ready && !c.closed) this.transport.send(c.peer, channel, data);
+      },
       hasConnections: () => this.transport.connectionCount > 0,
     };
     this.sequencer = new Sequencer(this.state, sink, {
       inputDelayFrames: opts.inputDelayFrames ?? HostDefaults.inputDelayFrames,
     });
     this.sequencer.onError = (err) => this.reportError(err);
+    this.sequencer.onViewConverged = (id) => {
+      this.discOverrides.delete(id);
+      const cb = this.onPrivateViewEnd;
+      if (cb !== null) this.callUser(() => cb(id));
+    };
     this.sequencer.onEventApplied = (ev) => {
       // official `Ab`: the recorder serializes the event right after `apply`
       const rec = this.rec;
@@ -574,6 +604,156 @@ export class HostRoom {
     this.transport.setMaxPlayers(n);
   }
 
+  // ================================================================ private views (haxlite)
+
+  /**
+   * Changes disc `discIndex` ONLY in the world of `viewerId` (haxlite private
+   * view; docs/04 §7.4). The change travels as a sequenced SetDiscProperties
+   * in a slot where every other client gets a no-op, and from then on the
+   * host simulates that viewer's world (a copy stepped in lockstep) so its
+   * CheckConsistency carries the viewer's own hash: no desync flag, no
+   * stall, nobody else sees anything.
+   *
+   * Validated when flushed (right after the current action / hook loop): a
+   * running game, a non-player stadium disc other than disc 0 whose cGroup
+   * is 0 in the room's and the viewer's world (and stays 0) and that no
+   * joint uses. Such a disc can't touch, be kicked by or score against
+   * anything, so the viewer's game plays exactly like everyone else's.
+   * `force` skips that check: the private world then may diverge for real
+   * (still protocol-consistent, but that viewer sees another game).
+   * Errors are reported through {@link onError}; the update is skipped.
+   */
+  setDiscPropertiesFor(viewerId: number, discIndex: number, props: DiscPropsInput, force = false): void {
+    this.queuePrivate(viewerId, SetDiscPropertiesEvent.create(discIndex, false, props), force, false);
+  }
+
+  /**
+   * Sends `viewerId` the room's current values of every disc field it had
+   * overridden. When its world then equals the room's (always, unless an
+   * overridden value is not representable as float32 or the disc moved), the
+   * private view ends; otherwise it stays (still consistent) until the next
+   * game stop/start, stadium change or kick-off reset that makes them equal.
+   */
+  clearDiscOverrides(viewerId: number): void {
+    const map = this.discOverrides.get(viewerId);
+    if (map === undefined) return;
+    const gs = this.state.gameState;
+    for (const [index, mask] of map) {
+      const d = gs?.world.discs[index];
+      if (d == null) continue;
+      const props: DiscPropsInput = {};
+      const all = discProperties(d)!;
+      for (const name of Object.keys(DiscProp) as DiscPropName[]) {
+        if ((mask & (1 << DiscProp[name])) === 0) continue;
+        props[name] = name === 'bCoef' ? all.bCoeff : all[name];
+      }
+      this.queuePrivate(viewerId, SetDiscPropertiesEvent.create(index, false, props), true, true);
+    }
+    map.clear();
+  }
+
+  /** True while `viewerId` has a private world (overrides sent and not yet converged). */
+  hasPrivateView(viewerId: number): boolean {
+    return this.sequencer.getView(viewerId) !== null;
+  }
+
+  /** A disc as `viewerId` sees it (its private world, else the room's). */
+  getDiscPropertiesFor(viewerId: number, discIndex: number): DiscProperties | null {
+    const v = this.sequencer.getView(viewerId);
+    const gs = v !== null ? v.rs.gameState : this.state.gameState;
+    if (gs === null) return null;
+    return discProperties(gs.world.discs[discIndex] ?? null);
+  }
+
+  private queuePrivate(viewerId: number, ev: SetDiscPropertiesEvent, force: boolean, restore: boolean): void {
+    this.pendingPrivate.push({ viewerId, ev, force, restore });
+    if (this.privateFlushQueued || this.privateBatching > 0) return;
+    this.privateFlushQueued = true;
+    this.run(this.flushPrivateFn);
+  }
+
+  private privateBatching = 0;
+
+  /**
+   * Runs `fn` and sends every private update it queued
+   * ({@link setDiscPropertiesFor}, {@link clearDiscOverrides}) together: the
+   * k-th update of each viewer shares one slot, so the other clients get one
+   * no-op per slot instead of one per update.
+   */
+  batchPrivate(fn: () => void): void {
+    this.privateBatching++;
+    try {
+      fn();
+    } finally {
+      this.privateBatching--;
+    }
+    if (this.privateBatching === 0 && this.pendingPrivate.length > 0 && !this.privateFlushQueued) {
+      this.privateFlushQueued = true;
+      this.run(this.flushPrivateFn);
+    }
+  }
+
+  /** Throws when `ev` could make the viewer's world play differently (see {@link setDiscPropertiesFor}). */
+  private checkVisualOnly(viewerId: number, ev: SetDiscPropertiesEvent): void {
+    const i = ev.targetId;
+    const gs = this.state.gameState;
+    if (gs === null) throw new Error(`setDiscPropertiesFor(${viewerId}, ${i}): no game running`);
+    const d = gs.world.discs[i];
+    if (d === undefined) throw new Error(`setDiscPropertiesFor(${viewerId}, ${i}): no such disc`);
+    const where = `setDiscPropertiesFor(${viewerId}, ${i})`;
+    if (i === 0) throw new Error(`${where}: disc 0 drives the kick-off and the camera; pass force to override it anyway`);
+    const players = this.state.players;
+    for (let k = 0; k < players.length; k++) {
+      if (players[k]!.disc === d) throw new Error(`${where}: disc of player ${players[k]!.id}; pass force to override it anyway`);
+    }
+    const joints = gs.world.joints;
+    for (let k = 0; k < joints.length; k++) {
+      const j = joints[k]!;
+      if (j.d0 === i || j.d1 === i) throw new Error(`${where}: disc is part of a joint; pass force to override it anyway`);
+    }
+    const own = this.sequencer.getView(viewerId)?.rs.gameState?.world.discs[i];
+    const group = ev.has('cGroup') ? ev.values[DiscProp.cGroup]! : (own ?? d).cGroup;
+    if (d.cGroup !== 0 || group !== 0) {
+      throw new Error(`${where}: cGroup must be 0 in every world (it is ${d.cGroup} in the room, ${group} for the viewer); pass force to override it anyway`);
+    }
+  }
+
+  /** Sends the queued private updates: the k-th update of every viewer shares slot k. */
+  private flushPrivate(): void {
+    this.privateFlushQueued = false;
+    const pending = this.pendingPrivate.splice(0);
+    if (pending.length === 0) return;
+    this.catchUp();
+    const seq = this.sequencer;
+    const slots: Map<number, RoomEvent>[] = [];
+    const slotOf = new Map<number, number>();
+    for (const p of pending) {
+      const c = this.connections.get(p.viewerId);
+      if (c === undefined || !c.ready || c.closed) continue;
+      if (this.state.gameState === null) continue; // nothing to override (restores included)
+      if (!p.force) {
+        try {
+          this.checkVisualOnly(p.viewerId, p.ev);
+        } catch (err) {
+          this.reportError(err);
+          continue;
+        }
+      }
+      if (p.ev.mask === 0) continue;
+      seq.ensureView(p.viewerId);
+      if (!p.restore) {
+        let map = this.discOverrides.get(p.viewerId);
+        if (map === undefined) this.discOverrides.set(p.viewerId, (map = new Map()));
+        map.set(p.ev.targetId, (map.get(p.ev.targetId) ?? 0) | p.ev.mask);
+      }
+      const k = slotOf.get(p.viewerId) ?? 0;
+      slotOf.set(p.viewerId, k + 1);
+      (slots[k] ??= new Map()).set(p.viewerId, p.ev);
+    }
+    for (const slot of slots) seq.privateSlot(slot);
+    if (slots.length > 0 && pending.some((p) => p.restore)) seq.dropConvergedViews();
+  }
+
   // ================================================================ queries
 
   /** Players in list order (live model objects; do not mutate). */
@@ -834,6 +1014,8 @@ export class HostRoom {
     c.closed = true;
     c.ready = false;
     if (this.connections.get(c.playerId) === c) this.connections.delete(c.playerId);
+    this.sequencer.dropView(c.playerId);
+    this.discOverrides.delete(c.playerId);
     const i = this.ready.indexOf(c);
     if (i >= 0) this.ready.splice(i, 1);
     this.updatePingTimer();

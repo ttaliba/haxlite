@@ -58,7 +58,7 @@ room.onPlayerChat = (player, msg) => msg !== '!secreto'; // false = el mensaje n
 process.once('SIGINT', () => room.haxlite.stop()); // el proceso termina solo
 ```
 
-Ejemplos completos: [`examples/basic-room.mjs`](examples/basic-room.mjs) (admin al primer jugador, equipos automáticos, comandos `!bb`, `!afk`, `!swap`, `!rr`) y [`examples/moderation.mjs`](examples/moderation.mjs) (bans persistentes en JSON, re-ban al volver con otra IP, cuarentena de chat para `auth` nuevos, mute, bans por rango CIDR y rechazo de jugadores sin `auth`). Ambos se ejecutan en los tests (`test/api/examples.test.ts`).
+Ejemplos completos: [`examples/basic-room.mjs`](examples/basic-room.mjs) (admin al primer jugador, equipos automáticos, comandos `!bb`, `!afk`, `!swap`, `!rr`) y [`examples/moderation.mjs`](examples/moderation.mjs) (bans persistentes en JSON, re-ban al volver con otra IP, cuarentena de chat para `auth` nuevos, mute, bans por rango CIDR y rechazo de jugadores sin `auth`), y [`examples/among-us-vision.mjs`](examples/among-us-vision.mjs) (niebla por habitación y marcador de tarea visibles solo para cada jugador). Se ejecutan en los tests (`test/api/examples.test.ts`).
 
 ### Compatibilidad con el `HBInit` oficial
 
@@ -113,6 +113,7 @@ room.haxlite.getPlayerConnection(id); // { auth, conn, ip, srflxIps, ping }
 | `haxlite.onRecaptcha` / `useRecaptchaToken(r)` | el maestro pide captcha (token caducado al reconectar): se recibe la `sitekey` y se reintenta con la respuesta |
 | `haxlite.stop()` / `close()` | cierra temporizadores, señalización y conexiones; con la última sala del proceso libera node-datachannel para que Node termine solo (`shutdownWebRtcOnLastStop`) |
 | `haxlite.peerBackend: 'rtc'`, `haxlite.rtc: { port, publicAddresses, iceLite }` | jugadores sobre haxlite-rtc (TypeScript puro, un puerto UDP, sin hilos nativos, −35 % de CPU con 20 jugadores); ICE completo con STUN, funciona también tras NAT sin configurar (`publicAddresses` opcional). Por defecto `'ndc'` (node-datachannel). `haxlite.rtcPort`, `haxlite.rtcStats()`. Ver [docs/10 §3](docs/10-haxlite-rtc.md) |
+| `haxlite.setDiscPropertiesFor(viewerId, disco, props, {force})`, `clearDiscOverrides(viewerId)`, `getDiscPropertiesFor`, `hasPrivateView`, `onPrivateViewEnd` | **visuales privados**: cambia un disco solo en el mundo de un jugador (niebla / visión, marcador de tarea) sin desincronizar a nadie. El disco debe ser "solo visual" (de estadio, no el 0, sin *joints*, `cGroup` 0) salvo `force`. El host simula el mundo de ese jugador y le manda su propio hash de *CheckConsistency*. Se descarta al parar/empezar el juego, cambiar de estadio o salir el jugador. Ver [docs/04 §7.4](docs/04-netcode-y-sincronizacion.md) y [`examples/among-us-vision.mjs`](examples/among-us-vision.mjs) |
 | `haxlite.setMaxPlayers(n)`, `haxlite.roomLink`, `haxlite.frame`, `haxlite.onError` | utilidades |
 | `haxlite.host`, `haxlite.transport` | el motor (`HostRoom`) y el transporte (`HostTransport`) para usos avanzados |
 

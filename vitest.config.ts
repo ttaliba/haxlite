@@ -30,6 +30,7 @@ export default defineConfig({
             'test/api/extensions.test.ts',
             'test/api/multi-room.test.ts',
             'test/api/parity.test.ts',
+            'test/api/private-view.test.ts',
             'test/api/shutdown.test.ts',
             'test/net/transport.test.ts',
             'test/net/transport-e2e.test.ts',

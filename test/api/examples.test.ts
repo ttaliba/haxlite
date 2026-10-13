@@ -17,7 +17,7 @@ let OUT = '';
 beforeAll(async () => {
   env = await startEnv();
   OUT = buildPackage('haxlite-api-examples-test');
-  for (const f of ['basic-room.mjs', 'moderation.mjs']) copyFileSync(path.join(ROOT, 'examples', f), path.join(OUT, f));
+  for (const f of ['basic-room.mjs', 'moderation.mjs', 'among-us-vision.mjs']) copyFileSync(path.join(ROOT, 'examples', f), path.join(OUT, f));
 }, 60_000);
 afterAll(async () => {
   await env.master.close();
@@ -80,6 +80,50 @@ describe('examples', () => {
       expect(err.params?.[0]).toBe('Bye!');
       expect(alice.chats.some(([, m]) => m === '!bb')).toBe(false); // commands are hidden
       expect(r.lines.some((l) => l === 'alice joined (auth ' + playerAuth(r, 'alice') + ', conn 3132372E302E302E31)')).toBe(true);
+      expect(await interrupt(r)).toBe(0);
+    } finally {
+      for (const c of clients) c.leave();
+      r.child.kill('SIGKILL');
+    }
+  });
+
+  it('among-us-vision.mjs: per-player fog and task marker, no desync', async () => {
+    const opts = { masterUrl: env.master.httpBase, iceServers: [], transport: { iceCandidatePolicy: 'all' }, checksumIntervalFrames: 30 };
+    const r = run('among-us-vision.mjs', { HAXLITE_OPTIONS: JSON.stringify(opts) });
+    const clients: Client[] = [];
+    const disc = (c: Client, i: number): Any => c.room.gameState?.physicsState?.discs?.[i] ?? null;
+    const at = (c: Client, i: number) => [disc(c, i)?.pos.x, disc(c, i)?.pos.y];
+    try {
+      const roomId = await r.roomId;
+      const alice = await join(env, roomId, 'alice');
+      const bob = await join(env, roomId, 'bob');
+      clients.push(alice, bob);
+      const syncs: Any[] = [];
+      for (const c of clients) c.room.onPlayerSyncChange = (id: number, v: boolean) => syncs.push([c.name, id, v]);
+      // both spawn in the Cafeteria (left): each sees the Electrical fog (disc 2), not the Cafeteria one
+      await waitFor(() => clients.every((c) => at(c, 2)[0] === 200 && at(c, 1)[1] === 5000), 10_000, 'initial fog');
+      // alice walks right into Electrical: her fog flips, bob's does not
+      alice.room.setKeyState(8);
+      await waitFor(() => at(alice, 1)[0] === -200 && at(alice, 2)[1] === 5000, 10_000, 'alice fog flipped');
+      alice.room.setKeyState(0);
+      expect(at(bob, 2)).toEqual([200, 0]);
+      expect(at(bob, 1)).toEqual([0, 5000]);
+      // she reaches the task marker: lit only for her, private prompt only for her
+      const steer = setInterval(() => {
+        const me = alice.room.getPlayer(alice.room.currentPlayerId)?.disc?.pos;
+        if (!me) return;
+        const dx = 280 - me.x;
+        const dy = -80 - me.y;
+        alice.room.setKeyState((dy < -10 ? 1 : dy > 10 ? 2 : 0) | (dx < -10 ? 4 : dx > 10 ? 8 : 0));
+      }, 50);
+      await waitFor(() => disc(alice, 3)?.color === 0xffd700, 10_000, 'task marker lit').finally(() => clearInterval(steer));
+      alice.room.setKeyState(0);
+      expect(disc(bob, 3).color).toBe(0x555555);
+      // the prompt is a msg 6 on another channel: no ordering with the sequenced marker update
+      await waitFor(() => alice.announcements.includes('Task: fix wiring - stay here 3 s'), 5000, 'private prompt');
+      expect(bob.announcements).not.toContain('Task: fix wiring - stay here 3 s');
+      await sleep(1200); // >= one CheckConsistency round with private worlds
+      expect(syncs).toEqual([]);
       expect(await interrupt(r)).toBe(0);
     } finally {
       for (const c of clients) c.leave();

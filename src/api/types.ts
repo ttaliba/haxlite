@@ -384,6 +384,30 @@ export interface HaxliteRoomExtensions {
   getPlayerConnection(playerId: number): PlayerConnectionInfo | null;
   /** Changes the capacity at runtime (not possible officially). */
   setMaxPlayers(n: number): void;
+
+  /**
+   * Private visuals: changes disc `discIndex` ONLY for player `viewerId`
+   * (e.g. a fog / vision mask, a task marker). Deferred like the official
+   * setters. Must be a "visual-only" stadium disc: not disc 0, not a player
+   * disc, in no joint, cGroup 0 in every world (nothing can touch, kick or
+   * score with it), so the viewer's game plays exactly like everyone
+   * else's; otherwise the update is rejected through `onError`, unless
+   * `opts.force` (then that viewer may really see another game). The host
+   * simulates the viewer's world and sends it its own CheckConsistency hash:
+   * no desync flag, nobody else sees anything. Overrides vanish when the
+   * worlds become equal again: game stop/start, stadium change, a kick-off
+   * reset that resets the disc, or {@link clearDiscOverrides}; and when the
+   * viewer leaves. docs/04 §7.4.
+   */
+  setDiscPropertiesFor(viewerId: number, discIndex: number, properties: DiscPropertiesUpdate, opts?: { force?: boolean }): void;
+  /** Restores, for `viewerId`, the room's values of every disc field it had overridden (deferred). */
+  clearDiscOverrides(viewerId: number): void;
+  /** A disc as `viewerId` currently sees it (its private world, else the room's). */
+  getDiscPropertiesFor(viewerId: number, discIndex: number): DiscPropertiesObject | null;
+  /** True while `viewerId` has a private world (overrides applied and not yet converged). */
+  hasPrivateView(viewerId: number): boolean;
+  /** A private view ended because the viewer's world became identical to the room's again. */
+  onPrivateViewEnd: ((viewerId: number) => void) | null;
   /** Edge tunnel statistics (state, data plane, RTT, peers, bytes), null without `haxlite.edge`. */
   edgeStats(): EdgeBackendStats | null;
   /** haxlite-rtc endpoint counters (sessions, packets, bytes, handshakes; of the whole shared endpoint), null unless `peerBackend: 'rtc'`. */

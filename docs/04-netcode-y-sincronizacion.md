@@ -267,7 +267,7 @@ Puntos clave:
 1. **El reloj del cliente no avanza el estado autoritativo.** `LM()` del cliente (`api.js:2894`) solo recalcula `UW` (cuántos frames va el host "por delante"). El único camino a `D1()` es `V1()` → `A$()`.
 2. **Comprobación de completitud por contador.** Como los eventos viajan por `ru` (fiable pero **desordenado**) y los heartbeats por `uu` (pueden perderse o llegar antes que los eventos), el cliente solo avanza hasta `Y5` cuando el número de eventos que conoce con frame menor que `Y5` coincide con el contador del host. Si falta alguno, espera al siguiente heartbeat. Si se pierde un heartbeat, el siguiente llega unos 7 frames después.
 3. **No hay "eventos tardíos" en el cliente.** Por construcción el cliente nunca ha simulado más allá de un frame cuyo conjunto de eventos esté completo, así que nunca necesita rebobinar. Si por un error llegara un evento con `dM < j`, se quedaría atascado en la cabeza de la cola (`D1` solo consume `a.dM == this.j`) y bloquearía los demás. Por eso node-haxball expone `room.clearEvents()` ("*can be useful when the game engine is stuck*", README; implementado como `this.I.eW.ME.length = 0`, `api.js:6783`).
-4. `s$` (tipo 6) aplica eventos **fuera de la secuencia** (chat o anuncio privado). Solo son válidos si no tocan el estado simulado. Con `executeEventWithTarget` el propio README advierte: "*It will probably cause 'intentional' desync*".
+4. `s$` (tipo 6) aplica eventos **fuera de la secuencia** (chat o anuncio privado). Solo son válidos si no tocan el estado simulado. Con `executeEventWithTarget` el propio README advierte: "*It will probably cause 'intentional' desync*". Medido en §7.4.
 
 ---
 
@@ -400,6 +400,72 @@ w1: (desync, estadoHost) => {
 ### 7.3 ¿Hay resync?
 
 **No he encontrado ninguna resincronización automática.** El snapshot completo (`$h()` en el host / `G$()` en node-haxball) solo se envía cuando un jugador se une (`Lh` → `$h`). Un cliente desincronizado sigue simulando su estado divergente, avisa con `SetPlayerSync` y, en la práctica, tiene que **reconectarse** para recuperar el estado (**no verificado** en la UI oficial). Las herramientas de depuración de node-haxball (`debugDesync`, `examples/other/compareStates.js`) existen precisamente porque no hay corrección automática.
+
+### 7.4 Eventos para un solo jugador y visuales privados (haxlite)
+
+**Qué hace de verdad `executeEventWithTarget` de node-haxball** (medido con un host node-haxball 2.3.1, dos clientes node-haxball y el `FakeMaster`; host con jugador, los tres en juego):
+
+- El host (`ji(ev, targetId)`, `api.js:2539`) pone `ev.G = 0` y manda al objetivo **solo** `[6][u8 tipo][payload]`. Con `sendInput(8)` el objetivo recibió exactamente `06 03 00000008`: ni frame, ni orden, ni `byId`.
+- El cliente (`s$`, `api.js:2960`) lo aplica **al instante** sobre su estado confirmado, con `byId = 0`. El cliente oficial hace lo mismo (`game-min.js` `0349dd60`, `fr(a){a=p.Jj(a);a.P=0;a.Ge=0;a.apply(this.T);…}`).
+- Consecuencia: un `SendInput` dirigido **solo puede cambiar el input del jugador del host (id 0)** en el mundo del objetivo. Poner `ev.byId = B` antes de enviarlo no sirve: no viaja. En la prueba, el disco del host avanzó en el mundo del objetivo (−277,5 → −182,3 en 1 s) y siguió quieto en el host y en el otro cliente. Ese input nunca se "deshace", así que el mundo del objetivo **divergió para siempre**: marcó un gol (1-0) que no existe en los demás.
+- En el siguiente `CheckConsistency` (≈10,8 s) el objetivo emitió `SetPlayerSync(true)` y **toda la sala** vio su marca de desincronización. Con `noPlayer: true` el evento no tendría efecto alguno (no hay jugador 0).
+- Conclusión: no existe "mandar inputs a un jugador" en ningún cliente. Lo que hay es aplicar un evento fuera de secuencia sobre el jugador 0, con desync visible garantizado si toca el estado.
+
+**Por qué el mensaje 6 no sirve para nada que toque la simulación.** El host no sabe en qué punto de la secuencia lo aplica el cliente: su estado confirmado va por detrás un tiempo variable (RTT + *heartbeat*). Si entre medias hay un reinicio de saque, un `StartGame` o un `StopGame`, el resultado cambia según el orden. Ni siquiera con un disco estático puede el host reproducir el mundo del cliente.
+
+**Lo que sí funciona: ranura privada secuenciada + mundo sombra** (`room.haxlite.setDiscPropertiesFor`, `src/host/sequencer.ts` `privateSlot`/`ViewerWorld`):
+
+1. El host reserva **un** hueco normal de la secuencia: frame actual y el siguiente orden, como hace `CheckConsistency` (§7.1). El jugador V recibe ahí un `SetDiscProperties` (solo-host, `byId` 0). Todos los demás reciben **en el mismo `(frame, orden)`** un `SetDiscProperties` con máscara 0, que no hace nada (`Mb.apply` oficial solo asigna los campos presentes). Así los contadores de eventos y los *heartbeats* coinciden para todos: nadie se atasca. El host no aplica nada a su estado.
+2. Desde ese momento el host mantiene una **copia exacta del mundo de V**: la ronda de serialización del snapshot de unión. La copia recibe los mismos eventos secuenciados que V y avanza a la vez que la sala, en el mismo bucle (`stepRoom`, ~1 µs/tick por vista).
+3. En cada `CheckConsistency` todos reciben el mismo `(frame, orden)`, pero V lleva **el hash de su mundo**. No hay `SetPlayerSync` y nadie ve nada.
+4. La vista se descarta sola cuando el mundo de V vuelve a ser idéntico byte a byte al de la sala. Se comprueba tras cada `StopGame`/`StartGame`/`SetStadium` y en cada `CheckConsistency`, así que cubre parar o empezar el juego, cambiar de estadio, un saque que reinicia el disco (`kickOffReset: "full"`) y `clearDiscOverrides`. También se descarta cuando V sale.
+5. Solo se aceptan discos **solo visuales**: de estadio, distinto del 0 (el 0 decide el saque y la cámara), que no sean de jugador, sin *joints* y con `cGroup` 0 en todos los mundos. Con `cGroup` 0 nadie choca con él (§ física: hacen falta `a.cMask & b.cGroup` **y** `a.cGroup & b.cMask`), no se puede chutar (`cGroup & kick`) y no marca (`cGroup & score`). Puede moverse y rebotar en paredes (eso solo le afecta a él; la copia lo simula). Cualquier otra cosa se rechaza (por `onError`) salvo `force`. Con `force`, el protocolo sigue siendo consistente, pero V ve otro partido.
+
+Probado con clientes node-haxball reales (`test/api/private-view.test.ts`):
+
+- un disco cambia de posición, radio y color solo para V, y otro disco con velocidad diverge solo para V;
+- ningún `SetPlayerSync` durante más de 8 rondas de `CheckConsistency` (intervalo de 30 frames);
+- los frames confirmados de todos avanzan;
+- discos de jugadores y balón idénticos en los tres clientes en el mismo frame;
+- `clearDiscOverrides`, `stopGame` y la salida del jugador cierran la vista;
+- control negativo: el mismo cambio enviado como mensaje 6 marca al jugador como desincronizado ante toda la sala en la ronda siguiente.
+
+`examples/among-us-vision.mjs` lo usa para una niebla por habitación y un marcador de tarea, y también se prueba.
+
+**Orden de dibujo del cliente oficial** (`game-min.js` `0349dd60`, método de render de la vista de juego; el `defaultRenderer` de node-haxball sigue el mismo orden):
+
+1. fondo;
+2. segmentos con `vis`;
+3. *joints* (sin los de color < 0);
+4. flechas de borde de pantalla del balón y de cada jugador fuera de cámara (`wr`/`Jk`);
+5. nombres e indicador de chat;
+6. halo propio;
+7. **discos de jugador**;
+8. **el resto de discos** en orden de `world.discs`.
+
+Por tanto **los discos de estadio se dibujan encima de los jugadores**: un disco opaco grande tapa a los jugadores que tenga debajo, y también sus nombres. Basta con ponerlo en el estadio; no hace falta ningún truco de orden en el snapshot. Detalles:
+
+- `color: -1` ("transparente") no rellena, pero sigue trazando el contorno negro (`-1 != (a.S|0) && fill(); stroke()`).
+- Un disco con radio negativo no se dibuja y **corta el bucle**: no se dibuja ningún disco de estadio posterior.
+- Para ocultar un disco por jugador lo más limpio es aparcarlo fuera del campo (la cámara no sale de los límites del estadio).
+- `SetDiscProperties` cambia `x`, `y`, velocidad, gravedad, `radius`, `bCoef`, `invMass`, `damping`, `color`, `cMask` y `cGroup`. Puertas o máscaras de visión pueden mostrarse u ocultarse por jugador cambiando posición, radio o color.
+
+Límites:
+
+- solo hay círculos: segmentos, planos y fondo no se pueden cambiar por jugador, y el estadio es global;
+- las flechas de borde delatan a los jugadores fuera de la cámara (se dibujan antes que los discos, pero en el borde de la pantalla);
+- cada cambio llega con ≈ 1 RTT + *heartbeat*, porque `SetDiscProperties` no se predice;
+- seguir al jugador cuadro a cuadro (un cono de visión pegado a él) cuesta un evento por frame y por jugador: es viable por habitación o zona, no por píxel;
+- cada actualización manda además un no-op de 20 bytes a cada otro cliente. Las actualizaciones de varios jugadores en la misma tanda comparten ranura (`HostRoom.batchPrivate`; la fachada `HBInit` agrupa las llamadas consecutivas);
+- los espectadores y la grabación `.hbr2` ven el mundo de la sala.
+
+**Lo que no necesita ninguna divergencia** (camino recomendado para las interacciones de tarea):
+
+- el host lee posiciones (`getPlayerDiscProperties`, `onGameTick`) y decide;
+- `sendAnnouncement`/`sendChat` con `targetId` (mensaje 6: no tocan el estado);
+- `setPlayerAvatar` cambia el avatar que ve **toda** la sala (`SetHeadlessAvatar` es secuenciado y global). Un avatar distinto por jugador cabría en el mismo mecanismo de ranura privada (el campo se serializa con el jugador y la copia lo sigue), pero no está expuesto.
+
+**¿Y los inputs de otro jugador vistos distintos por uno solo?** Con el mismo mecanismo sería posible: sustituir en el flujo de V los `SendInput` de P, mantener los contadores y simular la copia. Pero V vería **otro partido**: la pelota, los goles, el marcador y el fin del juego divergen sin vuelta atrás, porque no existe resync y `SetDiscProperties` cuantiza a f32. Restaurar el mundo exige reiniciar el juego o que V se reconecte. Reenviar el snapshot (mensaje 1) en mitad de la partida no parece fiable: `j$`/`ar` recargan el estado pero no vacían la cola de eventos ya recibidos, y los que tengan frame anterior al nuevo bloquearían la cola (**no verificado** en ejecución). Por eso no se implementa.
 
 ---
 

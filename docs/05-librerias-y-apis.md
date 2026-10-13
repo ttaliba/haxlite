@@ -548,7 +548,7 @@ Relacionado: `Utils.refreshRoomToken({token, rcr})` y `Utils.generateRoomId({tok
 | Render | Ninguno | Renderers pluggables (canvas, PIXI…) |
 | Plugins | No (un único script de bot) | Plugin/RoomConfig/Library/Language con activación en caliente |
 | Protocolo propio | No | `CustomEvent`, `BinaryCustomEvent`, `SetPlayerIdentity` entre clientes de la API |
-| Funciones "hack" | No | `fakePassword`, `playerCount` falso, `unlimitedPlayerCount`, `fakePlayerJoin/Leave`, `fakeSendPlayerChat/Input` (eventos atribuidos a otros), `executeEventWithTarget` (desync intencionado), aimbot/speedhack de ejemplo, `passwordGuesser.js` |
+| Funciones "hack" | No | `fakePassword`, `playerCount` falso, `unlimitedPlayerCount`, `fakePlayerJoin/Leave`, `fakeSendPlayerChat/Input` (eventos atribuidos a otros), `executeEventWithTarget` (desync intencionado: mensaje 6 sin frame ni `byId`, el objetivo lo aplica como jugador 0; medido en docs/04 §7.4), aimbot/speedhack de ejemplo, `passwordGuesser.js` |
 | Navegador | No (Node ≥ 22.18) | Sí (con proxy o extensión de Origin) y Node ≥ 16.9 |
 | WebRTC | `@webrtc-node/webrtc` (sustituible) | `node-datachannel/polyfill` (o el del `window`) |
 | Proxy | `proxy` (solo WebSocket) | `proxyAgent` global o por sala; `proxy.WebSocketUrl/HttpUrl`; backend personalizado |

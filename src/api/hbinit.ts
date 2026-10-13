@@ -326,10 +326,35 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
   };
 
   /** Official `c(event)`: apply in a microtask, in call order. */
+  let deferSeq = 0;
   const defer = (fn: () => void): void => {
+    deferSeq++;
     queueMicrotask(() => {
       if (!stopped) fn();
     });
+  };
+
+  // haxlite private visuals: consecutive calls (no other action in between)
+  // share one deferred batch, sent as shared slots (HostRoom.batchPrivate).
+  type PrivateUpdate = { viewerId: number; discIndex: number; props: DiscPropsInput; force: boolean };
+  let privateList: PrivateUpdate[] | null = null;
+  let privateSeq = -1;
+  const privateBatch = (u: PrivateUpdate): void => {
+    if (privateList === null || privateSeq !== deferSeq) {
+      const list: PrivateUpdate[] = [];
+      privateList = list;
+      defer(() => {
+        if (privateList === list) privateList = null;
+        host.batchPrivate(() => {
+          for (const p of list) {
+            if (p.discIndex < 0) host.clearDiscOverrides(p.viewerId);
+            else host.setDiscPropertiesFor(p.viewerId, p.discIndex, p.props, p.force);
+          }
+        });
+      });
+      privateSeq = deferSeq;
+    }
+    privateList.push(u);
   };
 
   async function stop(): Promise<void> {
@@ -449,6 +474,25 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     setMaxPlayers(n: number) {
       const v = castInt(n, 12);
       host.setMaxPlayers(v < 2 ? 2 : v > 30 ? 30 : v);
+    },
+    setDiscPropertiesFor(viewerId: number, discIndex: number, properties: DiscPropertiesUpdate, opts?: { force?: boolean }) {
+      const update = { viewerId: castInt(viewerId, 0), discIndex: castInt(discIndex, 0), props: copyDiscProps(properties), force: opts?.force === true };
+      privateBatch(update);
+    },
+    clearDiscOverrides(viewerId: number) {
+      privateBatch({ viewerId: castInt(viewerId, 0), discIndex: -1, props: {}, force: false });
+    },
+    getDiscPropertiesFor(viewerId: number, discIndex: number) {
+      return host.getDiscPropertiesFor(viewerId, discIndex);
+    },
+    hasPrivateView(viewerId: number) {
+      return host.hasPrivateView(viewerId);
+    },
+    get onPrivateViewEnd() {
+      return host.onPrivateViewEnd;
+    },
+    set onPrivateViewEnd(h) {
+      host.onPrivateViewEnd = h ?? null;
     },
     stop,
     close: stop,
