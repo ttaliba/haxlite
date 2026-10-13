@@ -814,7 +814,9 @@ export class HostTransport {
 
   /**
    * Local answer available (synchronously for the local backend, after a
-   * tunnel round trip for an edge): wait for gathering or `answerIceWaitMs`.
+   * tunnel round trip for an edge): wait for gathering or `answerIceWaitMs`
+   * (`ub.li`), or — with an `answerOnFirstCandidate` backend — only until the
+   * first candidate allowed by the ICE policy is known.
    */
   private onLocalDescription(peer: Peer, sdp: string): void {
     if (peer.state !== 'negotiating' || peer.localSdp !== null) return;
@@ -826,6 +828,7 @@ export class HostTransport {
       return;
     }
     if (peer.gatheringDone) this.sendAnswer(peer);
+    else if (this.backend.answerOnFirstCandidate === true && peer.localCandidates.length > 0) this.answerSoon(peer);
     else {
       peer.timer = setTimeout(
         () => this.safely(() => this.sendAnswer(peer)),
@@ -843,8 +846,25 @@ export class HostTransport {
     }
     const idx = peer.mids.indexOf(mid);
     const c: IceCandidateInit = { candidate: line, sdpMid: mid, sdpMLineIndex: idx >= 0 ? idx : 0 };
-    if (!peer.answerSent) peer.localCandidates.push(c);
-    else if (!peer.endSent) this.signaling.sendCandidate(peer.id, c);
+    if (!peer.answerSent) {
+      peer.localCandidates.push(c);
+      if (this.backend.answerOnFirstCandidate === true && peer.localCandidates.length === 1 && peer.localSdp !== null) {
+        this.answerSoon(peer);
+      }
+    } else if (!peer.endSent) this.signaling.sendCandidate(peer.id, c);
+  }
+
+  /**
+   * `answerOnFirstCandidate` backends (node-datachannel): answer on the next
+   * timer turn once one usable candidate is known instead of waiting for the
+   * whole gathering (the STUN round trip, or `answerIceWaitMs` when the STUN
+   * server is unreachable). The rest of the burst delivered in the same turn
+   * still goes in the answer; later candidates are trickled as usual.
+   */
+  private answerSoon(peer: Peer): void {
+    if (peer.state !== 'negotiating' || peer.answerSent) return;
+    if (peer.timer !== null) clearTimeout(peer.timer);
+    peer.timer = setTimeout(() => this.safely(() => this.sendAnswer(peer)), 0);
   }
 
   private onGatheringComplete(peer: Peer): void {

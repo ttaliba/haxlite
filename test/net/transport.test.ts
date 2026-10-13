@@ -279,6 +279,21 @@ describe('ICE privacy and deployment options', () => {
     }
   });
 
+  it.skipIf(RTC_UNDER_TEST)('answers on the first usable candidate (no wait for an unreachable STUN) and takes the DTLS server role', async () => {
+    const { roomId, t } = await startHost({
+      iceCandidatePolicy: 'all',
+      iceServers: ['stun:127.0.0.1:9'], // unreachable: gathering never completes in time
+      answerIceWaitMs: 5_000, // the old behaviour would hold the answer this long
+    });
+    const t0 = performance.now();
+    const j = nextJoin(t);
+    const c = join(roomId);
+    await j;
+    expect(performance.now() - t0).toBeLessThan(4_000);
+    expect(c.answerSdp).toMatch(/a=setup:passive/);
+    expect(c.answerCandidates.some((x) => / typ host/.test(x.candidate))).toBe(true);
+  });
+
   it('a throwing host callback is reported, never crashes the process', async () => {
     const errors: Error[] = [];
     const { roomId, t } = await startHost();

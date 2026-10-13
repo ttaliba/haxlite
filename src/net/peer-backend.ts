@@ -64,6 +64,14 @@ export interface PeerBackend {
   /** New peers can be created now (the edge tunnel is up). */
   readonly ready: boolean;
   /**
+   * The transport may send the answer as soon as one local candidate passes
+   * the ICE policy, trickling the rest, instead of waiting for gathering to
+   * complete (or `answerIceWaitMs`). Set by {@link LocalPeerBackend}: its
+   * host candidates are known at once while the STUN (srflx) one takes a
+   * round trip — or never comes when the STUN server is unreachable.
+   */
+  readonly answerOnFirstCandidate?: boolean;
+  /**
    * Starts the backend; `onReady` is called every time it becomes ready (the
    * edge tunnel after each (re)connection), `onDown` when it stops being
    * ready (every live link has already been closed with
@@ -102,6 +110,7 @@ export class LocalPeerBackend implements PeerBackend {
   readonly kind = 'local';
   readonly prefiltered = false;
   readonly ready = true;
+  readonly answerOnFirstCandidate = true;
   private readonly rtc: RtcConfig;
 
   constructor(opts: LocalPeerBackendOptions) {
@@ -117,6 +126,23 @@ export class LocalPeerBackend implements PeerBackend {
   createPeer(id: number, offerSdp: string, ev: PeerLinkEvents): PeerLink {
     return new LocalPeerLink(`haxlite-${id}`, this.rtc, offerSdp, ev);
   }
+}
+
+/**
+ * Makes libdatachannel answer `a=setup:passive` (this side = DTLS server) to
+ * an `actpass` offer by presenting the offer as `a=setup:active`; the answer
+ * that goes to the client says `passive`, which every WebRTC stack accepts
+ * for an `actpass` offer (RFC 8842 §5.3), so the client becomes the DTLS
+ * client. Left alone, libdatachannel answers `active` and sends its
+ * ClientHello the moment ICE connects — usually *before* the client has the
+ * answer (a full ICE agent answers connectivity checks before it knows the
+ * remote description) — so the client drops it and the handshake waits for
+ * OpenSSL's 1 s retransmission: ≈ 0.5–1 s of every join. As DTLS server the
+ * host just waits for the client's ClientHello, which the client only sends
+ * once it has the answer.
+ */
+export function passiveDtlsOffer(sdp: string): string {
+  return sdp.indexOf('a=setup:actpass') >= 0 ? sdp.replaceAll('a=setup:actpass', 'a=setup:active') : sdp;
 }
 
 /** Selected-pair remote IP of a PeerConnection, or null. */
@@ -155,7 +181,7 @@ export class LocalPeerLink implements PeerLink {
     this.pc = pc;
     let sdp: string | null;
     try {
-      pc.setRemoteDescription(offerSdp, 'offer');
+      pc.setRemoteDescription(passiveDtlsOffer(offerSdp), 'offer');
       for (let i = 0; i < CHANNELS.length; i++) this.createChannel(pc, i, onError);
       pc.setLocalDescription('answer');
       sdp = pc.localDescription()?.sdp ?? null;

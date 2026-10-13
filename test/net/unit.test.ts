@@ -38,6 +38,7 @@ import {
   type RoomInfo,
 } from '../../src/net/index.js';
 import { Reader } from '../../src/codec/index.js';
+import { passiveDtlsOffer } from '../../src/net/peer-backend.js';
 import { officialNet } from './official-net.js';
 
 describe('ip', () => {
@@ -255,6 +256,17 @@ describe('ICE candidates', () => {
       { hostname: '2001:db8::1', port: 5349, username: 'a', password: 'b', relayType: 'TurnTls' },
     ]);
     expect(() => toNativeIceServers([{ urls: 'http://nope' }])).toThrow(/invalid ICE server url/);
+  });
+});
+
+describe('DTLS role', () => {
+  it('an actpass offer is presented as active so libdatachannel answers passive; other roles untouched', () => {
+    const offer = 'v=0\r\na=setup:actpass\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=setup:actpass\r\n';
+    expect(passiveDtlsOffer(offer)).toBe(offer.replaceAll('actpass', 'active'));
+    const active = 'v=0\r\na=setup:active\r\n';
+    expect(passiveDtlsOffer(active)).toBe(active);
+    const passive = 'v=0\r\na=setup:passive\r\n';
+    expect(passiveDtlsOffer(passive)).toBe(passive);
   });
 });
 
