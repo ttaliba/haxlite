@@ -407,25 +407,35 @@ export class Gatherer {
       if (--pending === 0) finish();
     };
     for (const server of this.o.stunServers) {
-      doLookup(server.host).then(
-        (addrs) => {
-          if (this.closed) return finish();
-          for (const a of addrs) {
-            const s = this.host.sockets.find((x) => x.family === a.family);
-            if (s === undefined) continue;
-            pending++;
-            this.query(s.sock, a.address, server.port, (r) => {
-              if (r !== null && isIP(r.address) !== 0 && r.port > 0) {
-                mapped.push(r);
-                if (!found.some((c) => c.address === r.address && c.port === r.port)) found.push({ type: 'srflx', address: r.address, port: r.port });
-              }
-              oneDone();
-            });
-          }
-          oneDone();
-        },
-        () => oneDone(),
-      );
+      // a hanging resolver (offline host) must not keep the round open: same budget as a query
+      let lookupTimer: NodeJS.Timeout | null = null;
+      const lookupTimeout = new Promise<{ address: string; family: number }[]>((resolve) => {
+        lookupTimer = setTimeout(() => resolve([]), this.o.timeoutMs ?? 1500);
+        lookupTimer.unref?.();
+      });
+      Promise.race([doLookup(server.host), lookupTimeout])
+        .finally(() => {
+          if (lookupTimer !== null) clearTimeout(lookupTimer);
+        })
+        .then(
+          (addrs) => {
+            if (this.closed) return finish();
+            for (const a of addrs) {
+              const s = this.host.sockets.find((x) => x.family === a.family);
+              if (s === undefined) continue;
+              pending++;
+              this.query(s.sock, a.address, server.port, (r) => {
+                if (r !== null && isIP(r.address) !== 0 && r.port > 0) {
+                  mapped.push(r);
+                  if (!found.some((c) => c.address === r.address && c.port === r.port)) found.push({ type: 'srflx', address: r.address, port: r.port });
+                }
+                oneDone();
+              });
+            }
+            oneDone();
+          },
+          () => oneDone(),
+        );
     }
   }
 

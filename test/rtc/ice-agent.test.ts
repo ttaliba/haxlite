@@ -12,7 +12,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { RtcEndpoint, rawDataLayer, type RtcSession } from '../../src/rtc/index.js';
 import { formatFingerprint } from '../../src/rtc/sdp.js';
 import { StunMessage, StunType, buildBindingError, buildBindingRequest, buildBindingSuccess, checkFingerprint, checkIntegrity, parseStun } from '../../src/rtc/stun.js';
-import { candidatePriority, classifyIp, formatCandidates, hostAddresses, policyAllows, stunServers } from '../../src/rtc/gather.js';
+import { Gatherer, candidatePriority, classifyIp, formatCandidates, hostAddresses, policyAllows, stunServers } from '../../src/rtc/gather.js';
 import { MAX_PAIRS, _pairPriority } from '../../src/rtc/ice-agent.js';
 import { ecClientCert } from './dtls-helpers.js';
 import { FakeStunServer } from './nat-sim.js';
@@ -169,6 +169,25 @@ describe('gathering helpers', () => {
     expect(hostAddresses(4, '127.0.0.1', 'all')).toEqual(['127.0.0.1']);
     expect(hostAddresses(4, '0.0.0.0', 'all')).toContain('127.0.0.1');
     expect(hostAddresses(4, '0.0.0.0', 'public')).not.toContain('127.0.0.1');
+  });
+
+  it('a hanging DNS lookup does not keep a gathering round open', async () => {
+    const sock = await udp();
+    try {
+      const g = new Gatherer(
+        { sockets: [{ sock, family: 4, bindAddress: '127.0.0.1' }], send: () => {}, now: () => Date.now(), register: () => {}, unregister: () => {} },
+        { port: sock.address().port, stunServers: [{ host: 'stun.invalid', port: 3478 }], policy: 'all', timeoutMs: 200, lookup: () => new Promise(() => {}) },
+      );
+      const t0 = Date.now();
+      g.start();
+      expect(g.isGathering).toBe(true);
+      await g.whenIdle();
+      expect(Date.now() - t0).toBeLessThan(1000);
+      expect(g.candidateLines()).toEqual([`candidate:1 1 udp 2130706431 127.0.0.1 ${sock.address().port} typ host generation 0`]);
+      g.close();
+    } finally {
+      sock.close();
+    }
   });
 
   it('pair priority (we are controlled: G = remote, D = local) orders by the remote candidate', () => {
