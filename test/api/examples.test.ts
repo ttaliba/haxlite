@@ -224,7 +224,9 @@ describe('examples', () => {
       expect(bobErr.params?.slice(0, 2)).toEqual(['spamming', true]);
       await waitFor(() => JSON.parse(readFileSync(file, 'utf8')).bans.length === 3, 5000, 'ban saved');
       const saved = JSON.parse(readFileSync(file, 'utf8'));
-      expect(saved.bans[2]).toMatchObject({ id: 3, name: 'bob', reason: 'spamming', by: 'alice', ips: ['127.0.0.1'] });
+      expect(saved.bans[2]).toMatchObject({ id: 3, name: 'bob', reason: 'spamming', by: 'alice' });
+      // conn IP first; a client that reaches a STUN server (e.g. on CI) adds its srflx IP too
+      expect(saved.bans[2].ips[0]).toBe('127.0.0.1');
       n = env.master.rejections.length;
       await expect(join(env, roomId, 'bob2', { timeoutMs: 10_000 })).rejects.toBeTruthy();
       expect(env.master.rejections.slice(n).map((x) => x.code)).toEqual([4102]);

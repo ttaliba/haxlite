@@ -158,8 +158,10 @@ function checkChannel(ch: number, s: ChannelStats, sent: number, lossy: boolean,
   } else {
     expect(s.dups, ctx).toBe(0);
     expect(s.data, ctx).toBeLessThanOrEqual(sent);
-    // unreliable: nothing is retransmitted; on clean loopback nearly everything arrives
-    expect(s.data, ctx).toBeGreaterThanOrEqual(Math.floor(sent * (lossy ? 0.5 : 0.9)));
+    // unreliable: nothing is retransmitted; on clean loopback nearly everything arrives. With 5 %
+    // loss + jitter and 30 PeerConnections on a 2-vCPU CI runner, Chromium also abandons queued
+    // maxRetransmits:0 messages under congestion (seen: 9 of 20), so lossy only checks a floor.
+    expect(s.data, ctx).toBeGreaterThanOrEqual(Math.floor(sent * (lossy ? 0.25 : 0.9)));
   }
 }
 
