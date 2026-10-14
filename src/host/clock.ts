@@ -22,7 +22,10 @@ export class ClockEntry {
   wakeAt = Infinity;
   /** Index in the clock's list, -1 when not registered. */
   index = -1;
-  constructor(readonly wake: () => void) {}
+  readonly wake: () => void;
+  constructor(wake: () => void) {
+    this.wake = wake;
+  }
 }
 
 export class SharedClock {

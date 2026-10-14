@@ -23,7 +23,7 @@
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.build.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "bench:build": "tsc -p tsconfig.build.json --outDir node_modules/.cache/haxlite-bench/dist --declaration false --sourceMap false && node scripts/build.mjs --out node_modules/.cache/haxlite-bench/bundle",

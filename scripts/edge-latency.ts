@@ -1,7 +1,7 @@
 // haxlite Edge overhead on loopback: message RTT and host CPU per player,
 // direct haxlite host vs the same host behind a haxlite Edge.
 //
-//   node --experimental-transform-types --no-warnings --import ./scripts/ts-resolve.mjs \
+//   node --experimental-strip-types --no-warnings --import ./scripts/ts-resolve.mjs \
 //        scripts/edge-latency.ts [--players 8] [--seconds 20] [--modes direct,edge,edge-ws] [--runs 1]
 //
 // Modes: `direct`, or `edge[-<players>][-<plane>]` with players `rtc` (haxlite-rtc,
@@ -133,7 +133,7 @@ async function hostMain(): Promise<void> {
 // ======================================================================= orchestrator
 function child(role: string, args: string[]): ChildProcess {
   return fork(fileURLToPath(import.meta.url), [role, ...args], {
-    execArgv: ['--experimental-transform-types', '--no-warnings', '--import', './scripts/ts-resolve.mjs'],
+    execArgv: ['--experimental-strip-types', '--no-warnings', '--import', './scripts/ts-resolve.mjs'],
     stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
   });
 }

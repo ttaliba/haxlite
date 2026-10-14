@@ -39,7 +39,9 @@ export class ReplayFormatError extends CodecError {
  */
 export class ReplayVersionError extends ReplayFormatError {
   override name = 'ReplayVersionError';
-  constructor(readonly version: number) {
+  readonly version: number;
+  constructor(version: number) {
     super(`unsupported replay version ${version} (expected ${REPLAY_VERSION})`);
+    this.version = version;
   }
 }

@@ -64,7 +64,10 @@ export class ReplayRecorder {
   };
 
   /** Format version written in the header (official recorder is built with 3). */
-  constructor(readonly version: number = REPLAY_VERSION) {}
+  readonly version: number;
+  constructor(version: number = REPLAY_VERSION) {
+    this.version = version;
+  }
 
   /** True between {@link start} and {@link stop}. */
   get isRecording(): boolean {

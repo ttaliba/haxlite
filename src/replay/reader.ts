@@ -21,25 +21,31 @@ export interface ReplayGoalMarker {
 
 /** Decoded `.hbr2` contents. */
 export class ReplayData {
-  constructor(
-    /** Header version (always 3 for files accepted by {@link readReplay}). */
-    readonly version: number,
-    /** Header total frame count (frame at stop − frame at start). */
-    readonly totalFrames: number,
-    /** Goal markers in file order (non-decreasing frames). */
-    readonly goalMarkers: ReplayGoalMarker[],
-    /**
-     * Serialized initial RoomState (official `Ta.G` layout), exactly as stored
-     * in the file. Decode with {@link initialState}.
-     */
-    readonly stateBytes: Uint8Array,
-    /**
-     * Recorded events in application order. `ev.frame` = frame (relative to
-     * the start) the event was applied at, before that frame's tick;
-     * `ev.byId` = issuer. `order`/`clientSeq` are not stored in replays (0).
-     */
-    readonly events: RoomEvent[],
-  ) {}
+  /** Header version (always 3 for files accepted by {@link readReplay}). */
+  readonly version: number;
+  /** Header total frame count (frame at stop − frame at start). */
+  readonly totalFrames: number;
+  /** Goal markers in file order (non-decreasing frames). */
+  readonly goalMarkers: ReplayGoalMarker[];
+  /**
+   * Serialized initial RoomState (official `Ta.G` layout), exactly as stored
+   * in the file. Decode with {@link initialState}.
+   */
+  readonly stateBytes: Uint8Array;
+  /**
+   * Recorded events in application order. `ev.frame` = frame (relative to
+   * the start) the event was applied at, before that frame's tick;
+   * `ev.byId` = issuer. `order`/`clientSeq` are not stored in replays (0).
+   */
+  readonly events: RoomEvent[];
+
+  constructor(version: number, totalFrames: number, goalMarkers: ReplayGoalMarker[], stateBytes: Uint8Array, events: RoomEvent[]) {
+    this.version = version;
+    this.totalFrames = totalFrames;
+    this.goalMarkers = goalMarkers;
+    this.stateBytes = stateBytes;
+    this.events = events;
+  }
 
   /** A fresh RoomState decoded from {@link stateBytes} (hooks unset). */
   initialState(): RoomState {

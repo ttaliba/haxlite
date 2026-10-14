@@ -4,7 +4,11 @@
     "rootDir": "src",
     "outDir": "dist",
     "noEmit": false,
-    "sourceMap": false
+    "sourceMap": false,
+    // src runs as-is under `node --experimental-strip-types` (npm run edge,
+    // the child processes of the edge tests): no enums, namespaces or
+    // parameter properties. Node 26 dropped --experimental-transform-types.
+    "erasableSyntaxOnly": true
   },
   "include": ["src/**/*.ts"]
 }
