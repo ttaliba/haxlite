@@ -50,11 +50,17 @@ describe('HBInit facade (official API)', () => {
       const fake = await waiter;
       expect(fake.id).toBe(roomId);
       expect(room.haxlite.roomLink).toBe(`https://www.haxball.com/play?c=${roomId}`);
-      // a handler set after `await HBInit` still gets the link
+      // a handler set after `await HBInit` still gets the link, also when the
+      // script wraps it in the same tick (try/catch wrapper over every on*)
       const links: string[] = [];
-      room.onRoomLink = (l) => links.push(l);
+      room.onRoomLink = (l) => links.push(`raw:${l}`);
+      const original = room.onRoomLink;
+      room.onRoomLink = (l) => {
+        links.push('wrapped');
+        original(l);
+      };
       await sleep(0);
-      expect(links).toEqual([room.haxlite.roomLink]);
+      expect(links).toEqual(['wrapped', `raw:${room.haxlite.roomLink}`]);
       // RoomInfo: name, geo from api/geo (fake: AR), clamped maxPlayers, host player not counted
       await waitFor(() => fake.info !== null, 5000, 'room info');
       expect(fake.info).toMatchObject({ name: 'api test', flag: 'ar', maxPlayers: 30, players: 0, password: false });

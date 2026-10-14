@@ -667,10 +667,18 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
       if (fn != null && pendingLink !== null) {
         const link = pendingLink;
         pendingLink = null;
+        // Delivered to whichever handler is current by then: a script that
+        // wraps its handlers right after assigning them (same tick) must
+        // still get the link; a handler cleared in between keeps it pending.
         queueMicrotask(() => {
-          if (stopped || roomLinkHandler !== fn) return;
+          if (stopped) return;
+          const cb = roomLinkHandler;
+          if (cb == null) {
+            pendingLink ??= link;
+            return;
+          }
           try {
-            fn(link);
+            cb(link);
           } catch (err) {
             reportError(err);
           }
