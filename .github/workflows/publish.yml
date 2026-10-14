@@ -1,0 +1,47 @@
+name: Publish
+
+# Publishes the package to GitHub Packages as @<owner>/haxlite when a v* tag is
+# pushed (git tag v0.1.1 && git push --tags). The tag must match package.json.
+# In the repo the package stays "haxlite" (private): the self-imports in
+# examples/tests resolve by that name. Consumers install it with an alias so
+# their code keeps require('haxlite'):
+#   "haxlite": "npm:@<owner>/haxlite@^0.1.0"
+# plus an ~/.npmrc with "@<owner>:registry=https://npm.pkg.github.com" and a
+# classic token with read:packages.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24.x'
+          cache: npm
+          registry-url: https://npm.pkg.github.com
+          scope: '@${{ github.repository_owner }}'
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/')
+        run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - name: Scoped name for GitHub Packages
+        run: |
+          npm pkg set name="@${GITHUB_REPOSITORY_OWNER,,}/haxlite"
+          npm pkg set publishConfig.registry=https://npm.pkg.github.com
+          npm pkg set repository.url="https://github.com/${GITHUB_REPOSITORY}.git"
+          npm pkg delete private
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
