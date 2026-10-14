@@ -211,6 +211,31 @@ function releaseLater<T>(set: Map<T, unknown>, obj: T): void {
   });
 }
 
+/**
+ * {@link releaseLater} for a PeerConnection, which must also give its native
+ * object back. A PeerConnection that libdatachannel closed by itself (ICE or
+ * DTLS failure, remote close) reports `closed` while node-datachannel's
+ * wrapper still owns the `rtc::PeerConnection` — only `close()` or the
+ * wrapper's garbage collection drop it, and the binding no longer lists it,
+ * so `cleanup()`'s own `CloseAll` misses it too. That native holds
+ * libdatachannel's init token, and `cleanup()` waits for every token: it
+ * blocked the event loop for its full 10 s, failed ("cleanup timeout") and
+ * turned the idle release off for good — while whoever holds the wrapper
+ * (a transport lingering before its own close, a test) keeps it from being
+ * collected. `close()` on a closed PeerConnection only drops the native.
+ */
+function releasePcLater(pc: PeerConnection): void {
+  setImmediate(() => {
+    try {
+      pc.close();
+    } catch {
+      /* already destroyed */
+    }
+    livePcs.delete(pc);
+    released();
+  });
+}
+
 export interface PeerConnectionHandlers {
   onStateChange?: (state: string) => void;
   onLocalCandidate?: (candidate: string, mid: string) => void;
@@ -231,7 +256,7 @@ export function createPeerConnection(name: string, config: RtcConfig, h: PeerCon
     const onState = h.onStateChange;
     pc.onStateChange(
       guard((state: string) => {
-        if (state === 'closed') releaseLater(livePcs, pc);
+        if (state === 'closed') releasePcLater(pc);
         onState?.(state);
       }, h.onError),
     );
