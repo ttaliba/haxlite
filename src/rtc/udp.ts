@@ -35,8 +35,16 @@ interface UdpHandle {
 
 type SendReq = { list?: Uint8Array[] };
 
+/**
+ * Bun's `node:dgram` mimics the same state shape (a `handle` with `send` and
+ * `onmessage`) but never calls `handle.onmessage`: taking it over there loses
+ * every incoming datagram. Only Node's real `UDPWrap` gets the direct path.
+ */
+const NODE_UDPWRAP = typeof (process.versions as Record<string, string | undefined>).bun !== 'string';
+
 /** The socket's `UDPWrap` (dgram keeps it in `socket[kStateSymbol].handle`), or null. */
 function handleOf(sock: Socket): UdpHandle | null {
+  if (!NODE_UDPWRAP) return null;
   for (const sym of Object.getOwnPropertySymbols(sock)) {
     if (sym.description !== 'state symbol') continue;
     const state = (sock as unknown as Record<symbol, unknown>)[sym] as { handle?: unknown } | null;
