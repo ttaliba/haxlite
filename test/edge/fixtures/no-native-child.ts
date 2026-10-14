@@ -6,7 +6,8 @@
  *   edge                       an EdgeServer with the defaults (players on haxlite-rtc, tunnel v2)
  *   host <masterUrl> <edgeUrl>  a full room (HBInit) hosted through that edge (UDP tunnel)
  *
- * Talks to the parent over IPC: sends its endpoint/room link, answers 'report'.
+ * Talks to the parent over IPC: sends its endpoint/room link, answers 'report'
+ * (no side effects) and closes and exits on 'stop'.
  */
 import module, { createRequire } from 'node:module';
 
@@ -52,9 +53,8 @@ if (mode === 'edge') {
   });
   send({ url: edge.url(), tunnelPort: edge.tunnelPort, playerPort: edge.playerPort });
   process.on('message', (m) => {
-    if (m !== 'report') return;
-    send(report({ stats: edge.stats() }));
-    void edge.close({ shutdownWebRtc: true }).then(() => process.exit(0));
+    if (m === 'report') send(report({ stats: edge.stats() }));
+    else if (m === 'stop') void edge.close({ shutdownWebRtc: true }).then(() => process.exit(0));
   });
 } else {
   const { HBInit } = await import('../../../src/api/index.js');
@@ -72,8 +72,7 @@ if (mode === 'edge') {
   };
   send({ roomLink: room.haxlite.roomLink });
   process.on('message', (m) => {
-    if (m !== 'report') return;
-    send(report({ edgeStats: room.haxlite.edgeStats(), conn: room.haxlite.getPlayerConnection(1) }));
-    void room.haxlite.stop().then(() => process.exit(0));
+    if (m === 'report') send(report({ edgeStats: room.haxlite.edgeStats(), conn: room.haxlite.getPlayerConnection(1) }));
+    else if (m === 'stop') void room.haxlite.stop().then(() => process.exit(0));
   });
 }

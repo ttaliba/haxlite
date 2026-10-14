@@ -26,20 +26,40 @@ afterAll(async () => {
   await shutdownAll();
 });
 
-function spawnChild(args: string[], key: string, env: Record<string, string> = {}): { proc: ChildProcess; messages: Any[] } {
+interface Child {
+  proc: ChildProcess;
+  messages: Any[];
+  /** `code/signal` once the child has exited (it never should before 'stop'). */
+  exited: string | null;
+}
+
+function spawnChild(args: string[], key: string, env: Record<string, string> = {}): Child {
+  // Type stripping only (src is erasable syntax, tsconfig.build.json): Node 26
+  // no longer has --experimental-transform-types and exits on the bad option.
   const proc = fork(CHILD, args, {
-    execArgv: ['--experimental-transform-types', '--no-warnings', '--import', LOADER],
+    execArgv: ['--experimental-strip-types', '--no-warnings', '--import', LOADER],
     env: { ...process.env, NN_KEY: key, ...env },
     stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
   });
   children.push(proc);
-  const messages: Any[] = [];
-  proc.on('message', (m) => messages.push(m));
-  return { proc, messages };
+  const c: Child = { proc, messages: [], exited: null };
+  proc.on('message', (m) => c.messages.push(m));
+  proc.on('exit', (code, signal) => (c.exited = `${code}/${signal}`));
+  return c;
 }
 
-async function next(c: { messages: Any[] }, pred: (m: Any) => boolean, what: string): Promise<Any> {
-  await waitFor(() => c.messages.some(pred), 30_000, what, 20);
+/** Next IPC message matching `pred`; fails at once if the child dies first. */
+async function next(c: Child, pred: (m: Any) => boolean, what: string): Promise<Any> {
+  await waitFor(
+    () => {
+      if (c.messages.some(pred)) return true;
+      if (c.exited !== null) throw new Error(`${what}: child exited (${c.exited}) before answering`);
+      return false;
+    },
+    20_000,
+    what,
+    20,
+  );
   return c.messages.find(pred);
 }
 
@@ -64,10 +84,14 @@ describe('edge deployment without native addons', () => {
       open.sendChat('hello without addons');
       await next(host, (m) => m.chat === 'hello without addons', 'chat relayed');
 
+      // both reports before either child stops: a host closing its edge session while the
+      // edge's 'report' is still in flight made the edge report no session at all
       host.proc.send('report');
       edge.proc.send('report');
       const hr = await next(host, (m) => m.dlopened !== undefined, 'host report');
       const er = await next(edge, (m) => m.dlopened !== undefined, 'edge report');
+      host.proc.send('stop');
+      edge.proc.send('stop');
       for (const r of [er, hr]) {
         expect(r.dlopened).toEqual([]);
         expect(r.resolved).toEqual([]);
@@ -112,6 +136,7 @@ describe('edge deployment without native addons', () => {
     ws.close();
     edge.proc.send('report');
     const er = await next(edge, (m) => m.dlopened !== undefined, 'edge report');
+    edge.proc.send('stop');
     expect(er.dlopened.some((f: string) => /datachannel/.test(f))).toBe(true);
     expect(er.resolved.length).toBeGreaterThan(0);
     expect(er.stats.playerBackend).toBe('ndc');
