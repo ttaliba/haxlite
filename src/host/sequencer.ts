@@ -33,6 +33,42 @@ import {
   type RoomState,
 } from '../room/index.js';
 
+/**
+ * The world's disc list travels with a `u8` count (World wire form): stadium
+ * discs + one per player in a team can never exceed 255. Past that, every
+ * client serializes a wrapped count and new joiners get a corrupt snapshot,
+ * so the host refuses the event that would cross the limit instead.
+ */
+export const MAX_WORLD_DISCS = 255;
+
+/** Why `ev` must not be sequenced (it would push the world past {@link MAX_WORLD_DISCS}), or null. */
+export function discLimitViolation(rs: RoomState, ev: RoomEvent): string | null {
+  if (ev.type === EventType.SetPlayerTeam) {
+    const gs = rs.gameState;
+    if (gs === null) return null;
+    const e = ev as RoomEvent & { playerId: number; team: number };
+    if (e.team === 0) return null;
+    const p = rs.players.find((x) => x.id === e.playerId);
+    if (p === undefined || p.disc !== null) return null;
+    if (gs.world.discs.length >= MAX_WORLD_DISCS) {
+      return `setPlayerTeam(${e.playerId}): the world already has ${gs.world.discs.length} discs (max ${MAX_WORLD_DISCS} with players)`;
+    }
+    return null;
+  }
+  if (ev.type === EventType.AutoTeams) {
+    const gs = rs.gameState;
+    if (gs !== null && gs.world.discs.length >= MAX_WORLD_DISCS) return `autoTeams: the world already has ${gs.world.discs.length} discs (max ${MAX_WORLD_DISCS})`;
+    return null;
+  }
+  if (ev.type === EventType.StartGame) {
+    if (rs.gameState !== null || rs.stadium === null) return null;
+    let n = rs.stadium.discs.length;
+    for (const p of rs.players) if (p.team !== 0) n++;
+    if (n > MAX_WORLD_DISCS) return `startGame: ${rs.stadium.discs.length} stadium discs + players in teams = ${n} (max ${MAX_WORLD_DISCS})`;
+  }
+  return null;
+}
+
 /** Fixed-size moving average (official `$a`): ring of samples, running sum. */
 export class MovingAverage {
   private readonly samples: Float64Array;
@@ -552,6 +588,11 @@ export class Sequencer {
    * then broadcast on `ru` when any connection exists.
    */
   hostEvent(ev: RoomEvent): void {
+    const tooMany = discLimitViolation(this.rs, ev);
+    if (tooMany !== null) {
+      this.reportError(new Error(tooMany));
+      return;
+    }
     ev.byId = 0;
     ev.clientSeq = 0;
     ev.order = 0;
@@ -623,6 +664,7 @@ export class Sequencer {
     ev.clientSeq = clientSeq;
     ev.byId = client.playerId;
     if (!ev.validate(this.rs)) return null;
+    if (discLimitViolation(this.rs, ev) !== null) return null;
     const hook = this.onBeforeOperation;
     if (hook !== null && hook(ev, client.playerId, requested) === false) return null;
     const variants = this.makeVariants(ev);
