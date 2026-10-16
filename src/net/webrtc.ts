@@ -236,6 +236,32 @@ function releasePcLater(pc: PeerConnection): void {
   });
 }
 
+/**
+ * node-datachannel config plus haxlite's `ipv6` switch (default false).
+ *
+ * Without `ipv6: true` libdatachannel is kept IPv4-only: unless a
+ * `bindAddress` is given its ICE socket is bound to `0.0.0.0`, so libjuice
+ * neither gathers IPv6 host/srflx candidates nor answers or sends checks
+ * over IPv6 (no peer-reflexive IPv6 pair either), and any IPv6 candidate
+ * that still shows up is not trickled. IPv6 headers are 20 bytes larger:
+ * ≈ +19 % egress for HaxBall's small datagrams, and browsers prefer IPv6
+ * pairs when both are offered.
+ */
+export type NdcRtcConfig = RtcConfig & { ipv6?: boolean };
+
+/** The config handed to libdatachannel for `config` (see {@link NdcRtcConfig}). */
+export function nativeRtcConfig(config: NdcRtcConfig): RtcConfig {
+  const { ipv6, ...rest } = config;
+  if (ipv6 === true || rest.bindAddress !== undefined) return rest;
+  return { ...rest, bindAddress: '0.0.0.0' };
+}
+
+/** Whether a candidate line (`candidate:…`, with or without `a=`) has an IPv6 connection address. */
+export function isIpv6Candidate(line: string): boolean {
+  const addr = line.split(' ')[4];
+  return addr !== undefined && addr.indexOf(':') >= 0;
+}
+
 export interface PeerConnectionHandlers {
   onStateChange?: (state: string) => void;
   onLocalCandidate?: (candidate: string, mid: string) => void;
@@ -244,12 +270,12 @@ export interface PeerConnectionHandlers {
 }
 
 /** `new PeerConnection` + guarded callbacks + lifetime tracking. Throws like the constructor. */
-export function createPeerConnection(name: string, config: RtcConfig, h: PeerConnectionHandlers): PeerConnection {
+export function createPeerConnection(name: string, config: NdcRtcConfig, h: PeerConnectionHandlers): PeerConnection {
   if (idleTimer !== null) {
     clearTimeout(idleTimer);
     idleTimer = null;
   }
-  const pc = new (ndc().PeerConnection)(name, config);
+  const pc = new (ndc().PeerConnection)(name, nativeRtcConfig(config));
   createdCount++;
   livePcs.set(pc, name);
   try {
@@ -260,7 +286,11 @@ export function createPeerConnection(name: string, config: RtcConfig, h: PeerCon
         onState?.(state);
       }, h.onError),
     );
-    if (h.onLocalCandidate) pc.onLocalCandidate(guard(h.onLocalCandidate, h.onError));
+    const onCand = h.onLocalCandidate;
+    if (onCand) {
+      const ipv6 = config.ipv6 === true;
+      pc.onLocalCandidate(guard((cand: string, mid: string) => (ipv6 || !isIpv6Candidate(cand) ? onCand(cand, mid) : undefined), h.onError));
+    }
     if (h.onGatheringStateChange) pc.onGatheringStateChange(guard(h.onGatheringStateChange, h.onError));
   } catch (err) {
     closeNative(pc);

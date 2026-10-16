@@ -61,8 +61,21 @@ export interface RtcBackendOptions {
    * and open it in the firewall for production).
    */
   port?: number;
-  /** Bind address (default: the wildcard of each family in `publicAddresses`). */
+  /**
+   * Bind address (default: the wildcard of each family in `publicAddresses`).
+   * `'::'` is the IPv4 wildcard unless {@link ipv6} is on; another IPv6
+   * literal needs {@link ipv6}.
+   */
   address?: string;
+  /**
+   * Use IPv6 (default false): bind a `udp6` socket too when the machine has a
+   * global IPv6 address, announce IPv6 candidates (interface, detected
+   * ICE-lite and explicit `publicAddresses`, STUN srflx) and look up STUN
+   * servers' AAAA records. Off: IPv4 only — IPv6 headers are 20 bytes
+   * larger, ≈ +19 % egress for HaxBall's small datagrams, and browsers
+   * prefer IPv6 pairs when both are offered.
+   */
+  ipv6?: boolean;
   /**
    * IP literals advertised to players as host candidates (instead of the
    * interface addresses). Full ICE: optional (server-reflexive candidates are
@@ -70,7 +83,8 @@ export interface RtcBackendOptions {
    * IP STUN cannot see, or to skip STUN (then `iceServers` defaults to none).
    * ICE-lite: the only addresses ever written in SDP; default every
    * non-internal interface address classified `public`, and the transport
-   * refuses to start when there is none.
+   * refuses to start when there is none. IPv6 entries (given or detected)
+   * are skipped unless {@link ipv6} is on.
    */
   publicAddresses?: readonly string[];
   /**
@@ -122,15 +136,17 @@ export interface RtcBackendOptions {
 
 /**
  * Public addresses of this machine's interfaces (non-internal, `public`
- * class: not RFC 1918/CGNAT/ULA/link-local/loopback).
+ * class: not RFC 1918/CGNAT/ULA/link-local/loopback). IPv4 only unless
+ * `opts.ipv6`.
  */
-export function detectPublicAddresses(): string[] {
+export function detectPublicAddresses(opts: { ipv6?: boolean } = {}): string[] {
   const out: string[] = [];
   const ifs = networkInterfaces();
   for (const name of Object.keys(ifs)) {
     for (const a of ifs[name] ?? []) {
       if (a.internal) continue;
       const addr = a.address.split('%')[0]!;
+      if (opts.ipv6 !== true && isIP(addr) !== 4) continue;
       if (classifyAddress(addr) === 'public' && out.indexOf(addr) < 0) out.push(addr);
     }
   }
@@ -145,13 +161,17 @@ export function resolvePublicAddresses(o: RtcBackendOptions): string[] {
     for (const a of list) {
       if (isIP(a) === 0) throw new Error(`peerBackend 'rtc': publicAddresses must be IP literals (got ${JSON.stringify(a)})`);
     }
-    return list;
+    if (o.ipv6 === true) return list;
+    const v4 = list.filter((a) => isIP(a) === 4);
+    if (v4.length === 0) throw new Error("peerBackend 'rtc': publicAddresses has only IPv6 addresses (set rtc.ipv6: true to use them)");
+    return v4;
   }
-  const found = detectPublicAddresses();
+  const found = detectPublicAddresses({ ipv6: o.ipv6 === true });
   if (found.length === 0) {
     throw new Error(
       "peerBackend 'rtc' with iceLite needs a publicly reachable address: no interface has a public IP, so set " +
         "rtc.publicAddresses (e.g. ['203.0.113.7'], the public IP of a 1:1 NAT with the UDP port forwarded), " +
+        (o.ipv6 === true ? '' : 'or rtc.ipv6: true if the public address is IPv6, ') +
         'or drop iceLite (full ICE works behind NAT)',
     );
   }
@@ -355,6 +375,7 @@ export class RtcPeerBackend implements PeerBackend {
       ...(this.policy !== 'public' ? { candidatePolicy: this.policy } : null),
       ...(o.gatherRefreshMs !== undefined ? { gatherRefreshMs: o.gatherRefreshMs } : null),
       ...(o.address !== undefined ? { address: o.address } : null),
+      ...(o.ipv6 === true ? { ipv6: true } : null),
       ...(o.publicPort !== undefined ? { publicPort: o.publicPort } : null),
       ...(o.certificate !== undefined ? { certificate: o.certificate } : null),
       ...(o.certificateFile !== undefined ? { certificateFile: o.certificateFile } : null),

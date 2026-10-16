@@ -236,8 +236,9 @@ describe('RtcEndpoint ICE-lite', () => {
     expect(await nextMessage(c)).not.toBeNull();
   });
 
-  it.skipIf(!ipv6Available)('IPv6 + IPv4 on the same port', async () => {
-    ep = await RtcEndpoint.listen({ publicAddresses: ['::1', '127.0.0.1'], dataLayer: rawDataLayer });
+  it.skipIf(!ipv6Available)('IPv6 + IPv4 on the same port (ipv6: true)', async () => {
+    ep = await RtcEndpoint.listen({ publicAddresses: ['::1', '127.0.0.1'], ipv6: true, dataLayer: rawDataLayer });
+    expect(ep.boundAddresses.map((b) => b.family).sort()).toEqual([4, 6]);
     const session = ep.createSession(offerSdp(cert.sha256));
     expect(session.answerSdp).toContain(`a=candidate:1 1 udp 2130706431 ::1 ${ep.port} typ host`);
     const c6 = dgram.createSocket({ type: 'udp6', ipv6Only: true });
@@ -249,6 +250,29 @@ describe('RtcEndpoint ICE-lite', () => {
     expect(parseStun(res!, m)).toBe(true);
     expect(readXorAddress(res!, findAttr(m, StunAttr.XorMappedAddress), m.transactionId()).port).toBe(c6.address().port);
     expect(session.remoteAddress?.address).toBe('::1');
+  });
+
+  it('IPv6 is off by default: IPv6 public addresses skipped, no udp6 socket, no IPv6 candidate', async () => {
+    ep = await RtcEndpoint.listen({ publicAddresses: ['::1', '127.0.0.1'], dataLayer: rawDataLayer });
+    expect(ep.boundAddresses).toEqual([{ family: 4, address: '0.0.0.0' }]);
+    expect(ep.localCandidates).toEqual([`candidate:1 1 udp 2130706431 127.0.0.1 ${ep.port} typ host generation 0`]);
+    const session = ep.createSession(offerSdp(cert.sha256));
+    expect(session.answerSdp).not.toMatch(/::1/);
+    expect(session.answerSdp).toContain('c=IN IP4 127.0.0.1');
+    await ep.close();
+    // '::' is the IPv4 wildcard without ipv6
+    ep = await RtcEndpoint.listen({ address: '::', publicAddresses: ['127.0.0.1'], dataLayer: rawDataLayer });
+    expect(ep.boundAddresses).toEqual([{ family: 4, address: '0.0.0.0' }]);
+    await ep.close();
+    // no interface host candidate of the other family either (full ICE, interface addresses)
+    ep = await RtcEndpoint.listen({ address: '::', candidatePolicy: 'all', dataLayer: rawDataLayer });
+    expect(ep.boundAddresses).toEqual([{ family: 4, address: '0.0.0.0' }]);
+    for (const l of ep.localCandidates) expect(l.split(' ')[4]).not.toContain(':');
+  });
+
+  it('IPv6-only settings need ipv6: true', async () => {
+    await expect(RtcEndpoint.listen({ publicAddresses: ['::1'], dataLayer: rawDataLayer })).rejects.toThrow(/ipv6: true/);
+    await expect(RtcEndpoint.listen({ address: '::1', dataLayer: rawDataLayer })).rejects.toThrow(/ipv6: true/);
   });
 
   it('validates options', async () => {

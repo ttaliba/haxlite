@@ -7,6 +7,7 @@
  */
 import dgram, { type Socket } from 'node:dgram';
 import { randomBytes } from 'node:crypto';
+import { lookup as dnsLookup } from 'node:dns';
 import { isIP } from 'node:net';
 import { RtcCertificate } from './cert.js';
 import { buildAnswer, parseOffer } from './sdp.js';
@@ -30,15 +31,33 @@ interface RawBound {
 export interface RtcEndpointOptions {
   /** UDP port (default 0 = ephemeral). With two families both sockets use the same port. */
   port?: number;
-  /** Bind address (default: the wildcard of each family present in {@link publicAddresses}). */
+  /**
+   * Bind address (default: the wildcard of each family present in
+   * {@link publicAddresses}). `'::'` binds both families when {@link ipv6}
+   * is on, only IPv4 (`0.0.0.0`) otherwise; any other IPv6 literal needs
+   * {@link ipv6}.
+   */
   address?: string;
   /**
    * IP literals advertised as host candidates. ICE-lite: required, the only
    * addresses ever written in SDP. Full ICE (default): optional — when set
    * they replace the interface addresses as host candidates; server-reflexive
-   * candidates from {@link iceServers} are added either way.
+   * candidates from {@link iceServers} are added either way. IPv6 entries
+   * are skipped unless {@link ipv6} is on (an all-IPv6 list is then an error).
    */
   publicAddresses?: string[];
+  /**
+   * Use IPv6 (default false): bind a `udp6` socket next to the IPv4 one when
+   * the machine has a global IPv6 address (or for IPv6 {@link publicAddresses}
+   * / {@link address}), announce IPv6 host and server-reflexive candidates
+   * and resolve STUN servers over both families.
+   *
+   * Off by default for bandwidth: an IPv6 header is 20 bytes larger than an
+   * IPv4 one, ≈ +19 % egress for HaxBall's small datagrams, and browsers
+   * prefer IPv6 pairs when both are offered. With it off the endpoint is
+   * IPv4-only: no `udp6` socket, no IPv6 candidates, no AAAA lookups.
+   */
+  ipv6?: boolean;
   /**
    * ICE-lite (the original behaviour): `a=ice-lite`, only host candidates
    * from {@link publicAddresses}, no connectivity checks, no gathering.
@@ -139,6 +158,15 @@ const defaultDataLayer: SctpFactory = (o) => new SctpAssociation(o);
  */
 function literalLookup(address: string, family: unknown, cb: (err: Error | null, address: string, family: number) => void): void {
   cb(null, address, typeof family === 'number' ? family : isIP(address));
+}
+
+/** STUN server name → its IPv4 addresses (the endpoint has no IPv6 socket). */
+function ipv4Lookup(host: string): Promise<{ address: string; family: number }[]> {
+  const fam = isIP(host);
+  if (fam !== 0) return Promise.resolve(fam === 4 ? [{ address: host, family: 4 }] : []);
+  return new Promise((resolve) => {
+    dnsLookup(host, { all: true, family: 4 }, (err, addrs) => resolve(err ? [] : addrs.slice(0, 4)));
+  });
 }
 
 function bindSocket(type: 'udp4' | 'udp6', address: string, port: number, bufSize: number): Promise<Socket> {
@@ -252,6 +280,8 @@ export class RtcEndpoint {
         stunServers: this.iceLite ? [] : stunServers(opts.iceServers),
         policy,
         ...(opts.gatherRefreshMs !== undefined ? { refreshMs: opts.gatherRefreshMs } : null),
+        // no udp6 socket: STUN servers are only resolved to IPv4 (no AAAA lookups)
+        ...(bound.some((b) => b.family === 6) ? null : { lookup: ipv4Lookup }),
       },
     );
     this.host = {
@@ -300,22 +330,33 @@ export class RtcEndpoint {
 
   /** Binds the socket(s). */
   static async listen(opts: RtcEndpointOptions): Promise<RtcEndpoint> {
-    const pubs = opts.publicAddresses;
+    let pubs = opts.publicAddresses;
     const lite = opts.iceLite === true;
+    const ipv6 = opts.ipv6 === true;
     if (pubs !== undefined) {
       if (!Array.isArray(pubs) || pubs.length === 0) throw new Error('RtcEndpoint: publicAddresses is empty');
       for (const a of pubs) if (isIP(a) === 0) throw new Error(`RtcEndpoint: publicAddresses must be IP literals (${a})`);
+      if (!ipv6) {
+        pubs = pubs.filter((a) => isIP(a) === 4);
+        if (pubs.length === 0) throw new Error('RtcEndpoint: publicAddresses has only IPv6 addresses (set ipv6: true to use them)');
+      }
     } else if (lite) {
       throw new Error('RtcEndpoint: publicAddresses is required with iceLite');
     }
-    // families to bind: those of the public addresses, else of the bind address, else IPv4 (+ IPv6 when routable)
+    // '::' without IPv6 is the IPv4 wildcard; another IPv6 literal is a contradiction
+    let address = opts.address;
+    if (address !== undefined && !ipv6 && isIP(address) === 6) {
+      if (address !== '::') throw new Error(`RtcEndpoint: IPv6 bind address ${address} needs ipv6: true`);
+      address = undefined;
+    }
+    // families to bind: those of the public addresses, else of the bind address, else IPv4 (+ IPv6 when enabled and routable)
     let families: Set<number>;
     let optional6 = false;
     if (pubs !== undefined) families = new Set(pubs.map((a) => isIP(a)));
-    else if (opts.address !== undefined) families = new Set(opts.address === '::' ? [6, 4] : [isIP(opts.address)]);
+    else if (address !== undefined) families = new Set(address === '::' ? [6, 4] : [isIP(address)]);
     else {
       families = new Set([4]);
-      if (hasGlobalIpv6()) {
+      if (ipv6 && hasGlobalIpv6()) {
         families.add(6);
         optional6 = true;
       }
@@ -333,17 +374,17 @@ export class RtcEndpoint {
           : RtcCertificate.processDefault();
     certificatePromise.catch(() => {}); // awaited below (unless binding fails first)
     try {
-      if (opts.address !== undefined) {
-        const fam = isIP(opts.address);
-        if (fam === 0) throw new Error(`RtcEndpoint: address must be an IP literal (${opts.address})`);
+      if (address !== undefined) {
+        const fam = isIP(address);
+        if (fam === 0) throw new Error(`RtcEndpoint: address must be an IP literal (${address})`);
         for (const f of families) {
-          if (f !== fam && !(fam === 6 && opts.address === '::')) {
+          if (f !== fam && !(fam === 6 && address === '::')) {
             throw new Error('RtcEndpoint: publicAddresses family does not match the bind address');
           }
         }
-        const sock = await bindSocket(fam === 4 ? 'udp4' : 'udp6', opts.address, port, bufSize);
-        bound.push({ sock, family: fam === 4 ? 4 : 6, bindAddress: opts.address });
-        if (fam === 6 && opts.address === '::' && families.has(4)) {
+        const sock = await bindSocket(fam === 4 ? 'udp4' : 'udp6', address, port, bufSize);
+        bound.push({ sock, family: fam === 4 ? 4 : 6, bindAddress: address });
+        if (fam === 6 && address === '::' && families.has(4)) {
           // '::' explicitly given with IPv4 public addresses: also bind udp4 on the same port
           port = sock.address().port;
           bound.push({ sock: await bindSocket('udp4', '0.0.0.0', port, bufSize), family: 4, bindAddress: '0.0.0.0' });
@@ -371,7 +412,7 @@ export class RtcEndpoint {
       for (const s of bound) s.sock.close();
       throw err;
     }
-    return new RtcEndpoint(opts, bound, port, certificate, dataLayer);
+    return new RtcEndpoint(pubs !== opts.publicAddresses ? { ...opts, publicAddresses: pubs } : opts, bound, port, certificate, dataLayer);
   }
 
   private replaceScratch(size: number): void {

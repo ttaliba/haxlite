@@ -79,7 +79,10 @@ describe("peerBackend: 'rtc' configuration", () => {
     expect(() => new HostTransport({ ...base, peerBackend: 'rtc', rtcEndpoint: { publicAddresses: ['example.com'] } })).toThrow(/IP literals/);
     expect(() => new HostTransport({ ...base, peerBackend: 'rtc', rtcEndpoint: { publicAddresses: [] } })).toThrow(/empty/);
     expect(() => new HostTransport({ ...base, peerBackend: 'bogus' as 'rtc' })).toThrow(/peerBackend/);
-    expect(resolvePublicAddresses({ publicAddresses: ['203.0.113.7', '2001:db8::7'] })).toEqual(['203.0.113.7', '2001:db8::7']);
+    // IPv6 entries only with ipv6: true
+    expect(resolvePublicAddresses({ publicAddresses: ['203.0.113.7', '2001:db8::7'] })).toEqual(['203.0.113.7']);
+    expect(resolvePublicAddresses({ publicAddresses: ['203.0.113.7', '2001:db8::7'], ipv6: true })).toEqual(['203.0.113.7', '2001:db8::7']);
+    expect(() => new HostTransport({ ...base, peerBackend: 'rtc', rtcEndpoint: { publicAddresses: ['2001:db8::7'] } })).toThrow(/ipv6/);
     // without publicAddresses: the machine's public interface addresses, or a clear error
     let detected: string[] | null = null;
     try {
