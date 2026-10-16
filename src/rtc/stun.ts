@@ -47,6 +47,8 @@ export const StunAttr = {
 
 // ---------------------------------------------------------------- CRC-32
 
+// (Bun has zlib.crc32 too. Bun.hash.crc32 gives the same values but is not faster —
+// Bun 1.4, 68 / 548 B: 83 / 111 ns vs zlib.crc32's 80 / 101 ns — so zlib it is everywhere.)
 const zlibCrc32 = (zlib as unknown as { crc32?: (data: Uint8Array, value?: number) => number }).crc32;
 let crcTable: Uint32Array | null = null;
 
