@@ -78,6 +78,8 @@ export interface SessionHost {
    * not validated yet — may be handed to this session ({@link RtcSessionImpl.holdDtls}).
    */
   holdAddress(session: RtcSessionImpl, address: string, port: number): void;
+  /** Undoes {@link holdAddress} (our check to the address failed). */
+  unholdAddress(session: RtcSessionImpl, address: string, port: number): void;
 }
 
 const MAX_VALIDATED = 8;
@@ -87,6 +89,8 @@ const MAX_HELD = 4;
 const MAX_HELD_BYTES = 6144;
 /** Full ICE: unvalidated sources whose DTLS may be held, per session. */
 const MAX_HOLD_ADDRESSES = 16;
+/** Full ICE: a held datagram is dropped after this long (a triggered check fails after ~6 s; most succeed in one RTT). */
+const HOLD_TTL_MS = 5000;
 
 export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
   /** The answer until DTLS connects (the peer had it then), null afterwards: ~0.5 KB less per live session. */
@@ -129,7 +133,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
   /** Full ICE: the latest USE-CANDIDATE from a source our check has not validated yet (nominated once it succeeds). */
   private pendingNomination: { sock: UdpIo; address: string; port: number } | null = null;
   /** Full ICE: DTLS datagrams from sources awaiting our check (null: none). */
-  private held: { sock: UdpIo; address: string; port: number; buf: Buffer }[] | null = null;
+  private held: { sock: UdpIo; address: string; port: number; buf: Buffer; at: number }[] | null = null;
   private heldBytes = 0;
   /** Full ICE: `address|port` keys registered with {@link SessionHost.holdAddress} (the endpoint drops them on unregister). */
   readonly holdKeys: string[] = [];
@@ -267,11 +271,41 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
    */
   holdDtls(msg: Buffer, sock: UdpIo, address: string, port: number): boolean {
     if (this.state === 'closed' || this.agent === null) return false;
+    const now = this.host.now();
+    this.dropHeld(null, 0, now - HOLD_TTL_MS);
     const held = (this.held ??= []);
     if (held.length >= MAX_HELD || this.heldBytes + msg.length > MAX_HELD_BYTES) return false;
-    held.push({ sock, address, port, buf: Buffer.from(msg) });
+    held.push({ sock, address, port, buf: Buffer.from(msg), at: now });
     this.heldBytes += msg.length;
     return true;
+  }
+
+  /**
+   * Drops held datagrams from `sock`/`address`/`port` (sock null: from any
+   * source) or received before `before` (ms, endpoint clock).
+   */
+  private dropHeld(sock: UdpIo | null, port: number, before: number, address = ''): void {
+    const held = this.held;
+    if (held === null) return;
+    for (let i = 0; i < held.length; ) {
+      const h = held[i]!;
+      if (h.at < before || (sock !== null && h.port === port && h.sock === sock && sameIp(h.address, address))) {
+        held.splice(i, 1);
+        this.heldBytes -= h.buf.length;
+      } else i++;
+    }
+    if (held.length === 0) this.held = null;
+  }
+
+  /**
+   * Our check on (sock, address, port) failed: what was held for it will not
+   * be released by a success — free its slots now (they could keep the real
+   * path's ClientHello out), and its hold registration with them.
+   */
+  onCheckFailed(sock: UdpIo, address: string, port: number): void {
+    if (this.state === 'closed') return;
+    this.dropHeld(sock, port, 0, address);
+    this.host.unholdAddress(this, address, port);
   }
 
   /** Our consent check was answered (RFC 7675). */
@@ -353,14 +387,16 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
     if (v === null) {
       v = { session: this, sock, address, port, key: `${address}|${port}` };
       if (this.validated.length >= MAX_VALIDATED) {
-        // keep the nominated one, drop the oldest other
-        const idx = this.validated.findIndex((x) => x !== this.nominated);
+        // drop the oldest one that is neither nominated, the handshake's address nor the data destination
+        const idx = this.validated.findIndex((x) => x !== this.nominated && x !== this.dtlsFrom && x !== this.dest);
         const [old] = this.validated.splice(idx < 0 ? 0 : idx, 1);
         // its 5-tuple must not keep routing DTLS here (nor keep this session reachable after close)
         if (old !== undefined) {
           this.host.unbindAddress(old);
-          this.dropped(old);
+          if (this.dtlsFrom === old) this.dtlsFrom = null;
           if (this.dest === old) this.dest = null;
+          // full ICE: not re-checked by the ordinary loop (that would evict another one in turn), only on a new request
+          if (this.agent !== null) this.agent.park(old.sock, old.address, old.port);
         }
       }
       this.validated.push(v);
@@ -501,6 +537,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
       return;
     }
     const a = this.agent;
+    if (this.held !== null) this.dropHeld(null, 0, now - HOLD_TTL_MS);
     if (a !== null && this.state === 'open') {
       const d = this.nominated ?? this.dest;
       if (d !== null) a.consentTick(now, d.sock, d.address, d.port);

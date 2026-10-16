@@ -14,7 +14,8 @@ import { RtcEndpoint, rawDataLayer, type RtcSession } from '../../src/rtc/index.
 import { formatFingerprint } from '../../src/rtc/sdp.js';
 import { StunMessage, StunType, buildBindingError, buildBindingRequest, buildBindingSuccess, checkFingerprint, checkIntegrity, parseStun } from '../../src/rtc/stun.js';
 import { Gatherer, candidatePriority, classifyIp, formatCandidates, hostAddresses, policyAllows, stunServers } from '../../src/rtc/gather.js';
-import { MAX_PAIRS, _pairPriority } from '../../src/rtc/ice-agent.js';
+import { IceAgent, IceScheduler, MAX_PAIRS, _pairPriority } from '../../src/rtc/ice-agent.js';
+import { parseCandidate } from '../../src/rtc/sdp.js';
 import { clientHelloDatagram, ecClientCert } from './dtls-helpers.js';
 import { FakeStunServer } from './nat-sim.js';
 
@@ -440,6 +441,111 @@ describe('RtcEndpoint full ICE (controlled agent)', () => {
     expect(s.remoteAddress).toEqual({ address: '127.0.0.1', port: spoofed.port });
   });
 
+  it('held DTLS from an address whose check fails is released (slots and hold registration); holds also expire', async () => {
+    const e = await setup();
+    const s = e.createSession(offerSdp());
+    const creds = answerCreds(s.answerSdp);
+    const victim = await client(); // never answers our checks
+    victim.s.send(
+      buildBindingRequest({ txid: randomBytes(12), username: `${creds.ufrag}:${CLIENT_UFRAG}`, key: Buffer.from(creds.pwd), priority: 1845501695 }),
+      e.port,
+      '127.0.0.1',
+    );
+    await sleep(50);
+    victim.s.send(clientHelloDatagram().datagram, e.port, '127.0.0.1');
+    await sleep(50);
+    const impl = s as unknown as { held: unknown[] | null; holdKeys: string[]; holdDtls(m: Buffer, sock: unknown, a: string, p: number): boolean; checkTimers(now: number, h: number, i: number): void };
+    const holds = (e as unknown as { holds: Map<string, unknown> }).holds;
+    expect(e.stats().dtlsHeld).toBe(1);
+    expect(impl.held?.length).toBe(1);
+    expect(impl.holdKeys).toEqual([`127.0.0.1|${victim.port}`]);
+    await sleep(6500); // 0, 200, 600, 1400, 3000 → failed at 6.2 s
+    expect(e.stats().ice.checksFailed).toBe(1);
+    expect(impl.held).toBeNull();
+    expect(impl.holdKeys).toEqual([]);
+    expect(holds.size).toBe(0);
+    // expiry: a datagram held longer than a few seconds is dropped by the sweep, and frees its slot
+    const sock = (e as unknown as { ios: unknown[] }).ios[0];
+    for (let i = 0; i < 4; i++) expect(impl.holdDtls(Buffer.alloc(100, 22), sock, '127.0.0.1', 40000 + i)).toBe(true);
+    expect(impl.holdDtls(Buffer.alloc(100, 22), sock, '127.0.0.1', 40010)).toBe(false); // full
+    impl.checkTimers(Date.now() + 5500, 1e9, 1e9);
+    expect(impl.held).toBeNull();
+    expect(impl.holdDtls(Buffer.alloc(100, 22), sock, '127.0.0.1', 40010)).toBe(true);
+    s.close();
+  }, 15_000);
+
+  it('evicting a validated address for capacity: no re-check churn, and never the handshake address', async () => {
+    const e = await setup();
+    // clients that answer every check of ours
+    const responders = await Promise.all(Array.from({ length: 11 }, () => client()));
+    const checksTo = new Map<number, number>();
+    for (const r of responders) {
+      r.s.on('message', (buf) => {
+        if (buf[0]! >= 4) return;
+        const m = parse(buf);
+        if (m.type !== StunType.BindingRequest) return;
+        checksTo.set(r.port, (checksTo.get(r.port) ?? 0) + 1);
+        r.s.send(buildBindingSuccess(m.transactionId(), '127.0.0.1', e.port, Buffer.from(CLIENT_PWD)), e.port, '127.0.0.1');
+      });
+    }
+    const [a, ...rest] = responders;
+    const s = e.createSession(offerSdp([cand('127.0.0.1', a!.port)]));
+    await sleep(100);
+    expect(s.remoteAddress).toEqual({ address: '127.0.0.1', port: a!.port });
+    // the handshake starts from `a`: it is the address of the flights
+    a!.s.send(clientHelloDatagram().datagram, e.port, '127.0.0.1');
+    await sleep(50);
+    const impl = s as unknown as { validated: { port: number }[]; dtlsFrom: { port: number } | null };
+    expect(impl.dtlsFrom?.port).toBe(a!.port);
+    // ten more validated addresses: two evictions (cap 8), never `a`
+    for (const r of rest) s.addRemoteCandidate(cand('127.0.0.1', r.port));
+    await sleep(1500);
+    expect(e.stats().ice.checksSucceeded).toBe(11);
+    expect(impl.validated.length).toBe(8);
+    expect(impl.validated.some((v) => v.port === a!.port)).toBe(true);
+    expect(impl.dtlsFrom?.port).toBe(a!.port);
+    // each address was checked once: the evicted ones are not re-checked by the ordinary loop
+    for (const r of responders) expect(checksTo.get(r.port)).toBe(1);
+    // ...but a new request from an evicted one triggers a check (and validates it again)
+    const creds = answerCreds(s.answerSdp);
+    const evicted = rest.find((r) => !impl.validated.some((v) => v.port === r.port))!;
+    expect(evicted).toBeDefined();
+    evicted.s.send(
+      buildBindingRequest({ txid: randomBytes(12), username: `${creds.ufrag}:${CLIENT_UFRAG}`, key: Buffer.from(creds.pwd), priority: 1845501695 }),
+      e.port,
+      '127.0.0.1',
+    );
+    await sleep(150);
+    expect(checksTo.get(evicted.port)).toBe(2);
+    expect(impl.validated.some((v) => v.port === evicted.port)).toBe(true);
+    expect(impl.dtlsFrom?.port).toBe(a!.port);
+    s.close();
+  });
+
+  it('a request from a new address when the check list is full still gets a check (peer-reflexive replaces a waiting pair)', async () => {
+    const e = await setup();
+    const dead = await Promise.all(Array.from({ length: MAX_PAIRS }, () => client()));
+    const s = e.createSession(offerSdp(dead.map((x) => cand('127.0.0.1', x.port))));
+    const creds = answerCreds(s.answerSdp);
+    const real = await client();
+    real.s.send(
+      buildBindingRequest({ txid: randomBytes(12), username: `${creds.ufrag}:${CLIENT_UFRAG}`, key: Buffer.from(creds.pwd), priority: 1845501695, useCandidate: true }),
+      e.port,
+      '127.0.0.1',
+    );
+    expect(parse((await real.box.next())!.buf).type).toBe(StunType.BindingSuccess);
+    const check = await real.box.next(500);
+    expect(check).not.toBeNull();
+    const m = expectCheck(check!.buf, creds.ufrag);
+    const agent = (s as unknown as { agent: IceAgent }).agent;
+    expect(agent.describe().length).toBe(MAX_PAIRS);
+    expect(agent.describe().some((p) => p.port === real.port)).toBe(true);
+    real.s.send(buildBindingSuccess(m.transactionId(), '127.0.0.1', e.port, Buffer.from(CLIENT_PWD)), e.port, '127.0.0.1');
+    await sleep(50);
+    expect(s.remoteAddress).toEqual({ address: '127.0.0.1', port: real.port }); // validated and nominated
+    s.close();
+  });
+
   it('ICE-lite sends no checks at all', async () => {
     const e = await setup({ iceLite: true });
     const c = await client();
@@ -568,5 +674,114 @@ describe('RtcEndpoint full ICE (controlled agent)', () => {
     expect(s1.gatheringComplete).toBe(true);
     // the lost reply keeps the previous srflx
     expect(e.createSession(offerSdp()).answerSdp).toContain(srflx);
+  });
+});
+
+describe('IceAgent (manual clock)', () => {
+  const CHECK_TIMEOUT = 6200;
+  function harness() {
+    let t = 1_000_000;
+    const sock = { tag: 'sock' } as unknown as UdpIo;
+    const sent: { address: string; port: number; buf: Buffer }[] = [];
+    const sched = new IceScheduler({
+      send: (_s, buf, address, port) => sent.push({ address, port, buf: Buffer.from(buf) }),
+      now: () => t,
+      sockets: [{ sock, family: 4, bindAddress: '0.0.0.0' }],
+      policy: 'public',
+    });
+    const failed: number[] = [];
+    const agent = new IceAgent(sched, {
+      localUfrag: 'ours',
+      remoteUfrag: CLIENT_UFRAG,
+      remoteKey: Buffer.from(CLIENT_PWD),
+      onCheckSucceeded() {},
+      onConsent() {},
+      onCheckFailed(_s, _a, port) {
+        failed.push(port);
+      },
+    });
+    const run = (ms: number) => {
+      for (let i = 0; i < ms; i += 20) {
+        t += 20;
+        agent.tick(t);
+      }
+    };
+    return { sock, sent, sched, agent, failed, run, now: () => t };
+  }
+
+  it('full check list: a peer-reflexive address replaces a failed signaled pair, never an in-progress one', () => {
+    const h = harness();
+    try {
+      for (let i = 0; i < MAX_PAIRS; i++) h.agent.addRemote(parseCandidate(cand(`198.51.100.${i + 1}`, 5000))!);
+      h.run(400); // all 16 checks in progress
+      expect(h.agent.describe().every((p) => p.state === 'in-progress')).toBe(true);
+      h.agent.onRequest(h.sock, '203.0.113.9', 6000, 1845501695);
+      expect(h.agent.describe().some((p) => p.port === 6000)).toBe(false); // nothing replaceable
+      h.run(CHECK_TIMEOUT + 200);
+      expect(h.agent.describe().every((p) => p.state === 'failed')).toBe(true);
+      expect(h.failed.length).toBe(MAX_PAIRS); // the owner is told of every failure
+      h.sent.length = 0;
+      h.agent.onRequest(h.sock, '203.0.113.9', 6000, 1845501695);
+      const pairs = h.agent.describe();
+      expect(pairs.length).toBe(MAX_PAIRS);
+      expect(pairs.some((p) => p.address === '198.51.100.16')).toBe(false); // the lowest-priority failed one went
+      h.run(40);
+      expect(h.sent.map((x) => x.port)).toEqual([6000]); // triggered check to the new address
+    } finally {
+      h.agent.close();
+      h.sched.close();
+    }
+  });
+
+  it('a parked (capacity-evicted) pair is not re-checked by the ordinary loop, only after a request', () => {
+    const h = harness();
+    try {
+      h.agent.addRemote(parseCandidate(cand('198.51.100.1', 5000))!);
+      h.run(40);
+      expect(h.sent.length).toBe(1);
+      const m = parse(h.sent[0]!.buf);
+      // a symmetric authenticated success
+      h.sched.onResponse(parse(buildBindingSuccess(m.transactionId(), '192.0.2.1', 3478, Buffer.from(CLIENT_PWD))), h.sock, '198.51.100.1', 5000);
+      expect(h.agent.describe()[0]!.state).toBe('succeeded');
+      h.agent.park(h.sock, '198.51.100.1', 5000);
+      h.sent.length = 0;
+      h.run(1000);
+      expect(h.sent.length).toBe(0);
+      h.agent.onRequest(h.sock, '198.51.100.1', 5000, 1845501695);
+      h.run(40);
+      expect(h.sent.length).toBe(1);
+    } finally {
+      h.agent.close();
+      h.sched.close();
+    }
+  });
+
+  it('after connecting, triggered checks use a refilling allowance (the lifetime budget no longer blocks rebindings)', () => {
+    const h = harness();
+    try {
+      (h.agent as unknown as { sentTotal: number }).sentTotal = 1000; // pre-connection budget long spent
+      h.agent.connected(h.now());
+      // a NAT rebinding: a request from a new address must be checked
+      h.agent.onRequest(h.sock, '203.0.113.50', 7000, 1845501695);
+      h.run(40);
+      expect(h.sent.map((x) => x.port)).toEqual([7000]);
+      // a flood of new sources is rate-limited: burst 10, then ~4 transmissions per second
+      for (let i = 0; i < 40; i++) h.agent.onRequest(h.sock, `203.0.113.${100 + i}`, 7000, 1845501695);
+      h.run(1000);
+      expect(h.sent.length).toBeGreaterThan(10);
+      expect(h.sent.length).toBeLessThanOrEqual(10 + 4 + 1);
+      h.run(5000);
+      expect(h.sent.length).toBeLessThanOrEqual(10 + 4 * 6 + 1);
+      expect(h.sent.length).toBeGreaterThan(20);
+      // once those checks are over and the allowance refilled, a later rebinding is checked at once again
+      h.run(40000);
+      h.sent.length = 0;
+      h.agent.onRequest(h.sock, '203.0.113.51', 7001, 1845501695);
+      h.run(20);
+      expect(h.sent.some((x) => x.port === 7001)).toBe(true);
+    } finally {
+      h.agent.close();
+      h.sched.close();
+    }
   });
 });

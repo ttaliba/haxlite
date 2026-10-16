@@ -194,9 +194,13 @@ describe('RtcEndpoint ICE-lite', () => {
     }
     const demux = (ep as unknown as { byAddress: Map<string, Map<number, unknown>> }).byAddress;
     expect(demux.get('127.0.0.1')?.size).toBe(8);
-    // DTLS from the first (evicted) port is no longer routed to the session
+    // the first port is the data destination (never evicted); the next one went first
+    expect(session.remoteAddress?.port).toBe(clients[0]!.address().port);
+    expect(demux.get('127.0.0.1')?.has(clients[0]!.address().port)).toBe(true);
+    expect(demux.get('127.0.0.1')?.has(clients[1]!.address().port)).toBe(false);
+    // DTLS from an evicted port is no longer routed to the session
     const before = ep.stats().dtlsUnknownSource;
-    clients[0]!.send(Buffer.from('16fefd000000000000000000000000', 'hex'), ep.port, '127.0.0.1');
+    clients[1]!.send(Buffer.from('16fefd000000000000000000000000', 'hex'), ep.port, '127.0.0.1');
     await sleep(50);
     expect(ep.stats().dtlsUnknownSource).toBe(before + 1);
     session.close();
