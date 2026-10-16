@@ -236,6 +236,8 @@ export class Sequencer {
 
   private depth = 0;
   private readonly out = new Writer(256);
+  /** Join snapshot body, kept between joins (created on the first one; grows to the largest snapshot). */
+  private snapWriter: Writer | null = null;
 
   constructor(rs: RoomState, sink: SequencerSink, opts: SequencerOptions = {}) {
     this.rs = rs;
@@ -732,10 +734,11 @@ export class Sequencer {
   /**
    * Join snapshot, message 1 (official `Wa.$h`): `[1] deflateRaw(u16 playerId,
    * u32 frame, u32 eventCounter, varuint eventsInFrame, RoomState, EventFrame*)`
-   * with every queued future event. Returns a fresh array.
+   * with every queued future event. Returns a fresh array (the uncompressed
+   * body is written into a writer reused across joins).
    */
   snapshot(playerId: number): Uint8Array {
-    const inner = new Writer(2048);
+    const inner = (this.snapWriter ??= new Writer(2048)).reset();
     inner.u16(playerId);
     inner.u32(this.frame);
     inner.u32(this.eventCounter);
