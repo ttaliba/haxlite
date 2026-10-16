@@ -7,7 +7,7 @@
 import { createHash, createHmac } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { RtcCertificate } from '../../src/rtc/cert.js';
-import { RecordCipher, ReplayWindow, SUITES, defaultSuites, hasNativeChaCha, prf } from '../../src/rtc/dtls/crypto.js';
+import { RecordCipher, ReplayWindow, SUITES, defaultSuites, hasNativeChaCha, prf, resolveSuites } from '../../src/rtc/dtls/crypto.js';
 import { DtlsServer } from '../../src/rtc/dtls/server.js';
 import {
   clientHelloDatagram,
@@ -102,11 +102,12 @@ describe('DTLS primitives', () => {
     expect(typeof hasNativeChaCha()).toBe('boolean');
   });
 
-  it('default suite order: ChaCha20-Poly1305 first on Node, AES-128-GCM first on Bun', () => {
+  it('default suite order: ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM on Node and Bun', () => {
     expect(defaultSuites(false)).toEqual([0xcca9, 0xc02b, 0xc02c]);
-    expect(defaultSuites(true)).toEqual([0xc02b, 0xcca9, 0xc02c]);
-    expect(defaultSuites()).toEqual(defaultSuites('bun' in process.versions));
-    for (const id of defaultSuites(true)) expect(SUITES.some((s) => s.id === id)).toBe(true);
+    expect(defaultSuites(true)).toEqual([0xcca9, 0xc02b, 0xc02c]);
+    expect(defaultSuites()).toEqual([0xcca9, 0xc02b, 0xc02c]);
+    for (const id of defaultSuites()) expect(SUITES.some((s) => s.id === id)).toBe(true);
+    expect(resolveSuites(['aes128gcm', 'chacha20', 'aes256gcm'])).toEqual([0xc02b, 0xcca9, 0xc02c]);
   });
 
   it('self-signed certificate is valid X.509 (openssl-compatible, verifies itself)', () => {
@@ -315,12 +316,16 @@ describe('DTLS ClientHello handling and negotiation (hand-built ClientHello)', (
     s.close();
   });
 
-  it('default suite preference picks ChaCha20-Poly1305 on Node; an explicit list overrides it', () => {
+  it('default suite preference picks ChaCha20-Poly1305 (Node and Bun); an explicit list overrides it', () => {
     const offer = { suites: [0xc02b, 0xc02c, 0xcca9] }; // browser-like order: the server's preference decides
     const a = server();
     a.s.handleDatagram(clientHelloDatagram(offer).datagram, 'p');
-    expect(a.s.suite?.id).toBe(defaultSuites()[0]);
+    expect(a.s.suite?.id).toBe(0xcca9);
     a.s.close();
+    const aes = server({ suites: resolveSuites(['aes128gcm', 'chacha20', 'aes256gcm']) }); // cipherSuites: AES first
+    aes.s.handleDatagram(clientHelloDatagram(offer).datagram, 'p');
+    expect(aes.s.suite?.id).toBe(0xc02b);
+    aes.s.close();
     const b = server({ suites: [0xc02c, 0xcca9] });
     b.s.handleDatagram(clientHelloDatagram(offer).datagram, 'p');
     expect(b.s.suite?.id).toBe(0xc02c);

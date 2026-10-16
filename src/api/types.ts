@@ -316,7 +316,7 @@ export interface HaxliteConfig {
    * Rooms of one process with the same settings share one endpoint / UDP
    * socket (`shared: false` for a socket per room); `certificateFile` keeps
    * the DTLS identity on disk; `cipherSuites` sets the DTLS preference
-   * (default ChaCha20-Poly1305 first on Node, AES-128-GCM first on Bun). See docs/10.
+   * (default ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM on Node and Bun). See docs/10.
    */
   rtc?: RtcBackendOptions | null;
 }

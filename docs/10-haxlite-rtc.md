@@ -54,7 +54,7 @@ oficial (`ro` id 0 fiable y ordenado, `ru` id 1 fiable y desordenado, `uu` id 2 
 | SDP (`sdp.ts`) | Lee la oferta, escribe la respuesta | `a=setup:passive`, los candidatos del endpoint (host + srflx; con `iceLite`, `a=ice-lite` y solo `host` de `publicAddresses`), `a=end-of-candidates` si la recolección terminó, `a=max-message-size:262144` |
 | Recolección (`gather.ts`) | Candidatos locales, por endpoint | `host`: direcciones de las interfaces del socket filtradas por la política (o `publicAddresses` tal cual); `srflx`: Binding STUN a cada `iceServers` desde el socket compartido, con `raddr 0.0.0.0 rport 0`. Solo IPv4 salvo `ipv6: true`. Resultado cacheado y refrescado en segundo plano cada `gatherRefreshMs` (60 s); solo las sesiones creadas durante la **primera** ronda reciben el resto por trickle (§2.1) |
 | ICE (`stun.ts`, `session.ts`, `ice-agent.ts`) | Responde Binding requests **y envía las suyas** | USERNAME `nuestroUfrag:suyoUfrag`, MESSAGE‑INTEGRITY (HMAC‑SHA1) y FINGERPRINT obligatorios, rol *controlling* del navegador. Cada origen autenticado queda *validado* (y es un candidato prflx con *triggered check*); USE‑CANDIDATE nomina. Checks propios a cada candidato remoto (oferta + trickle) con ICE‑CONTROLLED, validación simétrica, retransmisión acotada. Consentimiento: checks propios cada 5 s ± 20 % (RFC 7675) además de los del navegador; sin ninguno respondido/recibido en `idleTimeoutMs` (30 s) se cierra. Cambio de NAT solo con un Binding autenticado nuevo |
-| DTLS 1.2 (`dtls/`) | Servidor DTLS (RFC 6347) | HelloVerifyRequest según el modo (`helloVerify`): con ICE completo no, el primer ClientHello recibe el flight 4 (el demux solo entrega DTLS desde direcciones que respondieron a un check nuestro, y los flights solo van ahí); con ICE‑lite sí, por defecto (§6.7); preferencia por runtime: en Node `ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (AEAD en JS puro, sin asignaciones, cifra/descifra en el sitio: `dtls/chacha.ts`, §6.4), luego AES_128_GCM y AES_256_GCM (`node:crypto`); en Bun AES_128_GCM primero; configurable con `cipherSuites`; x25519 / P‑256; *extended master secret* obligatorio; certificado del cliente obligatorio y comparado (tiempo constante) con el `a=fingerprint` de la oferta; CertificateVerify comprobado; ventana anti‑replay de 64; retransmisión 1 s → 8 s; fragmentación y reensamblado; `close_notify`. Un Chromium que ofrece DTLS 1.3 recibe un ServerHello 1.2 y conecta |
+| DTLS 1.2 (`dtls/`) | Servidor DTLS (RFC 6347) | HelloVerifyRequest según el modo (`helloVerify`): con ICE completo no, el primer ClientHello recibe el flight 4 (el demux solo entrega DTLS desde direcciones que respondieron a un check nuestro, y los flights solo van ahí); con ICE‑lite sí, por defecto (§6.7); preferencia (igual en Node y Bun): `ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (AEAD en JS puro, sin asignaciones, cifra/descifra en el sitio: `dtls/chacha.ts`, §6.4), luego AES_128_GCM y AES_256_GCM (`node:crypto`); configurable con `cipherSuites`; x25519 / P‑256; *extended master secret* obligatorio; certificado del cliente obligatorio y comparado (tiempo constante) con el `a=fingerprint` de la oferta; CertificateVerify comprobado; ventana anti‑replay de 64; retransmisión 1 s → 8 s; fragmentación y reensamblado; `close_notify`. Un Chromium que ofrece DTLS 1.3 recibe un ServerHello 1.2 y conecta |
 | SCTP (`sctp/association.ts`) | Asociación SCTP sobre DTLS | RFC 9260, PR‑SCTP (RFC 3758) para `uu`, *stream reset* (RFC 6525) para cerrar canales, *zero checksum* (RFC 9653). Cookie de estado HMAC (INIT sin estado). Sin Nagle: un `send` sale en el acto si las ventanas lo permiten; los envíos hechos dentro de `onMessage` se agrupan en un paquete junto con el SACK. Un solo temporizador por asociación. Ruta caliente sin asignaciones (arena FIFO de bytes, anillos tipados indexados por TSN); `input` nunca lanza |
 | Certificado (`cert.ts`) | ECDSA P‑256 autofirmado | Codificador DER mínimo |
 
@@ -227,7 +227,7 @@ new HostTransport({ token, peerBackend: 'rtc', rtcEndpoint: { port: 40000, publi
 | `certificateFile` | — | PEM (certificado + clave, modo 0600) donde guardar/cargar la identidad DTLS: huella estable entre reinicios y sin generar claves al arrancar (`RtcCertificate.loadOrCreate`, E/S síncrona, escritura atómica vía `.tmp` + rename) |
 | `shared` | `true` | todas las salas del proceso con la misma configuración (puerto —también 0—, direcciones, `ipv6`, certificado, tiempos, suites) comparten **un** endpoint y un socket UDP (refcontado, `src/rtc/shared.ts`); `false` = endpoint propio |
 | `helloVerify` | `false` con ICE completo, `true` con `iceLite` | intercambio de cookie DTLS (HelloVerifyRequest) antes del flight 4 (~1 KB): un RTT más por entrada. Con ICE‑lite no mandamos checks y nada prueba la dirección de origen (§6.7) |
-| `cipherSuites` | Node: `['chacha20', 'aes128gcm', 'aes256gcm']`; Bun: `['aes128gcm', 'chacha20', 'aes256gcm']` | preferencia DTLS del servidor (nombres IANA, ids o cortos); un cliente sin la primera negocia la siguiente. En Bun, sin ChaCha20 nativo en `node:crypto`, el AES‑GCM nativo es más barato que la ChaCha20 en JS (§6.7) |
+| `cipherSuites` | `['chacha20', 'aes128gcm', 'aes256gcm']` (Node y Bun) | preferencia DTLS del servidor (nombres IANA, ids o cortos); un cliente sin la primera negocia la siguiente. En Bun el AES‑GCM nativo gana la micro‑medida por registro pero pierde de extremo a extremo (§6.7) |
 | `sendBatchFrames` | `0` | `1` o `2`: retiene los mensajes de `ru` (difusión de eventos de cliente) por jugador hasta la siguiente frontera de la rejilla de 60 Hz del proceso múltiplo de n; menos datagramas a cambio de n × 8,3 ms de media (máx. n × 16,7 ms) en las entradas ajenas (§6.7). Por sala, también con endpoint compartido |
 | `endpoint` | — | un `RtcEndpoint` ya abierto (el backend no lo cierra) |
 
@@ -886,16 +886,28 @@ ClientHello retransmitido solo retransmite el flight 4 tal cual (como mucho uno 
 cookie no pedido se ignora.
 Interop: Chrome real (loopback4, lossy, dtls13), libdatachannel y OpenSSL sin fallos nuevos.
 
-**Suites por runtime** (`defaultSuites` en `dtls/crypto.ts`; `cipherSuites` sigue mandando):
+**Suites: ChaCha20‑Poly1305 primero también en Bun** (`defaultSuites` en `dtls/crypto.ts`, mismo
+orden en los dos runtimes: ChaCha20‑Poly1305, AES‑128‑GCM, AES‑256‑GCM; `cipherSuites` sigue
+mandando). En la micro‑medida por registro Bun favorece AES‑128‑GCM (sellar + abrir 300 B: 2,95 µs
+frente a 10,2 µs de la ChaCha JS), y durante un tiempo fue el primero en Bun. De extremo a extremo
+pierde: partida N = 10, Linux (Debian 12, 4 vCPU), 3 repeticiones, monitor de lag del arnés apagado,
+Bun 1.4.0 frente a Node 26.8.1:
 
-| runtime | orden por defecto | sellar + abrir 300 B |
-|---|---|---|
-| Node | ChaCha20‑Poly1305, AES‑128‑GCM, AES‑256‑GCM | ChaCha JS más barata (tabla de §6.4) |
-| Bun | AES‑128‑GCM, ChaCha20‑Poly1305, AES‑256‑GCM | AES‑128‑GCM 2,95 µs frente a 10,2 µs de la ChaCha JS |
+| variante | CPU | RSS | UDP B/s por jugador |
+|---|---|---|---|
+| Bun, AES‑128‑GCM primero | 2,96 % | 64 MB | 5635 |
+| Bun, ChaCha20‑Poly1305 primero | 2,45 % | 64 MB | 5150 |
+| Node 26 (ChaCha20‑Poly1305) | 2,42 % | 76 MB | 5140 |
+
+Por hilo: con AES el hilo principal gasta 2,4–2,5 % y el *scavenger* de mimalloc (`mi-scavenger`)
+0,40–0,45 %; con ChaCha, 1,95–2,2 % y 0,2 %. AES‑GCM crea un objeto de cifrado nativo
+(`createCipheriv`) por registro: esa basura no aparece en la micro‑medida pero mantiene ocupado al
+*scavenger* de Bun; la ChaCha JS cifra en el sitio sin asignar. Además AES‑GCM lleva un nonce
+explícito de 8 B por registro (≈ 9 % más bytes). Resultado: ≈ 17 % menos CPU con ChaCha, a la par
+con Node. Lo mismo vale para el túnel UDP del edge (`tunnelAead: 'auto'`, docs/09 §1.3).
 
 Bun no tiene `chacha20-poly1305` en `node:crypto`: `chacha: 'node'` (opción de `DtlsServer`) cae a la
-AEAD en JS en vez de lanzar «Unknown cipher». Con AES‑GCM se acepta el nonce explícito de 8 B por
-registro a cambio de CPU.
+AEAD en JS en vez de lanzar «Unknown cipher».
 
 **Claves como `KeyObject`**: `createHmac`/`createCipheriv` con una clave `Buffer` la importan en cada
 llamada. Ahora se crean una vez con `createSecretKey` las claves MESSAGE‑INTEGRITY de STUN (local y

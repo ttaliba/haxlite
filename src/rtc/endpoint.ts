@@ -102,10 +102,10 @@ export interface RtcEndpointOptions {
   /**
    * DTLS cipher suites in server preference order, as IANA names, ids or
    * `'chacha20'` / `'aes128gcm'` / `'aes256gcm'`. Default (`defaultSuites` in
-   * dtls/crypto.ts): on Node ChaCha20-Poly1305 first (allocation-free JS
-   * AEAD), then AES-128-GCM, AES-256-GCM; on Bun AES-128-GCM first (Bun's
-   * native AES-GCM is cheaper than the JS ChaCha20), then ChaCha20-Poly1305,
-   * AES-256-GCM. A browser without the first suite gets the next one.
+   * dtls/crypto.ts), on Node and Bun: ChaCha20-Poly1305 first (allocation-free
+   * JS AEAD; on Bun too, end to end, despite AES-GCM's cheaper micro-benchmark),
+   * then AES-128-GCM, AES-256-GCM. A browser without the first suite gets the
+   * next one.
    */
   cipherSuites?: readonly (number | string)[];
   /**
