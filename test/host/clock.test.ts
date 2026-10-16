@@ -303,6 +303,21 @@ describe('shared host clock', () => {
     expect((hostClock as Any).timer).toBeNull();
   });
 
+  it('heartbeatFrames / checksumIntervalFrames: integers in range (option and setter)', () => {
+    const f = fakeTransport();
+    const mk = (o: Partial<HostRoomOptions>) => new HostRoom({ transport: f.transport, state: createHostRoomState({ noPlayer: true }), now: () => 0, ...o });
+    for (const v of [0, -1, 1.5, NaN, Infinity, 601]) expect(() => mk({ heartbeatFrames: v })).toThrow(RangeError);
+    for (const v of [0, 0.5, NaN, Infinity, 2 ** 20 + 1]) expect(() => mk({ checksumIntervalFrames: v })).toThrow(RangeError);
+    const host = mk({ heartbeatFrames: 600, checksumIntervalFrames: 1 });
+    for (const v of [0, 2.5, Infinity, 601]) expect(() => (host.heartbeatFrames = v)).toThrow(RangeError);
+    expect(() => (host.checksumIntervalFrames = 0)).toThrow(RangeError);
+    expect(host.heartbeatFrames).toBe(600);
+    expect(host.checksumIntervalFrames).toBe(1);
+    host.heartbeatFrames = 1;
+    host.checksumIntervalFrames = 2 ** 20;
+    expect([host.heartbeatFrames, host.checksumIntervalFrames]).toEqual([1, 2 ** 20]);
+  });
+
   it('Ping event every pingIntervalMs while clients are connected', async () => {
     const { host, sent, join } = makeRoom({ pingIntervalMs: 100 });
     join('a');
