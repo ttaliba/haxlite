@@ -184,6 +184,11 @@ describe('handshake and identity', () => {
     expect(peer.srflxIps).toEqual(['192.0.2.77']);
     expect(peer.ips).toEqual(['127.0.0.1', '192.0.2.77']);
     await c.whenOpen();
+    // negotiation state released once the answer went out (per-peer memory)
+    expect(peer.localSdp).toBeNull();
+    expect(peer.localCandidates).toEqual([]);
+    expect(peer.mids).toEqual(['0']);
+    expect(c.answerSdp).toContain('a=fingerprint:');
 
     const got: [number, number[]][] = [];
     const three = new Promise<void>((resolve) => {

@@ -98,6 +98,9 @@ export type PeerCloseReason =
   /** Transport stopped or signaling lost during negotiation. */
   | 'shutdown';
 
+/** `mids` of an offer with one m-section whose mid is `0` (every HaxBall client): shared by all peers. */
+const SINGLE_MID: readonly string[] = Object.freeze(['0']);
+
 /** A client connection. Fields are read-only for the host except `playerId`/`userData`. */
 export class Peer {
   /** Master-assigned negotiation id (u32), unique per signaling session. */
@@ -145,12 +148,12 @@ export class Peer {
   /** @internal */ answerSent = false;
   /** @internal */ gatheringDone = false;
   /** @internal one-shot timer: answer ICE wait, then challenge delay */ timer: NodeJS.Timeout | null = null;
-  /** @internal */ localSdp: string | null = null;
-  /** @internal */ readonly localCandidates: IceCandidateInit[] = [];
+  /** @internal answer SDP until it is sent (then released) */ localSdp: string | null = null;
+  /** @internal candidates for the answer (emptied once it is sent) */ readonly localCandidates: IceCandidateInit[] = [];
   /** @internal candidates received while 'validating' */ queuedRemote: IceCandidateInit[] = [];
   /** @internal when a deferred close started (see CLOSE_LINGER_MS) */ closedAt = 0;
   /** @internal remote candidates accepted so far (capped by MAX_REMOTE_CANDIDATES) */ remoteCandidates = 0;
-  /** @internal */ mids: string[] = [];
+  /** @internal mids of the offer's m-sections (usually the shared {@link SINGLE_MID}) */ mids: readonly string[] = SINGLE_MID;
 
   constructor(offer: SignalingOffer, srflxIps: string[], now: number) {
     this.id = offer.peerId;
@@ -789,7 +792,8 @@ export class HostTransport {
 
   private negotiate(peer: Peer, offer: SignalingOffer): void {
     peer.state = 'negotiating';
-    peer.mids = sdpMids(offer.sdp);
+    const mids = sdpMids(offer.sdp);
+    peer.mids = mids.length === 1 && mids[0] === '0' ? SINGLE_MID : mids;
     peer.challengeDelay =
       this.opts.challengeDelayMs ?? (isLibdatachannelOffer(offer.sdp) ? LIBDATACHANNEL_CHALLENGE_DELAY_MS : 0);
     const events: PeerLinkEvents = {
@@ -856,7 +860,7 @@ export class HostTransport {
    * first candidate allowed by the ICE policy is known.
    */
   private onLocalDescription(peer: Peer, sdp: string): void {
-    if (peer.state !== 'negotiating' || peer.localSdp !== null) return;
+    if (peer.state !== 'negotiating' || peer.answerSent || peer.localSdp !== null) return;
     try {
       peer.localSdp = filterSdp(sdp, this.icePolicy);
     } catch (err) {
@@ -919,6 +923,9 @@ export class HostTransport {
     peer.answerSent = true;
     this.log(`peer ${peer.id}: answer sent with ${peer.localCandidates.length} candidates`);
     this.signaling.sendAnswer(peer.id, peer.localSdp, peer.localCandidates);
+    // encoded synchronously and never read again (later candidates are trickled): release them
+    peer.localSdp = null;
+    peer.localCandidates.length = 0;
     if (peer.gatheringDone) this.sendEnd(peer);
   }
 
