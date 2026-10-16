@@ -273,6 +273,9 @@ corta antes.
   resto 3; `--pin` solo → host 0, resto 1–3 (`info.cores` y `cores` por corrida). Sin `taskset`
   (Windows) corre igual sin fijar núcleos y lo avisa.
 * `--settle-ms` (250): pausa tras la salida de los procesos de una corrida.
+* `--eld-window S` (10; `--quick` 3), `--eld-method timer|native`, `--eld-mode separate|inline`,
+  `--eld 0`: lag del event loop en una sub-ventana propia antes de la ventana de CPU, con el mismo
+  timer en Node y Bun (ver [Lag del event loop](#lag-del-event-loop-sub-ventana-propia-y-mismo-método-en-node-y-bun)).
 
 **Tanda publicable completa en la VM Linux** (Debian 12, 4 vCPU; `bun` en el PATH o `BUN_PATH`):
 
@@ -311,10 +314,53 @@ para uno corto, ≈ 50 min) y `node bench/net/report.mjs` (tablas de flota, soak
   el de JSC) y además `host.jsc` (`heapStats()` de `bun:jsc`: `heapSize`, `objectCount`,
   `extraMemorySize`, y `memoryUsage().current` de mimalloc). **Sin eventos de GC** (Bun acepta el
   observador `gc` pero nunca informa: `gcCount`/`gcMs` = `null`, «n/d» en las tablas). El **lag
-  del event loop** en Bun sale de un `setInterval` de 10 ms propio (lag = intervalo − 10 ms,
-  histograma acotado; `eld.method = 'setInterval-10ms'`), porque `monitorEventLoopDelay` de Bun
-  devuelve otra magnitud; en Node sigue `monitorEventLoopDelay`. Hilos, despertares y fds vienen
-  de `/proc` y valen igual en Bun sobre Linux.
+  del event loop** se mide igual en los dos runtimes y fuera de la ventana de CPU: ver
+  [Lag del event loop](#lag-del-event-loop-sub-ventana-propia-y-mismo-método-en-node-y-bun).
+  Hilos, despertares y fds vienen de `/proc` y valen igual en Bun sobre Linux. En las muestras del
+  `soak` (dentro de la ventana) solo se lee `heapSize()` y el contador de mimalloc, que son O(1);
+  `heapStats()` recorre el heap para contar objetos por tipo y se llama solo al cerrar la ventana,
+  después de la foto de CPU e hilos.
+
+### Lag del event loop: sub-ventana propia y mismo método en Node y Bun
+
+**Artefacto corregido (16-10-2026).** Hasta este cambio el monitor de lag corría **dentro** de la
+ventana en la que se mide la CPU y los despertares, y con un método distinto por runtime: en Node
+`monitorEventLoopDelay` (un timer de libuv de 100 Hz cuyo callback se queda en C++) y en Bun un
+`setInterval` de 10 ms en JS (≈ 100 despertares/s más del hilo JS y CPU real en el proceso
+medido). En la VM Linux de 4 vCPU, partida N = 10: con el monitor, Bun daba **4,4 % de CPU y
+≈ 600 despertares/s** frente a 3,4 % / ≈ 320 en Node; con `--eld 0` (sin monitor), Bun 2,45 % y
+Node 2,42 %. Es decir, las cifras de CPU y despertares de Bun estaban **infladas por el arnés**,
+no por haxlite ni por Bun. Afecta a las corridas de Bun anteriores (las pruebas de humo de abajo
+y cualquier JSON con `haxlite…@bun` sin `eld.window`); las de Node también incluían el coste del
+monitor, menor (§6: ≈ 0,7–0,8 puntos con N = 4).
+
+**Método actual** (`bench/net/run.ts`, `host-proc.mjs`):
+
+* El lag se mide en una **sub-ventana propia** de `--eld-window` segundos (10; `--quick` 3),
+  justo después del calentamiento y **antes** de la ventana de CPU, con la misma carga (los
+  clientes siguen jugando). La ventana de CPU corre **sin monitor**: CPU %, reparto por hilo y
+  despertares ya no lo incluyen en ningún runtime. Coste: + `--eld-window` por corrida en `game`,
+  `rooms`, `fleet` y `soak` (≈ + 10 min en `unified.sh`).
+* El monitor es el **mismo código en los dos runtimes**: `setInterval` de 10 ms, lag = intervalo
+  entre callbacks − 10 ms, histograma de 0,01 ms hasta 2 s (`eld.method = 'setInterval-10ms'`). Se
+  eligió el timer en JS y no `monitorEventLoopDelay` porque el de Bun mide otra magnitud: así las
+  cifras de lag de Node y Bun son comparables entre sí. Al medirse aparte, que el timer cueste CPU
+  ya no importa.
+* Cada corrida guarda cómo se midió: `host.eld.method`, `host.eld.window` (`'separate'` = sub-ventana
+  propia; `'cpu'` = dentro de la ventana de CPU) y `host.eld.windowMs`. La consola lo imprime junto
+  al lag, el `summary` lo resume en `eldHow` y `report.mjs` lo muestra en la columna/fila «método
+  del lag» (los JSON anteriores salen como «dentro de la ventana de CPU»; los más viejos, sin
+  `method`, son `monitorEventLoopDelay` de Node).
+* Flags: `--eld 0` (sin lag), `--eld-window S`, `--eld-method timer|native` (`native` =
+  `monitorEventLoopDelay`, solo Node; en Bun cae a `timer` y el JSON dice cuál se usó),
+  `--eld-mode separate|inline` (`inline` = el método anterior, dentro de la ventana de CPU; solo
+  para diagnóstico o para reproducir el artefacto). Quedan en `info.params` y en el `spec` de cada
+  corrida (`eldMode`, `eldMethod`, `eldWindowS`).
+* Lo demás que mide el proceso host ya era igual en los dos runtimes: muestreo de
+  `process.cpuUsage()`/`memoryUsage()` cada `sampleMs` (1 s; 5 s en ociosa) y lecturas de `/proc`
+  solo al inicio y al final de la ventana. La única asimetría que queda es el observador de GC,
+  solo en Node (Bun no emite eventos de GC): entrega entradas por lotes cuando hay GC, coste
+  despreciable frente a un timer de 100 Hz.
 
 ### Portabilidad (Windows) y métricas solo de Linux
 
@@ -322,8 +368,9 @@ El arnés corre en Windows y en Linux. La CPU de la máquina (para el ruido ajen
 `/proc/stat` o, sin `/proc`, de `os.cpus()`. Reparto por hilo, despertares, número de hilos y fds
 son **solo Linux** (`null` en otro sistema). En Windows la CPU por proceso se contabiliza por
 muestreo del tic de 15,6 ms (también en Node): las cargas bajas (< 2 %) salen subestimadas o en 0,
-y el lag del event loop en Node no baja de la resolución del temporizador (p50 ≈ 5 ms). Para
-publicar, solo Linux.
+y el lag del event loop en Node no baja de la resolución del temporizador (p50 ≈ 5–7 ms con
+`monitorEventLoopDelay` o con el timer de 10 ms; Bun en Windows ≈ 0,5–0,7 ms, su temporizador es
+más fino). Para publicar, solo Linux.
 
 ### Salida por jugador y huecos entre mensajes (todos los escenarios con clientes)
 
@@ -427,6 +474,14 @@ máquina (no son resultados: la CPU en Windows no es fiable y el ruido ajeno fue
 
 En `game` con N = 4 también se probaron `haxlite:ndc` y `official` (salida por jugador de
 aplicación 34 / 33 msg/s, UDP n/d), `rooms` K = 2 con `haxlite` y `nodehaxball`, e `idle` en Bun.
+
+**Las cifras de CPU y despertares de Bun de estas pruebas (y de toda corrida de Bun anterior al
+16-10-2026) están infladas** por el monitor de lag, que en Bun era un timer de JS dentro de la
+ventana de CPU: ver [Lag del event loop](#lag-del-event-loop-sub-ventana-propia-y-mismo-método-en-node-y-bun).
+Comprobación tras el cambio (Windows, `--quick`, N = 4, ventana 5 s, 1 rep; CPU de Windows
+gruesa, solo para ver que las métricas se llenan): Node 0,32 % y Bun 0,62 % de CPU, lag p50 / p99
+5,93 / 13,64 ms (Node) y 0,66 / 1,95 ms (Bun) en su sub-ventana de 3 s; `fleet` 2 × 1 × 2 en Bun
+y `soak` de 30 s en Bun también con lag en sub-ventana y `jsc` en cada muestra.
 
 ---
 
