@@ -127,6 +127,15 @@ export interface RtcBackendOptions {
   shared?: boolean;
   /** DTLS cipher suites in preference order (default on Node: ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM; on Bun AES-128-GCM first; see RtcEndpointOptions). */
   cipherSuites?: readonly (number | string)[];
+  /**
+   * DTLS cookie exchange (HelloVerifyRequest) before the server sends its
+   * ~1 KB first flight. Default: off with full ICE (DTLS is only accepted from,
+   * and answered to, addresses our own connectivity checks proved reachable),
+   * on with {@link iceLite} (addresses are only vouched for by Binding
+   * requests, whose key every joining client knows: without the cookie a
+   * spoofed ClientHello could aim that flight at a victim). See RtcEndpointOptions.
+   */
+  helloVerify?: boolean;
   /** No ICE consent from an open session for this long → closed (default 30 000 ms). */
   idleTimeoutMs?: number;
   /** A session not open this long after the offer → closed (default 20 000 ms; the transport's own 10 s open timeout fires first). */
@@ -398,6 +407,17 @@ export class RtcPeerBackend implements PeerBackend {
   readonly kind = 'rtc';
   /** Only the configured public addresses are ever announced (no host policy filtering). */
   readonly prefiltered = true;
+
+  /**
+   * While the endpoint refreshes its STUN candidates, sessions are answered
+   * with the previous result but not yet complete (a changed srflx is
+   * trickled): the transport must answer at once instead of waiting
+   * `answerIceWaitMs` for the end of gathering. Otherwise (first round)
+   * unchanged: the answer waits for the round.
+   */
+  get answerOnFirstCandidate(): boolean {
+    return this.ep !== null && this.ep.refreshingCandidates;
+  }
   private ep: RtcEndpoint | null = null;
   private readonly owned: boolean;
   private readonly opts: RtcBackendOptions;
@@ -509,6 +529,7 @@ export class RtcPeerBackend implements PeerBackend {
       ...(o.handshakeTimeoutMs !== undefined ? { handshakeTimeoutMs: o.handshakeTimeoutMs } : null),
       ...(o.maxSessions !== undefined ? { maxSessions: o.maxSessions } : null),
       ...(o.cipherSuites !== undefined ? { cipherSuites: o.cipherSuites } : null),
+      ...(o.helloVerify !== undefined ? { helloVerify: o.helloVerify } : null),
     };
     const p = import('../rtc/index.js')
       .then((rtc) => {

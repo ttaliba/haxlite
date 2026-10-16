@@ -15,7 +15,7 @@ import { formatFingerprint } from '../../src/rtc/sdp.js';
 import { StunMessage, StunType, buildBindingError, buildBindingRequest, buildBindingSuccess, checkFingerprint, checkIntegrity, parseStun } from '../../src/rtc/stun.js';
 import { Gatherer, candidatePriority, classifyIp, formatCandidates, hostAddresses, policyAllows, stunServers } from '../../src/rtc/gather.js';
 import { MAX_PAIRS, _pairPriority } from '../../src/rtc/ice-agent.js';
-import { ecClientCert } from './dtls-helpers.js';
+import { clientHelloDatagram, ecClientCert } from './dtls-helpers.js';
 import { FakeStunServer } from './nat-sim.js';
 
 const CLIENT_UFRAG = 'cLnT';
@@ -314,13 +314,17 @@ describe('RtcEndpoint full ICE (controlled agent)', () => {
     const trig = await c.box.next();
     expect(trig).not.toBeNull();
     expectCheck(trig!.buf, creds.ufrag);
-    // a second request on the same pair (check in progress) does not trigger another one
+    // a second request on the same pair (check in progress) retransmits that check at once
+    // (RFC 8445 §7.3.1.4: same transaction, no new one), then nothing until its RTO
     c.s.send(
       buildBindingRequest({ txid: randomBytes(12), username: `${creds.ufrag}:${CLIENT_UFRAG}`, key: Buffer.from(creds.pwd), priority: 1845501695 }),
       e.port,
       '127.0.0.1',
     );
     expect(parse((await c.box.next())!.buf).type).toBe(StunType.BindingSuccess);
+    const re = await c.box.next(100);
+    expect(re).not.toBeNull();
+    expect(re!.buf.subarray(8, 20)).toEqual(trig!.buf.subarray(8, 20));
     expect(await c.box.next(150)).toBeNull();
   });
 
@@ -359,6 +363,82 @@ describe('RtcEndpoint full ICE (controlled agent)', () => {
     expect(total).toBeLessThanOrEqual(120);
     expect(e.stats().ice.remoteIgnored).toBe(24 - MAX_PAIRS);
   }, 15_000);
+
+  it('spoofed source: an authenticated request + USE-CANDIDATE validates nothing and gets no DTLS until our check there succeeds', async () => {
+    // `victim` plays a spoofed source: a request with valid MESSAGE-INTEGRITY (any joining client
+    // knows our password from its answer) arrives "from" it, but it never answers our checks.
+    const e = await setup();
+    const s = e.createSession(offerSdp());
+    const creds = answerCreds(s.answerSdp);
+    const victim = await client();
+    const req = () =>
+      buildBindingRequest({ txid: randomBytes(12), username: `${creds.ufrag}:${CLIENT_UFRAG}`, key: Buffer.from(creds.pwd), priority: 1845501695, useCandidate: true });
+    victim.s.send(req(), e.port, '127.0.0.1');
+    expect(parse((await victim.box.next())!.buf).type).toBe(StunType.BindingSuccess); // answered (no amplification)
+    const check = parse((await victim.box.next())!.buf); // our triggered check
+    expect(check.type).toBe(StunType.BindingRequest);
+    expect(s.state).toBe('new');
+    expect(s.remoteAddress).toBeNull(); // neither validated nor nominated
+    const demux = (e as unknown as { byAddress: Map<string, unknown> }).byAddress;
+    expect(demux.size).toBe(0);
+    // a ClientHello "from" it: held, not answered (flight 4 would be ~1 KB, retransmitted)
+    victim.s.send(clientHelloDatagram().datagram, e.port, '127.0.0.1');
+    victim.s.send(req(), e.port, '127.0.0.1'); // a renewed request does not change that
+    await sleep(1500);
+    const dtls = () => victim.box.msgs.filter((m) => m.buf[0]! >= 20 && m.buf[0]! <= 63);
+    expect(dtls()).toEqual([]);
+    expect(e.stats().dtlsHeld).toBe(1);
+    expect(e.stats().handshakesCompleted + e.stats().handshakesFailed).toBe(0);
+    expect(s.state).toBe('new');
+    // the real owner of the address answers our check (retransmitted at its request): proven → nominated,
+    // the held ClientHello is answered
+    victim.box.msgs.length = 0;
+    victim.s.send(req(), e.port, '127.0.0.1');
+    let retx: StunMessage | null = null;
+    for (let i = 0; i < 5 && retx === null; i++) {
+      const m = await victim.box.next(1000);
+      if (m !== null && m.buf[0]! < 4) {
+        const p = parse(m.buf);
+        if (p.type === StunType.BindingRequest) retx = p;
+      }
+    }
+    expect(retx).not.toBeNull();
+    victim.s.send(buildBindingSuccess(retx!.transactionId(), '127.0.0.1', e.port, Buffer.from(CLIENT_PWD)), e.port, '127.0.0.1');
+    await sleep(100);
+    expect(s.state).toBe('connecting');
+    expect(s.remoteAddress).toEqual({ address: '127.0.0.1', port: victim.port });
+    expect(dtls().length).toBeGreaterThan(0); // flight 4 now, to the proven address
+    expect(e.stats().dtlsUnknownSource).toBe(0);
+    s.close();
+  }, 15_000);
+
+  it('a request from an unproven address cannot steal a proven 5-tuple or move the nomination there', async () => {
+    const e = await setup();
+    const a = await client();
+    const spoofed = await client();
+    const s = e.createSession(offerSdp([cand('127.0.0.1', a.port)]));
+    const creds = answerCreds(s.answerSdp);
+    const m = parse((await a.box.next())!.buf);
+    a.s.send(buildBindingSuccess(m.transactionId(), '127.0.0.1', e.port, Buffer.from(CLIENT_PWD)), e.port, '127.0.0.1');
+    await sleep(30);
+    const req = () =>
+      buildBindingRequest({ txid: randomBytes(12), username: `${creds.ufrag}:${CLIENT_UFRAG}`, key: Buffer.from(creds.pwd), priority: 1845501695, useCandidate: true });
+    a.s.send(req(), e.port, '127.0.0.1');
+    await sleep(30);
+    expect(s.remoteAddress).toEqual({ address: '127.0.0.1', port: a.port }); // proven + nominated at once
+    spoofed.s.send(req(), e.port, '127.0.0.1');
+    await sleep(100);
+    expect(s.remoteAddress).toEqual({ address: '127.0.0.1', port: a.port }); // nomination stays on the proven pair
+    // DTLS "from" the unproven source never reaches the DTLS server
+    spoofed.s.send(clientHelloDatagram().datagram, e.port, '127.0.0.1');
+    await sleep(100);
+    expect(spoofed.box.msgs.filter((x) => x.buf[0]! >= 20 && x.buf[0]! <= 63)).toEqual([]);
+    // once the check to it succeeds, the pending USE-CANDIDATE takes effect (RFC 8445 §7.3.1.5: rebinding)
+    const check = spoofed.box.msgs.map((x) => parse(x.buf)).find((x) => x.type === StunType.BindingRequest)!;
+    spoofed.s.send(buildBindingSuccess(check.transactionId(), '127.0.0.1', e.port, Buffer.from(CLIENT_PWD)), e.port, '127.0.0.1');
+    await sleep(50);
+    expect(s.remoteAddress).toEqual({ address: '127.0.0.1', port: spoofed.port });
+  });
 
   it('ICE-lite sends no checks at all', async () => {
     const e = await setup({ iceLite: true });
@@ -416,14 +496,51 @@ describe('RtcEndpoint full ICE (controlled agent)', () => {
     expect(n).toBeGreaterThan(0);
     await sleep(150);
     const s = e.createSession(offerSdp());
-    // the cached result answers at once; the refresh runs in the background
-    expect(s.gatheringComplete).toBe(true);
+    // the cached result is in the answer at once; the refresh runs in the background
+    expect(e.refreshingCandidates).toBe(true);
     expect(s.answerSdp).toContain(`127.0.0.1 ${e.port} typ srflx raddr 0.0.0.0 rport 0`);
+    expect(s.gatheringComplete).toBe(false); // a changed srflx would be trickled
+    const trickled: string[] = [];
+    s.onLocalCandidate = (c) => trickled.push(c);
+    const done = new Promise<void>((r) => (s.onGatheringComplete = r));
     await e.whenGathered();
+    await done;
+    expect(trickled).toEqual([]); // same reflexive address: nothing new
+    expect(e.refreshingCandidates).toBe(false);
     expect(stun.requests).toBeGreaterThan(n);
   });
 
-  it('a stale result whose refresh gets no reply: sessions still answer complete with the cached srflx', async () => {
+  it('a refresh that finds a different srflx trickles it to the sessions answered meanwhile', async () => {
+    const stun = await FakeStunServer.start('127.0.0.1');
+    closers.push(() => stun.close());
+    const e = await setup({ publicAddresses: undefined, iceServers: [stun.url], gatherRefreshMs: 100 });
+    await e.whenGathered();
+    await sleep(150);
+    stun.portOffset = 7; // the NAT's mapping changed
+    const oldSrflx = `candidate:1 1 udp ${candidatePriority(100, 65535)} 127.0.0.1 ${e.port} typ srflx raddr 0.0.0.0 rport 0 generation 0`;
+    const s1 = e.createSession(offerSdp()); // starts the refresh
+    const s2 = e.createSession(offerSdp()); // while it runs
+    const got = new Map<RtcSession, string[]>();
+    const done: Promise<void>[] = [];
+    for (const s of [s1, s2]) {
+      expect(s.localCandidates).toEqual([oldSrflx]); // answered at once with the previous result
+      expect(s.answerSdp).toContain(oldSrflx);
+      expect(s.answerSdp).not.toContain('a=end-of-candidates');
+      got.set(s, []);
+      s.onLocalCandidate = (c) => got.get(s)!.push(c);
+      done.push(new Promise<void>((r) => (s.onGatheringComplete = r)));
+    }
+    await Promise.all(done);
+    const newSrflx = `candidate:1 1 udp ${candidatePriority(100, 65535)} 127.0.0.1 ${e.port + 7} typ srflx raddr 0.0.0.0 rport 0 generation 0`;
+    expect(got.get(s1)).toEqual([newSrflx]);
+    expect(got.get(s2)).toEqual([newSrflx]);
+    // later sessions get the new one in the answer, complete
+    const s3 = e.createSession(offerSdp());
+    expect(s3.gatheringComplete).toBe(true);
+    expect(s3.localCandidates).toEqual([newSrflx]);
+  });
+
+  it('a stale result whose refresh gets no reply: sessions answer at once with the cached srflx, completed by the timeout', async () => {
     const stun = await FakeStunServer.start('127.0.0.1');
     closers.push(() => stun.close());
     const e = await setup({ publicAddresses: undefined, iceServers: [stun.url], gatherRefreshMs: 100 });
@@ -435,17 +552,20 @@ describe('RtcEndpoint full ICE (controlled agent)', () => {
     const s1 = e.createSession(offerSdp()); // starts the refresh
     const s2 = e.createSession(offerSdp()); // while the refresh runs
     for (const s of [s1, s2]) {
-      expect(s.gatheringComplete).toBe(true);
+      expect(s.gatheringComplete).toBe(false);
       expect(s.answerSdp).toContain(srflx);
-      expect(s.answerSdp).toContain('a=end-of-candidates');
+      expect(s.answerSdp).not.toContain('a=end-of-candidates');
     }
     let late = 0;
+    let completed = 0;
     s1.onLocalCandidate = () => late++;
-    s1.onGatheringComplete = () => late++;
+    s1.onGatheringComplete = () => completed++;
     await sleep(50);
     expect(stun.requests).toBeGreaterThan(n); // the refresh did go out
     await e.whenGathered(); // times out without a reply
-    expect(late).toBe(0); // nothing trickled to sessions that were complete
+    expect(late).toBe(0); // nothing new to trickle
+    expect(completed).toBe(1);
+    expect(s1.gatheringComplete).toBe(true);
     // the lost reply keeps the previous srflx
     expect(e.createSession(offerSdp()).answerSdp).toContain(srflx);
   });

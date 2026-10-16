@@ -204,7 +204,10 @@ describe.skipIf(PUBLIC === undefined)('haxlite-rtc full ICE behind a simulated N
   it('consent freshness: our consent checks are answered once open', async () => {
     const r = await run({ hostNat: {} });
     expect(r.connected).toBe(true);
-    await sleep(6500);
+    // the first consent check leaves 4–6 s after DTLS connected, on the endpoint's 1 Hz sweep (so up
+    // to ~7 s): wait for the condition instead of a fixed sleep (6.5 s failed ~1 run in 10)
+    const answered = () => r.ep.stats().ice.consentAnswered >= 1;
+    for (let t0 = Date.now(); !answered() && Date.now() - t0 < 10_000; ) await sleep(100);
     const st = r.ep.stats();
     expect(st.ice.consentSent).toBeGreaterThanOrEqual(1);
     expect(st.ice.consentAnswered).toBeGreaterThanOrEqual(1);

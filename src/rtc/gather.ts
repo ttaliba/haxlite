@@ -356,6 +356,11 @@ export class Gatherer {
     return this.gathering;
   }
 
+  /** A refresh round runs while an earlier round's result is known (sessions answer with that result meanwhile). */
+  get isRefreshing(): boolean {
+    return this.gathering && this.rounds > 0;
+  }
+
   /** Candidate lines known now. */
   candidateLines(): string[] {
     return this.lines.slice();
@@ -366,20 +371,20 @@ export class Gatherer {
    * complete. Starts a refresh round when the last result is stale; register
    * the session with {@link wait} when not complete.
    *
-   * Only the very first round (nothing gathered yet) leaves a session
-   * incomplete. Once a round has finished, its result is used as complete
-   * while a refresh runs in the background: a join arriving after
-   * `refreshMs` must not wait for a new STUN round trip (the transport holds
-   * an incomplete answer up to `answerIceWaitMs`, the whole 500 ms when a
-   * reply is lost). The reflexive address of the shared socket rarely changes;
-   * when it does, the refreshed candidates serve the following sessions.
+   * While a round runs the session is incomplete (no end-of-candidates) and
+   * gets what the round finds that it does not have yet (trickle), then the
+   * end of gathering. During a refresh ({@link isRefreshing}) the lines are
+   * the previous round's result, srflx included, so the answer need not wait
+   * for the new STUN round trip (the rtc backend answers on the first
+   * candidate then: `answerOnFirstCandidate`); if the refresh finds a
+   * different reflexive address, it is trickled to these sessions too.
    */
   forSession(): { lines: string[]; complete: boolean } {
     if (this.enabled && !this.gathering && !this.closed) {
       const refresh = this.o.refreshMs ?? 60_000;
       if (this.lastDone === 0 || this.host.now() - this.lastDone > refresh) this.start();
     }
-    return { lines: this.lines.slice(), complete: !this.gathering || this.rounds > 0 };
+    return { lines: this.lines.slice(), complete: !this.gathering };
   }
 
   /** `w` gets the result of the running round (no-op when none runs). */

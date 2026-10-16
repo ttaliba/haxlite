@@ -25,12 +25,14 @@
  *   (§7.2.5.2.1), MESSAGE-INTEGRITY with the remote password and FINGERPRINT
  *   on every response.
  *
- * Deviations, deliberate and documented in docs/10:
+ * Nomination (RFC 8445 §7.3.1.5): a USE-CANDIDATE request nominates its
+ * pair once OUR check on it has succeeded — at once when it already has,
+ * otherwise when the triggered check it causes does. The request's
+ * MESSAGE-INTEGRITY only proves the sender knows our password, which every
+ * joining client does: its source address could be spoofed (session.ts).
  *
- * * **Nomination**: a USE-CANDIDATE request moves the selected pair at once
- *   (as the ICE-lite implementation always did: the controlling browser only
- *   nominates a pair after its own check on it succeeded, which proves both
- *   directions); a triggered check is still sent on it.
+ * Deviation, deliberate and documented in docs/10:
+ *
  * * **Role conflicts**: we never take the controlling role. A request with
  *   ICE-CONTROLLED is answered 487 whatever the tie-breakers (the peer then
  *   switches to controlling, §7.2.5.1); a 487 to one of our checks just
@@ -213,7 +215,7 @@ export interface IceAgentOwner {
   readonly remoteUfrag: string;
   /** The remote ICE password (key of the MESSAGE-INTEGRITY of our checks and of their responses). */
   readonly remoteKey: StunKey;
-  /** One of our checks on (sock, address, port) succeeded: the pair is valid (DTLS may flow there). */
+  /** One of our checks on (sock, address, port) succeeded: the pair is valid (DTLS may flow there; `address` as the kernel reports it). */
   onCheckSucceeded(sock: UdpIo, address: string, port: number): void;
   /** One of our consent checks on the selected pair was answered (RFC 7675). */
   onConsent(): void;
@@ -313,12 +315,37 @@ export class IceAgent {
       if (this.pairs.length >= MAX_PAIRS) return;
       p = this.insert(sock, address, port, priority >>> 0);
     }
+    const tx = p.tx;
+    if (p.state === IN_PROGRESS && tx !== null) {
+      // RFC 8445 §7.3.1.4: retransmit the in-progress check at once and reset its timer. Typical
+      // case: our first check left before the peer had our answer (it could not answer it); the
+      // peer's request says it has it now — waiting for the 200 ms RTO would delay the join.
+      if (tx.n < TX_PER_CHECK) {
+        if (p.sent < MAX_TX_PER_PAIR && this.sentTotal < MAX_TX_PER_SESSION && this.transmit(p, tx)) {
+          tx.rto = INITIAL_RTO_MS;
+          tx.nextAt = this.s.o.now() + INITIAL_RTO_MS;
+        }
+        return;
+      }
+      this.endTx(p); // its transmissions are used up: a new triggered check instead (below)
+      p.state = WAITING;
+    }
     if (p.state === SUCCEEDED || p.state === IN_PROGRESS || p.triggered) return;
     if (p.sent >= MAX_TX_PER_PAIR) return;
     p.state = WAITING;
     p.triggered = true;
     this.queue.push(p);
     this.s.activate(this);
+  }
+
+  /**
+   * The session no longer trusts (sock, address, port) (its 5-tuple went to
+   * another session, or it was evicted): a succeeded pair goes back to
+   * Waiting so that the next request from there triggers a new check.
+   */
+  recheck(sock: UdpIo, address: string, port: number): void {
+    const p = this.find(sock, address, port);
+    if (p !== null && p.state === SUCCEEDED) p.state = WAITING;
   }
 
   /** The session is connected (DTLS up): no new ordinary checks; triggered ones and consent go on. */
@@ -429,7 +456,7 @@ export class IceAgent {
     if (m.type === StunType.BindingSuccess) {
       p.state = SUCCEEDED;
       this.s.stats.checksSucceeded++;
-      this.owner.onCheckSucceeded(p.sock, p.address, p.port);
+      this.owner.onCheckSucceeded(p.sock, address, p.port);
       return;
     }
     if (errorCode(m) === 487) {

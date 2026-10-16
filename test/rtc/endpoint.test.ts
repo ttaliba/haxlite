@@ -1,16 +1,16 @@
 /**
  * RtcEndpoint: ICE-lite Binding handling (authentication, roles,
  * nomination, rebinding, consent), demultiplexing, timeouts, and a full
- * ICE + DTLS run with `openssl s_client` behind a UDP relay that plays the
- * browser's ICE agent.
+ * ICE + DTLS run (ICE-lite with the DTLS cookie, and full ICE) with
+ * `openssl s_client` behind a UDP relay that plays the browser's ICE agent.
  */
 import { randomBytes } from 'node:crypto';
 import dgram, { type Socket } from 'node:dgram';
 import { afterEach, describe, expect, it } from 'vitest';
 import { RtcEndpoint, rawDataLayer, type RtcSession } from '../../src/rtc/index.js';
 import { formatFingerprint } from '../../src/rtc/sdp.js';
-import { StunAttr, StunMessage, buildBindingRequest, checkFingerprint, checkIntegrity, findAttr, parseStun, readXorAddress } from '../../src/rtc/stun.js';
-import { ecClientCert, hasOpenssl } from './dtls-helpers.js';
+import { StunAttr, StunMessage, StunType, buildBindingRequest, buildBindingSuccess, checkFingerprint, checkIntegrity, findAttr, parseStun, readXorAddress } from '../../src/rtc/stun.js';
+import { clientHelloDatagram, ecClientCert, hasOpenssl, parseRecords } from './dtls-helpers.js';
 
 const CLIENT_UFRAG = 'cLnT';
 const CLIENT_PWD = 'clientpasswordclientpwd0';
@@ -86,8 +86,8 @@ describe('RtcEndpoint ICE-lite', () => {
   };
   const cert = ecClientCert('ep');
 
-  async function setup(opts: { idleTimeoutMs?: number; handshakeTimeoutMs?: number } = {}) {
-    ep = await RtcEndpoint.listen({ address: '127.0.0.1', publicAddresses: ['127.0.0.1'], dataLayer: rawDataLayer, ...opts });
+  async function setup(opts: { idleTimeoutMs?: number; handshakeTimeoutMs?: number; helloVerify?: boolean } = {}) {
+    ep = await RtcEndpoint.listen({ address: '127.0.0.1', publicAddresses: ['127.0.0.1'], iceLite: true, dataLayer: rawDataLayer, ...opts });
     const session = ep.createSession(offerSdp(cert.sha256));
     return { ep, session, creds: answerCreds(session.answerSdp) };
   }
@@ -203,6 +203,54 @@ describe('RtcEndpoint ICE-lite', () => {
     expect(demux.size).toBe(0);
   });
 
+  it('DTLS cookie on by default (addresses are not proven): flight 4 only to the source that echoed it, never to another one', async () => {
+    const { ep, session, creds } = await setup();
+    const a = await client();
+    const v = await client(); // a "spoofed" address the attacker validated and nominated with its own credentials
+    a.send(binding(creds), ep.port, '127.0.0.1');
+    await nextMessage(a);
+    v.send(binding(creds, { useCandidate: true }), ep.port, '127.0.0.1');
+    await nextMessage(v);
+    expect(session.remoteAddress?.port).toBe(v.address().port);
+    const fromV: Buffer[] = [];
+    v.on('message', (m) => fromV.push(m));
+    // a ClientHello "from" v only gets a HelloVerifyRequest (smaller than the ClientHello)
+    const chV = clientHelloDatagram();
+    v.send(chV.datagram, ep.port, '127.0.0.1');
+    await sleep(50);
+    expect(fromV.map((m) => parseRecords(m).map((r) => r.fragment[0]))).toEqual([[3]]);
+    expect(fromV[0]!.length).toBeLessThan(chV.datagram.length);
+    // a's ClientHello: HVR to a (not to the nominated v), then flight 4 to a once it echoes the cookie
+    const ch = clientHelloDatagram({ recordSeq: 1 });
+    a.send(ch.datagram, ep.port, '127.0.0.1');
+    const hvr = (await nextMessage(a))!;
+    const rec = parseRecords(hvr)[0]!;
+    expect(rec.fragment[0]).toBe(3);
+    const cookie = rec.fragment.subarray(12 + 3, 12 + 3 + rec.fragment[12 + 2]!);
+    const got: Buffer[] = [];
+    a.on('message', (m) => got.push(m));
+    a.send(clientHelloDatagram({ random: ch.random, cookie, messageSeq: 1, recordSeq: 2 }).datagram, ep.port, '127.0.0.1');
+    await sleep(100);
+    expect(got.flatMap((m) => parseRecords(m).map((r) => r.fragment[0]))).toContain(2); // ServerHello
+    // a retransmitted ClientHello "from" v retransmits flight 4 to a (the handshake's address), not to v
+    got.length = 0;
+    fromV.length = 0;
+    v.send(clientHelloDatagram({ random: ch.random, cookie, messageSeq: 1, recordSeq: 3 }).datagram, ep.port, '127.0.0.1');
+    await sleep(100);
+    expect(fromV).toEqual([]);
+    expect(got.length).toBeGreaterThan(0);
+  });
+
+  it('helloVerify: false turns the cookie off (flight 4 at once)', async () => {
+    const { ep, creds } = await setup({ helloVerify: false });
+    const a = await client();
+    a.send(binding(creds), ep.port, '127.0.0.1');
+    await nextMessage(a);
+    a.send(clientHelloDatagram().datagram, ep.port, '127.0.0.1');
+    const first = (await nextMessage(a))!;
+    expect(parseRecords(first)[0]!.fragment[0]).toBe(2);
+  });
+
   it('closes sessions that never connect (handshake timeout)', async () => {
     const { session } = await setup({ handshakeTimeoutMs: 300 });
     const reason = await new Promise<string>((r) => (session.onClose = r));
@@ -245,7 +293,7 @@ describe('RtcEndpoint ICE-lite', () => {
   });
 
   it.skipIf(!ipv6Available)('IPv6 + IPv4 on the same port (ipv6: true)', async () => {
-    ep = await RtcEndpoint.listen({ publicAddresses: ['::1', '127.0.0.1'], ipv6: true, dataLayer: rawDataLayer });
+    ep = await RtcEndpoint.listen({ publicAddresses: ['::1', '127.0.0.1'], ipv6: true, iceLite: true, dataLayer: rawDataLayer });
     expect(ep.boundAddresses.map((b) => b.family).sort()).toEqual([4, 6]);
     const session = ep.createSession(offerSdp(cert.sha256));
     expect(session.answerSdp).toContain(`a=candidate:1 1 udp 2130706431 ::1 ${ep.port} typ host`);
@@ -291,14 +339,23 @@ describe('RtcEndpoint ICE-lite', () => {
 });
 
 /**
- * Relay that plays the browser's ICE agent for openssl: it validates its own
- * socket with authenticated Binding requests (USE-CANDIDATE, then periodic
- * consent) and forwards DTLS between openssl and the endpoint.
+ * Relay that plays the browser's ICE agent for openssl: it sends
+ * authenticated Binding requests from its socket (USE-CANDIDATE, then
+ * periodic consent — ICE-lite), answers the endpoint's connectivity and
+ * consent checks (full ICE) and forwards DTLS between openssl and the
+ * endpoint. `stopConsent` ends both.
  */
 async function iceRelay(endpointPort: number, creds: { ufrag: string; pwd: string }, consentMs: number | null) {
   const toEp = await udp();
   const forOpenssl = await udp();
   let opensslAddr: { port: number } | null = null;
+  let answering = true;
+  toEp.on('message', (m, r) => {
+    const s = new StunMessage();
+    if (!answering || m[0]! >= 4 || !parseStun(m, s) || s.type !== StunType.BindingRequest) return;
+    if (s.username() !== `${CLIENT_UFRAG}:${creds.ufrag}` || !checkIntegrity(s, Buffer.from(CLIENT_PWD))) return;
+    toEp.send(buildBindingSuccess(s.transactionId(), r.address, r.port, Buffer.from(CLIENT_PWD)), r.port, r.address);
+  });
   const bind = () =>
     toEp.send(
       buildBindingRequest({ txid: randomBytes(12), username: `${creds.ufrag}:${CLIENT_UFRAG}`, key: Buffer.from(creds.pwd), useCandidate: true }),
@@ -316,7 +373,10 @@ async function iceRelay(endpointPort: number, creds: { ufrag: string; pwd: strin
   const timer = consentMs === null ? null : setInterval(bind, consentMs);
   return {
     port: forOpenssl.address().port,
-    stopConsent: () => timer && clearInterval(timer),
+    stopConsent: () => {
+      answering = false;
+      if (timer) clearInterval(timer);
+    },
     close: () => {
       if (timer) clearInterval(timer);
       toEp.close();
@@ -325,11 +385,14 @@ async function iceRelay(endpointPort: number, creds: { ufrag: string; pwd: strin
   };
 }
 
-describe.skipIf(!hasOpenssl)('RtcEndpoint full stack (ICE-lite + DTLS) with openssl', () => {
+describe.skipIf(!hasOpenssl)('RtcEndpoint full stack (ICE + DTLS) with openssl', () => {
   const cert = ecClientCert('ep2');
 
-  it('handshakes, echoes through the data layer, then expires without consent', async () => {
-    const ep = await RtcEndpoint.listen({ address: '127.0.0.1', publicAddresses: ['127.0.0.1'], dataLayer: rawDataLayer, idleTimeoutMs: 1500 });
+  it.each([
+    ['ICE-lite (DTLS cookie on by default)', true],
+    ['full ICE (no cookie: our checks prove the address)', false],
+  ])('%s: handshakes, echoes through the data layer, then expires without consent', async (_name, iceLite) => {
+    const ep = await RtcEndpoint.listen({ address: '127.0.0.1', publicAddresses: ['127.0.0.1'], iceLite, dataLayer: rawDataLayer, idleTimeoutMs: 1500 });
     const session: RtcSession = ep.createSession(offerSdp(cert.sha256));
     const relay = await iceRelay(ep.port, answerCreds(session.answerSdp), 300);
     const got: string[] = [];
@@ -352,6 +415,7 @@ describe.skipIf(!hasOpenssl)('RtcEndpoint full stack (ICE-lite + DTLS) with open
     expect(got).toEqual(['ping\n']);
     expect(out).toContain('ping');
     expect(ep.stats().handshakesCompleted).toBe(1);
+    expect(ep.stats().dtlsUnknownSource).toBe(0);
     // consent keeps it alive past idleTimeoutMs…
     await sleep(2200);
     expect(session.state).toBe('open');

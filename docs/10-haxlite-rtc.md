@@ -54,7 +54,7 @@ oficial (`ro` id 0 fiable y ordenado, `ru` id 1 fiable y desordenado, `uu` id 2 
 | SDP (`sdp.ts`) | Lee la oferta, escribe la respuesta | `a=setup:passive`, los candidatos del endpoint (host + srflx; con `iceLite`, `a=ice-lite` y solo `host` de `publicAddresses`), `a=end-of-candidates` si la recolección terminó, `a=max-message-size:262144` |
 | Recolección (`gather.ts`) | Candidatos locales, por endpoint | `host`: direcciones de las interfaces del socket filtradas por la política (o `publicAddresses` tal cual); `srflx`: Binding STUN a cada `iceServers` desde el socket compartido, con `raddr 0.0.0.0 rport 0`. Solo IPv4 salvo `ipv6: true`. Resultado cacheado y refrescado en segundo plano cada `gatherRefreshMs` (60 s); solo las sesiones creadas durante la **primera** ronda reciben el resto por trickle (§2.1) |
 | ICE (`stun.ts`, `session.ts`, `ice-agent.ts`) | Responde Binding requests **y envía las suyas** | USERNAME `nuestroUfrag:suyoUfrag`, MESSAGE‑INTEGRITY (HMAC‑SHA1) y FINGERPRINT obligatorios, rol *controlling* del navegador. Cada origen autenticado queda *validado* (y es un candidato prflx con *triggered check*); USE‑CANDIDATE nomina. Checks propios a cada candidato remoto (oferta + trickle) con ICE‑CONTROLLED, validación simétrica, retransmisión acotada. Consentimiento: checks propios cada 5 s ± 20 % (RFC 7675) además de los del navegador; sin ninguno respondido/recibido en `idleTimeoutMs` (30 s) se cierra. Cambio de NAT solo con un Binding autenticado nuevo |
-| DTLS 1.2 (`dtls/`) | Servidor DTLS (RFC 6347) | Sin HelloVerifyRequest: el primer ClientHello recibe el flight 4 (el demux solo entrega DTLS desde direcciones validadas por STUN autenticado, §6.7); preferencia por runtime: en Node `ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (AEAD en JS puro, sin asignaciones, cifra/descifra en el sitio: `dtls/chacha.ts`, §6.4), luego AES_128_GCM y AES_256_GCM (`node:crypto`); en Bun AES_128_GCM primero; configurable con `cipherSuites`; x25519 / P‑256; *extended master secret* obligatorio; certificado del cliente obligatorio y comparado (tiempo constante) con el `a=fingerprint` de la oferta; CertificateVerify comprobado; ventana anti‑replay de 64; retransmisión 1 s → 8 s; fragmentación y reensamblado; `close_notify`. Un Chromium que ofrece DTLS 1.3 recibe un ServerHello 1.2 y conecta |
+| DTLS 1.2 (`dtls/`) | Servidor DTLS (RFC 6347) | HelloVerifyRequest según el modo (`helloVerify`): con ICE completo no, el primer ClientHello recibe el flight 4 (el demux solo entrega DTLS desde direcciones que respondieron a un check nuestro, y los flights solo van ahí); con ICE‑lite sí, por defecto (§6.7); preferencia por runtime: en Node `ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (AEAD en JS puro, sin asignaciones, cifra/descifra en el sitio: `dtls/chacha.ts`, §6.4), luego AES_128_GCM y AES_256_GCM (`node:crypto`); en Bun AES_128_GCM primero; configurable con `cipherSuites`; x25519 / P‑256; *extended master secret* obligatorio; certificado del cliente obligatorio y comparado (tiempo constante) con el `a=fingerprint` de la oferta; CertificateVerify comprobado; ventana anti‑replay de 64; retransmisión 1 s → 8 s; fragmentación y reensamblado; `close_notify`. Un Chromium que ofrece DTLS 1.3 recibe un ServerHello 1.2 y conecta |
 | SCTP (`sctp/association.ts`) | Asociación SCTP sobre DTLS | RFC 9260, PR‑SCTP (RFC 3758) para `uu`, *stream reset* (RFC 6525) para cerrar canales, *zero checksum* (RFC 9653). Cookie de estado HMAC (INIT sin estado). Sin Nagle: un `send` sale en el acto si las ventanas lo permiten; los envíos hechos dentro de `onMessage` se agrupan en un paquete junto con el SACK. Un solo temporizador por asociación. Ruta caliente sin asignaciones (arena FIFO de bytes, anillos tipados indexados por TSN); `input` nunca lanza |
 | Certificado (`cert.ts`) | ECDSA P‑256 autofirmado | Codificador DER mínimo |
 
@@ -106,9 +106,12 @@ familia, así que la recolección se hace una vez por endpoint:
   (aún sin resultado) quedan con `gatheringComplete = false`: lo nuevo llega por `onLocalCandidate`
   y luego `onGatheringComplete`; el backend lo traduce a los eventos de siempre, y `HostTransport`
   hace con ello lo mismo que con node-datachannel: espera ≤ 500 ms para la respuesta y manda el
-  resto por trickle. Después, toda sesión recibe el último resultado como completo y la respuesta
-  sale en el acto; si ese resultado tiene más de `gatherRefreshMs` (60 s), la sesión dispara una
-  ronda de refresco **en segundo plano** que sirve a las siguientes. (Antes la sesión que disparaba
+  resto por trickle. Después, toda sesión recibe el último resultado y la respuesta sale en el acto;
+  si ese resultado tiene más de `gatherRefreshMs` (60 s), la sesión dispara una ronda de refresco
+  **en segundo plano**. Las sesiones creadas mientras corre llevan el resultado anterior en la
+  respuesta pero sin `a=end-of-candidates` (el backend pide entonces responder con el primer
+  candidato, `answerOnFirstCandidate`): si el refresco encuentra otro srflx se les manda por trickle,
+  y después el fin de la recolección. (Antes la sesión que disparaba
   el refresco esperaba la respuesta STUN, y con un paquete perdido pagaba los 500 ms enteros: entrada
   de 555–577 ms → 63–65 ms en loopback con el refresco sin respuesta.) Sin servidores STUN no hay
   rondas.
@@ -164,10 +167,14 @@ por cada Binding del navegador, una búsqueda en ≤ 16 pares. La ruta DTLS/SCTP
 
 **Desviaciones deliberadas de RFC 8445.**
 
-* *Nominación*: un Binding con USE‑CANDIDATE mueve el par elegido en el acto (como hacía ICE‑lite),
-  sin esperar a que nuestro check en ese par tenga éxito: el navegador (*controlling*) solo nomina
-  pares cuyo check propio ya funcionó, lo que prueba los dos sentidos. Igual se manda el *triggered
-  check*.
+* *Nominación* (no es una desviación, §7.3.1.5): un Binding con USE‑CANDIDATE nomina su par cuando
+  **nuestro** check en ese par ha tenido éxito: en el acto si ya lo tuvo, si no al acabar el
+  *triggered check* que provoca. La MESSAGE‑INTEGRITY de un Binding solo prueba que el remitente
+  conoce nuestra contraseña ICE, y la conoce todo cliente que entra (va en su answer): podría
+  falsear la dirección de origen de una víctima. Solo una dirección validada por nuestro check
+  recibe DTLS; lo que llegue de ella antes (el ClientHello que adelanta al check) se retiene unos
+  pocos datagramas y se procesa al validarse, y una petición sobre un check en curso lo retransmite
+  en el acto (§7.3.1.4), así que la entrada no tarda más.
 * *Conflicto de rol*: nunca pasamos a *controlling*. Un Binding con ICE‑CONTROLLED recibe 487 sea cual
   sea el desempate (el otro pasa a *controlling*, §7.2.5.1) y un 487 a un check nuestro solo lo
   reintenta. Converge con cualquier agente RFC 8445; un par ICE‑lite (ningún cliente de HaxBall lo
@@ -219,6 +226,7 @@ new HostTransport({ token, peerBackend: 'rtc', rtcEndpoint: { port: 40000, publi
 | `certificate` | uno por proceso (`RtcCertificate.processDefault()`, clave generada de forma síncrona, ≈ 1 ms, sin despertar el *thread pool* de libuv) | certificado DTLS |
 | `certificateFile` | — | PEM (certificado + clave, modo 0600) donde guardar/cargar la identidad DTLS: huella estable entre reinicios y sin generar claves al arrancar (`RtcCertificate.loadOrCreate`, E/S síncrona, escritura atómica vía `.tmp` + rename) |
 | `shared` | `true` | todas las salas del proceso con la misma configuración (puerto —también 0—, direcciones, `ipv6`, certificado, tiempos, suites) comparten **un** endpoint y un socket UDP (refcontado, `src/rtc/shared.ts`); `false` = endpoint propio |
+| `helloVerify` | `false` con ICE completo, `true` con `iceLite` | intercambio de cookie DTLS (HelloVerifyRequest) antes del flight 4 (~1 KB): un RTT más por entrada. Con ICE‑lite no mandamos checks y nada prueba la dirección de origen (§6.7) |
 | `cipherSuites` | Node: `['chacha20', 'aes128gcm', 'aes256gcm']`; Bun: `['aes128gcm', 'chacha20', 'aes256gcm']` | preferencia DTLS del servidor (nombres IANA, ids o cortos); un cliente sin la primera negocia la siguiente. En Bun, sin ChaCha20 nativo en `node:crypto`, el AES‑GCM nativo es más barato que la ChaCha20 en JS (§6.7) |
 | `sendBatchFrames` | `0` | `1` o `2`: retiene los mensajes de `ru` (difusión de eventos de cliente) por jugador hasta la siguiente frontera de la rejilla de 60 Hz del proceso múltiplo de n; menos datagramas a cambio de n × 8,3 ms de media (máx. n × 16,7 ms) en las entradas ajenas (§6.7). Por sala, también con endpoint compartido |
 | `endpoint` | — | un `RtcEndpoint` ya abierto (el backend no lo cierra) |
@@ -233,8 +241,9 @@ Qué cambia y qué no respecto a node-datachannel (`'ndc'`, por defecto):
   (el backend es `prefiltered`: el endpoint aplica la política a sus candidatos); `portRange` y `rtc`
   (node-datachannel) se ignoran.
 * La respuesta sale **sin la espera de 500 ms** en cuanto hay un resultado STUN (el SDP ya trae
-  los candidatos y `a=end-of-candidates`; los refrescos corren en segundo plano); solo durante la
-  primera ronda, como con `ndc`: ≤ 500 ms y el resto por trickle. Tras enviarla, el `Peer` suelta
+  los candidatos y `a=end-of-candidates`; durante un refresco en segundo plano, sin él y con el srflx
+  nuevo por trickle si cambia); solo durante la primera ronda, como con `ndc`: ≤ 500 ms y el resto
+  por trickle. Tras enviarla, el `Peer` suelta
   su SDP y sus candidatos (≈ 0,5–1 KB por jugador), y la sesión su `answerSdp` al conectar DTLS.
 * **Arranque perezoso**, como `ndc` (que carga node-datachannel con el primer peer): la sala se
   anuncia al maestro en el acto y los módulos rtc, el socket y el certificado se preparan con la
@@ -862,15 +871,19 @@ haxlite corre en Node ≥ 22 y en Bun (medido con Bun 1.4). Esta pasada ajusta h
 runtimes y recorta la entrada y los datagramas. Micro‑medidas de los commits («mejor de», Windows
 salvo que se diga otra cosa); los resultados del host completo están en [docs/07](07-benchmarks.md).
 
-**DTLS sin HelloVerifyRequest** (`dtls/server.ts`). RFC 6347 §4.2.1 permite omitir el intercambio de
-cookie, cuyo único fin es probar que el cliente es dueño de su dirección de origen. Aquí eso ya está
-probado: `RtcEndpoint` solo entrega DTLS a una sesión desde direcciones validadas por STUN
-autenticado (Binding con USERNAME, MESSAGE‑INTEGRITY y FINGERPRINT correctos, o respuesta autenticada
-a nuestro check); el resto cuenta como `dtlsUnknownSource`. El edge usa el mismo `RtcEndpoint` y
-`DtlsServer` no se instancia en ningún otro sitio. El primer ClientHello recibe el flight 4: un RTT
-menos por entrada y dos HMAC menos por sesión. Un ClientHello retransmitido solo retransmite el
-flight 4 tal cual (como mucho uno cada 250 ms); un cookie no pedido se ignora. `helloVerify: true`
-(opción de `DtlsServer`; `RtcEndpoint` no la expone) conserva el intercambio para usos fuera de ICE.
+**DTLS sin HelloVerifyRequest con ICE completo** (`dtls/server.ts`). RFC 6347 §4.2.1 permite omitir
+el intercambio de cookie, cuyo único fin es probar que el cliente es dueño de su dirección de origen.
+Con ICE completo eso lo prueba nuestro propio check: `RtcEndpoint` solo entrega DTLS a una sesión
+desde direcciones cuyo check nuestro recibió una respuesta autenticada y simétrica, y los flights del
+handshake solo van a la dirección del ClientHello que lo empezó; el resto cuenta como
+`dtlsUnknownSource`. Un Binding autenticado **no** basta: su clave es nuestra contraseña ICE, que
+conoce todo cliente que entra, así que un cliente podría falsear el origen de una víctima, nominarla
+y mandar un ClientHello falso para que el flight 4 (~1 KB, retransmitido: ×20–40) le llegue a ella.
+Con ICE‑lite no mandamos checks, nada prueba la dirección y el cookie queda **activado por defecto**
+(`helloVerify`, opción de `RtcEndpoint` y `RtcBackendOptions`; un RTT más por entrada). Sin cookie,
+el primer ClientHello recibe el flight 4: un RTT menos por entrada y dos HMAC menos por sesión. Un
+ClientHello retransmitido solo retransmite el flight 4 tal cual (como mucho uno cada 250 ms); un
+cookie no pedido se ignora.
 Interop: Chrome real (loopback4, lossy, dtls13), libdatachannel y OpenSSL sin fallos nuevos.
 
 **Suites por runtime** (`defaultSuites` en `dtls/crypto.ts`; `cipherSuites` sigue mandando):
@@ -943,7 +956,7 @@ CPU del host (máquina compartida, ruidosa): 2,0–3,5 % / 1,1–2,0 % / 1,0–2
 `HAXLITE_TEST_RTC_BATCH_FRAMES=1|2` corre las suites rtc (proyecto vitest `rtc` y la sala del interop
 con el cliente oficial) con el agrupado activado.
 
-**Entrada y memoria por jugador.** Además del DTLS sin cookie: refresco STUN en segundo plano (§2.1),
+**Entrada y memoria por jugador.** Además del DTLS sin cookie (ICE completo): refresco STUN en segundo plano (§2.1),
 `challengeDelayMs` 0 / 10 ms según el cliente (§3), el `Peer` suelta SDP y candidatos al mandar la
 respuesta y `RtcSession.answerSdp` pasa a ser un getter que devuelve `''` una vez conectado DTLS (o
 cerrada la sesión). Certificado: `processDefault()` y `loadOrCreate` son síncronos (≈ 1–3 ms una vez),

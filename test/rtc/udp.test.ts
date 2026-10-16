@@ -174,6 +174,8 @@ function fakeBunSocket(opts: { reloadThrows?: boolean } = {}) {
     dgramSends: [] as { bytes: string; buf: Uint8Array }[],
     drains: 0,
     accept: true,
+    /** Destination ports that fail like EACCES/ENETUNREACH (send throws; sendMany throws when the first one fails, stops before a later one). */
+    badPorts: new Set<number>(),
     acceptMany: Infinity,
     closed: false,
     handlers: null as Handlers | null,
@@ -181,6 +183,7 @@ function fakeBunSocket(opts: { reloadThrows?: boolean } = {}) {
   const native = {
     send(data: Uint8Array, port: number, address: string) {
       if (log.closed) throw new Error('Socket is closed');
+      if (log.badPorts.has(port)) throw Object.assign(new Error('send EACCES'), { code: 'EACCES' });
       if (!log.accept) return false;
       log.sends.push([Buffer.from(data).toString(), port, address]);
       return true;
@@ -188,7 +191,13 @@ function fakeBunSocket(opts: { reloadThrows?: boolean } = {}) {
     sendMany(p: unknown[]) {
       if (log.closed) throw new Error('Socket is closed');
       expect(p.length % 3).toBe(0);
-      const n = Math.min(p.length / 3, log.acceptMany);
+      let n = Math.min(p.length / 3, log.acceptMany);
+      // like sendmmsg(2): an error on the first datagram is an error, on a later one a short count
+      for (let i = 0; i < n; i++) {
+        if (!log.badPorts.has(p[3 * i + 1] as number)) continue;
+        if (i === 0) throw Object.assign(new Error('sendMany EACCES'), { code: 'EACCES' });
+        n = i;
+      }
       const batch: [string, number, string][] = [];
       for (let i = 0; i < n; i++) batch.push([Buffer.from(p[3 * i] as Uint8Array).toString(), p[3 * i + 1] as number, p[3 * i + 2] as string]);
       log.many.push(batch);
@@ -343,6 +352,55 @@ describe('UdpIo (Bun native socket, shape-faked)', () => {
     io.send(Buffer.from('w'), 4, '127.0.0.1');
     endUdpBatch();
     expect(log.dgramSends.map((d) => Buffer.from(d.buf).toString())).toEqual(['y', 'z', 'w']);
+  });
+
+  it('a destination that fails first in the batch (sendMany throws) does not drop the others', () => {
+    const { sock, log } = fakeBunSocket();
+    const io = new UdpIo(sock, () => {}, () => {});
+    log.badPorts.add(9);
+    for (let round = 0; round < 2; round++) {
+      // the bad peer is first every time (e.g. the first player of every tick)
+      beginUdpBatch();
+      io.send(Buffer.from('bad'), 9, '127.0.0.1');
+      io.send(Buffer.from(`a${round}`), 1, '127.0.0.1');
+      io.send(Buffer.from(`b${round}`), 2, '127.0.0.1');
+      expect(() => endUdpBatch()).not.toThrow();
+    }
+    expect(log.many).toEqual([]);
+    expect(log.sends).toEqual([
+      ['a0', 1, '127.0.0.1'],
+      ['b0', 2, '127.0.0.1'],
+      ['a1', 1, '127.0.0.1'],
+      ['b1', 2, '127.0.0.1'],
+    ]);
+    expect(log.dgramSends).toEqual([]);
+    // a bad one later in the batch: short count, the tail (bad one included) goes to dgram
+    beginUdpBatch();
+    io.send(Buffer.from('c'), 1, '127.0.0.1');
+    io.send(Buffer.from('bad'), 9, '127.0.0.1');
+    io.send(Buffer.from('d'), 2, '127.0.0.1');
+    endUdpBatch();
+    expect(log.many).toEqual([[['c', 1, '127.0.0.1']]]);
+    expect(log.dgramSends.map((d) => d.bytes)).toEqual(['bad', 'd']);
+  });
+
+  it('per-datagram fallback: a full kernel queue sends the rest through dgram, in order', () => {
+    const { sock, log } = fakeBunSocket();
+    const io = new UdpIo(sock, () => {}, () => {});
+    log.badPorts.add(9);
+    let calls = 0;
+    const native = (sock as unknown as Record<symbol, { handle: { socket: { send: (...a: unknown[]) => boolean } } }>);
+    const h = native[Object.getOwnPropertySymbols(sock)[0]!]!.handle.socket;
+    const orig = h.send.bind(h);
+    h.send = (...a: unknown[]) => (++calls === 3 ? false : orig(...a)); // the 2nd good one finds the queue full
+    beginUdpBatch();
+    io.send(Buffer.from('bad'), 9, '127.0.0.1');
+    io.send(Buffer.from('x'), 1, '127.0.0.1');
+    io.send(Buffer.from('y'), 2, '127.0.0.1');
+    io.send(Buffer.from('z'), 3, '127.0.0.1');
+    endUdpBatch();
+    expect(log.sends.map((s) => s[0])).toEqual(['x']);
+    expect(log.dgramSends.map((d) => d.bytes)).toEqual(['y', 'z']);
   });
 
   it('a closed socket drops the batch without throwing', () => {
