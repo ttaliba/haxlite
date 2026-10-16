@@ -22,7 +22,7 @@ export interface ValidatedAddress {
   sock: UdpIo;
   address: string;
   port: number;
-  /** `address|port` (bound into the DTLS cookie). */
+  /** `address|port` (the DTLS server's peer key; bound into the HelloVerifyRequest cookie when that exchange is enabled — off by default). */
   key: string;
 }
 
