@@ -30,6 +30,7 @@ import {
   type RoomEvent,
 } from '../../src/room/index.js';
 import { MovingAverage, ProtocolViolation, Sequencer, SequencerClient } from '../../src/host/index.js';
+import { sameRoomState } from '../../src/host/sequencer.js';
 import { officialInternals } from '../oracle/official.js';
 import { prng } from '../oracle/index.js';
 
@@ -326,6 +327,58 @@ describe('Sequencer runner details', () => {
     }
     expect([a.frame, a.eventsInFrame, a.eventCounter, a.queue.length]).toEqual([b.frame, b.eventsInFrame, b.eventCounter, b.queue.length]);
     expect(a.eventCounter).toBe(2);
+  });
+  it('fully paused fast path == frame-by-frame (state, checksum, counters, views)', () => {
+    let ticks = 0;
+    const mkSeq = () => {
+      const s = new Sequencer(createRoomState(), { broadcast() {}, hasConnections: () => true });
+      s.rs.hooks.onGameTick = () => ticks++;
+      s.hostEvent(JoinRoomEvent.create(1, 'x', 'uy', null));
+      s.hostEvent(JoinRoomEvent.create(2, 'y', 'uy', null));
+      s.hostEvent(SetPlayerTeamEvent.create(1, 1));
+      s.hostEvent(SetPlayerTeamEvent.create(2, 2));
+      s.hostEvent(new StartGameEvent());
+      s.hostEvent(SendInputEvent.create(9)); // moving when paused
+      s.advance(30);
+      s.hostEvent(PauseResumeGameEvent.create(true)); // delay: applied at +Sb
+      s.ensureView(2); // a private view, also paused
+      return s;
+    };
+    const a = mkSeq();
+    const b = mkSeq();
+    b.onFrameStepped = () => {}; // disables the fast path
+    const ticksBefore = ticks;
+    const run = (s: Sequencer) => {
+      s.advance(5);
+      expect(s.rs.gameState!.pauseGameTickCounter).toBe(120);
+      expect(s.idleFrames(1000)).toBe(s === a ? 1000 : 0);
+      s.advance(216_000); // 1 h paused, nothing queued
+      // queued events in the middle of the pause: a far-ahead input, then the unpause
+      s.hostEvent(SendInputEvent.create(3));
+      s.hostEvent(PauseResumeGameEvent.create(false));
+      s.advance(5_000);
+      s.checksum();
+    };
+    run(a);
+    run(b);
+    expect(ticks).toBeGreaterThan(ticksBefore); // the game resumed and ticked again
+    expect([a.frame, a.eventsInFrame, a.eventCounter, a.queue.length, a.lastChecksumFrame]).toEqual([
+      b.frame,
+      b.eventsInFrame,
+      b.eventCounter,
+      b.queue.length,
+      b.lastChecksumFrame,
+    ]);
+    expect(ourStateBytes(a)).toEqual(ourStateBytes(b));
+    expect(Buffer.from(a.snapshot(3))).toEqual(Buffer.from(b.snapshot(3)));
+    expect(sameRoomState(a.getView(2)?.rs ?? a.rs, b.getView(2)?.rs ?? b.rs)).toBe(true);
+    // the skip is O(1): 30 days paused
+    const c = mkSeq();
+    c.advance(5);
+    const t0 = performance.now();
+    c.advance(30 * 24 * 216_000);
+    expect(performance.now() - t0).toBeLessThan(500);
+    expect(c.rs.gameState!.pauseGameTickCounter).toBe(120);
   });
   it('a hook that throws does not abort the loop', () => {
     const errors: unknown[] = [];

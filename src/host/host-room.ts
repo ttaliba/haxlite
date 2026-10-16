@@ -347,8 +347,8 @@ export class HostRoom {
     this.state = opts.state ?? createHostRoomState();
     this.realClock = opts.now === undefined;
     this.now = opts.now ?? (() => performance.now());
-    this.hbFrames = opts.heartbeatFrames ?? HostDefaults.heartbeatFrames;
-    this.csFrames = opts.checksumIntervalFrames ?? HostDefaults.checksumIntervalFrames;
+    this.hbFrames = HostRoom.checkFrames('heartbeatFrames', opts.heartbeatFrames ?? HostDefaults.heartbeatFrames, 600);
+    this.csFrames = HostRoom.checkFrames('checksumIntervalFrames', opts.checksumIntervalFrames ?? HostDefaults.checksumIntervalFrames, 1 << 20);
     this.wakeFrames = HostRoom.checkWakeFrames(opts.maxWakeFrames ?? HostDefaults.maxWakeFrames);
     this.pingIntervalMs = opts.pingIntervalMs ?? HostDefaults.pingIntervalMs;
     const sink: SequencerSink = {
@@ -446,7 +446,7 @@ export class HostRoom {
     return this.hbFrames;
   }
   set heartbeatFrames(v: number) {
-    this.hbFrames = v;
+    this.hbFrames = HostRoom.checkFrames('heartbeatFrames', v, 600);
     this.schedule();
   }
 
@@ -455,7 +455,7 @@ export class HostRoom {
     return this.csFrames;
   }
   set checksumIntervalFrames(v: number) {
-    this.csFrames = v;
+    this.csFrames = HostRoom.checkFrames('checksumIntervalFrames', v, 1 << 20);
     this.schedule();
   }
 
@@ -466,6 +466,18 @@ export class HostRoom {
   set maxWakeFrames(v: number) {
     this.wakeFrames = HostRoom.checkWakeFrames(v);
     this.schedule();
+  }
+
+  /**
+   * An integer in [1, max] (same ranges as HBInit): the heartbeat grid takes
+   * `frame % heartbeatFrames` (0 or a fraction would never wake the room, Infinity
+   * would loop) and the checksum cadence counts whole frames.
+   */
+  private static checkFrames(name: string, v: number, max: number): number {
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 1 || v > max) {
+      throw new RangeError(`${name} must be an integer in [1, ${max}] (got ${v})`);
+    }
+    return v;
   }
 
   private static checkWakeFrames(v: number): number {
@@ -1115,9 +1127,12 @@ export class HostRoom {
     const seq = this.sequencer;
     const n = this.targetFrame() - seq.frame;
     if (this.hiddenFor.size > 0 || this.reconciling.size > 0) {
-      // hidden players: re-hide / reconcile after every frame (a kick-off reset respawns discs)
-      for (let i = 0; i < n; i++) {
-        seq.advance(1);
+      // hidden players: re-hide / reconcile after every frame (a kick-off reset respawns discs);
+      // an idle stretch (fully paused game, no events) changes nothing: one jump, one sync
+      for (let i = 0; i < n; ) {
+        const k = seq.idleFrames(n - i) || 1;
+        seq.advance(k);
+        i += k;
         this.syncHidden();
       }
     } else if (n > 0) seq.advance(n);
@@ -1222,9 +1237,9 @@ export class HostRoom {
       if (cs < next) next = cs;
     }
     const gs = this.state.gameState;
-    // a fully paused game runs no per-frame hooks: no catch-up bound (frames
-    // are still stepped one by one on the next catch-up); the unpause
-    // countdown (counter < PAUSED_TICKS) keeps it
+    // a fully paused game runs no per-frame hooks: no catch-up bound (the
+    // next catch-up skips the paused frames in O(1), Sequencer.idleFrames);
+    // the unpause countdown (counter < PAUSED_TICKS) keeps it
     if (gs !== null && gs.pauseGameTickCounter !== PAUSED_TICKS) {
       const mw = this.wakeFrames;
       if (mw < hb) {

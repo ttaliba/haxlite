@@ -21,6 +21,7 @@ import { Channel, EventType, HostMsg, INPUT_DELAY_FRAMES, MAX_EVENT_FRAME_LEAD }
 import {
   CheckConsistencyEvent,
   EVENT_META,
+  PAUSED_TICKS,
   SetDiscPropertiesEvent,
   checkClientSender,
   createEvent,
@@ -41,32 +42,110 @@ import {
  */
 export const MAX_WORLD_DISCS = 255;
 
-/** Why `ev` must not be sequenced (it would push the world past {@link MAX_WORLD_DISCS}), or null. */
-export function discLimitViolation(rs: RoomState, ev: RoomEvent): string | null {
-  if (ev.type === EventType.SetPlayerTeam) {
-    const gs = rs.gameState;
-    if (gs === null) return null;
-    const e = ev as RoomEvent & { playerId: number; team: number };
-    if (e.team === 0) return null;
-    const p = rs.players.find((x) => x.id === e.playerId);
-    if (p === undefined || p.disc !== null) return null;
-    if (gs.world.discs.length >= MAX_WORLD_DISCS) {
-      return `setPlayerTeam(${e.playerId}): the world already has ${gs.world.discs.length} discs (max ${MAX_WORLD_DISCS} with players)`;
+/**
+ * Why `ev` must not be sequenced (it could push the world past
+ * {@link MAX_WORLD_DISCS}), or null. `queued` are the events already accepted
+ * for future frames (client events can be scheduled up to
+ * `MAX_EVENT_FRAME_LEAD` frames ahead, host `delay` events `Sb` ahead): they
+ * are checked against the state of their acceptance, so their effect is not
+ * in `rs` yet. The bound counts what they could add, ignoring their order and
+ * whether they will still be allowed when applied (never less than the real
+ * count; refusing at apply time instead would desync the clients, which
+ * apply every sequenced event):
+ *  - SetPlayerTeam into a team: one disc per distinct player that has none;
+ *  - AutoTeams: two discs (the teams may be even by then);
+ *  - StartGame: a new world of the largest stadium (current or queued
+ *    SetStadium) + every player in a team now + every player those events
+ *    could put in a team.
+ */
+export function discLimitViolation(rs: RoomState, ev: RoomEvent, queued: readonly RoomEvent[] = []): string | null {
+  const type = ev.type;
+  if (type !== EventType.SetPlayerTeam && type !== EventType.AutoTeams && type !== EventType.StartGame) return null;
+  let gainers: Set<number> | null = null; // players a queued SetPlayerTeam may give a disc
+  let autoGain = 0;
+  let start = type === EventType.StartGame;
+  let teamsMayChange = false;
+  let stadiumDiscs = rs.stadium?.discs.length ?? 0;
+  for (let i = 0; i < queued.length; i++) {
+    const q = queued[i]!;
+    switch (q.type) {
+      case EventType.SetPlayerTeam: {
+        teamsMayChange = true;
+        const e = q as RoomEvent & { playerId: number; team: number };
+        if (e.team !== 0 && mayGainDisc(rs, e.playerId)) (gainers ??= new Set()).add(e.playerId);
+        break;
+      }
+      case EventType.AutoTeams:
+        teamsMayChange = true;
+        autoGain += 2;
+        break;
+      case EventType.KickBanPlayer:
+        teamsMayChange = true;
+        break;
+      case EventType.StartGame:
+        start = true;
+        break;
+      case EventType.SetStadium: {
+        const st = (q as RoomEvent & { stadium: { discs: unknown[] } | null }).stadium;
+        if (st !== null && st.discs.length > stadiumDiscs) stadiumDiscs = st.discs.length;
+        break;
+      }
     }
-    return null;
   }
-  if (ev.type === EventType.AutoTeams) {
-    const gs = rs.gameState;
-    if (gs !== null && gs.world.discs.length >= MAX_WORLD_DISCS) return `autoTeams: the world already has ${gs.world.discs.length} discs (max ${MAX_WORLD_DISCS})`;
-    return null;
+  let own = 0;
+  let what = 'startGame';
+  if (type === EventType.SetPlayerTeam) {
+    const e = ev as RoomEvent & { playerId: number; team: number };
+    if (e.team === 0 || !mayGainDisc(rs, e.playerId) || gainers?.has(e.playerId) === true) return null;
+    own = 1;
+    what = `setPlayerTeam(${e.playerId})`;
+  } else if (type === EventType.AutoTeams) {
+    own = teamsMayChange ? 2 : autoTeamsAdds(rs);
+    if (own === 0) return null;
+    what = 'autoTeams';
   }
-  if (ev.type === EventType.StartGame) {
-    if (rs.gameState !== null || rs.stadium === null) return null;
-    let n = rs.stadium.discs.length;
-    for (const p of rs.players) if (p.team !== 0) n++;
-    if (n > MAX_WORLD_DISCS) return `startGame: ${rs.stadium.discs.length} stadium discs + players in teams = ${n} (max ${MAX_WORLD_DISCS})`;
+  const gain = (gainers?.size ?? 0) + autoGain + own;
+  const gs = rs.gameState;
+  let max = gs !== null ? gs.world.discs.length + gain : 0;
+  if (start) {
+    let n = stadiumDiscs + gain;
+    const players = rs.players;
+    for (let i = 0; i < players.length; i++) if (players[i]!.team !== 0) n++;
+    if (n > max) max = n;
   }
+  if (max > MAX_WORLD_DISCS) return `${what}: the world could reach ${max} discs (max ${MAX_WORLD_DISCS})`;
   return null;
+}
+
+/** A SetPlayerTeam into a team for `playerId` may add a disc (unknown ids too: the player may join first). */
+function mayGainDisc(rs: RoomState, playerId: number): boolean {
+  const players = rs.players;
+  for (let i = 0; i < players.length; i++) {
+    const p = players[i]!;
+    if (p.id === playerId) return p.team === 0 || (rs.gameState !== null && p.disc === null);
+  }
+  return true;
+}
+
+/**
+ * Players AutoTeams would move into a team in `rs` (= discs it adds with a
+ * running game; `AutoTeamsEvent.apply`): two spectators when the teams are
+ * even and there are at least two, one when they are uneven, else none.
+ */
+function autoTeamsAdds(rs: RoomState): number {
+  let specs = 0;
+  let red = 0;
+  let blue = 0;
+  const players = rs.players;
+  for (let i = 0; i < players.length; i++) {
+    const t = players[i]!.team;
+    if (t === 0) ++specs;
+    else if (t === 1) ++red;
+    else if (t === 2) ++blue;
+  }
+  if (specs === 0) return 0;
+  if (red === blue) return specs >= 2 ? 2 : 0;
+  return 1;
 }
 
 /** Fixed-size moving average (official `$a`): ring of samples, running sum. */
@@ -255,8 +334,9 @@ export class Sequencer {
   /**
    * Simulates `n` frames (official `Ma.rg`): before each step, the queued
    * events of the current frame; after the last step, the queued events of
-   * the new frame whose order is consecutive. Frames without a game and
-   * without events are skipped in O(1) (stepping them is a no-op).
+   * the new frame whose order is consecutive. Frames without events and
+   * without a game, or with a fully paused one, are skipped in O(1)
+   * (stepping them is a no-op, see {@link idleFrames}).
    */
   advance(n: number): void {
     if (n <= 0) return;
@@ -268,7 +348,7 @@ export class Sequencer {
     this.depth++;
     try {
       while (e < n) {
-        if (rs.gameState === null && this.onFrameStepped === null && (this.views.length === 0 || this.viewsIdle())) {
+        if (this.idle()) {
           const next = c < count ? list[c]!.frame : Infinity;
           if (next > this.frame) {
             const skip = Math.min(next - this.frame, n - e);
@@ -307,6 +387,28 @@ export class Sequencer {
       if (c > 0) dropFirst(list, c);
       this.depth--;
     }
+  }
+
+  /**
+   * Stepping a frame changes nothing but the frame counters: no game, or a
+   * fully paused one (official `Q.Da` only counts an unpause countdown down
+   * and runs no hook, not even `onGameTick`), in the room and in every
+   * private view, and nobody observes each frame ({@link onFrameStepped}).
+   */
+  private idle(): boolean {
+    return this.onFrameStepped === null && worldIdle(this.rs) && (this.views.length === 0 || this.viewsIdle());
+  }
+
+  /**
+   * How many of the next `max` frames {@link advance} skips in O(1): the
+   * frames before the next queued event while the room is idle (no game or
+   * a fully paused one), else 0. Lets a caller that must act after every
+   * real step (hidden players) jump over the idle stretch in one call.
+   */
+  idleFrames(max: number): number {
+    if (max <= 0 || !this.idle()) return 0;
+    const next = this.queue.length > 0 ? this.queue[0]!.frame : Infinity;
+    return next > this.frame ? Math.min(next - this.frame, max) : 0;
   }
 
   /**
@@ -392,7 +494,7 @@ export class Sequencer {
 
   private viewsIdle(): boolean {
     const views = this.views;
-    for (let i = 0; i < views.length; i++) if (views[i]!.rs.gameState !== null) return false;
+    for (let i = 0; i < views.length; i++) if (!worldIdle(views[i]!.rs)) return false;
     return true;
   }
 
@@ -590,7 +692,7 @@ export class Sequencer {
    * then broadcast on `ru` when any connection exists.
    */
   hostEvent(ev: RoomEvent): void {
-    const tooMany = discLimitViolation(this.rs, ev);
+    const tooMany = discLimitViolation(this.rs, ev, this.queue);
     if (tooMany !== null) {
       this.reportError(new Error(tooMany));
       return;
@@ -666,7 +768,7 @@ export class Sequencer {
     ev.clientSeq = clientSeq;
     ev.byId = client.playerId;
     if (!ev.validate(this.rs)) return null;
-    if (discLimitViolation(this.rs, ev) !== null) return null;
+    if (discLimitViolation(this.rs, ev, this.queue) !== null) return null;
     const hook = this.onBeforeOperation;
     if (hook !== null && hook(ev, client.playerId, requested) === false) return null;
     const variants = this.makeVariants(ev);
@@ -768,6 +870,12 @@ export class Sequencer {
     writeEventFrame(w, ev);
     this.sink.sendTo?.(playerId, w.finishShared(), channel);
   }
+}
+
+/** Stepping `rs` is a no-op: no game, or a fully paused one (not counting down to resume). */
+function worldIdle(rs: RoomState): boolean {
+  const gs = rs.gameState;
+  return gs === null || gs.pauseGameTickCounter === PAUSED_TICKS;
 }
 
 /**
