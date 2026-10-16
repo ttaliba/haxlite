@@ -1,9 +1,12 @@
 /**
- * Heartbeat piggyback (bundling backends): after a client event is broadcast
- * inside a cork()/uncork() scope, a heartbeat due within
- * floor((heartbeatFrames - 1) / 3) frames leaves in the same scope. Gaps
- * never exceed heartbeatFrames; without a bundling backend the cadence is
- * the exact one. Deterministic: injected clock, explicit catch-ups.
+ * Heartbeats on the absolute grid + piggyback (bundling backends). Periodic
+ * heartbeats leave on grid frames ((gridBase + frame) % heartbeatFrames ===
+ * 0; gridBase = 0 with an injected clock). After a client event is
+ * broadcast inside a cork()/uncork() scope, a heartbeat whose grid point is
+ * within floor((heartbeatFrames - 1) / 3) frames leaves in the same scope
+ * and covers that grid point. Gaps stay within heartbeatFrames ± lead
+ * (official host: 7..9 frames); without a bundling backend the cadence is
+ * the exact grid. Deterministic: injected clock, explicit catch-ups.
  */
 import { describe, expect, it } from 'vitest';
 import { Reader, Writer } from '../../src/codec/index.js';
@@ -100,25 +103,29 @@ function run(bundling: boolean, heartbeatFrames = 7) {
   return { hb, gaps, withEvent };
 }
 
-describe('heartbeat piggyback', () => {
-  it('bundling backend: imminent heartbeats leave with the event, gaps <= heartbeatFrames', () => {
+describe('heartbeat grid + piggyback', () => {
+  it('bundling backend: heartbeats ride with events up to 2 frames before their grid point', () => {
     const { hb, gaps, withEvent } = run(true);
-    expect(hb.length).toBeGreaterThan(80);
-    expect(Math.max(...gaps)).toBeLessThanOrEqual(7);
-    // early only by up to floor((7 - 1) / 3) = 2 frames
-    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(5);
+    expect(hb.length).toBeGreaterThan(70);
+    // on a grid point or up to floor((7 - 1) / 3) = 2 frames before one
+    expect(hb.filter((h) => h.frame > 0 && ![0, 5, 6].includes(h.frame % 7))).toEqual([]);
+    expect(Math.max(...gaps)).toBeLessThanOrEqual(7 + 2);
+    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(7 - 2);
+    // one heartbeat per grid period: the piggybacked one covers its grid point
+    expect(hb.length).toBeLessThanOrEqual(Math.ceil(600 / 7) + 1);
     // with an event every 3 frames, every heartbeat rides with one
     expect(withEvent / hb.length).toBeGreaterThan(0.95);
   });
 
-  it('heartbeatFrames 4: lead 1, gaps 3..4', () => {
+  it('heartbeatFrames 4: lead 1, gaps 3..5', () => {
     const { gaps } = run(true, 4);
-    expect(Math.max(...gaps)).toBeLessThanOrEqual(4);
+    expect(Math.max(...gaps)).toBeLessThanOrEqual(5);
     expect(Math.min(...gaps)).toBeGreaterThanOrEqual(3);
   });
 
-  it('no bundling backend: exact cadence', () => {
-    const { gaps } = run(false);
+  it('no bundling backend: exact grid cadence', () => {
+    const { hb, gaps } = run(false);
     expect(gaps.filter((g) => g !== 7)).toEqual([]);
+    expect(hb.filter((h) => h.frame % 7 !== 0)).toEqual([]);
   });
 });

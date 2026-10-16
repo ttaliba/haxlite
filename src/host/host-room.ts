@@ -324,6 +324,8 @@ export class HostRoom {
   private wakePing = NaN;
   /** Room-clock ms of the next Ping event (Infinity while no client is ready). */
   private nextPingAt = Infinity;
+  /** Room-clock ms the Ping event is nominally due (nextPingAt = that, rounded up to the grid). */
+  private pingDue = Infinity;
   private readonly deferred: (() => void)[] = [];
   private flushing = false;
   private readonly pongWriter = new Writer(32);
@@ -1106,15 +1108,65 @@ export class HostRoom {
         this.syncHidden();
       }
     } else if (n > 0) seq.advance(n);
-    seq.periodic(this.hbFrames, this.csFrames);
+    this.periodic();
   }
 
   /**
-   * Frames ahead of its due frame that a heartbeat may leave with a client
-   * event (bundling backends): floor((heartbeatFrames - 1) / 3), 2 by default.
+   * Heartbeat / CheckConsistency cadence (official `Wa.Da` after `rg`, on
+   * the absolute heartbeat grid): a heartbeat once the frame reaches the
+   * next grid point not already covered ({@link nextHeartbeatFrame}), and
+   * heartbeat + CheckConsistency every `checksumIntervalFrames`.
+   */
+  private periodic(): void {
+    const seq = this.sequencer;
+    if (seq.frame >= this.nextHeartbeatFrame()) seq.heartbeat();
+    if (seq.frame - seq.lastChecksumFrame >= this.csFrames) {
+      seq.heartbeat();
+      seq.checksum();
+    }
+  }
+
+  // ---- absolute heartbeat grid
+  //
+  // Periodic heartbeats leave on frames whose index on the process-wide
+  // frame grid (gridBase + frame) is a multiple of heartbeatFrames, and the
+  // in-game catch-ups, CheckConsistency and Ping wake-ups are placed on that
+  // same grid, so every room of the process wakes on the same few frame
+  // boundaries (~2 per heartbeat period) whatever their number.
+
+  /** Position of room frame `f` inside its heartbeat period (0 = grid point). */
+  private gridMod(f: number): number {
+    return (this.gridBase + f) % this.hbFrames;
+  }
+
+  /** First heartbeat grid point after frame `f`. */
+  private gridAfter(f: number): number {
+    return f + this.hbFrames - this.gridMod(f);
+  }
+
+  /** First heartbeat grid point at or after frame `f`. */
+  private gridCeil(f: number): number {
+    const m = this.gridMod(f);
+    return m === 0 ? f : f + this.hbFrames - m;
+  }
+
+  /**
+   * Frame of the next periodic heartbeat: the first grid point more than
+   * {@link heartbeatLead} frames after the last heartbeat (a heartbeat that
+   * left up to that many frames early with a client event covers its grid
+   * point). Gaps: heartbeatFrames, up to + lead with bundling.
+   */
+  private nextHeartbeatFrame(): number {
+    return this.gridAfter(this.sequencer.lastHeartbeatFrame + this.heartbeatLead());
+  }
+
+  /**
+   * Frames ahead of its grid point that a heartbeat may leave with a client
+   * event: floor((heartbeatFrames - 1) / 3), 2 by default, with a bundling
+   * backend (it rides in the event's packet); 0 otherwise.
    */
   private heartbeatLead(): number {
-    return ((this.hbFrames - 1) / 3) | 0;
+    return this.bundle !== null ? ((this.hbFrames - 1) / 3) | 0 : 0;
   }
 
   /** Pre-bound so wake-ups allocate nothing. */
@@ -1128,8 +1180,9 @@ export class HostRoom {
     const now = this.now();
     if (now >= this.nextPingAt) {
       // setInterval-like cadence; never fire twice in a row after a stall
-      let next = this.nextPingAt + this.pingIntervalMs;
+      let next = this.pingDue + this.pingIntervalMs;
       if (next <= now) next = now + this.pingIntervalMs;
+      this.pingDue = next;
       this.nextPingAt = this.onGrid(next);
       this.run(this.pingFn);
     } else {
@@ -1151,8 +1204,8 @@ export class HostRoom {
     const clients = this.ready.length > 0;
     let next = Infinity;
     if (clients) {
-      next = seq.lastHeartbeatFrame + hb;
-      const cs = seq.lastChecksumFrame + this.csFrames;
+      next = this.nextHeartbeatFrame();
+      const cs = this.gridCeil(seq.lastChecksumFrame + this.csFrames);
       if (cs < next) next = cs;
     }
     const gs = this.state.gameState;
@@ -1161,20 +1214,23 @@ export class HostRoom {
     // countdown (counter < PAUSED_TICKS) keeps it
     if (gs !== null && gs.pauseGameTickCounter !== PAUSED_TICKS) {
       const mw = this.wakeFrames;
-      if (!clients) {
-        const f = frame + (mw < hb ? mw : hb);
-        if (f < next) next = f;
-      } else if (mw < hb) {
-        // k catch-ups per heartbeat period: lastHeartbeat + ceil(i * hb / k)
-        const base = seq.lastHeartbeatFrame;
+      if (mw < hb) {
+        // k catch-up points per heartbeat period (grid point + ceil(i * hb / k),
+        // shared by every room): the LAST one within maxWakeFrames of the
+        // frame just caught up, so a room caught up by a message skips points
+        const base = frame - this.gridMod(frame);
         const k = Math.ceil(hb / mw);
-        for (let i = 1; i < k; i++) {
-          const f = base + Math.ceil((i * hb) / k);
-          if (f > frame) {
-            if (f < next) next = f;
-            break;
-          }
+        const limit = frame + mw;
+        let f = limit; // unreachable fallback: points are <= ceil(hb / k) <= mw apart
+        for (let i = 1; ; i++) {
+          const p = base + Math.floor(i / k) * hb + Math.ceil(((i % k) * hb) / k);
+          if (p > limit) break;
+          if (p > frame) f = p;
         }
+        if (f < next) next = f;
+      } else if (!clients) {
+        const f = this.gridAfter(frame);
+        if (f < next) next = f;
       }
     } else if ((clients || gs !== null) && seq.queue.length > 0) {
       // without a game: the next queued event; paused: also without clients
@@ -1213,20 +1269,24 @@ export class HostRoom {
   }
 
   /**
-   * Room time `t` rounded up to a process-wide frame boundary (real clock),
-   * so the Ping event shares the wake-up of whatever else is due then. The
+   * Room time `t` rounded up to a heartbeat grid point (real clock), so the
+   * Ping event shares the wake-up of the heartbeats due then. The
    * 1e-6-frame tolerance keeps a boundary computed with rounding error
    * (`k / 0.06 + 3000`) from moving to the next one.
    */
   private onGrid(t: number): number {
     if (!this.realClock || t === Infinity) return t;
-    return Math.ceil(t * TICKS_PER_MS - 1e-6) / TICKS_PER_MS;
+    const f = this.gridCeil(Math.ceil(t * TICKS_PER_MS - 1e-6) - this.gridBase);
+    return (this.gridBase + f) / TICKS_PER_MS;
   }
 
   /** Starts / stops the 3 s Ping event with the first / last ready client. */
   private updatePingTimer(): void {
     if (this.running && this.ready.length > 0) {
-      if (this.nextPingAt === Infinity) this.nextPingAt = this.onGrid(this.now() + this.pingIntervalMs);
+      if (this.nextPingAt === Infinity) {
+        this.pingDue = this.now() + this.pingIntervalMs;
+        this.nextPingAt = this.onGrid(this.pingDue);
+      }
     } else {
       this.nextPingAt = Infinity;
     }
@@ -1360,7 +1420,10 @@ export class HostRoom {
         else throw new ProtocolViolation(`unexpected message type ${type}`);
         if (r.remaining > 0) throw new ProtocolViolation('trailing bytes');
         // bundling backend: an imminent heartbeat rides along with the event just broadcast
-        if (broadcast && this.bundle !== null) this.sequencer.heartbeatAhead(this.hbFrames, this.heartbeatLead());
+        if (broadcast && this.bundle !== null) {
+          const seq = this.sequencer;
+          if (this.nextHeartbeatFrame() - seq.frame <= this.heartbeatLead()) seq.heartbeat();
+        }
       } catch (err) {
         this.badActor(c, err);
       } finally {
