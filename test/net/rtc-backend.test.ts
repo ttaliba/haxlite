@@ -323,10 +323,14 @@ describe("peerBackend: 'rtc' frame batching (sendBatchFrames)", () => {
       await withTimeout(s.c.waitMessages(have + 2), 5000, `held ru + ${ch}`);
       expect(performance.now() * 0.06).toBeLessThan(g + 1); // the held one was due at g + 1 or g + 2
       expect(ep.stats().packetsOut - out0).toBe(1);
-      expect(s.c.received.slice(have).map(([c, b]) => [c, b[1]])).toEqual([
+      // same datagram; SCTP does not order delivery across streams (libdatachannel on Linux may hand
+      // the ro / uu message to the app first), so only the contents are checked
+      const got = s.c.received.slice(have).map(([c, b]) => [c, b[1]]);
+      expect(got).toHaveLength(2);
+      expect(got).toEqual(expect.arrayContaining([
         [1, 10 + ch],
         [ch, 20 + ch],
-      ]);
+      ]));
     }
   });
 });

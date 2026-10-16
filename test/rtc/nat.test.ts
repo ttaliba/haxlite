@@ -146,7 +146,8 @@ async function run(sc: Scenario): Promise<Result> {
     const m = await toHost(c);
     if (m !== null) session.addRemoteCandidate(m);
   }
-  let answer = session.answerSdp;
+  const hostAnswer = session.answerSdp; // released once DTLS connects
+  let answer = hostAnswer;
   if (clientNat !== null) answer = await clientNat.rewriteSdp(answer);
   session.onLocalCandidate = (c) => void toClient(c).then((m) => m && client.pc.addRemoteCandidate(m, session.mid));
   const opened = new Promise<void>((r) => (session.onOpen = r));
@@ -163,7 +164,7 @@ async function run(sc: Scenario): Promise<Result> {
     client.dcs[0]!.sendMessage('ping');
     reply = await Promise.race([client.received, sleep(3000).then(() => null)]);
   }
-  return { connected, session, ep, hostNat, answer: session.answerSdp, echo: reply };
+  return { connected, session, ep, hostNat, answer: hostAnswer, echo: reply };
 }
 
 describe.skipIf(PUBLIC === undefined)('haxlite-rtc full ICE behind a simulated NAT (libdatachannel client)', () => {
