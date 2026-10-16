@@ -140,6 +140,7 @@ export class Peer {
   /** @internal */ challenge: Uint8Array | null = null;
   /** @internal */ challengeDue = false;
   /** @internal */ challengeSent = false;
+  /** @internal ms between channel-0 open and the challenge (set at negotiation) */ challengeDelay = 0;
   /** @internal signaling `[0][peer]` already sent (`la.qf`). */ endSent = false;
   /** @internal */ answerSent = false;
   /** @internal */ gatheringDone = false;
@@ -268,10 +269,13 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   /** Housekeeping period (timeouts, deferred closes). Default 1000 ms. */
   sweepIntervalMs?: number;
   /**
-   * Delay between channel-0 open and the challenge (official: 0). Default 40 ms
-   * so libdatachannel-based clients (node-haxball) don't drop it; see
-   * `maybeSendChallenge`. Same default with `peerBackend: 'rtc'` (the delay
-   * protects the client side, whatever the server stack).
+   * Delay between channel-0 open and the challenge, for every client (official:
+   * 0). Default: 10 ms for libdatachannel-based clients (node-haxball bots,
+   * offer origin `o=rtc `), which drop a message that arrives before they
+   * report their channels open (see `maybeSendChallenge`; docs/10 measured
+   * 0/30 failures with 10 ms on both backends, 29/30 with 0 ms on `rtc`), and
+   * 0 for everyone else (browsers, like the official host). The delay protects
+   * the client side, whatever the server stack.
    */
   challengeDelayMs?: number;
   /** Debug logger (peer lifecycle). */
@@ -301,8 +305,17 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   rtcEndpoint?: RtcBackendOptions | null;
 }
 
-/** See {@link HostTransportOptions.challengeDelayMs}. */
-const DEFAULT_CHALLENGE_DELAY_MS = 40;
+/** Default challenge delay for libdatachannel clients, see {@link HostTransportOptions.challengeDelayMs}. */
+const LIBDATACHANNEL_CHALLENGE_DELAY_MS = 10;
+
+/**
+ * The offer comes from libdatachannel (node-datachannel, node-haxball): its
+ * SDP origin line is `o=rtc …` (Chrome/Safari write `o=- …`, Firefox
+ * `o=mozilla…`).
+ */
+export function isLibdatachannelOffer(sdp: string): boolean {
+  return sdp.startsWith('o=rtc ') || sdp.indexOf('\no=rtc ') >= 0;
+}
 /** Minimum time between a deferred close (kick) and the native close, so the notice is delivered first. */
 const CLOSE_LINGER_MS = 500;
 /** Remote ICE candidates accepted per negotiation (the edge has the same cap, `EdgeLimits.maxRemoteCandidates`). */
@@ -777,6 +790,8 @@ export class HostTransport {
   private negotiate(peer: Peer, offer: SignalingOffer): void {
     peer.state = 'negotiating';
     peer.mids = sdpMids(offer.sdp);
+    peer.challengeDelay =
+      this.opts.challengeDelayMs ?? (isLibdatachannelOffer(offer.sdp) ? LIBDATACHANNEL_CHALLENGE_DELAY_MS : 0);
     const events: PeerLinkEvents = {
       onLocalDescription: (sdp) => this.safely(() => this.onLocalDescription(peer, sdp)),
       onLocalCandidate: (cand, mid) => this.safely(() => this.onLocalCandidate(peer, cand, mid)),
@@ -991,7 +1006,7 @@ export class HostTransport {
     );
     this.connected.push(peer);
     peer.challenge = createChallenge();
-    const delay = this.opts.challengeDelayMs ?? DEFAULT_CHALLENGE_DELAY_MS;
+    const delay = peer.challengeDelay;
     if (delay <= 0) {
       peer.challengeDue = true;
       this.maybeSendChallenge(peer);
@@ -1015,7 +1030,8 @@ export class HostTransport {
    * separate queues and silently drop a message that arrives before all
    * their channels report open, which happens when the challenge is sent the
    * instant the SCTP association comes up. haxlite therefore waits until its
-   * three channels are open and `challengeDelayMs` (default 40 ms) elapsed.
+   * three channels are open and `challengeDelayMs` elapsed (default 10 ms for
+   * libdatachannel offers, 0 for browsers).
    */
   private maybeSendChallenge(peer: Peer): void {
     const open = peer.channelOpen;

@@ -39,6 +39,7 @@ import {
 } from '../../src/net/index.js';
 import { Reader } from '../../src/codec/index.js';
 import { passiveDtlsOffer } from '../../src/net/peer-backend.js';
+import { isLibdatachannelOffer } from '../../src/net/transport.js';
 import { officialNet } from './official-net.js';
 
 describe('ip', () => {
@@ -267,6 +268,18 @@ describe('DTLS role', () => {
     expect(passiveDtlsOffer(active)).toBe(active);
     const passive = 'v=0\r\na=setup:passive\r\n';
     expect(passiveDtlsOffer(passive)).toBe(passive);
+  });
+});
+
+describe('client stack from the offer', () => {
+  it('libdatachannel offers (o=rtc) are told apart from browser ones (o=- Chrome/Safari, o=mozilla Firefox)', () => {
+    const offer = (o: string) => `v=0\r\n${o}\r\ns=-\r\nt=0 0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n`;
+    expect(isLibdatachannelOffer(offer('o=rtc 3394405913 0 IN IP4 127.0.0.1'))).toBe(true);
+    expect(isLibdatachannelOffer('o=rtc 1 0 IN IP4 127.0.0.1\n')).toBe(true);
+    expect(isLibdatachannelOffer(offer('o=- 8733133226796603598 2 IN IP4 127.0.0.1'))).toBe(false);
+    expect(isLibdatachannelOffer(offer('o=mozilla...THIS_IS_SDPARTA-99.0 7710052215259647220 0 IN IP4 0.0.0.0'))).toBe(false);
+    expect(isLibdatachannelOffer(offer('o=rtcx 1 0 IN IP4 127.0.0.1'))).toBe(false);
+    expect(isLibdatachannelOffer(offer('o=- 1 0 IN IP4 127.0.0.1') + 'a=x-o=rtc \r\n')).toBe(false);
   });
 });
 
