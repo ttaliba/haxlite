@@ -173,10 +173,14 @@ hasta la primera PeerConnection (por eso los 7 hilos en la sala ociosa).
 
 ```sh
 npm ci
-sh bench/net/unified.sh          # compila haxlite y corre los cuatro escenarios (+ haxlite:rtc@bun desde ahora)
+sh bench/net/unified.sh          # ≈ 1 h 35 min: compila haxlite (si cambió) y corre los cuatro escenarios (+ haxlite:rtc@bun)
 node bench/net/report.mjs --unified
 node bench/charts.mjs docs/img/benchmark bench/results/unified rtc,off,nh
 ```
+
+Desde el 16-10-2026 `unified.sh` corre `idle` con `--parallel 3` y todos los escenarios con el
+calentamiento automático y sin pausas fijas (ver [Duración del arnés](#duración-del-arnés-perfiles-y-flags));
+ventanas, repeticiones, intercalado y métricas no cambian.
 
 La tanda del 13-10 ejecutó, cada uno bajo `flock /tmp/haxlite-bench.lock` (entonces con
 `node --experimental-transform-types`, que Node 26 eliminó; hoy el cargador de
@@ -192,15 +196,106 @@ flock /tmp/haxlite-bench.lock $R game --impl $I --n 4,10,20 --reps 3 --warmup 15
 flock /tmp/haxlite-bench.lock $R rooms --impl $I --k 10 --reps 3 --warmup 15 --window 60 --max-foreign 50 --attempts 3 --out bench/results/unified-rooms.json
 ```
 
+## Duración del arnés: perfiles y flags
+
+Dónde se iba el tiempo (antes del 16-10-2026) y qué cambió. Las **ventanas de medición, las
+repeticiones, el intercalado y las métricas son las mismas**; lo que se recortó es lo que pasa
+entre ventanas.
+
+| fase | antes | ahora |
+|---|---|---|
+| build | `tsc` + rolldown en cada `npm run bench:*` (≈ 3 s) | `bench/build.mjs`: se salta si el SHA-256 de `src/**`, tsconfig, `scripts/build.mjs`, `package*.json` y las versiones de typescript/rolldown coincide con el sello (≈ 0,1 s); `--force` o `HAXLITE_BENCH_REBUILD=1` recompilan |
+| fin de cada corrida | 0,5 s + 1,5 s de pausas fijas | se espera a que los procesos salgan (≤ 2,5 s) + `--settle-ms` (250 ms) |
+| `startup` | ventana de 1 s tras el link (ninguna tabla la usa) → ≈ 3,3 s por corrida | ventana de 0,25 s → ≈ 0,7 s por corrida |
+| entradas de clientes | una tras otra en cada proceso de clientes: ≈ 1,07 s por cliente (haxlite), ≈ 2,07 s (oficial, node-haxball); 10 clientes ≈ 11 / 21 s por corrida | `--join-concurrency` (4) en `rooms` y `fleet`: ≈ 3,3 / 6,4 s. **`game` y `join-impaired` siguen en 1**: su latencia de entrada se publica |
+| calentamiento | fijo: `--warmup` (15 s; idle 10; soak 60) | `--warmup-mode auto` (por defecto): sondas de CPU y RSS del host cada 1 s; termina cuando dos bloques de 3 s coinciden (CPU ± 5 % o ± 0,25 puntos, RSS ± 1 %), nunca antes de `--min-warmup` (6 s) ni después de `--warmup`. Lo usado queda en cada corrida (`warmup`). `soak`: siempre fijo |
+| `idle` | un host tras otro (15 × 135 s en la tabla unificada) | `--parallel 3`: tres hosts a la vez, cada uno en su núcleo |
+| `soak`, `join-impaired` | Node y luego Bun | `--parallel 2` en `extra.sh` |
+
+**Duración de una tanda completa** (4 vCPU Linux; «antes» de los tiempos de las tandas del 11 y
+13-10, «ahora» estimado con los mismos tiempos por fase; el calentamiento automático se cuenta en
+≈ 9 s, y con el tope de 15 s en todas las corridas `unified.sh` sube a ≈ 1 h 40):
+
+| guion / escenario (parámetros de los guiones) | antes | ahora |
+|---|---:|---:|
+| `unified.sh` | ≈ 2 h 07 | ≈ 1 h 35 |
+| · `startup` 5 hosts × 10 | 2,8 min | 0,9 min |
+| · `idle` 5 × 3 × 120 s | 34 min | 13 min |
+| · `game` N = 4, 10, 20 × 5 × 3 × 60 s | 67 min | 61 min |
+| · `rooms` K = 10 × 5 × 3 × 60 s | 23 min | 19 min |
+| `ours.sh` | ≈ 19 min | ≈ 13 min |
+| `quick.sh` | ≈ 40 min | ≈ 27 min |
+| `extra.sh` (soak de 6 h) | ≈ 12 h 31 | ≈ 6 h 18 |
+| `SOAK_MIN=30 sh bench/net/extra.sh` | ≈ 1 h 31 | ≈ 48 min |
+| · `fleet` 3 × 4 × 4, 2 runtimes × 3 × 60 s | 9 min | 7 min |
+| · `join-impaired` 6 configuraciones × 2 runtimes × 3 × 20 entradas | 20 min | 9 min |
+
+Medido en Windows (Node 26.8.1, Bun 1.4.0, máquina compartida), mismos argumentos con el
+orquestador anterior y el nuevo, tamaños chicos: `startup` 5 hosts × 2: 32,7 → 7,2 s; `game`
+N = 4, 10 × 2 hosts, ventana 20 s: 194 → 179 s; `rooms` K = 5 × 2 hosts: 106 → 81 s; `idle`
+3 hosts, ventana 30 s: 128 → 41 s; `fleet` 2 × 2 × 4 × 2 runtimes: 97 → 79 s; `join-impaired`
+5 entradas × 8 configuraciones: 88 → 38 s (p50 iguales: 1 402 / 1 285 ms antes, 1 404 / 1 282 ms
+en paralelo, sin pérdida); `soak` 1 min × 2 runtimes: 146 → 72 s. En Windows la CPU por proceso
+se cuenta por tics de 15,6 ms y el calentamiento automático casi siempre llega al tope; en Linux
+corta antes.
+
+**Flags** (`bench/net/run.ts`; todos quedan en `info.params` del JSON):
+
+* `--quick`: perfil de **desarrollo**, **no publicable**: 2 repeticiones (startup 3),
+  calentamiento ≤ 3 s, ventana 10 s (idle 20), `--n 4,10`, `--k 1,5`, fleet/soak 2 × 2, soak
+  3 min (muestra cada 15 s), join-impaired 5 entradas con pérdida 0 y 3 %, entradas de 4 en 4.
+  Salida en `bench/results/dev/` (ignorado por git), `info.publishable: false`; la consola y
+  `report.mjs` lo avisan. Cualquier flag explícito manda sobre el perfil.
+* `--precision P` (%) y `--max-reps M`: tras `--reps`, más rondas intercaladas solo para las
+  configuraciones cuya **métrica clave** (startup: inicio del proceso → link; join-impaired: entrada
+  p50; el resto: CPU % del host) tenga un IC 95 % (t de Student, de la media) más ancho que P % de
+  la media, hasta M (por defecto 2 × reps). Apagado por defecto.
+* Ruido siempre informado: cada métrica del `summary` lleva `mean`, `ci95` y `ci95Pct` además de
+  mediana, mín y máx; `summary.key` es la métrica clave y la consola imprime al final media ± IC
+  de cada configuración. Referencia: en la tabla unificada del 13-10 (3 × 60 s) el IC 95 % de la
+  CPU en partida va de 1,3 % a 16 % de la media; con 30 s (tanda `quick` del 11-10), de 0,7 % a
+  9 %: la varianza entre repeticiones (procesos distintos) domina sobre la de la ventana, así que
+  `--precision 3` suele llegar a `--max-reps`, y para un mismo IC rinden más ventanas cortas con más
+  repeticiones (no se adoptó por defecto para conservar la comparabilidad).
+* `--warmup-mode auto|fixed`, `--min-warmup S`: ver tabla; `fixed` reproduce el método anterior.
+* `--join-concurrency C`: entradas en vuelo por proceso de clientes (4 en rooms/fleet, 1 en game y
+  join-impaired). Con C > 1 la latencia de entrada sube algo (en Windows, primera tanda de 4:
+  + 50–100 ms; p50 + 1–3 %; node-haxball, cuyo join es de 2 s, hasta + 400 ms en p90) y
+  `report.mjs` lo marca en la columna de entrada («×4 a la vez»).
+* `--parallel K`: K configuraciones de la misma repetición a la vez, **solo `idle`, `soak` y
+  `join-impaired`** (CPU < 1 % de un núcleo por host, pendientes de memoria y latencia de entrada;
+  en el resto el arnés lo rechaza). El orden rota en cada ronda. `machine.foreignPct` incluye
+  entonces a las corridas hermanas (cota superior del ruido ajeno).
+* `--pin` (implícito con `--parallel` > 1): en Linux con `taskset`, cada host se lanza como
+  `taskset -c <núcleo> <runtime> …` (todos sus hilos heredan la máscara) y el orquestador, la
+  FakeMaster y los clientes van a los núcleos restantes. Disposición en la VM de **4 vCPU**:
+  `--parallel 2` → hosts en los núcleos 0 y 1, resto en 2–3; `--parallel 3` → hosts 0, 1, 2,
+  resto 3; `--pin` solo → host 0, resto 1–3 (`info.cores` y `cores` por corrida). Sin `taskset`
+  (Windows) corre igual sin fijar núcleos y lo avisa.
+* `--settle-ms` (250): pausa tras la salida de los procesos de una corrida.
+
+**Tanda publicable completa en la VM Linux** (Debian 12, 4 vCPU; `bun` en el PATH o `BUN_PATH`):
+
+```sh
+npm ci
+sh bench/net/unified.sh            # ≈ 1 h 35 min → bench/results/unified-*.json
+sh bench/net/extra.sh              # ≈ 6 h 20 min → fleet / join-impaired / soak .json
+node bench/net/report.mjs --unified
+node bench/net/report.mjs
+```
+
+Para desarrollo: `npm run bench:game -- --quick --impl haxlite:rtc,haxlite:rtc@bun` (≈ 1 min,
+no publicable).
+
 ## Escenarios de producción y Bun
 
 Producción corre haxlite con **Bun 1.x**, `peerBackend: 'rtc'`, **3 procesos pm2 × 4 salas** por
 servidor Linux. Hasta esta pasada nada se medía en Bun. El arnés (`bench/net/run.ts`) suma un
 runtime para el host, tres escenarios y dos métricas nuevas en todas las corridas. Todavía **no
 hay tanda publicada** de estos escenarios: solo pruebas de humo (abajo), que no sirven como
-resultado. Para correrlos todos en la VM: `sh bench/net/extra.sh` (≈ 12 h 30 min con el soak de
-6 h por runtime; `SOAK_MIN=30` para uno corto) y `node bench/net/report.mjs` (tablas de flota,
-soak y red degradada).
+resultado. Para correrlos todos en la VM: `sh bench/net/extra.sh` (≈ 6 h 20 min: los soaks de
+6 h de Node y de Bun corren a la vez, cada host en su núcleo; antes ≈ 12 h 30; `SOAK_MIN=30`
+para uno corto, ≈ 50 min) y `node bench/net/report.mjs` (tablas de flota, soak y red degradada).
 
 ### Runtime del host: `--runtime bun` y `haxlite:rtc@bun`
 
