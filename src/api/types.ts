@@ -175,6 +175,13 @@ export interface RoomObject {
   startRecording(): void;
   /** Stops the recording: `.hbr2` bytes, or null if not recording. */
   stopRecording(): Uint8Array | null;
+  /**
+   * haxlite extension (not in the official headless API, which only has the
+   * synchronous {@link stopRecording}): same bytes, but the deflate runs on
+   * the libuv threadpool instead of blocking the game loop. The recording
+   * stops at the call; resolves null if not recording.
+   */
+  stopRecordingAsync(): Promise<Uint8Array | null>;
   setPassword(pass: string | null): void;
   setRequireRecaptcha(required: boolean): void;
   reorderPlayers(playerIdList: readonly number[], moveToTop: boolean): void;

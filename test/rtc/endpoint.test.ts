@@ -211,6 +211,14 @@ describe('RtcEndpoint ICE-lite', () => {
     expect(ep!.stats().sessions).toBe(0);
   });
 
+  it('the answer is released when the session closes (read it right after createSession)', async () => {
+    const { session } = await setup();
+    expect(session.answerSdp).toMatch(/^v=0\r\n[\s\S]*a=fingerprint:/);
+    expect(session.answerSdp).toBe(session.answerSdp); // readable any number of times until then
+    session.close();
+    expect(session.answerSdp).toBe('');
+  });
+
   it('only advertises the configured public addresses', async () => {
     ep = await RtcEndpoint.listen({ address: '127.0.0.1', publicAddresses: ['203.0.113.9'], dataLayer: rawDataLayer });
     const s = ep.createSession(offerSdp(cert.sha256));
@@ -338,6 +346,7 @@ describe.skipIf(!hasOpenssl)('RtcEndpoint full stack (ICE-lite + DTLS) with open
     p.stderr.on('data', () => {});
     await opened;
     expect(session.state).toBe('open');
+    expect(session.answerSdp).toBe(''); // released once DTLS connected
     p.stdin.write('ping\n');
     for (let i = 0; i < 100 && !out.includes('ping'); i++) await sleep(20);
     expect(got).toEqual(['ping\n']);

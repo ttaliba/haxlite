@@ -12,7 +12,7 @@ export {
   decodeHaxUtf8,
   standardUtf8Encode,
 } from './utf8.js';
-export { deflateRaw, inflateRaw, SIGNALING_INFLATE_LIMIT } from './compress.js';
+export { deflateRaw, deflateRawAsync, inflateRaw, SIGNALING_INFLATE_LIMIT } from './compress.js';
 export { xorInt32Words } from './checksum.js';
 
 /** Number of bytes `v` takes as a HaxBall varuint (same thresholds as the official sizer). */

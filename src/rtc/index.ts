@@ -1,6 +1,7 @@
 /**
- * haxlite-rtc: pure-TypeScript WebRTC data channels for servers with a
- * public IP (ICE-lite + DTLS 1.2 server + SCTP). See src/rtc/README.md.
+ * haxlite-rtc: pure-TypeScript WebRTC data channels (full ICE in the
+ * controlled role by default, or ICE-lite for servers with a public IP;
+ * DTLS 1.2 server + SCTP). See src/rtc/README.md.
  */
 export { RtcEndpoint, type RtcEndpointOptions, type RtcEndpointStats } from './endpoint.js';
 export { RtcCertificate } from './cert.js';

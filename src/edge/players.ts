@@ -12,11 +12,11 @@
  * Both produce {@link PeerLink}s driven through the host's
  * {@link PeerLinkEvents}, exactly like `HostTransport` drives a backend.
  */
+import { isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
-import type { RtcConfig } from 'node-datachannel';
 import { classifyAddress, parseCandidate, type IceCandidatePolicy } from '../net/ice.js';
 import type { PeerLink, PeerLinkEvents } from '../net/peer-backend.js';
-import type { WebRtcStats } from '../net/webrtc.js';
+import type { NdcRtcConfig, WebRtcStats } from '../net/webrtc.js';
 import type { RtcEndpoint, RtcEndpointStats, RtcSession } from '../rtc/index.js';
 
 export type EdgePlayerBackendKind = 'rtc' | 'ndc';
@@ -31,22 +31,59 @@ export interface EdgePlayers {
 /**
  * Addresses the edge announces when `webrtc.publicAddresses` is not set: the
  * bind address if it is a specific IP, else this machine's interface
- * addresses allowed by `policy` (`'public'`: public ones only).
+ * addresses allowed by `policy` (`'public'`: public ones only). IPv6
+ * interface addresses only with `ipv6` (`webrtc.ipv6`, default false, like
+ * the `'rtc'` endpoint itself).
  */
-export function detectPublicAddresses(bindAddress: string | undefined, policy: IceCandidatePolicy): string[] {
+export function detectPublicAddresses(bindAddress: string | undefined, policy: IceCandidatePolicy, ipv6 = false): string[] {
   if (bindAddress !== undefined && bindAddress !== '0.0.0.0' && bindAddress !== '::') return [bindAddress];
   const p = typeof policy === 'function' ? 'public' : policy;
   const out: string[] = [];
   for (const list of Object.values(networkInterfaces())) {
     for (const a of list ?? []) {
       if (a.family === 'IPv6' && a.scopeid !== undefined && a.scopeid !== 0) continue; // link-local
-      if (bindAddress === '0.0.0.0' && a.family !== 'IPv4') continue;
+      if ((bindAddress === '0.0.0.0' || !ipv6) && a.family !== 'IPv4') continue;
       const cls = classifyAddress(a.address);
       const ok = p === 'all' ? cls !== 'linklocal' : p === 'private' ? cls === 'public' || cls === 'private' : cls === 'public';
       if (ok && !out.includes(a.address)) out.push(a.address);
     }
   }
   return out;
+}
+
+/**
+ * The addresses an `'rtc'` edge announces (`webrtc.publicAddresses`, else
+ * {@link detectPublicAddresses}), IPv6 ones only with `ipv6`. Throws a
+ * configuration error when nothing is left, naming `webrtc.ipv6` when only
+ * IPv6 addresses were given or found.
+ */
+export function resolveEdgePublicAddresses(
+  w: { publicAddresses?: readonly string[]; bindAddress?: string; ipv6?: boolean },
+  policy: IceCandidatePolicy,
+): string[] {
+  const ipv6 = w.ipv6 === true;
+  const hint = 'set webrtc.ipv6: true to announce IPv6';
+  if (!ipv6 && w.bindAddress !== undefined && w.bindAddress !== '::' && isIP(w.bindAddress) === 6) {
+    throw new Error(`playerBackend 'rtc': webrtc.bindAddress ${w.bindAddress} is IPv6 (${hint}, or bind an IPv4 address)`);
+  }
+  if (w.publicAddresses !== undefined) {
+    const list = ipv6 ? [...w.publicAddresses] : w.publicAddresses.filter((a) => isIP(a) !== 6);
+    if (list.length === 0) {
+      throw new Error(
+        w.publicAddresses.length > 0
+          ? `playerBackend 'rtc': webrtc.publicAddresses has only IPv6 addresses (${hint})`
+          : "playerBackend 'rtc': webrtc.publicAddresses is empty",
+      );
+    }
+    return list;
+  }
+  const found = detectPublicAddresses(w.bindAddress, policy, ipv6);
+  if (found.length > 0) return found;
+  const only6 = !ipv6 && w.bindAddress !== '0.0.0.0' && detectPublicAddresses(w.bindAddress, policy, true).length > 0;
+  throw new Error(
+    "playerBackend 'rtc': no public address to announce (set webrtc.publicAddresses or webrtc.bindAddress" +
+      (only6 ? `; this machine only has public IPv6 addresses: ${hint})` : ')'),
+  );
 }
 
 /** First srflx address among the offer's candidates (the player's public IP as its STUN server saw it). */
@@ -71,6 +108,8 @@ export interface RtcPlayersOptions {
   address?: string;
   /** The only addresses ever written into answers/candidates. */
   publicAddresses: string[];
+  /** Bind/announce IPv6 too (default false: IPv6 public addresses are skipped, `::` binds IPv4). */
+  ipv6?: boolean;
   /** Advertised port behind a 1:1 NAT. */
   publicPort?: number;
   handshakeTimeoutMs: number;
@@ -94,6 +133,7 @@ export class RtcPlayers implements EdgePlayers {
       port: o.port,
       ...(o.address !== undefined && o.address !== '' ? { address: o.address } : null),
       publicAddresses: o.publicAddresses,
+      ...(o.ipv6 === true ? { ipv6: true } : null),
       ...(o.publicPort !== undefined ? { publicPort: o.publicPort } : null),
       handshakeTimeoutMs: o.handshakeTimeoutMs,
       ...(o.idleTimeoutMs !== undefined ? { idleTimeoutMs: o.idleTimeoutMs } : null),
@@ -160,14 +200,14 @@ type NdcModule = typeof import('../net/edge-ndc.js');
 export class NdcPlayers implements EdgePlayers {
   readonly kind = 'ndc';
   readonly mod: NdcModule;
-  private readonly rtc: RtcConfig;
+  private readonly rtc: NdcRtcConfig;
 
-  private constructor(mod: NdcModule, rtc: RtcConfig) {
+  private constructor(mod: NdcModule, rtc: NdcRtcConfig) {
     this.mod = mod;
     this.rtc = rtc;
   }
 
-  static async start(rtc: RtcConfig): Promise<NdcPlayers> {
+  static async start(rtc: NdcRtcConfig): Promise<NdcPlayers> {
     return new NdcPlayers(await import('../net/edge-ndc.js'), rtc);
   }
 

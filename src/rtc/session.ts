@@ -22,7 +22,7 @@ export interface ValidatedAddress {
   sock: UdpIo;
   address: string;
   port: number;
-  /** `address|port` (bound into the DTLS cookie). */
+  /** `address|port` (the DTLS server's peer key; bound into the HelloVerifyRequest cookie when that exchange is enabled — off by default). */
   key: string;
 }
 
@@ -56,7 +56,8 @@ const MAX_VALIDATED = 8;
 const MAX_REMOTE_CANDIDATES = 32;
 
 export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
-  readonly answerSdp: string;
+  /** The answer until DTLS connects (the peer had it then), null afterwards: ~0.5 KB less per live session. */
+  private answer: string | null;
   readonly localCandidates: string[];
   readonly mid: string;
   readonly localUfrag: string;
@@ -112,7 +113,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
     this.remoteUfrag = offer.iceUfrag;
     this.integrityKey = createSecretKey(Buffer.from(localPwd, 'latin1'));
     this.expectedUsername = Buffer.from(`${localUfrag}:${offer.iceUfrag}`, 'latin1');
-    this.answerSdp = answerSdp;
+    this.answer = answerSdp;
     this.localCandidates = localCandidates;
     this.mid = offer.mid;
     this.createdAt = host.now();
@@ -136,6 +137,11 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
       },
       onClose: (reason) => this.terminate(reason),
     });
+  }
+
+  /** See {@link RtcSession.answerSdp}: `''` once DTLS connected or the session closed. */
+  get answerSdp(): string {
+    return this.answer ?? '';
   }
 
   get remoteAddress(): RemoteAddress | null {
@@ -282,6 +288,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
   private onDtlsConnected(): void {
     if (this.state === 'closed') return;
     this.state = 'dtls';
+    this.answer = null; // the peer completed DTLS with our fingerprint: it has the answer
     this.host.countHandshake(true);
     if (this.agent !== null) this.agent.connected(this.host.now());
     try {
@@ -414,6 +421,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
     this.dtls.close();
     if (this.agent !== null) this.agent.close();
     this.state = 'closed';
+    this.answer = null;
     this.host.unregister(this);
     this.validated.length = 0;
     this.nominated = null;

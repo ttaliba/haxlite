@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { RtcCertificate, acquireSharedEndpoint, sharedEndpointCount } from '../../src/rtc/index.js';
+import { sharedEndpointKey } from '../../src/rtc/shared.js';
 
 const LOOP = { address: '127.0.0.1', publicAddresses: ['127.0.0.1'] };
 const dir = mkdtempSync(path.join(tmpdir(), 'haxlite-rtc-'));
@@ -28,6 +29,19 @@ describe('shared RtcEndpoint', () => {
     await b.release();
     expect((ea as unknown as { closed: boolean }).closed).toBe(true);
     await c.release();
+    expect(sharedEndpointCount()).toBe(before);
+  });
+
+  it('the ipv6 switch is part of the key: rooms with and without IPv6 never share an endpoint', async () => {
+    expect(sharedEndpointKey({ ...LOOP, ipv6: true })).not.toBe(sharedEndpointKey({ ...LOOP }));
+    expect(sharedEndpointKey({ ...LOOP, ipv6: false })).toBe(sharedEndpointKey({ ...LOOP }));
+    const before = sharedEndpointCount();
+    const a = acquireSharedEndpoint({ ...LOOP });
+    const b = acquireSharedEndpoint({ ...LOOP, ipv6: true });
+    const [ea, eb] = await Promise.all([a.ready, b.ready]);
+    expect(eb).not.toBe(ea);
+    expect(sharedEndpointCount()).toBe(before + 2);
+    await Promise.all([a.release(), b.release()]);
     expect(sharedEndpointCount()).toBe(before);
   });
 

@@ -33,7 +33,6 @@
  * t.start();
  * ```
  */
-import type { RtcConfig } from 'node-datachannel';
 import { PROTOCOL_VERSION } from '../protocol.js';
 import { createChallenge, verifyAuthBlob } from './auth.js';
 import { BanList, type BanRecord } from './bans.js';
@@ -59,6 +58,7 @@ import { HostSignaling, type HostSignalingOptions, type SignalingOffer } from '.
 import { Writer } from '../codec/index.js';
 import { LocalPeerBackend, type PeerBackend, type PeerLink, type PeerLinkEvents } from './peer-backend.js';
 import { RtcPeerBackend, type RtcBackendOptions } from './rtc-backend.js';
+import type { NdcRtcConfig } from './webrtc.js';
 
 /** Lifecycle of a {@link Peer}. */
 export type PeerState =
@@ -266,9 +266,11 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
    * socket — 1 fd instead of 1 per player and ≈ −6 % host CPU with 20
    * players, docs/07 «Pasada de ligereza — red»; set it to false to give
    * each connection its own port, e.g. per-player `bindAddress`), `iceTransportPolicy`,
-   * `maxMessageSize`, `mtu`, `proxyServer`…
+   * `maxMessageSize`, `mtu`, `proxyServer`…, plus haxlite's `ipv6` (default
+   * false: IPv4 only, see {@link NdcRtcConfig}). For `peerBackend: 'rtc'`
+   * use {@link rtcEndpoint} (`rtcEndpoint.ipv6`) instead.
    */
-  rtc?: Partial<Omit<RtcConfig, 'iceServers'>>;
+  rtc?: Partial<Omit<NdcRtcConfig, 'iceServers'>>;
   /** Housekeeping period (timeouts, deferred closes). Default 1000 ms. */
   sweepIntervalMs?: number;
   /**
@@ -401,7 +403,7 @@ export class HostTransport {
       }
       const iceServers: (string | NativeIceServer)[] = toNativeIceServers(opts.iceServers ?? DEFAULT_ICE_SERVERS);
       const range = opts.portRange;
-      const rtc: RtcConfig = {
+      const rtc: NdcRtcConfig = {
         enableIceUdpMux: true,
         ...(range ? { portRangeBegin: range[0], portRangeEnd: range[1] } : null),
         ...opts.rtc,

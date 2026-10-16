@@ -50,6 +50,7 @@ export function sharedEndpointKey(o: RtcEndpointOptions): string {
   return JSON.stringify([
     o.port ?? 0,
     o.address ?? null,
+    o.ipv6 === true,
     o.publicAddresses !== undefined ? [...o.publicAddresses] : null,
     o.iceLite === true,
     o.iceServers ?? null,

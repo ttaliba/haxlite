@@ -99,9 +99,11 @@ export interface RtcEndpointOptions {
   socketBufferSize?: number;
   /**
    * DTLS cipher suites in server preference order, as IANA names, ids or
-   * `'chacha20'` / `'aes128gcm'` / `'aes256gcm'`. Default: ChaCha20-Poly1305
-   * (allocation-free JS AEAD), AES-128-GCM, AES-256-GCM — browsers without
-   * ChaCha20 get AES-GCM.
+   * `'chacha20'` / `'aes128gcm'` / `'aes256gcm'`. Default (`defaultSuites` in
+   * dtls/crypto.ts): on Node ChaCha20-Poly1305 first (allocation-free JS
+   * AEAD), then AES-128-GCM, AES-256-GCM; on Bun AES-128-GCM first (Bun's
+   * native AES-GCM is cheaper than the JS ChaCha20), then ChaCha20-Poly1305,
+   * AES-256-GCM. A browser without the first suite gets the next one.
    */
   cipherSuites?: readonly (number | string)[];
 }
@@ -160,7 +162,7 @@ function literalLookup(address: string, family: unknown, cb: (err: Error | null,
   cb(null, address, typeof family === 'number' ? family : isIP(address));
 }
 
-/** STUN server name → its IPv4 addresses (the endpoint has no IPv6 socket). */
+/** STUN server name → its IPv4 addresses (used when the endpoint has no IPv6 socket: `ipv6` off or no global IPv6). */
 function ipv4Lookup(host: string): Promise<{ address: string; family: number }[]> {
   const fam = isIP(host);
   if (fam !== 0) return Promise.resolve(fam === 4 ? [{ address: host, family: 4 }] : []);

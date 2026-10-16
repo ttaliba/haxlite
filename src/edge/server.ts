@@ -48,7 +48,7 @@ import {
 } from '../net/ice.js';
 import type { PeerLink, PeerLinkEvents } from '../net/peer-backend.js';
 import { TokenBucket } from '../net/rate-limit.js';
-import type { WebRtcStats } from '../net/webrtc.js';
+import type { NdcRtcConfig, WebRtcStats } from '../net/webrtc.js';
 import type { NdcTunnelPlane } from '../net/edge-ndc.js';
 import type { RtcEndpointStats } from '../rtc/index.js';
 import {
@@ -71,7 +71,7 @@ import {
   roLaneChannel,
 } from '../net/edge-protocol.js';
 import { deriveTunnelSecrets, x25519Generate, x25519Shared } from '../net/edge-udp.js';
-import { NdcPlayers, RtcPlayers, detectPublicAddresses, type EdgePlayerBackendKind, type EdgePlayers } from './players.js';
+import { NdcPlayers, RtcPlayers, resolveEdgePublicAddresses, type EdgePlayerBackendKind, type EdgePlayers } from './players.js';
 import { EdgeUdpServer, type EdgeTunnelOptions, type EdgeTunnelStats, type EdgeUdpConn } from './tunnel-udp.js';
 
 export type { EdgeTunnelOptions, EdgeTunnelStats } from './tunnel-udp.js';
@@ -110,12 +110,21 @@ export interface EdgeKeyConfig {
 export interface EdgeWebRtcOptions {
   /**
    * `'rtc'` only: the addresses announced to players (IP literals, v4 and/or
-   * v6) — the ONLY ones ever written into answers/candidates. Default:
-   * `bindAddress` if it is a specific IP, else this machine's interface
-   * addresses allowed by `iceCandidatePolicy` (public ones by default). Set it
-   * behind a 1:1 NAT (cloud VM with a private interface address).
+   * v6 — IPv6 ones only with {@link ipv6}) — the ONLY ones ever written into
+   * answers/candidates. Default: `bindAddress` if it is a specific IP, else
+   * this machine's interface addresses allowed by `iceCandidatePolicy`
+   * (public ones by default; IPv4 only unless {@link ipv6}). Set it behind a
+   * 1:1 NAT (cloud VM with a private interface address).
    */
   publicAddresses?: string[];
+  /**
+   * Use IPv6 for players (default false, as for the host's backends): `'rtc'`
+   * binds and announces IPv6 too (IPv6 `publicAddresses` / detected interface
+   * addresses are skipped without it, and an IPv6 `bindAddress` is an error);
+   * `'ndc'` gathers and trickles IPv6 candidates. IPv6 headers are 20 bytes
+   * larger: ≈ +19 % egress for HaxBall's small datagrams.
+   */
+  ipv6?: boolean;
   /** `'rtc'` only: the players' UDP port (default `portRange[0]`, else ephemeral). */
   port?: number;
   /** `'rtc'` only: advertised port when a NAT maps a different one. */
@@ -300,7 +309,7 @@ export class EdgeServer {
   private readonly keys = new Map<string, KeyState>();
   /** @internal */ readonly sessions = new Set<EdgeSession>();
   /** @internal */ readonly limits: Required<EdgeLimitsOptions>;
-  /** @internal */ readonly playerRtc: RtcConfig;
+  /** @internal */ readonly playerRtc: NdcRtcConfig;
   /** @internal */ readonly tunnelRtc: RtcConfig;
   /** @internal */ readonly icePolicy: IceCandidatePolicy;
   /** @internal */ readonly remotePolicy: 'public' | 'private' | 'all';
@@ -349,7 +358,7 @@ export class EdgeServer {
       ...(w.bindAddress !== undefined ? { bindAddress: w.bindAddress } : null),
       ...(w.enableIceUdpMux ? { enableIceUdpMux: true } : null),
     };
-    this.playerRtc = { ...base, ...w.rtc, iceServers: base.iceServers, disableAutoNegotiation: true };
+    this.playerRtc = { ...base, ...w.rtc, ...(w.ipv6 === true ? { ipv6: true } : null), iceServers: base.iceServers, disableAutoNegotiation: true };
     this.tunnelRtc = { ...base, maxMessageSize: 1 << 20, disableAutoNegotiation: true };
     this.icePolicy = w.iceCandidatePolicy ?? 'public';
     this.remotePolicy = w.remoteCandidatePolicy ?? 'public';
@@ -389,14 +398,12 @@ export class EdgeServer {
     try {
       if (this.players === null) {
         if (this.playerBackend === 'rtc') {
-          const publicAddresses = w.publicAddresses ?? detectPublicAddresses(w.bindAddress, this.icePolicy);
-          if (publicAddresses.length === 0) {
-            throw new Error("playerBackend 'rtc': no public address to announce (set webrtc.publicAddresses or webrtc.bindAddress)");
-          }
+          const publicAddresses = resolveEdgePublicAddresses(w, this.icePolicy);
           this.players = await RtcPlayers.start({
             port: w.port ?? w.portRange?.[0] ?? 0,
             ...(w.bindAddress !== undefined ? { address: w.bindAddress } : null),
             publicAddresses,
+            ...(w.ipv6 === true ? { ipv6: true } : null),
             ...(w.publicPort !== undefined ? { publicPort: w.publicPort } : null),
             handshakeTimeoutMs: this.limits.channelOpenTimeoutMs + 1000,
             ...(w.consentTimeoutMs !== undefined ? { idleTimeoutMs: w.consentTimeoutMs } : null),
