@@ -10,7 +10,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { HostRoom, createHostRoomState, type HostRoomOptions } from '../../src/host/index.js';
-import { hostClock } from '../../src/host/clock.js';
+import { TIMER_SLACK_MS, hostClock } from '../../src/host/clock.js';
 import { Reader } from '../../src/codec/index.js';
 import type { HostTransport } from '../../src/net/index.js';
 import { EventType } from '../../src/protocol.js';
@@ -79,6 +79,10 @@ function heartbeatFrames(sent: Sent[]): number[] {
 }
 
 describe('shared host clock', () => {
+  it('timer slack: 1 ms on Node (early fires), 0 on Bun', () => {
+    expect(TIMER_SLACK_MS).toBe((process.versions as { bun?: string }).bun !== undefined ? 0 : 1);
+  });
+
   it('idle room (no clients, no game): zero wake-ups', async () => {
     const { host } = makeRoom();
     const w0 = hostClock.wakeups;
