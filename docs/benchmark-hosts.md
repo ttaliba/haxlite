@@ -22,7 +22,9 @@ Misma sesión, las opciones **intercaladas** en cada repetición, 3 repeticiones
 | **Arranque** proceso → link ms | 196 | 204 | **112** |
 | RSS al link MB | 77,9 | 73,7 | **59,1** |
 
-haxlite = `peerBackend: 'rtc'` (WebRTC propio en TypeScript). La tanda midió también el backend `ndc` (node-datachannel); sus números están en los JSON y en `node bench/net/report.mjs --unified`.
+haxlite = `peerBackend: 'rtc'` (WebRTC propio en TypeScript). La tanda midió también el backend `ndc` (node-datachannel); sus números están en los JSON, en `node bench/net/report.mjs --unified` y en la tabla de cuatro columnas de [docs/07](07-benchmarks.md#comparativa-unificada-misma-sesión).
+
+Todo en **Node 22**. Bun (el runtime de producción) todavía no tiene tanda publicada: el arnés ya lo mide (`--impl haxlite:rtc@bun`, incluido en `unified.sh` y `ours.sh`), junto con los escenarios de producción `fleet` (3 procesos × 4 salas × 4 clientes), `soak` (horas con jugadores entrando y saliendo) y `join-impaired` (latencia y pérdida con el NAT simulado), la salida por jugador y los huecos entre mensajes en el cliente: ver [docs/07, «Escenarios de producción y Bun»](07-benchmarks.md#escenarios-de-producción-y-bun) y `sh bench/net/extra.sh`.
 
 **Lectura:**
 

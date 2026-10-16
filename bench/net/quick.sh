@@ -4,7 +4,7 @@
 set -e
 cd "$(dirname "$0")/../.."
 npm run -s bench:build
-R="node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs bench/net/run.ts"
+R="node --no-warnings --import ./bench/ts-resolve.mjs bench/net/run.ts"
 I=official,nodehaxball,haxlite:ndc,haxlite:rtc
 L="flock /tmp/haxlite-bench.lock"
 $L $R startup --impl $I --reps 10 --max-foreign 50 --attempts 3 --out bench/results/quick-startup.json
