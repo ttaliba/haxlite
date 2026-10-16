@@ -47,6 +47,18 @@
  * the plain `socket.send()` / `'message'` path is used instead.
  */
 import type { RemoteInfo, Socket } from 'node:dgram';
+import { isIP } from 'node:net';
+
+/**
+ * dgram `lookup` for IP literals: answers synchronously. Every address the
+ * rtc endpoint and the edge tunnel bind or send to is an IP literal (validated
+ * public/bind addresses, kernel-reported sources), so the default `dns.lookup`
+ * only adds a `process.nextTick` hop and two closures per datagram — and makes
+ * the send asynchronous, which would forbid reusing the send buffer.
+ */
+export function literalLookup(address: string, family: unknown, cb: (err: Error | null, address: string, family: number) => void): void {
+  cb(null, address, typeof family === 'number' ? family : isIP(address));
+}
 
 /** The bits of Node's `UDPWrap` used here (src/udp_wrap.cc). */
 interface UdpHandle {
@@ -361,6 +373,8 @@ export class UdpIo {
     } catch {
       return true; // closed socket: dropped
     }
-    return this.sock.getSendQueueCount() === 0;
+    // Node: dgram may still hold buf (lookup hop, or a request libuv queued), so it is never
+    // reported free; this path only runs for the probe send and when SendWrap is unavailable
+    return IS_BUN && this.sock.getSendQueueCount() === 0;
   }
 }

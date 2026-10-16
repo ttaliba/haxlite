@@ -133,7 +133,7 @@ describe.skipIf(IS_BUN)('UdpIo (direct UDPWrap send/receive)', () => {
     } as unknown as Socket;
     const io = new UdpIo(sock, () => {}, () => {});
     const b = Buffer.from('hello');
-    expect(io.send(b, 1, '127.0.0.1')).toBe(true); // through dgram: captures FakeReq
+    expect(io.send(b, 1, '127.0.0.1')).toBe(false); // through dgram: captures FakeReq; dgram may still hold b
     expect(io.send(b, 1, '127.0.0.1')).toBe(true); // direct, synchronous
     const r1 = calls[1]!.req;
     expect(r1).toBeInstanceOf(FakeReq);

@@ -19,7 +19,7 @@ import { resolveSuites } from './dtls/crypto.js';
 import type { RtcSession, SctpFactory } from './types.js';
 import { Gatherer, classifyIp, hasGlobalIpv6, stunServers, type AddressClass, type CandidatePolicy, type IceServerInput } from './gather.js';
 import { IceScheduler, type BoundSocket, type IceStats } from './ice-agent.js';
-import { UdpIo } from './udp.js';
+import { UdpIo, literalLookup } from './udp.js';
 
 /** A socket bound by {@link RtcEndpoint.listen}, before the endpoint wraps it. */
 interface RawBound {
@@ -151,16 +151,6 @@ const VIEW_CACHE_MAX = 1536;
 /** Default data-channel layer: R2's SCTP association (src/rtc/sctp). */
 const defaultDataLayer: SctpFactory = (o) => new SctpAssociation(o);
 
-/**
- * dgram `lookup` for IP literals: answers synchronously. Every address this
- * endpoint binds or sends to is an IP literal (validated public/bind
- * addresses, kernel-reported sources), so the default `dns.lookup` only adds a
- * `process.nextTick` hop and two closures per datagram — and makes the send
- * asynchronous, which would forbid reusing the send buffer.
- */
-function literalLookup(address: string, family: unknown, cb: (err: Error | null, address: string, family: number) => void): void {
-  cb(null, address, typeof family === 'number' ? family : isIP(address));
-}
 
 /** STUN server name → its IPv4 addresses (used when the endpoint has no IPv6 socket: `ipv6` off or no global IPv6). */
 function ipv4Lookup(host: string): Promise<{ address: string; family: number }[]> {

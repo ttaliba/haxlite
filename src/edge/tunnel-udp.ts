@@ -22,7 +22,7 @@ import { createRequire } from 'node:module';
 import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { TokenBucket } from '../net/rate-limit.js';
-import { UdpIo } from '../rtc/udp.js';
+import { UdpIo, literalLookup } from '../rtc/udp.js';
 import { UdpTunnelPlane, udpConnId, type TunnelAead, type TunnelAeadOption, type TunnelSecrets, type UdpPlaneEvents } from '../net/edge-udp.js';
 
 export interface EdgeTunnelOptions {
@@ -88,7 +88,7 @@ function bindSocket(address: string, port: number): Promise<Socket> {
   return new Promise((resolve, reject) => {
     // loaded on first use: importing the package must not load node:dgram
     const dgram = createRequire(import.meta.url)('node:dgram') as typeof import('node:dgram');
-    const sock = dgram.createSocket({ type: fam === 6 ? 'udp6' : 'udp4', reuseAddr: false });
+    const sock = dgram.createSocket({ type: fam === 6 ? 'udp6' : 'udp4', reuseAddr: false, lookup: literalLookup as never });
     const onError = (err: Error) => {
       sock.close();
       reject(err);
