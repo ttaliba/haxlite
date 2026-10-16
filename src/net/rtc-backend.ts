@@ -42,12 +42,18 @@
  *   operation, one datagram. Each message is still delivered separately to
  *   the data channel. Closing a link flushes first, so a kick message still
  *   precedes the ABORT;
+ * * **frame batching** (opt-in, {@link RtcBackendOptions.sendBatchFrames}):
+ *   messages on `ru` are held (the association stays corked) until the
+ *   next boundary of the process-wide 60 Hz frame grid (every 1 or 2
+ *   frames), see SendBatcher;
  * * received messages may be transient views (only valid during
  *   `onMessage`, see `transientDelivery` in src/rtc/sctp): the transport and
  *   the host consume them synchronously and copy what they keep.
  */
 import { networkInterfaces } from 'node:os';
 import { isIP } from 'node:net';
+import { ClockEntry, hostClock } from '../host/clock.js';
+import { TICKS_PER_MS } from '../protocol.js';
 import type { RtcCertificate, RtcEndpoint, RtcEndpointStats, RtcSession, SharedEndpointLease } from '../rtc/index.js';
 import { freezeSctpClock, thawSctpClock } from '../rtc/sctp/clock.js';
 import { beginUdpBatch, endUdpBatch } from '../rtc/udp.js';
@@ -127,6 +133,24 @@ export interface RtcBackendOptions {
   handshakeTimeoutMs?: number;
   /** Session cap of the endpoint (default 10 000; the transport's 16-pending / maxPlayers limits apply first). */
   maxSessions?: number;
+  /**
+   * Frame batching of outgoing game events (default 0 = off: every message
+   * leaves at the end of the event-loop iteration that sent it, as before).
+   * 1 or 2: messages on channel 1 (`ru`, the client-event broadcasts: inputs,
+   * chat, client-side actions) are held per player and leave together on
+   * the next boundary of the process-wide 60 Hz frame grid (every `n`
+   * frames, the grid the rooms wake on, so every room and player of the
+   * process flushes on one timer wake-up), in one SCTP packet / DTLS record /
+   * datagram per player up to the MTU. Any other message to that player
+   * (`ro`: join snapshot, host events, kicks; `uu`: heartbeats, pongs) still
+   * leaves in its own iteration and takes the held ones with it, so the
+   * per-player send order is unchanged and the ping the client shows is not
+   * skewed. Cost: other players' inputs arrive on average n × 8.3 ms later
+   * (at most n × 16.7 ms); gain: far fewer datagrams, each carrying ≈ 85
+   * bytes of IP/UDP/DTLS/SCTP overhead. Applies per room, also on a shared
+   * endpoint.
+   */
+  sendBatchFrames?: 0 | 1 | 2;
   /**
    * Use an already-listening endpoint (several rooms on one UDP port). It is
    * not closed by this backend; the options above are then ignored.
@@ -263,10 +287,106 @@ class SendBundler {
 const bundler = new SendBundler();
 
 /**
+ * Frame batching ({@link RtcBackendOptions.sendBatchFrames}): links holding
+ * `ru` messages, released on the process-wide 60 Hz frame grid.
+ *
+ * A held link keeps its SCTP association corked across event-loop
+ * iterations (the messages wait in the association's send queue, in order;
+ * the SACK it owes the player waits too and rides along). At its due grid
+ * boundary (the first one after the hold whose index is a multiple of the
+ * link's batch frames) it is handed to the per-iteration {@link SendBundler},
+ * so the release is one `setImmediate` pass (one clock read, one UDP batch)
+ * right after the timer callback, together with any heartbeat a room sent
+ * at that boundary. A send that may not be held promotes the link to the
+ * bundler at once (it leaves in that iteration, held messages first).
+ *
+ * The timer is one {@link ClockEntry} in the rooms' {@link hostClock}: the
+ * boundary is the same double the rooms compute, so it shares their
+ * wake-ups; it is not armed while nothing is held, and nothing exists until
+ * a backend enables batching. SCTP retransmission and delayed-SACK timers
+ * still fire while held (they flush the association early).
+ */
+class SendBatcher {
+  /** Held links (may contain stale entries: checked against `mode` / `holdDue`). */
+  private list: (RtcPeerLink | null)[] = [];
+  private n = 0;
+  /** Grid index the clock entry is armed for (Infinity = none). */
+  private armed = Infinity;
+  /** Registered in {@link hostClock} only while something is held. */
+  private readonly entry = new ClockEntry(() => this.onTick());
+
+  /** Holds `link` (just corked) until the grid boundary due for `frames`. */
+  hold(link: RtcPeerLink, frames: number): void {
+    // next grid boundary strictly after now, rounded up to a multiple of `frames`
+    let due = Math.floor(performance.now() * TICKS_PER_MS + 1e-6) + 1;
+    if (frames > 1) {
+      const m = due % frames;
+      if (m !== 0) due += frames - m;
+    }
+    link.holdDue = due;
+    this.list[this.n++] = link;
+    if (due < this.armed) this.arm(due);
+  }
+
+  private arm(due: number): void {
+    this.armed = due;
+    const e = this.entry;
+    if (due === Infinity) {
+      hostClock.remove(e);
+      return;
+    }
+    hostClock.add(e);
+    // the same double the rooms compute for this boundary: one shared wake-up
+    hostClock.set(e, due / TICKS_PER_MS);
+  }
+
+  /** Grid wake-up: releases the due links to the bundler, keeps the rest. */
+  private onTick(): void {
+    this.armed = Infinity;
+    this.release(Math.floor(performance.now() * TICKS_PER_MS + 1e-6));
+  }
+
+  /** Releases every held link due at or before grid index `g` (Infinity: all). */
+  release(g: number): void {
+    const l = this.list;
+    let k = 0;
+    let next = Infinity;
+    for (let i = 0; i < this.n; i++) {
+      const link = l[i]!;
+      l[i] = null;
+      if (link.mode !== LINK_HELD) continue; // promoted / flushed / closed since: stale entry
+      if (link.holdDue <= g) {
+        link.mode = LINK_BUNDLED;
+        bundler.add(link);
+      } else {
+        l[k++] = link;
+        if (link.holdDue < next) next = link.holdDue;
+      }
+    }
+    this.n = k;
+    if (next !== this.armed) this.arm(next);
+  }
+}
+
+/** Created by the first backend with batching on: no cost at all otherwise. */
+let batcher: SendBatcher | null = null;
+
+/** RtcPeerLink send states: nothing pending. */
+const LINK_IDLE = 0;
+/** Corked, held by the {@link SendBatcher} until a frame boundary. */
+const LINK_HELD = 1;
+/** Corked, registered in the {@link SendBundler} for this iteration. */
+const LINK_BUNDLED = 2;
+
+/** The only channel whose messages frame batching holds (`ru`, see {@link RtcBackendOptions.sendBatchFrames}). */
+const BATCHED_CHANNEL = 1;
+
+/**
  * Flushes every bundled peer now instead of at the end of the iteration.
  * For synchronous harnesses (simulated time, benches) only.
  */
 export function flushRtcBundles(): void {
+  batcher?.release(Infinity);
   bundler.flushNow();
 }
 
@@ -299,6 +419,8 @@ export class RtcPeerBackend implements PeerBackend {
   private starting = false;
   /** Offers accepted while {@link starting}, answered once the endpoint listens. */
   private readonly deferred = new Set<DeferredRtcPeerLink>();
+  /** {@link RtcBackendOptions.sendBatchFrames} (0 = off). */
+  private readonly batchFrames: number;
 
   /**
    * @param defaults the transport's `iceServers` / `iceCandidatePolicy`
@@ -306,6 +428,10 @@ export class RtcPeerBackend implements PeerBackend {
    */
   constructor(opts: RtcBackendOptions = {}, defaults: { iceServers?: readonly IceServerConfig[]; iceCandidatePolicy?: IceCandidatePolicy } = {}) {
     this.opts = opts;
+    const bf = opts.sendBatchFrames ?? 0;
+    if (bf !== 0 && bf !== 1 && bf !== 2) throw new Error(`peerBackend 'rtc': sendBatchFrames must be 0, 1 or 2 (got ${String(bf)})`);
+    this.batchFrames = bf;
+    if (bf > 0 && batcher === null) batcher = new SendBatcher();
     this.owned = opts.endpoint === undefined;
     this.policy = opts.iceCandidatePolicy ?? defaults.iceCandidatePolicy ?? 'public';
     if (opts.endpoint !== undefined) {
@@ -478,7 +604,7 @@ export class RtcPeerBackend implements PeerBackend {
   /** Session for `offerSdp` on `ep`, answer delivered synchronously. Throws RtcSdpError on an unusable offer. */
   attach(ep: RtcEndpoint, offerSdp: string, ev: PeerLinkEvents): RtcPeerLink {
     const s = ep.createSession(offerSdp); // throws RtcSdpError on an unusable offer: nothing left behind
-    const link = new RtcPeerLink(s, ev, this.links);
+    const link = new RtcPeerLink(s, ev, this.links, this.batchFrames);
     this.links.add(link);
     ev.onLocalDescription(s.answerSdp);
     if (!link.closed) for (const c of s.localCandidates) ev.onLocalCandidate(c, s.mid);
@@ -551,11 +677,16 @@ class RtcPeerLink implements PeerLink {
   private readonly s: RtcSession;
   private readonly owner: Set<RtcPeerLink>;
   closed = false;
-  /** Corked for this event-loop iteration (registered in the bundler). */
-  private corked = false;
+  /** LINK_IDLE, LINK_HELD (corked, in the batcher) or LINK_BUNDLED (corked, in the bundler). */
+  mode = LINK_IDLE;
+  /** Grid index the held messages are due at (LINK_HELD). */
+  holdDue = 0;
+  /** Frame batching of `ru` (0 = off). */
+  private readonly batchFrames: number;
 
-  constructor(s: RtcSession, ev: PeerLinkEvents, owner: Set<RtcPeerLink>) {
+  constructor(s: RtcSession, ev: PeerLinkEvents, owner: Set<RtcPeerLink>, batchFrames = 0) {
     this.s = s;
+    this.batchFrames = batchFrames;
     this.owner = owner;
     this.ev = ev;
     s.onOpen = () => {
@@ -595,18 +726,28 @@ class RtcPeerLink implements PeerLink {
   }
 
   send(index: number, data: Uint8Array): boolean {
-    if (!this.corked && !this.closed) {
-      this.corked = true;
-      this.s.cork();
-      bundler.add(this);
+    const mode = this.mode;
+    if (mode !== LINK_BUNDLED && !this.closed) {
+      if (index === BATCHED_CHANNEL && this.batchFrames > 0) {
+        if (mode === LINK_IDLE) {
+          this.mode = LINK_HELD;
+          this.s.cork();
+          batcher!.hold(this, this.batchFrames);
+        }
+      } else {
+        // leaves this iteration; held messages (queued before it) go first, in the same packet
+        if (mode === LINK_IDLE) this.s.cork();
+        this.mode = LINK_BUNDLED;
+        bundler.add(this);
+      }
     }
     return this.s.send(index, data);
   }
 
-  /** End of the iteration (or close): sends what was bundled. Never throws. */
+  /** End of the iteration / frame boundary (or close): sends what was bundled or held. Never throws. */
   flushBundle(): void {
-    if (!this.corked) return;
-    this.corked = false;
+    if (this.mode === LINK_IDLE) return;
+    this.mode = LINK_IDLE;
     try {
       this.s.uncork();
     } catch (err) {
