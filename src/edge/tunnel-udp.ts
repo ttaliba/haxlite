@@ -23,7 +23,7 @@ import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { TokenBucket } from '../net/rate-limit.js';
 import { UdpIo } from '../rtc/udp.js';
-import { UdpTunnelPlane, udpConnId, type TunnelSecrets, type UdpPlaneEvents } from '../net/edge-udp.js';
+import { UdpTunnelPlane, udpConnId, type TunnelAead, type TunnelAeadOption, type TunnelSecrets, type UdpPlaneEvents } from '../net/edge-udp.js';
 
 export interface EdgeTunnelOptions {
   /** Accept tunnel v2 (UDP) data planes. Default true. */
@@ -48,6 +48,21 @@ export interface EdgeTunnelOptions {
   idleTimeoutMs?: number;
   /** Accept the legacy WebRTC (node-datachannel) tunnel from hosts that ask for it (loads the addon then). Default true. */
   allowWebRtc?: boolean;
+  /**
+   * Datagram AEAD granted to hosts that ask for ChaCha20-Poly1305
+   * (`AuthFlag.ChaCha`): `'auto'` (default) = this runtime's cheaper one
+   * (Node: ChaCha20-Poly1305, Bun: AES-128-GCM); `'aes-128-gcm'` never
+   * grants it. Hosts that do not ask always get AES-128-GCM.
+   */
+  aead?: TunnelAeadOption;
+}
+
+/** Per-tunnel options of {@link EdgeUdpServer.open}. */
+export interface EdgeUdpConnOptions {
+  /** Negotiated datagram AEAD (default AES-128-GCM). */
+  aead?: TunnelAead;
+  /** Tests: ratchet after this many datagrams. */
+  rekeyAfterPackets?: number;
 }
 
 export interface EdgeTunnelStats {
@@ -106,7 +121,7 @@ export class EdgeUdpConn {
   closed = false;
 
   /** @internal use {@link EdgeUdpServer.open} */
-  constructor(server: EdgeUdpServer, connId: number, secrets: TunnelSecrets, lanes: number, events: UdpPlaneEvents, extra: { rekeyAfterPackets?: number }) {
+  constructor(server: EdgeUdpServer, connId: number, secrets: TunnelSecrets, lanes: number, events: UdpPlaneEvents, extra: EdgeUdpConnOptions) {
     this.server = server;
     this.connId = connId;
     const pps = server.maxPps;
@@ -126,6 +141,7 @@ export class EdgeUdpConn {
       },
       events,
       ...(extra.rekeyAfterPackets !== undefined ? { rekeyAfterPackets: extra.rekeyAfterPackets } : null),
+      ...(extra.aead !== undefined ? { aead: extra.aead } : null),
     });
   }
 
@@ -173,6 +189,8 @@ export class EdgeUdpServer {
   readonly port: number;
   readonly maxPps: number;
   readonly maxForeignPps: number;
+  /** AEAD setting for hosts that ask for ChaCha20-Poly1305 ({@link EdgeTunnelOptions.aead}). */
+  readonly aead: TunnelAeadOption;
   private readonly idleMs: number;
   private readonly sock: Socket;
   private readonly io: UdpIo;
@@ -187,6 +205,7 @@ export class EdgeUdpServer {
     this.maxPps = Math.max(1, o.maxPps ?? 20_000);
     this.maxForeignPps = Math.max(1, o.maxForeignPps ?? 20);
     this.idleMs = o.idleTimeoutMs ?? 30_000;
+    this.aead = o.aead ?? 'auto';
     // the runtime's send/receive paths without dgram's per-datagram garbage (src/rtc/udp.ts)
     this.io = new UdpIo(sock, (msg, address, port) => this.onPacket(msg, address, port), () => {
       /* ICMP errors etc.: never fatal for a shared socket */
@@ -206,7 +225,7 @@ export class EdgeUdpServer {
   }
 
   /** Registers a new tunnel with a fresh random connection id. */
-  open(secretsFor: (connId: number) => TunnelSecrets, lanes: number, events: UdpPlaneEvents, extra: { rekeyAfterPackets?: number } = {}): EdgeUdpConn {
+  open(secretsFor: (connId: number) => TunnelSecrets, lanes: number, events: UdpPlaneEvents, extra: EdgeUdpConnOptions = {}): EdgeUdpConn {
     if (this.closed) throw new Error('tunnel socket closed');
     let id = 0;
     while (id === 0 || this.conns.has(id)) id = randomBytes(4).readUInt32BE(0);

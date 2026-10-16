@@ -114,6 +114,16 @@ export const AuthFlag = {
    * the UDP endpoint. Combinable with {@link RoLanes}.
    */
   Udp: 4,
+  /**
+   * Tunnel v2 datagrams sealed with ChaCha20-Poly1305 instead of AES-128-GCM
+   * (see `TunnelAead` in `edge-udp.ts`). Only with {@link Udp}; requested by
+   * a host that prefers it, granted by an edge that does too. Backwards
+   * compatible both ways: edges before this flag never grant it (they echo
+   * only the planes and lanes they know) and hosts before it never ask. The
+   * choice is authenticated (the requested flags are under `mac2`, the
+   * granted ones under `okMac`), so it cannot be downgraded in transit.
+   */
+  ChaCha: 8,
 } as const;
 
 /** Ordered tunnel channels carrying player `ro` traffic when {@link AuthFlag.RoLanes} is granted. */
