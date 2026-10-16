@@ -1115,9 +1115,12 @@ export class HostRoom {
     const seq = this.sequencer;
     const n = this.targetFrame() - seq.frame;
     if (this.hiddenFor.size > 0 || this.reconciling.size > 0) {
-      // hidden players: re-hide / reconcile after every frame (a kick-off reset respawns discs)
-      for (let i = 0; i < n; i++) {
-        seq.advance(1);
+      // hidden players: re-hide / reconcile after every frame (a kick-off reset respawns discs);
+      // an idle stretch (fully paused game, no events) changes nothing: one jump, one sync
+      for (let i = 0; i < n; ) {
+        const k = seq.idleFrames(n - i) || 1;
+        seq.advance(k);
+        i += k;
         this.syncHidden();
       }
     } else if (n > 0) seq.advance(n);
@@ -1222,9 +1225,9 @@ export class HostRoom {
       if (cs < next) next = cs;
     }
     const gs = this.state.gameState;
-    // a fully paused game runs no per-frame hooks: no catch-up bound (frames
-    // are still stepped one by one on the next catch-up); the unpause
-    // countdown (counter < PAUSED_TICKS) keeps it
+    // a fully paused game runs no per-frame hooks: no catch-up bound (the
+    // next catch-up skips the paused frames in O(1), Sequencer.idleFrames);
+    // the unpause countdown (counter < PAUSED_TICKS) keeps it
     if (gs !== null && gs.pauseGameTickCounter !== PAUSED_TICKS) {
       const mw = this.wakeFrames;
       if (mw < hb) {

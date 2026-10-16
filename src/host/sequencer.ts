@@ -21,6 +21,7 @@ import { Channel, EventType, HostMsg, INPUT_DELAY_FRAMES, MAX_EVENT_FRAME_LEAD }
 import {
   CheckConsistencyEvent,
   EVENT_META,
+  PAUSED_TICKS,
   SetDiscPropertiesEvent,
   checkClientSender,
   createEvent,
@@ -333,8 +334,9 @@ export class Sequencer {
   /**
    * Simulates `n` frames (official `Ma.rg`): before each step, the queued
    * events of the current frame; after the last step, the queued events of
-   * the new frame whose order is consecutive. Frames without a game and
-   * without events are skipped in O(1) (stepping them is a no-op).
+   * the new frame whose order is consecutive. Frames without events and
+   * without a game, or with a fully paused one, are skipped in O(1)
+   * (stepping them is a no-op, see {@link idleFrames}).
    */
   advance(n: number): void {
     if (n <= 0) return;
@@ -346,7 +348,7 @@ export class Sequencer {
     this.depth++;
     try {
       while (e < n) {
-        if (rs.gameState === null && this.onFrameStepped === null && (this.views.length === 0 || this.viewsIdle())) {
+        if (this.idle()) {
           const next = c < count ? list[c]!.frame : Infinity;
           if (next > this.frame) {
             const skip = Math.min(next - this.frame, n - e);
@@ -385,6 +387,28 @@ export class Sequencer {
       if (c > 0) dropFirst(list, c);
       this.depth--;
     }
+  }
+
+  /**
+   * Stepping a frame changes nothing but the frame counters: no game, or a
+   * fully paused one (official `Q.Da` only counts an unpause countdown down
+   * and runs no hook, not even `onGameTick`), in the room and in every
+   * private view, and nobody observes each frame ({@link onFrameStepped}).
+   */
+  private idle(): boolean {
+    return this.onFrameStepped === null && worldIdle(this.rs) && (this.views.length === 0 || this.viewsIdle());
+  }
+
+  /**
+   * How many of the next `max` frames {@link advance} skips in O(1): the
+   * frames before the next queued event while the room is idle (no game or
+   * a fully paused one), else 0. Lets a caller that must act after every
+   * real step (hidden players) jump over the idle stretch in one call.
+   */
+  idleFrames(max: number): number {
+    if (max <= 0 || !this.idle()) return 0;
+    const next = this.queue.length > 0 ? this.queue[0]!.frame : Infinity;
+    return next > this.frame ? Math.min(next - this.frame, max) : 0;
   }
 
   /**
@@ -470,7 +494,7 @@ export class Sequencer {
 
   private viewsIdle(): boolean {
     const views = this.views;
-    for (let i = 0; i < views.length; i++) if (views[i]!.rs.gameState !== null) return false;
+    for (let i = 0; i < views.length; i++) if (!worldIdle(views[i]!.rs)) return false;
     return true;
   }
 
@@ -846,6 +870,12 @@ export class Sequencer {
     writeEventFrame(w, ev);
     this.sink.sendTo?.(playerId, w.finishShared(), channel);
   }
+}
+
+/** Stepping `rs` is a no-op: no game, or a fully paused one (not counting down to resume). */
+function worldIdle(rs: RoomState): boolean {
+  const gs = rs.gameState;
+  return gs === null || gs.pauseGameTickCounter === PAUSED_TICKS;
 }
 
 /**
