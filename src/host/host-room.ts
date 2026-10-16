@@ -1109,6 +1109,14 @@ export class HostRoom {
     seq.periodic(this.hbFrames, this.csFrames);
   }
 
+  /**
+   * Frames ahead of its due frame that a heartbeat may leave with a client
+   * event (bundling backends): floor((heartbeatFrames - 1) / 3), 2 by default.
+   */
+  private heartbeatLead(): number {
+    return ((this.hbFrames - 1) / 3) | 0;
+  }
+
   /** Pre-bound so wake-ups allocate nothing. */
   private readonly catchUpFn = (): void => this.catchUp();
   private readonly pingFn = (): void => this.broadcastPings();
@@ -1346,10 +1354,13 @@ export class HostRoom {
       this.readerBusy = true;
       try {
         const type = r.u8();
-        if (type === ClientMsg.Event) this.sequencer.clientMessage(c, r, this.now());
+        let broadcast = false;
+        if (type === ClientMsg.Event) broadcast = this.sequencer.clientMessage(c, r, this.now()) !== null;
         else if (type === ClientMsg.Ping) this.handlePing(c, r);
         else throw new ProtocolViolation(`unexpected message type ${type}`);
         if (r.remaining > 0) throw new ProtocolViolation('trailing bytes');
+        // bundling backend: an imminent heartbeat rides along with the event just broadcast
+        if (broadcast && this.bundle !== null) this.sequencer.heartbeatAhead(this.hbFrames, this.heartbeatLead());
       } catch (err) {
         this.badActor(c, err);
       } finally {

@@ -687,6 +687,17 @@ export class Sequencer {
   }
 
   /**
+   * Heartbeat now if the next one is due within `leadFrames` (the official
+   * `Wa.oc` also heartbeats right after its own events). HostRoom calls it
+   * after broadcasting a client event inside a bundling scope, so the
+   * heartbeat rides in the same packet as the event instead of costing its
+   * own wake-up and datagram per client a few frames later.
+   */
+  heartbeatAhead(heartbeatFrames: number, leadFrames: number): void {
+    if (this.frame - this.lastHeartbeatFrame >= heartbeatFrames - leadFrames) this.heartbeat();
+  }
+
+  /**
    * CheckConsistency (official `Wa.Wh`): stamped at the current frame with
    * the next order, carries the hash of the state at that exact point; not
    * applied on the host, broadcast on `ro`.
