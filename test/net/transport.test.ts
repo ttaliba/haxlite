@@ -238,19 +238,21 @@ describe('handshake and identity', () => {
     const { roomId } = await startHost({ log });
     // node-haxball / libdatachannel (the raw client's own offer)
     join(roomId);
-    expect(await nextGap(1)).toBeGreaterThanOrEqual(9);
+    // Node timers may fire ~1 ms before performance.now() reaches the delay (8.78 ms seen on a CI
+    // runner for 10 ms), so the bounds leave room on both sides
+    expect(await nextGap(1)).toBeGreaterThanOrEqual(7);
     // the same client presenting a Chrome / Firefox origin line: challenge at once
     // (the libdatachannel client itself may then drop it: only the host side is checked)
     join(roomId, { mungeOffer: (sdp) => sdp.replace(/^o=rtc /m, 'o=- ') });
-    expect(await nextGap(2)).toBeLessThan(9);
+    expect(await nextGap(2)).toBeLessThan(7);
     join(roomId, { mungeOffer: (sdp) => sdp.replace(/^o=rtc \S+/m, 'o=mozilla...THIS_IS_SDPARTA-99.0') });
-    expect(await nextGap(3)).toBeLessThan(9);
+    expect(await nextGap(3)).toBeLessThan(7);
     // explicit value: every client
     opened.clear();
     gaps.clear();
     const h2 = await startHost({ log, challengeDelayMs: 40 });
     join(h2.roomId, { mungeOffer: (sdp) => sdp.replace(/^o=rtc /m, 'o=- ') });
-    expect(await nextGap(1)).toBeGreaterThanOrEqual(39);
+    expect(await nextGap(1)).toBeGreaterThanOrEqual(37);
   });
 
   it('reverse-connection offers (remote ICE delayed) still connect', async () => {
