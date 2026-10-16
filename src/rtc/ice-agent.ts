@@ -41,7 +41,7 @@ import type { UdpIo } from './udp.js';
 import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { classifyIp, policyAllows, candidatePriority, sameIp, txidKey, TYPE_PREF, type CandidatePolicy, type TxnHandler, type TxnTable, type AddressClass } from './gather.js';
-import { StunAttr, StunType, buildBindingRequest, checkFingerprint, checkIntegrity, findAttr, type StunMessage } from './stun.js';
+import { StunAttr, StunType, buildBindingRequest, checkFingerprint, checkIntegrity, findAttr, type StunKey, type StunMessage } from './stun.js';
 import type { ParsedCandidate } from './sdp.js';
 
 /** Pacing of new checks per session (RFC 8445 Ta). */
@@ -212,7 +212,7 @@ export interface IceAgentOwner {
   readonly localUfrag: string;
   readonly remoteUfrag: string;
   /** The remote ICE password (key of the MESSAGE-INTEGRITY of our checks and of their responses). */
-  readonly remoteKey: Buffer;
+  readonly remoteKey: StunKey;
   /** One of our checks on (sock, address, port) succeeded: the pair is valid (DTLS may flow there). */
   onCheckSucceeded(sock: UdpIo, address: string, port: number): void;
   /** One of our consent checks on the selected pair was answered (RFC 7675). */

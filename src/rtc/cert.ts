@@ -14,6 +14,7 @@ import {
   sign,
   type KeyObject,
 } from 'node:crypto';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 
 // ---------------------------------------------------------------- DER
 
@@ -221,12 +222,15 @@ export class RtcCertificate {
    * generates one and writes it there (mode 0600) when the file is missing or
    * its certificate expires within a day. Saves the key generation at every
    * start and keeps the fingerprint stable across restarts.
+   *
+   * Synchronous file I/O and key generation on purpose (a few KiB, once per
+   * endpoint): the asynchronous variants would start libuv's thread pool
+   * (4 threads that then live as long as the process) for nothing.
    */
   static async loadOrCreate(file: string, opts: CertOptions = {}): Promise<RtcCertificate> {
-    const fs = await import('node:fs/promises');
     let text: string | null = null;
     try {
-      text = await fs.readFile(file, 'utf8');
+      text = readFileSync(file, 'utf8');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     }
@@ -234,11 +238,11 @@ export class RtcCertificate {
       const cert = RtcCertificate.fromPem(text, text);
       if (Date.parse(cert.x509.validTo) - Date.now() > 86_400_000) return cert;
     }
-    const cert = await RtcCertificate.generateAsync(opts);
+    const cert = RtcCertificate.generate(opts);
     const pem = cert.toPem();
     const tmp = `${file}.${process.pid}.tmp`;
-    await fs.writeFile(tmp, pem.cert + pem.key, { mode: 0o600 });
-    await fs.rename(tmp, file);
+    writeFileSync(tmp, pem.cert + pem.key, { mode: 0o600 });
+    renameSync(tmp, file);
     return cert;
   }
 

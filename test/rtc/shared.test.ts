@@ -2,7 +2,7 @@
  * Process-wide endpoint sharing (src/rtc/shared.ts) and the certificate
  * helpers used by it (process default, async generation, PEM file).
  */
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -73,5 +73,16 @@ describe('RtcCertificate helpers', () => {
     expect(readFileSync(file, 'utf8')).toMatch(/BEGIN CERTIFICATE[\s\S]*BEGIN PRIVATE KEY/);
     const b = await RtcCertificate.loadOrCreate(file);
     expect(Buffer.from(b.fingerprint)).toEqual(Buffer.from(a.fingerprint));
+  });
+
+  it('loadOrCreate replaces an identity that expires within a day (synchronous write + rename)', async () => {
+    const file = path.join(dir, 'expiring.pem');
+    const old = RtcCertificate.generate({ validDays: 1 }); // valid from 1 day ago: expires now
+    writeFileSync(file, old.toPem().cert + old.toPem().key);
+    const fresh = await RtcCertificate.loadOrCreate(file);
+    expect(Buffer.from(fresh.fingerprint)).not.toEqual(Buffer.from(old.fingerprint));
+    const again = await RtcCertificate.loadOrCreate(file);
+    expect(Buffer.from(again.fingerprint)).toEqual(Buffer.from(fresh.fingerprint));
+    expect(readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
   });
 });

@@ -5,6 +5,7 @@
  * {@link RtcEndpoint} (endpoint.ts), which owns the socket(s) and the
  * demultiplexing maps.
  */
+import { createSecretKey, type KeyObject } from 'node:crypto';
 import type { UdpIo } from './udp.js';
 import { DtlsServer } from './dtls/server.js';
 import type { OfferInfo } from './sdp.js';
@@ -60,8 +61,8 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
   readonly mid: string;
   readonly localUfrag: string;
   readonly remoteUfrag: string;
-  /** Our ICE password as bytes (STUN MESSAGE-INTEGRITY key). */
-  readonly integrityKey: Buffer;
+  /** Our ICE password as a secret key (STUN MESSAGE-INTEGRITY; a KeyObject: no per-check key import). */
+  readonly integrityKey: KeyObject;
   /** USERNAME every Binding request must carry: "ourUfrag:theirUfrag". */
   private readonly expectedUsername: Buffer;
   readonly createdAt: number;
@@ -74,8 +75,8 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
   onGatheringComplete?: () => void;
   /** All our candidates are known (false while the endpoint's STUN gathering runs). */
   gatheringComplete = true;
-  /** Remote ICE password (MESSAGE-INTEGRITY key of our checks). */
-  readonly remoteKey: Buffer;
+  /** Remote ICE password as a secret key (MESSAGE-INTEGRITY of our checks and their responses). */
+  readonly remoteKey: KeyObject;
   /** Full-ICE check list (null: ICE-lite). */
   readonly agent: IceAgent | null;
 
@@ -109,13 +110,13 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
     this.offer = offer;
     this.localUfrag = localUfrag;
     this.remoteUfrag = offer.iceUfrag;
-    this.integrityKey = Buffer.from(localPwd, 'latin1');
+    this.integrityKey = createSecretKey(Buffer.from(localPwd, 'latin1'));
     this.expectedUsername = Buffer.from(`${localUfrag}:${offer.iceUfrag}`, 'latin1');
     this.answerSdp = answerSdp;
     this.localCandidates = localCandidates;
     this.mid = offer.mid;
     this.createdAt = host.now();
-    this.remoteKey = Buffer.from(offer.icePwd, 'latin1');
+    this.remoteKey = createSecretKey(Buffer.from(offer.icePwd, 'latin1'));
     this.agent = host.ice !== null ? new IceAgent(host.ice, this) : null;
     for (const c of offer.candidates) this.addRemoteCandidate(c);
     this.dtls = new DtlsServer({
