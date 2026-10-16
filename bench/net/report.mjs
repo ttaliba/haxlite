@@ -7,7 +7,13 @@ import { fileURLToPath } from 'node:url';
 
 const UNIFIED = process.argv.includes('--unified');
 const dir = process.argv.slice(2).find((a) => !a.startsWith('--')) ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../results');
-const load = (n) => (existsSync(path.join(dir, `${n}.json`)) ? JSON.parse(readFileSync(path.join(dir, `${n}.json`), 'utf8')) : null);
+const load = (n) => {
+  if (!existsSync(path.join(dir, `${n}.json`))) return null;
+  const j = JSON.parse(readFileSync(path.join(dir, `${n}.json`), 'utf8'));
+  // run.ts --quick (development profile): flagged in the output, never a publishable table
+  if (j.info?.publishable === false) console.log(`> **${n}.json: perfil --quick (desarrollo), NO publicable.**\n`);
+  return j;
+};
 const NAMES = {
   haxlite: 'haxlite',
   official: 'oficial (haxball.js)',
@@ -225,6 +231,9 @@ function unifiedReport() {
     const lo = Math.floor(i);
     return xs[lo] + (xs[Math.min(lo + 1, xs.length - 1)] - xs[lo]) * (i - lo);
   };
+  // joins in flight per clients process (run.ts --join-concurrency; older results: sequential)
+  const conc = (c) => Math.max(1, ...ok(c ?? { runs: [] }).map((r) => r.spec?.joinConcurrency ?? r.joinConcurrency ?? 1));
+  const concMark = (c) => (c && conc(c) > 1 ? ` (×${conc(c)} a la vez)` : '');
   const cell = (c, f, d) => (c && ok(c).length ? es(med(c, f), d) : 'n/d');
   const flags = (c) => (c ? `${ok(c).length}${ok(c).some((r) => r.noisy) ? '*' : ''}${ok(c).every((r) => r.valid) ? '' : '⚠'}` : '0');
   const header = ['escenario', 'métrica', ...ORDER.map((i) => NAMES[i])];
@@ -257,7 +266,7 @@ function unifiedReport() {
       rows.push(['', 'lag del event loop p50 / p99 (ms)', ...cs.map((c) => (c ? `${cell(c, (r) => r.host.eld?.p50, 2)} / ${cell(c, (r) => r.host.eld?.p99, 2)}` : 'n/d'))]);
       rows.push(['', 'hilos · fds', ...cs.map((c) => (c ? `${cell(c, (r) => r.host.threadCount, 0)} · ${cell(c, (r) => r.host.fdCount, 0)}` : 'n/d'))]);
       rows.push(['', 'despertares/s', ...cs.map((c) => cell(c, (r) => r.host.wakeups?.voluntaryPerS, 0))]);
-      rows.push(['', 'entrada p50 (ms, Room.join → onOpen)', ...cs.map((c) => cell(c, (r) => joinQ(r, 0.5), 0))]);
+      rows.push(['', 'entrada p50 (ms, Room.join → onOpen)', ...cs.map((c) => cell(c, (r) => joinQ(r, 0.5), 0) + concMark(c))]);
       if (cs.some((c) => c && ok(c).some((r) => r.egressPerPlayer))) {
         rows.push(['', 'salida por jugador: mensajes/s · B/s (aplicación)', ...cs.map((c) => (c && ok(c).some((r) => r.egressPerPlayer) ? `${cell(c, (r) => r.egressPerPlayer.appMsgsPerS, 1)} · ${cell(c, (r) => r.egressPerPlayer.appBytesPerS, 0)}` : 'n/d'))]);
         rows.push(['', 'salida por jugador: datagramas/s · B/s (UDP)', ...cs.map((c) => (c && ok(c).some((r) => r.egressPerPlayer?.udpBytesPerS != null) ? `${cell(c, (r) => r.egressPerPlayer.udpPacketsPerS, 1)} · ${cell(c, (r) => r.egressPerPlayer.udpBytesPerS, 0)}` : 'n/d'))]);
@@ -295,7 +304,7 @@ function unifiedReport() {
         rng(c, (r) => r.host.threadCount, 0),
         rng(c, (r) => r.host.fdCount, 0),
         rng(c, (r) => r.host.wakeups?.voluntaryPerS, 0),
-        j.scenario === 'idle' ? '—' : `${es(med(c, (r) => joinQ(r, 0.5)), 0)} / ${es(med(c, (r) => joinQ(r, 0.9)), 0)}`,
+        j.scenario === 'idle' ? '—' : `${es(med(c, (r) => joinQ(r, 0.5)), 0)} / ${es(med(c, (r) => joinQ(r, 0.9)), 0)}${concMark(c)}`,
         `${es(med(c, (r) => r.machine.foreignPct), 0)} · ${es(med(c, (r) => r.machine.loadavgEnd[0]), 2)}`,
       ]),
     );

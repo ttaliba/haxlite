@@ -3,7 +3,7 @@
  * `import` of the package entry → `HBInit` → room link (FakeMaster, offline).
  * Entries are interleaved so machine drift affects all alike.
  *
- *   node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+ *   node --no-warnings --import ./bench/ts-resolve.mjs \
  *     bench/startup/run.ts <reps> <label=entry.js> [<label=entry.js> …] [-- node flags…]
  */
 import { fork } from 'node:child_process';

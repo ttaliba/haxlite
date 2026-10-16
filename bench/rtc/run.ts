@@ -1,6 +1,6 @@
 // haxlite-rtc vs node-datachannel: server cost and latency with real Chromium peers.
 //
-//   flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings \
+//   flock /tmp/haxlite-bench.lock node --no-warnings \
 //     --import ./bench/ts-resolve.mjs bench/rtc/run.ts [--backends ndc,rtc] [--peers 1,10,30] \
 //     [--seconds 30] [--warmup 5] [--input-hz 8] [--per-page 10] [--out bench/results/rtc.json]
 //

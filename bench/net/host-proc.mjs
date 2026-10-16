@@ -15,6 +15,7 @@
 //
 // IPC in : {cmd:'game'} | {cmd:'measure-start', eld, sampleMs, stream} | {cmd:'measure-stop'} | {cmd:'players'}
 //          {cmd:'auto-teams'} (soak: new players get a team, game kept running) | {cmd:'impair-stats'}
+//          {cmd:'probe'} (warm-up: → {type:'probe', t, cpuMs, rss, heapUsed})
 // IPC out: {type:'link', room, id, tCreate, tLink} | {type:'game', players} |
 //          {type:'stats', …} | {type:'players', counts} | {type:'error', message} |
 //          {type:'sample', …} (measure-start with stream: one per sampleMs) | {type:'impair-stats', …}
@@ -750,6 +751,13 @@ process.on('message', (msg) => {
         startAutoTeams();
         send({ type: 'auto-teams' });
         break;
+      case 'probe': {
+        // warm-up steady-state detection (run.ts): process CPU and memory so far, nothing else
+        const c = process.cpuUsage();
+        const mem = process.memoryUsage();
+        send({ type: 'probe', t: performance.now(), cpuMs: (c.user + c.system) / 1000, rss: mem.rss, heapUsed: mem.heapUsed });
+        break;
+      }
       case 'impair-stats':
         send({ type: 'impair-stats', rooms: rooms.map((r) => r.impairStats?.() ?? null), rtc: rtcTotals(true) });
         break;

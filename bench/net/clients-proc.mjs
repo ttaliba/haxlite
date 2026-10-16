@@ -3,10 +3,11 @@
 //
 //   node bench/net/clients-proc.mjs <master host:port> <roomId:count,roomId:count,…> <seed> [options JSON]
 //
-// options: { churn?: { stayS: [min, max], pauseS: [min, max] } }
+// options: { churn?: { stayS: [min, max], pauseS: [min, max] }, joinConcurrency?: number }
 //   churn (soak scenario): every client slot loops join → play for U(stayS) →
 //   leave → wait U(pauseS) → join again, until 'stop'. Without churn the
-//   clients join once, sequentially (join latency per client), and stay.
+//   clients join once, joinConcurrency at a time (default 1: sequentially; join
+//   latency per client), and stay.
 //
 // IPC in : {cmd:'drive'} | {cmd:'window'} (restart the traffic/jitter counters) | {cmd:'stop'}
 // IPC out: {type:'joined', joined, failures, ms, joinMs} | {type:'driving'} | {type:'report', …} | {type:'error', message}
@@ -214,22 +215,31 @@ if (churn) {
   // slots start in 'drive'; nothing to join up front
   send({ type: 'joined', joined: targets.reduce((a, t) => a + t.n, 0), failures: 0, ms: 0, joinMs: [] });
 } else {
-  for (const t of targets) {
-    for (let i = 0; i < t.n; i++) {
-      const name = `bot${k++}`;
+  // Joins run `joinConcurrency` at a time (default 1 = one after another). A join is
+  // ~1 s of client-side waiting (node-haxball's own ICE gathering before its offer,
+  // docs/07 "Dónde se iban los ~2 s de entrada"), not host work, so a few at once cut
+  // the set-up time; joinMs is still per client (Room.join → onOpen of the attempt that got in).
+  const slots = [];
+  for (const t of targets) for (let i = 0; i < t.n; i++) slots.push({ id: t.id, name: `bot${k++}` });
+  const ordered = new Array(slots.length).fill(null);
+  let next = 0;
+  const worker = async () => {
+    while (next < slots.length) {
+      const idx = next++;
+      const { id, name } = slots[idx];
       let c = null;
       for (let attempt = 0; attempt < 4 && c === null; attempt++) {
-        c = await joinOnce(t.id, name, 8000);
+        c = await joinOnce(id, name, 8000);
         if (c === null) failures++;
       }
-      if (c === null) {
-        send({ type: 'error', message: `could not join ${name} to ${t.id}` });
-        continue;
-      }
-      clients.push(c);
+      if (c === null) send({ type: 'error', message: `could not join ${name} to ${id}` });
+      ordered[idx] = c;
     }
-  }
-  send({ type: 'joined', joined: clients.length, failures, ms: performance.now() - t0, joinMs: clients.map((c) => +c.joinMs.toFixed(1)) });
+  };
+  const conc = Math.max(1, Math.min(slots.length, Number(OPTS.joinConcurrency ?? 1)));
+  await Promise.all(Array.from({ length: conc }, worker));
+  for (const c of ordered) if (c !== null) clients.push(c);
+  send({ type: 'joined', joined: clients.length, failures, ms: performance.now() - t0, joinMs: clients.map((c) => +c.joinMs.toFixed(1)), concurrency: conc });
 }
 
 function trafficReport() {
