@@ -24,25 +24,36 @@
  *
  * Cost: when not recording every entry point is a single boolean test. While
  * recording, an event costs a few buffer writes into a long-lived Writer
- * (amortized zero allocations; buffers are kept and reused by the next
- * recording). Only `stop()`/`snapshot()` allocate (deflate + output array).
+ * (amortized zero allocations). Only `stop()`/`snapshot()` allocate: one
+ * exact-size transient body (markers ++ events) for the deflate, plus the
+ * output file. At stop, writers that grew past their initial capacity are
+ * dropped (a 1 h match leaves ~8 MB of event log behind otherwise); small
+ * ones are kept for the next recording. `stopAsync()`/`snapshotAsync()`
+ * deflate on the libuv threadpool instead of the event loop (same bytes).
  */
 import { Writer, deflateRaw } from '../codec/index.js';
+import { deflateRawAsync } from '../codec/compress.js';
 import type { TeamId } from '../protocol.js';
 import type { RoomEvent, RoomState } from '../room/index.js';
 import { writeEvent, writeRoomState } from '../room/index.js';
 import { REPLAY_HEADER_SIZE, REPLAY_MAGIC, REPLAY_VERSION } from './format.js';
 
 /** Anything exposing the host's current logical frame (e.g. the host engine itself). */
+/** Initial writer capacities (official `Jb` / `yc`); writers that grew past them are dropped at stop. */
+const MARKERS_CAPACITY = 1000;
+const EVENTS_CAPACITY = 16384;
+
 export interface FrameClock {
   readonly frame: number;
 }
 
 export class ReplayRecorder {
-  /** u16 goal marker count (patched at stop) + markers. off `Jb` (initial capacity 1000). */
-  private readonly markers = new Writer(1000);
-  /** RoomState at start + event records. off `yc` (initial capacity 16384). */
-  private readonly events = new Writer(16384);
+  /** u16 goal marker count (patched at stop) + markers. off `Jb` (initial capacity 1000). Null until the first start / after a large recording stops. */
+  private markers: Writer | null = null;
+  /** RoomState at start + event records. off `yc` (initial capacity 16384). Null until the first start / after a large recording stops. */
+  private events: Writer | null = null;
+  /** {@link bodyLength} of the last recording once it stopped. */
+  private finalBodyLength = 0;
 
   private active = false;
   private startFrame = 0;
@@ -91,7 +102,7 @@ export class ReplayRecorder {
 
   /** Uncompressed body size so far (markers + state + events), in bytes. */
   get bodyLength(): number {
-    return this.markers.pos + this.events.pos;
+    return this.active ? this.markers!.pos + this.events!.pos : this.finalBodyLength;
   }
 
   /**
@@ -118,10 +129,10 @@ export class ReplayRecorder {
     this.lastMarkerFrame = frame;
     this.markerCount = 0;
     this.eventCount = 0;
-    this.markers.reset();
-    this.markers.u16(0);
-    this.events.reset();
-    writeRoomState(this.events, rs);
+    const markers = (this.markers ??= new Writer(MARKERS_CAPACITY)).reset();
+    markers.u16(0);
+    const events = (this.events ??= new Writer(EVENTS_CAPACITY)).reset();
+    writeRoomState(events, rs);
     if (clock !== null) {
       this.clock = clock;
       this.hookedRoom = rs;
@@ -137,7 +148,7 @@ export class ReplayRecorder {
    */
   onEvent(ev: RoomEvent, frame: number): void {
     if (!this.active) return;
-    const w = this.events;
+    const w = this.events!;
     w.varUint(frame - this.lastEventFrame);
     this.lastEventFrame = frame;
     w.u16(ev.byId);
@@ -152,7 +163,7 @@ export class ReplayRecorder {
    */
   onGoalMarker(goalOwner: TeamId, frame: number): void {
     if (!this.active) return;
-    const w = this.markers;
+    const w = this.markers!;
     w.varUint(frame - this.lastMarkerFrame);
     this.lastMarkerFrame = frame;
     w.u8(goalOwner);
@@ -166,10 +177,24 @@ export class ReplayRecorder {
    */
   stop(frame: number): Uint8Array {
     if (!this.active) throw new Error('ReplayRecorder: not recording');
-    const file = this.build(frame);
-    this.active = false;
-    this.unhook();
-    return file;
+    const total = frame - this.startFrame;
+    const body = this.body();
+    this.end();
+    return this.file(total, deflateRaw(body));
+  }
+
+  /**
+   * {@link stop}, deflating on the libuv threadpool (node:zlib) instead of the
+   * event loop: same bytes. Recording stops synchronously (events after this
+   * call are not recorded, a new {@link start} may follow at once); only the
+   * compression is deferred. Throws (synchronously) if not recording.
+   */
+  stopAsync(frame: number): Promise<Uint8Array> {
+    if (!this.active) throw new Error('ReplayRecorder: not recording');
+    const total = frame - this.startFrame;
+    const body = this.body();
+    this.end();
+    return deflateRawAsync(body).then((d) => this.file(total, d));
   }
 
   /**
@@ -178,13 +203,29 @@ export class ReplayRecorder {
    */
   snapshot(frame: number): Uint8Array {
     if (!this.active) throw new Error('ReplayRecorder: not recording');
-    return this.build(frame);
+    return this.file(frame - this.startFrame, deflateRaw(this.body()));
+  }
+
+  /** {@link snapshot}, deflating on the libuv threadpool (same bytes). */
+  snapshotAsync(frame: number): Promise<Uint8Array> {
+    if (!this.active) throw new Error('ReplayRecorder: not recording');
+    const total = frame - this.startFrame;
+    return deflateRawAsync(this.body()).then((d) => this.file(total, d));
   }
 
   /** Abandons the current recording (no output); restores the goal hook. */
   cancel(): void {
+    if (this.active) this.end();
+    else this.unhook();
+  }
+
+  /** Recording over: restores the goal hook, drops writers that grew. */
+  private end(): void {
+    this.finalBodyLength = this.markers!.pos + this.events!.pos;
     this.active = false;
     this.unhook();
+    if (this.markers!.capacity > MARKERS_CAPACITY) this.markers = null;
+    if (this.events!.capacity > EVENTS_CAPACITY) this.events = null;
   }
 
   private unhook(): void {
@@ -197,19 +238,28 @@ export class ReplayRecorder {
     this.previousGoalHook = null;
   }
 
-  private build(frame: number): Uint8Array {
-    const markers = this.markers;
+  /**
+   * `markers ++ events` (official `Jb.qb(yc.Db())`, deflated in one go) in one
+   * exact-size transient array, with the marker count patched in.
+   */
+  private body(): Uint8Array {
+    const markers = this.markers!;
+    const events = this.events!;
     markers.setU16At(0, this.markerCount);
-    // body = markers ++ events, deflated in one go (official `Jb.qb(yc.Db())`).
-    const markerLen = markers.pos;
-    markers.bytes(this.events.finish());
-    const deflated = deflateRaw(markers.finish());
-    markers.pos = markerLen; // keep appending markers after a snapshot
+    const m = markers.finish();
+    const body = new Uint8Array(m.length + events.pos);
+    body.set(m);
+    body.set(events.finish(), m.length);
+    return body;
+  }
+
+  /** Header (`"HBR2"`, version, total frames) + deflated body. */
+  private file(totalFrames: number, deflated: Uint8Array): Uint8Array {
     const file = new Uint8Array(REPLAY_HEADER_SIZE + deflated.length);
     const header = new DataView(file.buffer);
     header.setUint32(0, REPLAY_MAGIC); // "HBR2"
     header.setUint32(4, this.version);
-    header.setUint32(8, frame - this.startFrame);
+    header.setUint32(8, totalFrames);
     file.set(deflated, REPLAY_HEADER_SIZE);
     return file;
   }
