@@ -8,9 +8,16 @@
  * Parsing fills a reusable {@link StunMessage} (offsets into the datagram,
  * no per-attribute objects).
  */
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, timingSafeEqual, type KeyObject } from 'node:crypto';
 import { isIPv4 } from 'node:net';
 import * as zlib from 'node:zlib';
+
+/**
+ * MESSAGE-INTEGRITY key: the ICE password as bytes, or (sessions) the same
+ * bytes as a secret KeyObject made once, which spares createHmac the
+ * per-call key import (Node 26: ≈ 47 → 4 µs per HMAC; neutral on Bun).
+ */
+export type StunKey = Uint8Array | KeyObject;
 
 export const STUN_HEADER = 20;
 export const MAGIC_COOKIE = 0x2112a442;
@@ -226,7 +233,7 @@ function crc32WithLength(buf: Uint8Array, end: number, len: number): number {
  * MESSAGE-INTEGRITY present and valid for `key` (the ICE password as bytes;
  * RFC 5389 §15.4 short-term credential: key = SASLprep(password), ASCII here).
  */
-export function checkIntegrity(m: StunMessage, key: Uint8Array): boolean {
+export function checkIntegrity(m: StunMessage, key: StunKey): boolean {
   const off = m.integrityOffset;
   if (off < 0) return false;
   const buf = m.buf;
@@ -234,7 +241,7 @@ export function checkIntegrity(m: StunMessage, key: Uint8Array): boolean {
   return timingSafeEqual(mac, buf.subarray(off + 4, off + 24));
 }
 
-function hmacWithLength(buf: Uint8Array, end: number, len: number, key: Uint8Array): Buffer {
+function hmacWithLength(buf: Uint8Array, end: number, len: number, key: StunKey): Buffer {
   const b2 = buf[2]!;
   const b3 = buf[3]!;
   buf[2] = len >>> 8;
@@ -337,7 +344,7 @@ export function findAttr(m: StunMessage, type: number): number {
 }
 
 /** Appends MESSAGE-INTEGRITY (if `key`) and FINGERPRINT to a message whose attributes end at `p`; returns the final size. */
-function finishMessage(out: Uint8Array, p: number, key: Uint8Array | null): number {
+function finishMessage(out: Uint8Array, p: number, key: StunKey | null): number {
   if (key !== null) {
     out[p] = 0x00;
     out[p + 1] = 0x08;
@@ -382,7 +389,7 @@ function writeHeader(out: Uint8Array, type: number, txid: Uint8Array): void {
  * (our password), FINGERPRINT. Returns a new buffer (it is handed to the
  * socket, which may keep it until sent).
  */
-export function buildBindingSuccess(txid: Uint8Array, address: string, port: number, key: Uint8Array): Buffer {
+export function buildBindingSuccess(txid: Uint8Array, address: string, port: number, key: StunKey): Buffer {
   const out = Buffer.allocUnsafe(STUN_HEADER + 4 + 20 + 24 + 8);
   writeHeader(out, StunType.BindingSuccess, txid);
   out[20] = 0x00;
@@ -395,7 +402,7 @@ export function buildBindingSuccess(txid: Uint8Array, address: string, port: num
 }
 
 /** Binding error response (e.g. 487 Role Conflict, 400 Bad Request), authenticated when `key` is given. */
-export function buildBindingError(txid: Uint8Array, code: number, reason: string, key: Uint8Array | null): Buffer {
+export function buildBindingError(txid: Uint8Array, code: number, reason: string, key: StunKey | null): Buffer {
   const reasonBytes = Buffer.from(reason, 'utf8');
   const vlen = 4 + reasonBytes.length;
   const out = Buffer.alloc(STUN_HEADER + 4 + ((vlen + 3) & ~3) + 24 + 8);
@@ -415,7 +422,7 @@ export function buildBindingError(txid: Uint8Array, code: number, reason: string
 export function buildBindingRequest(opts: {
   txid: Uint8Array;
   username: string;
-  key: Uint8Array;
+  key: StunKey;
   priority?: number;
   useCandidate?: boolean;
   controlling?: boolean;

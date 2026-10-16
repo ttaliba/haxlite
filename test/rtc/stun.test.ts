@@ -1,3 +1,4 @@
+import { createSecretKey } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   StunMessage,
@@ -102,6 +103,22 @@ describe('STUN (RFC 5769 test vectors)', () => {
       expect(checkFingerprint(m)).toBe(true);
       expect(checkIntegrity(m, PASSWORD)).toBe(true);
     }
+  });
+
+  it('a KeyObject key (sessions) gives the same MESSAGE-INTEGRITY as the raw password bytes', () => {
+    const ko = createSecretKey(PASSWORD);
+    const m = new StunMessage();
+    for (const vec of [REQUEST, RESPONSE4, RESPONSE6]) {
+      expect(parseStun(vec, m)).toBe(true);
+      expect(checkIntegrity(m, ko)).toBe(true);
+    }
+    expect(parseStun(REQUEST, m)).toBe(true);
+    expect(checkIntegrity(m, createSecretKey(Buffer.from('VOkJxbRl1RmTxUk/WvJxBu')))).toBe(false);
+    const txid = REQUEST.subarray(8, 20);
+    expect(buildBindingSuccess(txid, '192.0.2.1', 32853, ko)).toEqual(buildBindingSuccess(txid, '192.0.2.1', 32853, PASSWORD));
+    expect(buildBindingError(txid, 487, 'Role Conflict', ko)).toEqual(buildBindingError(txid, 487, 'Role Conflict', PASSWORD));
+    const req = { txid: Buffer.alloc(12, 9), username: 'abcd:efgh', priority: 1, useCandidate: true };
+    expect(buildBindingRequest({ ...req, key: ko })).toEqual(buildBindingRequest({ ...req, key: PASSWORD }));
   });
 
   it('error responses carry ERROR-CODE and authenticate', () => {
