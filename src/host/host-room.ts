@@ -52,7 +52,7 @@ import {
   type RoomEvent,
   type RoomState,
 } from '../room/index.js';
-import { defaultStadiums, parseHbs, type Disc, type Stadium } from '../sim/index.js';
+import { defaultStadium, parseHbs, type Disc, type Stadium } from '../sim/index.js';
 import { ReplayRecorder } from '../replay/index.js';
 import { ClockEntry, hostClock } from './clock.js';
 import {
@@ -230,6 +230,20 @@ function discDiffMask(a: Disc, b: Disc): number {
   if ((a.cMask | 0) !== (b.cMask | 0)) m |= 2048;
   if ((a.cGroup | 0) !== (b.cGroup | 0)) m |= 4096;
   return m;
+}
+
+/** Names of the built-in stadiums by `defaultStadiumId` (= `defaultStadiums()` order). */
+export const DEFAULT_STADIUM_NAMES: readonly string[] = [
+  'Classic', 'Easy', 'Small', 'Big', 'Rounded', 'Hockey', 'Big Hockey', 'Big Easy', 'Big Rounded', 'Huge',
+];
+
+/**
+ * The shared built-in stadium called `name` (the `defaultStadiums()`
+ * instance), or null. Builds only that one, not all ten.
+ */
+export function defaultStadiumByName(name: string): Stadium | null {
+  const id = DEFAULT_STADIUM_NAMES.indexOf(name);
+  return id < 0 ? null : defaultStadium(id);
 }
 
 function teamOf(v: number): TeamId {
@@ -583,8 +597,8 @@ export class HostRoom {
 
   /** Built-in stadium by name ("Classic", "Easy", …); throws "Stadium doesn't exist". */
   setDefaultStadium(name: string): void {
-    const s = defaultStadiums().find((st) => st.name === name);
-    if (s === undefined) throw new Error("Stadium doesn't exist");
+    const s = defaultStadiumByName(name);
+    if (s === null) throw new Error("Stadium doesn't exist");
     this.setStadium(s);
   }
 
