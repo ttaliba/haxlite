@@ -13,17 +13,22 @@
 // 30, same geo, default stadium (Classic), score/time limit 0 (set before
 // starting the game) and default network settings (incl. default STUN list).
 //
-// IPC in : {cmd:'game'} | {cmd:'measure-start', eld, sampleMs, stream} | {cmd:'measure-stop'} | {cmd:'players'}
+// IPC in : {cmd:'game'} | {cmd:'measure-start', eld, eldMethod, sampleMs, stream} | {cmd:'measure-stop'} | {cmd:'players'}
+//          {cmd:'lag-start', method} | {cmd:'lag-stop'} (lag sub-window, outside the CPU window)
 //          {cmd:'auto-teams'} (soak: new players get a team, game kept running) | {cmd:'impair-stats'}
 //          {cmd:'probe'} (warm-up: → {type:'probe', t, cpuMs, rss, heapUsed})
 // IPC out: {type:'link', room, id, tCreate, tLink} | {type:'game', players} |
 //          {type:'stats', …} | {type:'players', counts} | {type:'error', message} |
-//          {type:'sample', …} (measure-start with stream: one per sampleMs) | {type:'impair-stats', …}
+//          {type:'sample', …} (measure-start with stream: one per sampleMs) | {type:'impair-stats', …} |
+//          {type:'lag-started'} | {type:'lag', eld}
 //
 // Runtime: Node (default) or Bun (`bun bench/net/host-proc.mjs …`, run.ts --runtime bun).
-// Under Bun there are no GC events (gcCount/gcMs = null), the event-loop lag
-// comes from a 10 ms timer of our own (see eldMonitor) and `bun:jsc` heapStats
-// are added to the stats. /proc metrics (threads, wake-ups, fds) are Linux only (null elsewhere).
+// Under Bun there are no GC events (gcCount/gcMs = null) and `bun:jsc` heapStats
+// are added to the stats. The event-loop lag is measured the same way on both
+// runtimes (a 10 ms timer of our own, see eldMonitor) and, from run.ts, in its own
+// sub-window outside the CPU window (lag-start / lag-stop), so the monitor's
+// 100 wake-ups/s never reach the CPU / wake-up figures.
+// /proc metrics (threads, wake-ups, fds) are Linux only (null elsewhere).
 //
 // HAXLITE_BENCH_IMPAIR (join-impaired scenario, haxlite:rtc only) = JSON
 // {rttMs, lossPct, jitterMs, stun:'cold'|'cached', outside, filtering}: the host's endpoint
@@ -482,21 +487,32 @@ function threadBreakdown(before, after, wallMs) {
 }
 
 /**
- * Event-loop lag monitor. Node: perf_hooks.monitorEventLoopDelay (10 ms
- * resolution; its values are the interval between the monitor's timer
- * callbacks, lag = value − 10 ms). Bun's monitorEventLoopDelay has different
- * semantics, so under Bun a 10 ms setInterval of our own measures the same
- * thing (lag = interval − 10 ms), into a bounded 0.01 ms-bin histogram.
+ * Event-loop lag monitor.
+ *
+ * method 'timer' (default, both runtimes): a setInterval of 10 ms of our own;
+ * lag = interval between callbacks − 10 ms, into a bounded 0.01 ms-bin histogram.
+ * Same code, same wake-up rate and same semantics under Node and Bun, so the
+ * figures are comparable across runtimes.
+ *
+ * method 'native' (Node only, diagnostics): perf_hooks.monitorEventLoopDelay
+ * (10 ms resolution; also a 100 Hz libuv timer, but its callback stays in C++;
+ * lag = value − 10 ms). Bun's monitorEventLoopDelay measures another quantity,
+ * so under Bun 'native' falls back to 'timer' (the result names the method used).
+ *
+ * Either way the monitor wakes the loop 100 times per second and costs CPU in
+ * the measured process: run.ts runs it in a separate sub-window, never during
+ * the CPU / wake-up window.
  */
-function eldMonitor() {
-  if (!IS_BUN) {
+function eldMonitor(method = 'timer') {
+  const t0 = performance.now();
+  if (method === 'native' && !IS_BUN) {
     const h = monitorEventLoopDelay({ resolution: 10 });
     h.enable();
     const lag = (ns) => Math.max(0, ns / 1e6 - 10);
     return {
       stop() {
         h.disable();
-        return { method: 'monitorEventLoopDelay', p50: lag(h.percentile(50)), p90: lag(h.percentile(90)), p99: lag(h.percentile(99)), max: lag(h.max), mean: lag(h.mean), samples: h.count };
+        return { method: 'monitorEventLoopDelay', windowMs: performance.now() - t0, p50:lag(h.percentile(50)), p90: lag(h.percentile(90)), p99: lag(h.percentile(99)), max: lag(h.max), mean: lag(h.mean), samples: h.count };
       },
     };
   }
@@ -523,14 +539,21 @@ function eldMonitor() {
   return {
     stop() {
       clearInterval(t);
-      return { method: 'setInterval-10ms', p50: pct(0.5), p90: pct(0.9), p99: pct(0.99), max, mean: n ? sum / n : NaN, samples: n };
+      return { method: 'setInterval-10ms', windowMs: performance.now() - t0, p50: pct(0.5), p90: pct(0.9), p99: pct(0.99), max, mean: n ? sum / n : NaN, samples: n };
     },
   };
 }
 
-/** `bun:jsc` heap figures (Bun only; JSC has no V8-style heap spaces nor GC events). */
-function jscHeap() {
+/**
+ * `bun:jsc` heap figures (Bun only; JSC has no V8-style heap spaces nor GC events).
+ * `full`: heapStats(), which walks the heap to count objects by type (≈ 0.4 ms on an
+ * empty heap, more with a real one) — only after the window's CPU / thread snapshot.
+ * Otherwise (soak samples, taken inside the window) only the O(1) heapSize() and
+ * mimalloc's counter, so Bun pays no more per sample than Node's memoryUsage().
+ */
+function jscHeap(full = true) {
   if (!JSC) return null;
+  if (!full) return { heapSize: JSC.heapSize(), mallocCurrent: JSC.memoryUsage?.()?.current ?? null };
   const h = JSC.heapStats();
   const m = JSC.memoryUsage?.();
   return { heapSize: h.heapSize, heapCapacity: h.heapCapacity, extraMemorySize: h.extraMemorySize, objectCount: h.objectCount, mallocCurrent: m?.current ?? null };
@@ -566,8 +589,12 @@ function mapSizes() {
   return out;
 }
 
-function startMeasure({ eld = true, sampleMs = 1000, stream = false } = {}) {
-  const h = eld ? eldMonitor() : null;
+/** Lag sub-window (run.ts: right before the CPU window, never overlapping it). */
+let lagMon = null;
+
+function startMeasure({ eld = false, eldMethod = 'timer', sampleMs = 1000, stream = false } = {}) {
+  // eld: true = monitor INSIDE the CPU window (diagnostics only: inflates CPU and wake-ups)
+  const h = eld ? eldMonitor(eldMethod) : null;
   // GC events: Node only (Bun's PerformanceObserver accepts 'gc' but never reports any)
   const gc = IS_BUN ? null : { count: 0, ms: 0 };
   let obs = null;
@@ -610,7 +637,7 @@ function startMeasure({ eld = true, sampleMs = 1000, stream = false } = {}) {
         players: rooms.map((r) => r.players().length),
         maps: mapSizes(),
         rtc: rtcTotals(true),
-        jsc: jscHeap(),
+        jsc: jscHeap(false),
         gcCount: gc?.count ?? null,
       });
     }
@@ -650,7 +677,7 @@ function stopMeasure() {
     arrayBuffersEnd: mem.arrayBuffers,
     gcCount: m.gc?.count ?? null,
     gcMs: m.gc?.ms ?? null,
-    eld: m.h?.stop() ?? null,
+    eld: m.h ? { ...m.h.stop(), window: 'cpu' } : null,
     jsc: jscHeap(),
     threadsPct: threadBreakdown(m.threads0, threads1, wallMs),
     cpuSplit: cpuSplit(m.threads0, threads1, wallMs),
@@ -761,6 +788,16 @@ process.on('message', (msg) => {
       case 'impair-stats':
         send({ type: 'impair-stats', rooms: rooms.map((r) => r.impairStats?.() ?? null), rtc: rtcTotals(true) });
         break;
+      case 'lag-start':
+        lagMon = eldMonitor(msg.method);
+        send({ type: 'lag-started' });
+        break;
+      case 'lag-stop': {
+        const eld = lagMon ? { ...lagMon.stop(), window: 'separate' } : null;
+        lagMon = null;
+        send({ type: 'lag', eld });
+        break;
+      }
       case 'measure-start':
         profileStart();
         startMeasure(msg);

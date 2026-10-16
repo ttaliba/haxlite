@@ -42,6 +42,20 @@ function fmt(st, d = 1) {
 const ok = (c) => c.runs.filter((r) => !r.failed);
 const col = (c, f, d) => fmt(stat(ok(c).map(f)), d);
 const implOf = (c) => NAMES[keyOf(c)] ?? keyOf(c);
+/**
+ * How a run's event-loop lag was measured (run.ts --eld-*). Since 16-10-2026: the same 10 ms
+ * timer on Node and Bun in its own sub-window, outside the CPU window. Older results have no
+ * `eld.window`: the monitor ran inside the CPU window (Node: monitorEventLoopDelay; Bun: its
+ * own JS timer, whose wake-ups and CPU inflated Bun's CPU % and wake-ups).
+ */
+function lagHow(eld) {
+  if (!eld) return 'sin lag';
+  // the oldest records have no `method`: Node with monitorEventLoopDelay
+  const m = eld.method === 'setInterval-10ms' ? 'timer 10 ms' : 'monitorEventLoopDelay';
+  return eld.window === 'separate' ? `${m}, sub-ventana propia de ${Math.round((eld.windowMs ?? 0) / 1000)} s` : `${m}, dentro de la ventana de CPU`;
+}
+/** The lag methods of a configuration's runs (normally one). */
+const lagCol = (c) => [...new Set(ok(c).map((r) => lagHow(r.host?.eld)))].join('; ') || '—';
 
 function table(header, rows) {
   console.log(`| ${header.join(' | ')} |`);
@@ -100,7 +114,7 @@ for (const [name, title] of [
   if (!g) continue;
   console.log(`### ${title}\n`);
   table(
-    ['config', 'reps', 'CPU %', 'RSS medio (MB)', 'heap usado medio (MB)', 'lag p50 (ms)', 'lag p99 (ms)', 'lag máx (ms)', 'GC/min', 'GC ms/min', 'clientes CPU %', 'ajeno %'],
+    ['config', 'reps', 'CPU %', 'RSS medio (MB)', 'heap usado medio (MB)', 'lag p50 (ms)', 'lag p99 (ms)', 'lag máx (ms)', 'método del lag', 'GC/min', 'GC ms/min', 'clientes CPU %', 'ajeno %'],
     g.configs.map((c) => [
       `${implOf(c)} ${name === 'game' ? `N=${c.spec.clientsPerRoom}` : `K=${c.spec.rooms}`}`,
       `${ok(c).length}${ok(c).some((r) => r.noisy) ? '*' : ''}${ok(c).every((r) => r.valid) ? '' : ' ⚠'}`,
@@ -110,6 +124,7 @@ for (const [name, title] of [
       col(c, (r) => r.host.eld?.p50, 2),
       col(c, (r) => r.host.eld?.p99, 2),
       col(c, (r) => r.host.eld?.max, 1),
+      lagCol(c),
       col(c, (r) => ((r.host.gcCount ?? NaN) / r.host.wallMs) * 60_000, 1),
       col(c, (r) => ((r.host.gcMs ?? NaN) / r.host.wallMs) * 60_000, 1),
       col(c, (r) => r.clients.reduce((a, x) => a + x.cpuPct, 0), 0),
@@ -139,7 +154,7 @@ const fleet = load('fleet');
 if (fleet) {
   console.log('### Flota: P procesos × R salas × C clientes (sumas sobre los procesos)\n');
   table(
-    ['config', 'reps', 'CPU % total', 'RSS total (MB)', 'heap total (MB)', 'lag p99 peor proceso (ms)', 'salida/jugador msg/s · B/s', 'UDP/jugador pkt/s · B/s', 'hueco p50 / p99 / p99,9 (ms)'],
+    ['config', 'reps', 'CPU % total', 'RSS total (MB)', 'heap total (MB)', 'lag p99 peor proceso (ms)', 'método del lag', 'salida/jugador msg/s · B/s', 'UDP/jugador pkt/s · B/s', 'hueco p50 / p99 / p99,9 (ms)'],
     fleet.configs.map((c) => [
       `${implOf(c)} P=${c.spec.procs} R=${c.spec.rooms} C=${c.spec.clientsPerRoom}`,
       ok(c).length,
@@ -147,6 +162,7 @@ if (fleet) {
       col(c, (r) => r.host.rssMean / MB, 1),
       col(c, (r) => r.host.heapUsedMean / MB, 1),
       col(c, (r) => r.host.eld?.p99 ?? NaN, 2),
+      lagCol(c),
       `${col(c, (r) => r.egressPerPlayer.appMsgsPerS, 1)} · ${col(c, (r) => r.egressPerPlayer.appBytesPerS, 0)}`,
       `${col(c, (r) => r.egressPerPlayer.udpPacketsPerS ?? NaN, 1)} · ${col(c, (r) => r.egressPerPlayer.udpBytesPerS ?? NaN, 0)}`,
       `${col(c, (r) => r.traffic.gapsAll.p50, 1)} / ${col(c, (r) => r.traffic.gapsAll.p99, 1)} / ${col(c, (r) => r.traffic.gapsAll.p999, 1)}`,
@@ -264,6 +280,7 @@ function unifiedReport() {
       rows.push(['', 'RSS / heap usado (MB)', ...cs.map((c) => (c ? `${cell(c, (r) => r.host.rssMean / MB, 1)} / ${cell(c, (r) => r.host.heapUsedMean / MB, 1)}` : 'n/d'))]);
       rows.push(['', 'GC/min', ...cs.map((c) => cell(c, (r) => ((r.host.gcCount ?? NaN) / r.host.wallMs) * 60_000, 0))]);
       rows.push(['', 'lag del event loop p50 / p99 (ms)', ...cs.map((c) => (c ? `${cell(c, (r) => r.host.eld?.p50, 2)} / ${cell(c, (r) => r.host.eld?.p99, 2)}` : 'n/d'))]);
+      rows.push(['', 'método del lag', ...cs.map((c) => (c ? lagCol(c) : 'n/d'))]);
       rows.push(['', 'hilos · fds', ...cs.map((c) => (c ? `${cell(c, (r) => r.host.threadCount, 0)} · ${cell(c, (r) => r.host.fdCount, 0)}` : 'n/d'))]);
       rows.push(['', 'despertares/s', ...cs.map((c) => cell(c, (r) => r.host.wakeups?.voluntaryPerS, 0))]);
       rows.push(['', 'entrada p50 (ms, Room.join → onOpen)', ...cs.map((c) => cell(c, (r) => joinQ(r, 0.5), 0) + concMark(c))]);
@@ -290,7 +307,7 @@ function unifiedReport() {
     if (!j) return;
     console.log(`### ${title}\n`);
     table(
-      ['host', 'reps', 'CPU %', 'hilo JS %', 'otros hilos %', 'RSS (MB)', 'heap (MB)', 'GC/min', 'lag p50 / p99 (ms)', 'hilos', 'fds', 'despertares/s', 'entrada p50 / p90 (ms)', 'ajeno % · loadavg'],
+      ['host', 'reps', 'CPU %', 'hilo JS %', 'otros hilos %', 'RSS (MB)', 'heap (MB)', 'GC/min', 'lag p50 / p99 (ms)', 'método del lag', 'hilos', 'fds', 'despertares/s', 'entrada p50 / p90 (ms)', 'ajeno % · loadavg'],
       j.configs.filter(pred).map((c) => [
         label(c),
         flags(c),
@@ -301,6 +318,7 @@ function unifiedReport() {
         rng(c, (r) => r.host.heapUsedMean / MB, 1),
         rng(c, (r) => ((r.host.gcCount ?? NaN) / r.host.wallMs) * 60_000, 0),
         j.scenario === 'idle' ? '—' : `${es(med(c, (r) => r.host.eld?.p50), 2)} / ${es(med(c, (r) => r.host.eld?.p99), 2)}`,
+        j.scenario === 'idle' ? '—' : lagCol(c),
         rng(c, (r) => r.host.threadCount, 0),
         rng(c, (r) => r.host.fdCount, 0),
         rng(c, (r) => r.host.wakeups?.voluntaryPerS, 0),
