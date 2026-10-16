@@ -13,7 +13,8 @@
  *
  * Constant time (as far as JavaScript allows): ChaCha20 is pure ARX on int32;
  * Poly1305 uses 13-bit limbs (poly1305-donna-16 layout, as in stablelib /
- * tweetnacl-js) whose partial products stay below 2^32, so no value ever
+ * tweetnacl-js) whose partial sums of products stay below 2^32 (computed
+ * with Math.imul and int32 wrap-around, exact modulo 2^32), so no value ever
  * leaves the exact integer range, there are no secret-dependent branches or
  * table lookups, the final reduction selects with masks and the tag check
  * ORs all byte differences. AES is deliberately NOT implemented in JS (table
@@ -101,7 +102,23 @@ function chachaXor(k: Int32Array, counter: number, n0: number, n1: number, n2: n
       off += 64;
       len -= 64;
     } else {
-      for (let i = 0; i < len; i++) buf[off + i] ^= ks[i >>> 2]! >>> ((i & 3) << 3);
+      // last partial block: whole words, then the 0–3 remaining bytes
+      const words = len >>> 2;
+      for (let i = 0; i < words; i++) {
+        const w = ks[i]!;
+        const p = off + 4 * i;
+        buf[p] ^= w;
+        buf[p + 1] ^= w >>> 8;
+        buf[p + 2] ^= w >>> 16;
+        buf[p + 3] ^= w >>> 24;
+      }
+      if ((len & 3) !== 0) {
+        let w = ks[words]!;
+        for (let p = off + 4 * words, end = off + len; p < end; p++) {
+          buf[p] ^= w;
+          w >>>= 8;
+        }
+      }
       return;
     }
   }
@@ -165,156 +182,161 @@ function polyBlocks(m: Uint8Array, off: number, len: number, hibit = 1 << 11): v
     h8 += ((t6 >>> 8) | (t7 << 8)) & 0x1fff;
     h9 += (t7 >>> 5) | hibit;
 
-    // h *= r (mod 2^130 - 5); every partial sum of five products stays < 2^32
+    // h *= r (mod 2^130 - 5); every partial sum of five products stays < 2^32.
+    // Products (< 2^30) by Math.imul and sums wrapped with `| 0`: the int32 bit
+    // pattern is the exact sum mod 2^32 (read back unsigned by `>>> 13`), so the
+    // whole loop stays in int32 — no double arithmetic once a sum passes 2^31
+    // (JSC fell back to doubles there: seal+open of 120 B 5.0 → 2.7 µs on Bun,
+    // 3.0 → 2.5 µs on Node).
     let c = 0;
     let d0 = c;
-    d0 += h0 * r0;
-    d0 += h1 * s9;
-    d0 += h2 * s8;
-    d0 += h3 * s7;
-    d0 += h4 * s6;
+    d0 = (d0 + Math.imul(h0, r0)) | 0;
+    d0 = (d0 + Math.imul(h1, s9)) | 0;
+    d0 = (d0 + Math.imul(h2, s8)) | 0;
+    d0 = (d0 + Math.imul(h3, s7)) | 0;
+    d0 = (d0 + Math.imul(h4, s6)) | 0;
     c = d0 >>> 13;
     d0 &= 0x1fff;
-    d0 += h5 * s5;
-    d0 += h6 * s4;
-    d0 += h7 * s3;
-    d0 += h8 * s2;
-    d0 += h9 * s1;
+    d0 = (d0 + Math.imul(h5, s5)) | 0;
+    d0 = (d0 + Math.imul(h6, s4)) | 0;
+    d0 = (d0 + Math.imul(h7, s3)) | 0;
+    d0 = (d0 + Math.imul(h8, s2)) | 0;
+    d0 = (d0 + Math.imul(h9, s1)) | 0;
     c += d0 >>> 13;
     d0 &= 0x1fff;
     let d1 = c;
-    d1 += h0 * r1;
-    d1 += h1 * r0;
-    d1 += h2 * s9;
-    d1 += h3 * s8;
-    d1 += h4 * s7;
+    d1 = (d1 + Math.imul(h0, r1)) | 0;
+    d1 = (d1 + Math.imul(h1, r0)) | 0;
+    d1 = (d1 + Math.imul(h2, s9)) | 0;
+    d1 = (d1 + Math.imul(h3, s8)) | 0;
+    d1 = (d1 + Math.imul(h4, s7)) | 0;
     c = d1 >>> 13;
     d1 &= 0x1fff;
-    d1 += h5 * s6;
-    d1 += h6 * s5;
-    d1 += h7 * s4;
-    d1 += h8 * s3;
-    d1 += h9 * s2;
+    d1 = (d1 + Math.imul(h5, s6)) | 0;
+    d1 = (d1 + Math.imul(h6, s5)) | 0;
+    d1 = (d1 + Math.imul(h7, s4)) | 0;
+    d1 = (d1 + Math.imul(h8, s3)) | 0;
+    d1 = (d1 + Math.imul(h9, s2)) | 0;
     c += d1 >>> 13;
     d1 &= 0x1fff;
     let d2 = c;
-    d2 += h0 * r2;
-    d2 += h1 * r1;
-    d2 += h2 * r0;
-    d2 += h3 * s9;
-    d2 += h4 * s8;
+    d2 = (d2 + Math.imul(h0, r2)) | 0;
+    d2 = (d2 + Math.imul(h1, r1)) | 0;
+    d2 = (d2 + Math.imul(h2, r0)) | 0;
+    d2 = (d2 + Math.imul(h3, s9)) | 0;
+    d2 = (d2 + Math.imul(h4, s8)) | 0;
     c = d2 >>> 13;
     d2 &= 0x1fff;
-    d2 += h5 * s7;
-    d2 += h6 * s6;
-    d2 += h7 * s5;
-    d2 += h8 * s4;
-    d2 += h9 * s3;
+    d2 = (d2 + Math.imul(h5, s7)) | 0;
+    d2 = (d2 + Math.imul(h6, s6)) | 0;
+    d2 = (d2 + Math.imul(h7, s5)) | 0;
+    d2 = (d2 + Math.imul(h8, s4)) | 0;
+    d2 = (d2 + Math.imul(h9, s3)) | 0;
     c += d2 >>> 13;
     d2 &= 0x1fff;
     let d3 = c;
-    d3 += h0 * r3;
-    d3 += h1 * r2;
-    d3 += h2 * r1;
-    d3 += h3 * r0;
-    d3 += h4 * s9;
+    d3 = (d3 + Math.imul(h0, r3)) | 0;
+    d3 = (d3 + Math.imul(h1, r2)) | 0;
+    d3 = (d3 + Math.imul(h2, r1)) | 0;
+    d3 = (d3 + Math.imul(h3, r0)) | 0;
+    d3 = (d3 + Math.imul(h4, s9)) | 0;
     c = d3 >>> 13;
     d3 &= 0x1fff;
-    d3 += h5 * s8;
-    d3 += h6 * s7;
-    d3 += h7 * s6;
-    d3 += h8 * s5;
-    d3 += h9 * s4;
+    d3 = (d3 + Math.imul(h5, s8)) | 0;
+    d3 = (d3 + Math.imul(h6, s7)) | 0;
+    d3 = (d3 + Math.imul(h7, s6)) | 0;
+    d3 = (d3 + Math.imul(h8, s5)) | 0;
+    d3 = (d3 + Math.imul(h9, s4)) | 0;
     c += d3 >>> 13;
     d3 &= 0x1fff;
     let d4 = c;
-    d4 += h0 * r4;
-    d4 += h1 * r3;
-    d4 += h2 * r2;
-    d4 += h3 * r1;
-    d4 += h4 * r0;
+    d4 = (d4 + Math.imul(h0, r4)) | 0;
+    d4 = (d4 + Math.imul(h1, r3)) | 0;
+    d4 = (d4 + Math.imul(h2, r2)) | 0;
+    d4 = (d4 + Math.imul(h3, r1)) | 0;
+    d4 = (d4 + Math.imul(h4, r0)) | 0;
     c = d4 >>> 13;
     d4 &= 0x1fff;
-    d4 += h5 * s9;
-    d4 += h6 * s8;
-    d4 += h7 * s7;
-    d4 += h8 * s6;
-    d4 += h9 * s5;
+    d4 = (d4 + Math.imul(h5, s9)) | 0;
+    d4 = (d4 + Math.imul(h6, s8)) | 0;
+    d4 = (d4 + Math.imul(h7, s7)) | 0;
+    d4 = (d4 + Math.imul(h8, s6)) | 0;
+    d4 = (d4 + Math.imul(h9, s5)) | 0;
     c += d4 >>> 13;
     d4 &= 0x1fff;
     let d5 = c;
-    d5 += h0 * r5;
-    d5 += h1 * r4;
-    d5 += h2 * r3;
-    d5 += h3 * r2;
-    d5 += h4 * r1;
+    d5 = (d5 + Math.imul(h0, r5)) | 0;
+    d5 = (d5 + Math.imul(h1, r4)) | 0;
+    d5 = (d5 + Math.imul(h2, r3)) | 0;
+    d5 = (d5 + Math.imul(h3, r2)) | 0;
+    d5 = (d5 + Math.imul(h4, r1)) | 0;
     c = d5 >>> 13;
     d5 &= 0x1fff;
-    d5 += h5 * r0;
-    d5 += h6 * s9;
-    d5 += h7 * s8;
-    d5 += h8 * s7;
-    d5 += h9 * s6;
+    d5 = (d5 + Math.imul(h5, r0)) | 0;
+    d5 = (d5 + Math.imul(h6, s9)) | 0;
+    d5 = (d5 + Math.imul(h7, s8)) | 0;
+    d5 = (d5 + Math.imul(h8, s7)) | 0;
+    d5 = (d5 + Math.imul(h9, s6)) | 0;
     c += d5 >>> 13;
     d5 &= 0x1fff;
     let d6 = c;
-    d6 += h0 * r6;
-    d6 += h1 * r5;
-    d6 += h2 * r4;
-    d6 += h3 * r3;
-    d6 += h4 * r2;
+    d6 = (d6 + Math.imul(h0, r6)) | 0;
+    d6 = (d6 + Math.imul(h1, r5)) | 0;
+    d6 = (d6 + Math.imul(h2, r4)) | 0;
+    d6 = (d6 + Math.imul(h3, r3)) | 0;
+    d6 = (d6 + Math.imul(h4, r2)) | 0;
     c = d6 >>> 13;
     d6 &= 0x1fff;
-    d6 += h5 * r1;
-    d6 += h6 * r0;
-    d6 += h7 * s9;
-    d6 += h8 * s8;
-    d6 += h9 * s7;
+    d6 = (d6 + Math.imul(h5, r1)) | 0;
+    d6 = (d6 + Math.imul(h6, r0)) | 0;
+    d6 = (d6 + Math.imul(h7, s9)) | 0;
+    d6 = (d6 + Math.imul(h8, s8)) | 0;
+    d6 = (d6 + Math.imul(h9, s7)) | 0;
     c += d6 >>> 13;
     d6 &= 0x1fff;
     let d7 = c;
-    d7 += h0 * r7;
-    d7 += h1 * r6;
-    d7 += h2 * r5;
-    d7 += h3 * r4;
-    d7 += h4 * r3;
+    d7 = (d7 + Math.imul(h0, r7)) | 0;
+    d7 = (d7 + Math.imul(h1, r6)) | 0;
+    d7 = (d7 + Math.imul(h2, r5)) | 0;
+    d7 = (d7 + Math.imul(h3, r4)) | 0;
+    d7 = (d7 + Math.imul(h4, r3)) | 0;
     c = d7 >>> 13;
     d7 &= 0x1fff;
-    d7 += h5 * r2;
-    d7 += h6 * r1;
-    d7 += h7 * r0;
-    d7 += h8 * s9;
-    d7 += h9 * s8;
+    d7 = (d7 + Math.imul(h5, r2)) | 0;
+    d7 = (d7 + Math.imul(h6, r1)) | 0;
+    d7 = (d7 + Math.imul(h7, r0)) | 0;
+    d7 = (d7 + Math.imul(h8, s9)) | 0;
+    d7 = (d7 + Math.imul(h9, s8)) | 0;
     c += d7 >>> 13;
     d7 &= 0x1fff;
     let d8 = c;
-    d8 += h0 * r8;
-    d8 += h1 * r7;
-    d8 += h2 * r6;
-    d8 += h3 * r5;
-    d8 += h4 * r4;
+    d8 = (d8 + Math.imul(h0, r8)) | 0;
+    d8 = (d8 + Math.imul(h1, r7)) | 0;
+    d8 = (d8 + Math.imul(h2, r6)) | 0;
+    d8 = (d8 + Math.imul(h3, r5)) | 0;
+    d8 = (d8 + Math.imul(h4, r4)) | 0;
     c = d8 >>> 13;
     d8 &= 0x1fff;
-    d8 += h5 * r3;
-    d8 += h6 * r2;
-    d8 += h7 * r1;
-    d8 += h8 * r0;
-    d8 += h9 * s9;
+    d8 = (d8 + Math.imul(h5, r3)) | 0;
+    d8 = (d8 + Math.imul(h6, r2)) | 0;
+    d8 = (d8 + Math.imul(h7, r1)) | 0;
+    d8 = (d8 + Math.imul(h8, r0)) | 0;
+    d8 = (d8 + Math.imul(h9, s9)) | 0;
     c += d8 >>> 13;
     d8 &= 0x1fff;
     let d9 = c;
-    d9 += h0 * r9;
-    d9 += h1 * r8;
-    d9 += h2 * r7;
-    d9 += h3 * r6;
-    d9 += h4 * r5;
+    d9 = (d9 + Math.imul(h0, r9)) | 0;
+    d9 = (d9 + Math.imul(h1, r8)) | 0;
+    d9 = (d9 + Math.imul(h2, r7)) | 0;
+    d9 = (d9 + Math.imul(h3, r6)) | 0;
+    d9 = (d9 + Math.imul(h4, r5)) | 0;
     c = d9 >>> 13;
     d9 &= 0x1fff;
-    d9 += h5 * r4;
-    d9 += h6 * r3;
-    d9 += h7 * r2;
-    d9 += h8 * r1;
-    d9 += h9 * r0;
+    d9 = (d9 + Math.imul(h5, r4)) | 0;
+    d9 = (d9 + Math.imul(h6, r3)) | 0;
+    d9 = (d9 + Math.imul(h7, r2)) | 0;
+    d9 = (d9 + Math.imul(h8, r1)) | 0;
+    d9 = (d9 + Math.imul(h9, r0)) | 0;
     c += d9 >>> 13;
     d9 &= 0x1fff;
     c = ((c << 2) + c) | 0;
@@ -340,6 +362,23 @@ function polyPadded(m: Uint8Array, off: number, len: number): void {
     for (let i = 0; i < 16; i++) b[i] = i < rest ? m[off + full + i]! : 0;
     polyBlocks(b, 0, 16);
   }
+}
+
+/**
+ * Absorbs the 13-byte DTLS 1.2 AAD — epoch(2) || seq(6) || type(1) ||
+ * version(2) || length(2), big-endian (RFC 6347 §4.1.2.1) — zero-padded to
+ * one block, as {@link polyPadded} would from a buffer.
+ */
+function polyDtlsAad(type: number, version: number, epoch: number, seqHi: number, seqLo: number, length: number): void {
+  const b = PB;
+  b[0] = epoch >>> 8; b[1] = epoch;
+  b[2] = seqHi >>> 8; b[3] = seqHi;
+  b[4] = seqLo >>> 24; b[5] = seqLo >>> 16; b[6] = seqLo >>> 8; b[7] = seqLo;
+  b[8] = type;
+  b[9] = version >>> 8; b[10] = version;
+  b[11] = length >>> 8; b[12] = length;
+  b[13] = 0; b[14] = 0; b[15] = 0;
+  polyBlocks(b, 0, 16);
 }
 
 /** Absorbs le64(aadLen) || le64(ctLen) (both < 2^32 here). */
@@ -508,6 +547,58 @@ export class ChaCha20Poly1305 {
     polyPadded(buf, off, len);
     polyLengths(aadLen, len);
     if (!polyFinish(null, tag, tagOff)) return false;
+    chachaXor(this.k, 1, n0, n1, n2, buf, off, len);
+    return true;
+  }
+
+  /**
+   * {@link seal} for a DTLS 1.2 record (RFC 7905): the nonce as three
+   * little-endian words, the 13-byte AAD from its fields (length = `len`),
+   * the tag written right after the ciphertext (buf[off+len…]). Same bytes
+   * as {@link seal} with those buffers, without building them.
+   */
+  sealDtls(
+    n0: number,
+    n1: number,
+    n2: number,
+    type: number,
+    version: number,
+    epoch: number,
+    seqHi: number,
+    seqLo: number,
+    buf: Uint8Array,
+    off: number,
+    len: number,
+  ): void {
+    chachaBlock(this.k, 0, n0, n1, n2);
+    polyInit();
+    chachaXor(this.k, 1, n0, n1, n2, buf, off, len);
+    polyDtlsAad(type, version, epoch, seqHi, seqLo, len);
+    polyPadded(buf, off, len);
+    polyLengths(13, len);
+    polyFinish(buf, null, off + len);
+  }
+
+  /** {@link open} for a DTLS 1.2 record, the counterpart of {@link sealDtls} (tag at buf[off+len…]). */
+  openDtls(
+    n0: number,
+    n1: number,
+    n2: number,
+    type: number,
+    version: number,
+    epoch: number,
+    seqHi: number,
+    seqLo: number,
+    buf: Uint8Array,
+    off: number,
+    len: number,
+  ): boolean {
+    chachaBlock(this.k, 0, n0, n1, n2);
+    polyInit();
+    polyDtlsAad(type, version, epoch, seqHi, seqLo, len);
+    polyPadded(buf, off, len);
+    polyLengths(13, len);
+    if (!polyFinish(null, buf, off + len)) return false;
     chachaXor(this.k, 1, n0, n1, n2, buf, off, len);
     return true;
   }

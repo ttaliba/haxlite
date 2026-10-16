@@ -4,9 +4,10 @@
  * client-certificate/fingerprint binding, cookies, anti-replay and record
  * authentication, plus the crypto primitives.
  */
-import { createHash, createHmac } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { RtcCertificate } from '../../src/rtc/cert.js';
+import { ChaCha20Poly1305 } from '../../src/rtc/dtls/chacha.js';
 import { RecordCipher, ReplayWindow, SUITES, defaultSuites, hasNativeChaCha, prf, resolveSuites } from '../../src/rtc/dtls/crypto.js';
 import { DtlsServer } from '../../src/rtc/dtls/server.js';
 import {
@@ -100,6 +101,45 @@ describe('DTLS primitives', () => {
       expect(rx.open(23, 0xfefd, 1, 0, 9, Buffer.from(out))?.toString()).toBe('ping 0123456789');
     }
     expect(typeof hasNativeChaCha()).toBe('boolean');
+  });
+
+  it('record ciphers: the JS ChaCha20-Poly1305 builds the RFC 7905 nonce and the DTLS AAD from the record fields', () => {
+    const suite = SUITES.find((s) => s.id === 0xcca9)!;
+    for (let i = 0; i < 200; i++) {
+      const key = randomBytes(32);
+      const iv = randomBytes(12);
+      const js = new RecordCipher(suite, Buffer.from(key), Buffer.from(iv), 'js');
+      // every byte of epoch / sequence distinct and with the high bits set at times
+      const epoch = i === 0 ? 0xffff : (i * 0x1357) & 0xffff;
+      const seqHi = i === 1 ? 0xffff : (i * 0x9e37) & 0xffff;
+      const seqLo = i === 2 ? 0xffffffff : (i * 0x9e3779b1) >>> 0;
+      const type = 20 + (i % 4);
+      const version = i % 2 ? 0xfefd : 0xfeff;
+      const pt = randomBytes(i % 3 === 0 ? 0 : (i * 37) % 300);
+      // reference: nonce = iv XOR (0^32 || epoch || seq), AAD = epoch || seq || type || version || length (big-endian)
+      const nonce = Buffer.from(iv);
+      const be = Buffer.alloc(8);
+      be.writeUInt16BE(epoch, 0);
+      be.writeUInt16BE(seqHi, 2);
+      be.writeUInt32BE(seqLo, 4);
+      for (let k = 0; k < 8; k++) nonce[4 + k]! ^= be[k]!;
+      const aad = Buffer.concat([be, Buffer.from([type, version >>> 8, version & 0xff, pt.length >>> 8, pt.length & 0xff])]);
+      const ref = Buffer.alloc(pt.length + 16);
+      pt.copy(ref);
+      new ChaCha20Poly1305(key).seal(nonce, aad, 0, 13, ref, 0, pt.length, ref, pt.length);
+      // separate plaintext, and plaintext already in place at an offset
+      const out = Buffer.alloc(5 + pt.length + 16);
+      expect(js.seal(type, version, epoch, seqHi, seqLo, pt, out, 5)).toBe(pt.length + 16);
+      expect(out.subarray(5).equals(ref)).toBe(true);
+      const inPlace = Buffer.alloc(3 + pt.length + 16);
+      pt.copy(inPlace, 3);
+      js.seal(type, version, epoch, seqHi, seqLo, inPlace.subarray(3, 3 + pt.length), inPlace, 3);
+      expect(inPlace.subarray(3).equals(ref)).toBe(true);
+      const rx = new RecordCipher(suite, Buffer.from(key), Buffer.from(iv), 'js');
+      expect(rx.open(type, version, epoch, seqHi, seqLo, Buffer.from(ref))?.equals(pt)).toBe(true);
+      expect(rx.open(type, version, epoch, seqHi, (seqLo + 1) >>> 0, Buffer.from(ref))).toBeNull();
+      expect(rx.open(type, version, epoch ^ 0x100, seqHi, seqLo, Buffer.from(ref))).toBeNull();
+    }
   });
 
   it('default suite order: ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM on Node and Bun', () => {
