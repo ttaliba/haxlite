@@ -208,19 +208,22 @@ describe('tunnel v2 cipher', () => {
   });
 
   it('AEAD negotiation: ChaCha20-Poly1305 only when both ends prefer it; old peers stay on AES-128-GCM', () => {
-    // host side: what to ask for
+    // host side: what to ask for ('auto' = ChaCha20-Poly1305 on Node and Bun)
     expect(tunnelAeadRequest('aes-128-gcm')).toBe(0);
     expect(tunnelAeadRequest('chacha20-poly1305')).toBe(AuthFlag.ChaCha);
-    expect(tunnelAeadRequest('auto')).toBe(preferredTunnelAead() === 'chacha20-poly1305' ? AuthFlag.ChaCha : 0);
+    expect(tunnelAeadRequest('auto')).toBe(AuthFlag.ChaCha);
+    expect(tunnelAeadRequest()).toBe(AuthFlag.ChaCha);
+    expect(preferredTunnelAead()).toBe('chacha20-poly1305');
     expect(preferredTunnelAead(false)).toBe('chacha20-poly1305'); // Node
-    expect(preferredTunnelAead(true)).toBe('aes-128-gcm'); // Bun
+    expect(preferredTunnelAead(true)).toBe('chacha20-poly1305'); // Bun
     // edge side: a host that did not ask (every host before the flag) gets AES-128-GCM, whatever the edge prefers
     const old = AuthFlag.Udp | AuthFlag.RoLanes;
     for (const opt of ['auto', 'aes-128-gcm', 'chacha20-poly1305'] as const) expect(grantTunnelAead(old, opt)).toBe('aes-128-gcm');
     const asks = old | AuthFlag.ChaCha;
     expect(grantTunnelAead(asks, 'chacha20-poly1305')).toBe('chacha20-poly1305');
     expect(grantTunnelAead(asks, 'aes-128-gcm')).toBe('aes-128-gcm');
-    expect(grantTunnelAead(asks, 'auto')).toBe(preferredTunnelAead());
+    expect(grantTunnelAead(asks, 'auto')).toBe('chacha20-poly1305');
+    expect(grantTunnelAead(asks)).toBe('chacha20-poly1305');
     // host side: an edge before the flag echoes only Udp | RoLanes → AES-128-GCM
     expect(grantedTunnelAead(old)).toBe('aes-128-gcm');
     expect(grantedTunnelAead(old | tunnelAeadFlag('chacha20-poly1305'))).toBe('chacha20-poly1305');

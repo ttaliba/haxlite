@@ -19,7 +19,7 @@ describe('tunnel v2 AEAD negotiation (real edge + room)', () => {
   });
 
   const cases = [
-    { host: undefined, edge: undefined, want: 'chacha20-poly1305' }, // both auto on Node
+    { host: undefined, edge: undefined, want: 'chacha20-poly1305' }, // both auto (Node and Bun)
     { host: 'aes-128-gcm', edge: undefined, want: 'aes-128-gcm' }, // host does not ask (= every older host)
     { host: 'chacha20-poly1305', edge: 'aes-128-gcm', want: 'aes-128-gcm' }, // edge does not grant (= every older edge)
     { host: 'chacha20-poly1305', edge: 'chacha20-poly1305', want: 'chacha20-poly1305' },

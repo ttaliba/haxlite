@@ -87,9 +87,8 @@ export interface EdgeOptions {
   roLanes?: boolean;
   /**
    * `dataPlane: 'udp'` only: datagram AEAD to ask the edge for. `'auto'`
-   * (default) asks for ChaCha20-Poly1305 where it is the cheaper one (Node;
-   * on Bun AES-128-GCM); the edge grants it only if it agrees, else (and
-   * with edges that predate it) AES-128-GCM.
+   * (default) asks for ChaCha20-Poly1305 (Node and Bun); the edge grants it
+   * only if it agrees, else (and with edges that predate it) AES-128-GCM.
    */
   tunnelAead?: TunnelAeadOption;
   /** Local address for the outbound WebSocket and the tunnel's UDP socket / PeerConnection. */

@@ -109,17 +109,16 @@ const ALGO = 'aes-128-gcm';
  */
 export type TunnelAead = 'aes-128-gcm' | 'chacha20-poly1305';
 
-const IS_BUN = typeof (process.versions as Record<string, string | undefined>).bun === 'string';
-
 /**
- * This runtime's cheaper tunnel AEAD. Node: ChaCha20-Poly1305 in JS (no
- * native cipher object and no Buffers per datagram, where node:crypto's
- * AES-GCM costs ~4 µs per seal or open, mostly the per-datagram cipher
- * object). Bun: AES-128-GCM — its node:crypto is cheap and JSC runs the JS
- * ChaCha slower than V8.
+ * The preferred tunnel AEAD, on Node and Bun: ChaCha20-Poly1305 in JS (no
+ * native cipher object and no Buffers per datagram). node:crypto's AES-GCM
+ * makes a cipher object per seal or open: ~4 µs on Node; on Bun cheaper in a
+ * micro-benchmark, but the churn keeps its mimalloc scavenger busy and costs
+ * more CPU end to end (the same measurement as DTLS: docs/10 §6.7). `_bun` is
+ * kept for callers and tests; the answer no longer depends on it.
  */
-export function preferredTunnelAead(bun = IS_BUN): TunnelAead {
-  return bun ? 'aes-128-gcm' : 'chacha20-poly1305';
+export function preferredTunnelAead(_bun?: boolean): TunnelAead {
+  return 'chacha20-poly1305';
 }
 
 /** Tunnel AEAD setting of either end: `'auto'` = {@link preferredTunnelAead}. */

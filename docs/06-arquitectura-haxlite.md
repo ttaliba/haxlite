@@ -191,10 +191,14 @@ salida en la red es la misma:
 |---|---|---|
 | Cliente HTTP del maestro (`src/net/master-http.ts`) | `node:http(s)`, cargado en la primera petición | `fetch` nativo si no hay `agent` ni variables `HTTP(S)_PROXY`/`ALL_PROXY` (si las hay, `node:http` como en Node). Diferencias: Bun añade `User-Agent: Bun/<v>`, `Accept` y `Accept-Encoding` (cuerpo descomprimido de forma transparente), sus mensajes de error de red y un timeout que acota la petición entera |
 | E/S UDP de haxlite-rtc y del socket del túnel v2 en el edge (`src/rtc/udp.ts`) | `UDPWrap` del socket con un `SendWrap` reutilizado | socket nativo dentro de `dgram` (envío directo, recepción por `reload`) y un `sendMany` por vaciado del bundler (`sendmmsg` en Linux) |
-| Suites DTLS por defecto | ChaCha20‑Poly1305 (JS) primero | AES‑128‑GCM (nativo) primero; `chacha: 'node'` cae a la AEAD JS |
-| AEAD del túnel v2 con `'auto'` | ChaCha20‑Poly1305 | AES‑128‑GCM |
+| `chacha: 'node'` de `DtlsServer` | ChaCha20‑Poly1305 de `node:crypto` | cae a la AEAD JS (`node:crypto` de Bun no la tiene) |
 | Holgura del reloj del host | +1 ms por temporizador (el de libuv puede disparar hasta ~1 ms antes) | 0 (Bun no dispara antes) |
 | `deflateRaw` | `node:zlib` | `Bun.deflateSync` cuando da los mismos bytes (§4.3) |
+
+Las suites DTLS por defecto y la AEAD del túnel v2 con `'auto'` **no** dependen del runtime:
+ChaCha20‑Poly1305 (JS, en el sitio, sin asignar) primero también en Bun. El AES‑GCM nativo de Bun
+gana la micro‑medida por registro, pero de extremo a extremo cuesta ≈ 21 % más CPU (un objeto de
+cifrado por registro despierta al *scavenger* de mimalloc) y ≈ 9 % más bytes ([10 §6.7](10-haxlite-rtc.md)).
 
 `node:http(s)` del `EdgeServer` y de `ws` tampoco se cargan en Bun con un host normal (arranque del
 paquete en Bun: 42,7 → 29,6 ms, RSS −3,6 MB).
