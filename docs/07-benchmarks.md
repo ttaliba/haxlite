@@ -1,22 +1,30 @@
 # 07 — Benchmarks de recursos: haxlite vs host oficial vs node-haxball
 
-> Medición reproducible del consumo de recursos de un **host** de HaxBall en Node.js:
+> Medición reproducible del consumo de recursos de un **host** de HaxBall en Node.js (y en Bun):
 > haxlite (este repo), el **script oficial del headless** ejecutado por `haxball.js` 5.1.0 y
 > **node-haxball** 2.3.1 actuando como host. Todo offline contra la `FakeMaster` de
 > `test/fake-master`, con clientes reales (node-haxball) en procesos aparte.
 > Datos crudos: `bench/results/*.json`. Tablas regenerables con `node bench/net/report.mjs`
 > (`--unified` para la comparativa unificada). **Empezar por la comparativa unificada**: es la
 > única medida en una sola sesión con las cuatro opciones (oficial, node-haxball, haxlite + ndc,
-> haxlite + rtc); el resto del documento es histórico.
+> haxlite + rtc). Los escenarios de producción (Bun, flota, soak, red degradada) se describen en
+> [Escenarios de producción y Bun](#escenarios-de-producción-y-bun); el resto del documento es histórico.
 
 ## Comparativa unificada (misma sesión)
 
-Las cuatro opciones de host medidas **en la misma sesión** (11-10-2026, 11:19–13:04 UTC), misma
-máquina, mismo build, mismos clientes y orden **intercalado** dentro de cada repetición (rep 1 de
-las cuatro, luego rep 2…). Es la única tabla en la que los números de distintas librerías son
-comparables entre sí; todo lo que viene después de esta sección es **histórico** (otras sesiones,
-otra CPU, otros builds). Datos crudos: `bench/results/unified-{startup,idle,game,rooms}.json`;
-tablas completas (mín–máx, reparto por hilo): `node bench/net/report.mjs --unified`.
+Las cuatro opciones de host medidas **en la misma sesión** (13-10-2026, 02:22–≈04:20 UTC, tras la
+pasada «puntero en todo»), misma máquina, mismo build, mismos clientes y orden **intercalado**
+dentro de cada repetición (rep 1 de las cuatro, luego rep 2…). Es la única tabla en la que los
+números de distintas librerías son comparables entre sí; todo lo que viene después de esta sección
+es **histórico** (otras sesiones, otra CPU, otros builds). Datos crudos:
+`bench/results/unified-{startup,idle,game,rooms}.json`; tablas completas (mín–máx, reparto por
+hilo): `node bench/net/report.mjs --unified`; imágenes: `docs/img/benchmark/`
+(`node bench/charts.mjs docs/img/benchmark bench/results/unified rtc,off,nh`). Resumen de tres
+columnas en [benchmark-hosts.md](benchmark-hosts.md).
+
+> La tabla anterior de esta sección (11-10-2026, Node 22.22 a 2,30 GHz, commit `bc5d625`) quedó
+> sustituida; sus JSON se sobrescribieron con esta tanda. Sus cifras siguen citadas en
+> «Pasada rtc posterior a la tabla» (histórico) y en benchmark-hosts.md.
 
 ### Qué se compara
 
@@ -24,15 +32,17 @@ tablas completas (mín–máx, reparto por hilo): `node bench/net/report.mjs --u
 |---|---|---|
 | **oficial** | `haxball.js` 5.1.0 ejecutando el script oficial del headless (`HBInit`) | `@webrtc-node/webrtc` 0.2.1 |
 | **node-haxball** | `node-haxball` 2.3.1 `Room.create` | su `node-datachannel` 0.25.0 propio |
-| **haxlite + ndc** | `HostRoom` + `HostTransport` (`peerBackend: 'ndc'`, el valor por defecto) | `node-datachannel` 0.33.4 |
+| **haxlite + ndc** | `HostRoom` + `HostTransport` (`peerBackend: 'ndc'`) | `node-datachannel` 0.33.4 |
 | **haxlite + rtc** | ídem con `peerBackend: 'rtc'` (`rtcEndpoint` en 127.0.0.1) | haxlite-rtc (TypeScript, sin addon nativo) |
 
-Los clientes son los mismos para los cuatro: node-haxball (libdatachannel) en procesos aparte,
-≤ 10 por proceso, con la carga de juego con semilla de §2.1 (los contadores lo confirman: N = 20 →
-9 662–9 810 inputs por repetición en los cuatro hosts). Mismos *shims* de cliente que en §1.1
-(retraso de 40 ms del primer envío por canal en oficial y node-haxball, que haxlite trae de serie;
-quitar el prefijo `a=` de los candidatos para `@webrtc-node/webrtc`). Las cuatro funcionaron sin
-fallos: **0 uniones fallidas, 0 desconexiones, 100 repeticiones válidas de 100**.
+haxlite se mide con el **paquete minificado** publicado (`npm run bench:build`, build
+`7a059fccc1da`). Los clientes son los mismos para los cuatro: node-haxball (libdatachannel) en
+procesos aparte, ≤ 10 por proceso, con la carga de juego con semilla de §2.1 (los contadores lo
+confirman: N = 20 → 9 631–9 811 inputs por repetición en los cuatro hosts). Mismos *shims* de
+cliente que en §1.1 (retraso de 40 ms del primer envío por canal en oficial y node-haxball, que
+haxlite trae de serie; quitar el prefijo `a=` de los candidatos para `@webrtc-node/webrtc`). Las
+cuatro funcionaron sin fallos: **0 uniones fallidas, 0 desconexiones, 100 repeticiones válidas de
+100**, ninguna repetida por ruido.
 
 ### Resultados
 
@@ -42,49 +52,51 @@ Despertares = cambios de contexto voluntarios por segundo de todos los hilos del
 
 | escenario | métrica | oficial (haxball.js) | node-haxball | haxlite + ndc | haxlite + rtc |
 |---|---|---:|---:|---:|---:|
-| arranque | inicio del proceso → link (ms) | 139 | 134 | **112** | 122 |
-| | RSS al link (MB) | 76,7 | 74,0 | **69,0** | 70,1 |
-| sala pública ociosa, 0 jugadores (3 × 120 s) | CPU % (ms de CPU por minuto) | 0,337 (202) | 0,632 (379) | **0,010 (5,9)** | **0,009 (5,7)** |
-| | RSS (MB) | 74,1 | 70,8 | **64,4** | 65,9 |
-| | hilos · fds | 7 · 24 | 7 · 24 | 7 · 24 | 7 · 25 |
-| | despertares/s | 20,5 | 81,0 | **0,2** ¹ | **0,2** ¹ |
-| partida, 4 clientes | CPU % (JS + otros) | 2,85 (1,3 + 1,5) | 3,42 (1,6 + 1,8) | 2,59 (1,1 + 1,5) | **2,00** (1,8 + 0,2) |
-| | RSS / heap usado (MB) | 79,3 / 10,9 | 83,8 / 14,1 | 78,2 / **9,3** | **72,2** / 10,5 |
-| | hilos · fds · despertares/s | 18 · 30 · 761 | 15 · 32 · 841 | 19 · 27 · 778 | **11 · 25 · 184** |
-| partida, 10 clientes | CPU % (JS + otros) | 5,81 (2,2 + 3,6) | 6,41 (2,6 + 3,8) | 5,13 (1,8 + 3,4) | **3,56** (3,3 + 0,3) |
-| | RSS / heap usado (MB) | 84,7 / 11,7 | 86,3 / 15,3 | 80,1 / **9,8** | **77,1** / 13,3 |
-| | hilos · fds · despertares/s | 18 · 36 · 1 731 | 15 · 38 · 1 786 | 19 · 27 · 1 730 | **11 · 25 · 279** |
-| partida, 20 clientes | CPU % (JS + otros) | 13,52 (5,0 + 8,5) | 15,10 (6,0 + 9,1) | 11,95 (4,1 + 7,9) | **7,79** (7,3 + 0,4) |
-| | RSS / heap usado (MB) | 85,3 / 12,4 | 92,4 / 16,0 | **83,3 / 9,9** | 88,7 / 14,2 |
-| | GC por minuto | 96 | 95 | **9** | 56 |
-| | lag del event loop p50 / p99 (ms) | 0,10 / 1,78 | 0,13 / 2,39 | 0,09 / 1,66 | 0,13 / 2,72 |
-| | hilos · fds · despertares/s | 18 · 46 · 4 331 | 15 · 48 · 4 375 | 19 · 27 · 4 138 | **11 · 25 · 509** |
-| | entrada p50 / p90 (ms) ² | 2 057 / 2 075 | 2 060 / 2 557 | 2 055 / 2 065 | **1 059 / 1 076** |
-| 10 salas × 4 clientes, 1 proceso | CPU % (JS + otros) | 19,89 (8,4 + 11,6) | 20,37 (8,4 + 11,9) | 15,79 (5,4 + 10,3) | **9,13** (8,9 + 0,3) |
-| | RSS / heap usado (MB) | 104,8 / 18,0 | 103,0 / 18,4 | 90,9 / **11,0** | **79,3** / 13,8 |
-| | GC por minuto | 237 | 154 | **22** | 103 |
-| | hilos · fds | 18 · 75 | 15 · 77 | 19 · **36** | **11** · 43 ³ |
+| arranque | inicio del proceso → link (ms) | 196 | 204 | **112** | **112** |
+| | RSS al link (MB) | 77,9 | 73,7 | **59,1** | **59,1** |
+| sala pública ociosa, 0 jugadores (3 × 120 s) | CPU % (ms de CPU por minuto) | 0,387 (232) | 0,766 (460) | **0,011 (6,9)** | **0,012 (6,9)** |
+| | RSS (MB) | 69,0 | 71,1 | **57,5** | 58,9 |
+| | hilos · fds | 7 · 24 | 7 · 24 | 7 · 24 | 11 · 25 ¹ |
+| | despertares/s | 20,6 | 81,3 | **0,3** ² | **0,3** ² |
+| partida, 4 clientes | CPU % (JS + otros) | 3,98 (1,9 + 2,1) | 4,55 (2,2 + 2,3) | 3,71 (1,6 + 2,1) | **2,39** (2,2 + 0,3) |
+| | RSS / heap usado (MB) | 78,3 / 10,9 | 84,3 / 14,1 | 71,0 / **8,3** | **64,7** / 9,4 |
+| | hilos · fds · despertares/s | 18 · 30 · 745 | 15 · 32 · 815 | 19 · 27 · 757 | **11 · 25 · 178** |
+| partida, 10 clientes | CPU % (JS + otros) | 7,68 (3,0 + 4,6) | 8,70 (3,7 + 4,9) | 7,01 (2,6 + 4,4) | **3,80** (3,5 + 0,3) |
+| | RSS / heap usado (MB) | 82,9 / 11,7 | 86,8 / 15,3 | 74,0 / **8,7** | **65,6** / 10,3 |
+| | hilos · fds · despertares/s | 18 · 36 · 1 705 | 15 · 38 · 1 749 | 19 · 27 · 1 682 | **11 · 25 · 263** |
+| partida, 20 clientes | CPU % (JS + otros) | 16,88 (6,5 + 10,3) | 18,35 (7,5 + 10,9) | 14,96 (5,3 + 9,7) | **7,12** (6,8 + 0,3) |
+| | RSS / heap usado (MB) | 91,4 / 12,5 | 92,5 / 16,1 | 77,6 / **8,9** | **67,0** / 10,6 |
+| | GC por minuto (ms de GC por minuto) | 97 (55,6) | 98 (53,8) | **8 (3,4)** | 42 (15,8) |
+| | lag del event loop p50 / p99 (ms) | 0,13 / 1,14 | 0,17 / 1,22 | 0,13 / 1,21 | 0,14 / 1,13 |
+| | hilos · fds · despertares/s | 18 · 46 · 4 199 | 15 · 48 · 4 260 | 19 · 27 · 4 060 | **11 · 25 · 481** |
+| | entrada p50 / p90 (ms) ³ | 2 059 / 2 071 | 2 141 / 2 565 | **1 062 / 1 080** | 1 063 / 1 077 |
+| 10 salas × 4 clientes, 1 proceso | CPU % (JS + otros) | 26,11 (11,2 + 14,7) | 25,46 (10,4 + 15,1) | 19,97 (6,9 + 13,2) | **8,67** (8,5 + 0,2) |
+| | RSS / heap usado (MB) | 103,4 / 17,8 | 103,2 / 18,5 | 85,1 / **10,0** | **70,4** / 12,0 |
+| | GC por minuto (ms de GC por minuto) | 238 (119,5) | 150 (66,7) | **22 (8,5)** | 51 (18,6) |
+| | hilos · fds | 18 · 75 | 15 · 77 | 19 · 36 | **11 · 34** ⁴ |
 
-GC por minuto y lag con 4 y 10 clientes (detalle en `report.mjs --unified`): GC 18 / 36 / **6** /
-33 (N = 4) y 58 / 65 / **8** / 80 (N = 10); lag p50 0,09–0,17 ms y p99 1,5–2,9 ms en todos.
+GC por minuto y lag con 4 y 10 clientes (detalle en `report.mjs --unified`): GC 19 / 35 / **7** /
+9 (N = 4) y 57 / 64 / **8** / 18 (N = 10); lag p50 0,13–0,22 ms y p99 0,98–1,07 ms en todos.
 
-¹ Es el propio muestreo de memoria del arnés (cada 5 s): sin él, 0. ² `Room.join` → `onOpen` en el
-cliente (señalización por la FakeMaster + oferta/respuesta + ICE/DTLS/SCTP + desafío), percentiles
-sobre los 20 clientes de cada repetición, mediana de las 3. ³ Cada sala abre su propio
-`RtcEndpoint` (un socket UDP por sala); con `rtc.endpoint` compartido serían ≈ 34.
+¹ Los 4 hilos extra de rtc en reposo son el *threadpool* de libuv que arrancaba la generación del
+certificado DTLS; tras esta tanda el certificado es síncrono y la sala vacía queda en 7 hilos
+(benchmark-hosts.md). ² Es el propio muestreo de memoria del arnés (cada 5 s): sin él, 0.
+³ `Room.join` → `onOpen` en el cliente (señalización por la FakeMaster + oferta/respuesta +
+ICE/DTLS/SCTP + desafío), percentiles sobre los 20 clientes de cada repetición, mediana de las 3.
+⁴ Las 10 salas comparten un `RtcEndpoint` (un socket UDP por proceso).
 
-Dispersión (mín–máx de las 3 repeticiones) de la CPU en partida: N = 4: oficial 2,77–3,23,
-node-haxball 3,13–3,82, ndc 2,48–2,60, rtc 1,77–2,02; N = 20: 13,43–13,96, 14,36–15,24,
-11,68–12,05, 7,77–7,90; 10 salas: 19,71–20,13, 20,03–20,98, 15,54–16,24, 8,99–9,49.
+Dispersión (mín–máx de las 3 repeticiones) de la CPU en partida: N = 4: oficial 3,78–4,01,
+node-haxball 4,39–4,98, ndc 3,61–3,75, rtc 2,38–2,42; N = 20: 16,67–17,13, 18,28–18,50,
+14,76–16,15, 6,97–7,15; 10 salas: 24,94–26,22, 25,24–26,78, 19,94–20,75, 8,64–9,10.
 
 **Reparto por hilo, partida con 20 clientes** (% de un núcleo, mediana):
 
 | | hilo JS | `RTC worker` ×4 | `juice poll` / `juice mux` | `SCTP timer` | resto (V8/libuv) |
 |---|---:|---:|---:|---:|---:|
-| oficial | 5,05 | 5,75 | 2,28 (poll) | 0,18 | 0,30 |
-| node-haxball | 6,02 | 6,13 | 2,47 (poll) | 0,18 | 0,32 |
-| haxlite + ndc | 4,07 | 5,60 | 1,97 (mux) | 0,17 | 0,13 |
-| haxlite + rtc | 7,33 | — | — | — | 0,43 |
+| oficial | 6,53 | 6,92 | 2,85 (poll) | 0,25 | 0,35 |
+| node-haxball | 7,50 | 7,28 | 3,03 (poll) | 0,25 | 0,40 |
+| haxlite + ndc | 5,28 | 6,78 | 2,45 (mux) | 0,23 | 0,22 |
+| haxlite + rtc | 6,83 | — | — | — | 0,25 |
 
 ### Qué WebRTC usa cada librería
 
@@ -96,8 +108,8 @@ de libdatachannel (`git describe`).
 |---|---|---|---|---|---|---|---|
 | **haxball.js** 5.1.0 | `@webrtc-node/webrtc` 0.2.1 (addon Node-API `webrtc_node.node` 6,1 MB + capa W3C en JS de ~4 500 líneas) | **sí**: commit `188ec93` de *master* (`v0.24.5-199`, 06-07-2026, versión CMake 0.24.5), enlazada estática | libjuice 1.7.2, ICE completo + STUN; un socket UDP por conexión (`enableIceUdpMux: false` por defecto) | OpenSSL 1.1.1w (estático) | usrsctp `fec583d5` | hilo JS + 4 `RTC worker` (= núcleos) + `juice poll` + hilos de usrsctp: 18 con jugadores | en cualquier red (tras NAT, como un navegador) |
 | **node-haxball** 2.3.1 | `node-datachannel` **0.25.0** (copia propia en `node-haxball/node_modules`, *polyfill* W3C) | v0.22.2 | libjuice 1.5.7, ICE completo + STUN; un socket por conexión | OpenSSL 1.1.1w (estático) | usrsctp `ebb18ada` | igual: 15 hilos con jugadores | en cualquier red |
-| **haxlite + ndc** | `node-datachannel` **0.33.4** (prebuild `@node-datachannel/linux-x64-gnu`, API nativa sin *polyfill*) | v0.24.5 | libjuice 1.7.2, ICE completo + STUN, **mux UDP** por defecto (un socket, hilo `juice mux`) | OpenSSL 1.1.1w (estático) | usrsctp `fec583d5` | igual: 19 hilos con jugadores; se liberan 15 s después de cerrar la última conexión | en cualquier red (por defecto de haxlite) |
-| **haxlite + rtc** | ninguno: **haxlite-rtc** (`src/rtc`, TypeScript, `node:dgram` + `node:crypto`) | no | ICE‑lite propio (solo responde Bindings; candidatos `host` de `publicAddresses`), un socket UDP compartido | DTLS 1.2 servidor propio; primitivas de `node:crypto` (OpenSSL 3.5.4 de Node 22.22) | SCTP propio (RFC 9260 + PR‑SCTP + *zero checksum*) | todo en el hilo JS; 0 hilos nativos (11 = 7 de Node + 4 del *threadpool* de libuv, que arranca la verificación ECDSA de los jugadores) | solo con **IP pública** alcanzable (o NAT 1:1 con `publicAddresses`/`publicPort`) y el puerto UDP abierto, o detrás del edge; **no** tras NAT doméstico (sin candidatos srflx) |
+| **haxlite + ndc** | `node-datachannel` **0.33.4** (prebuild `@node-datachannel/linux-x64-gnu`, API nativa sin *polyfill*) | v0.24.5 | libjuice 1.7.2, ICE completo + STUN, **mux UDP** por defecto (un socket, hilo `juice mux`) | OpenSSL 1.1.1w (estático) | usrsctp `fec583d5` | igual: 19 hilos con jugadores; se liberan 15 s después de cerrar la última conexión | en cualquier red |
+| **haxlite + rtc** | ninguno: **haxlite-rtc** (`src/rtc`, TypeScript, `node:dgram` + `node:crypto`) | no | ICE completo propio (rol controlado: candidatos host y srflx por STUN, comprobaciones propias hacia el jugador); `iceLite: true` opcional; un socket UDP compartido por todas las salas del proceso | DTLS 1.2 servidor propio; ChaCha20‑Poly1305 en JS, AES‑GCM de `node:crypto` | SCTP propio (RFC 9260 + PR‑SCTP + *zero checksum*) | todo en el hilo JS; 0 hilos nativos | en cualquier red, también tras NAT (docs/10 §2.1, §4.4); sin TURN |
 
 Los tres primeros son, por debajo, **la misma pila nativa** (libdatachannel + libjuice + usrsctp +
 OpenSSL 1.1.1w), en tres versiones y con tres *bindings* distintos. Ninguno arranca hilos nativos
@@ -106,64 +118,73 @@ hasta la primera PeerConnection (por eso los 7 hilos en la sala ociosa).
 ### Conclusiones
 
 * **Con jugadores, la diferencia la marca el WebRTC, no la librería de juego.** Los tres hosts
-  sobre libdatachannel gastan casi lo mismo en hilos nativos (7,9–9,1 % con 20 clientes); lo que
+  sobre libdatachannel gastan casi lo mismo en hilos nativos (9,7–10,9 % con 20 clientes); lo que
   los separa es el hilo JS. **haxlite + rtc** elimina los hilos nativos y es el más barato en todos
-  los escenarios con clientes: con 20 clientes 7,8 % frente a 12,0 (ndc, −35 %), 13,5 (oficial,
-  −42 %) y 15,1 (node-haxball, −48 %); con 10 salas 9,1 % frente a 15,8 / 19,9 / 20,4. Los rangos
-  no se solapan. Además hace ~8× menos despertares (509/s frente a ~4 100–4 400/s) y la entrada
-  tarda la mitad (≈ 1,06 s frente a ≈ 2,06 s: ICE‑lite responde sin esperar la recolección).
-* **haxlite + ndc frente al oficial** (misma pila nativa, más nueva y con mux): −9 % de CPU con 4
-  clientes (2,59 frente a 2,85: diferencia real pero pequeña, 0,26 puntos), −12 % con 10 y 20, −21 %
-  con 10 salas; ahorro sobre todo en el hilo JS y en el hilo ICE (mux). **node-haxball** es el más
-  caro en todos los escenarios con clientes (+10–20 % sobre el oficial con 1 sala; +2 % con 10
-  salas, dentro del ruido).
-* **Memoria**: RSS dentro de ~12 MB entre los cuatro con 1 sala (72–92 MB): lo domina el runtime
-  de Node. haxlite + ndc tiene el heap más pequeño (9,9 MB con 20 clientes) y **10× menos GC** que
-  oficial/node-haxball (9 frente a ~95 por minuto); rtc paga +4 MB de heap y más GC (56/min) porque
-  el estado DTLS/SCTP vive en JS. Con 10 salas, los dos haxlite usan 12–25 MB menos de RSS.
-* **Ociosa**: los dos haxlite están en ≈ 0,01 % (6 ms de CPU por minuto, sin despertares propios),
-  frente a 0,34 % del oficial (su `setInterval` de 50 ms: 20 despertares/s) y 0,63 % de node-haxball
-  (81 despertares/s). En valor absoluto todo es despreciable; **ndc y rtc son iguales** (dentro del
-  ruido: en reposo ninguno tiene conexiones).
-* **Lag del event loop**: sin diferencias que importen (p50 ≈ 0,1 ms; p99 1,5–2,9 ms en todos). El
-  de rtc es 0,3–1,3 ms mayor en p99 con 10–20 clientes (la red corre en el hilo JS), muy por debajo
-  de un frame (16,7 ms). Los máximos (15–120 ms) varían entre repeticiones sin patrón.
-* **Arranque**: 112–139 ms del inicio del proceso al link en los cuatro; haxlite + ndc es ~20 ms
-  más rápido (menos módulos que cargar), pero los rangos se solapan parcialmente (103–135 frente a
-  117–148): diferencia pequeña.
-* **Cuándo usar cada backend de haxlite**: `rtc` donde haya IP pública (VPS, dedicado, edge);
-  `ndc` (por defecto) tras NAT.
+  los escenarios con clientes: con 20 clientes 7,1 % frente a 15,0 (ndc, −52 %), 16,9 (oficial,
+  −58 %) y 18,4 (node-haxball, −61 %); con 10 salas 8,7 % frente a 20,0 / 26,1 / 25,5 (−57 %,
+  −67 %, −66 %). Los rangos no se solapan. Además hace ~9× menos despertares (481/s frente a
+  ~4 100–4 300/s).
+* **Entrada**: los dos haxlite tardan la mitad (≈ 1,06 s frente a ≈ 2,06 s del oficial y 2,1–2,6 s
+  de node-haxball). En esta tanda ndc ya no espera la recolección de candidatos (pasada `ndc`,
+  más abajo); el segundo restante es del propio cliente.
+* **haxlite + ndc frente al oficial** (misma pila nativa, más nueva y con mux): −7 % de CPU con 4
+  clientes, −9 % con 10, −11 % con 20 y −24 % con 10 salas; el ahorro está en el hilo JS y en el
+  hilo ICE (mux). **node-haxball** es el más caro con 1 sala (+9–14 % sobre el oficial); con 10
+  salas empata con el oficial (rangos solapados).
+* **Memoria**: los dos haxlite usan 7–26 MB menos de RSS que oficial/node-haxball con 1 sala y
+  ~18–33 MB menos con 10 salas; rtc es el de menor RSS con jugadores (67 MB con 20 clientes).
+  haxlite + ndc tiene el heap más pequeño y **12× menos GC** que oficial/node-haxball (8 frente a
+  ~97 por minuto con 20 clientes); rtc queda en medio (42/min, 15,8 ms/min: la basura que queda
+  es la del binding UDP de Node por datagrama, docs/10 §6.6), 3–6× menos tiempo de GC que los dos
+  de referencia.
+* **Ociosa**: los dos haxlite están en ≈ 0,01 % (7 ms de CPU por minuto, sin despertares propios),
+  frente a 0,39 % del oficial (su `setInterval` de 50 ms: 20 despertares/s) y 0,77 % de node-haxball
+  (81 despertares/s). En valor absoluto todo es despreciable; **ndc y rtc son iguales**.
+* **Lag del event loop**: sin diferencias (p50 0,13–0,22 ms; p99 0,98–1,22 ms en todos, rangos
+  solapados), 15 veces por debajo de un frame (16,7 ms). Los máximos (31–53 ms) varían entre
+  repeticiones sin patrón.
+* **Arranque**: los dos haxlite tienen el link en 112 ms desde el inicio del proceso, ~85–90 ms
+  antes que oficial (196) y node-haxball (204), con 15–19 MB menos de RSS (bundle minificado y
+  ASCII, `ws` sin el lexer CJS, carga perezosa del backend).
 
 ### Condiciones, ruido y advertencias
 
-* Máquina: VM Firecracker de **4 vCPU** (Intel Xeon, el kernel la reporta a 2,30 GHz; las tandas
-  históricas eran de 2,80 GHz), 16 GB, Linux 6.18.44, **Node v22.22.0** (V8 12.4, OpenSSL 3.5.4).
-  haxlite: commit `bc5d625`, `src/` sin cambios, build `0e27a1def092`.
-* Máquina tranquila durante toda la sesión: CPU ajena (sistema − nuestros procesos) ≤ 4 % de un
-  núcleo en las 60 ventanas con clientes u ociosas (`machine.foreignPct` en cada JSON; `loadavg` de
-  1 min ≤ 1,6 incluyendo nuestros propios procesos). Umbral de repetición: 50 %; solo se repitió
-  una medición de arranque (haxlite + ndc, 57 % ajeno durante los ~0,1 s del arranque).
+* Máquina: VM Firecracker de **4 vCPU** (Intel Xeon, el kernel la reporta a **2,10 GHz**; la
+  tanda del 11-10 era de 2,30 GHz y las históricas de 2,80 GHz: los valores absolutos de CPU suben
+  para todos, comparar solo dentro de esta tabla), 16 GB, Linux 6.18.44, **Node v22.22.0**
+  (V8 12.4). haxlite: commits `de3f879`/`cac332f`/`3cef679` (solo cambió `bench/` entre ellos),
+  `src/` sin cambios, build `7a059fccc1da` en los cuatro escenarios.
+* Máquina tranquila: CPU ajena (sistema − nuestros procesos) ≤ 7 % de un núcleo en las 60
+  ventanas con clientes u ociosas y ≤ 31 % durante los arranques (`machine.foreignPct` /
+  `startup.foreignPct` en cada JSON; `loadavg` de 1 min ≤ 1,6 incluyendo nuestros procesos).
+  Umbral de repetición: 50 %; no se repitió ninguna medición.
 * Las tres sobre libdatachannel no están en igualdad de versión (0.22.2 / 0.24.5 / master): es lo
   que cada librería instala hoy, que es lo que se quería comparar.
-* Todo es loopback y los clientes son libdatachannel: no hay pérdida ni latencia de red reales.
-  La interoperabilidad de haxlite-rtc con navegadores y el cliente oficial está en docs/10 §4–§6.
+* Todo es loopback y los clientes son libdatachannel: no hay pérdida ni latencia de red reales
+  (para eso, el escenario `join-impaired` de abajo). La interoperabilidad de haxlite-rtc con
+  navegadores y el cliente oficial está en docs/10 §4–§6.
 * El reparto por hilo usa tics de 10 ms: con 60 s de ventana la resolución es 0,017 puntos.
 * Los hosts oficial y node-haxball llevan los dos *shims* de cliente de §1.1 (coste en régimen:
   una llamada y una comparación por mensaje enviado).
+* Todo en Node: **Bun (el runtime de producción) no está en esta tanda**; el arnés ya lo soporta
+  (`haxlite:rtc@bun`, sección siguiente) y `unified.sh` lo incluye en la próxima.
 
 ### Comandos exactos
 
 ```sh
 npm ci
-sh bench/net/unified.sh          # ≈ 1 h 45 min; compila haxlite y corre los cuatro escenarios
+sh bench/net/unified.sh          # compila haxlite y corre los cuatro escenarios (+ haxlite:rtc@bun desde ahora)
 node bench/net/report.mjs --unified
+node bench/charts.mjs docs/img/benchmark bench/results/unified rtc,off,nh
 ```
 
-`bench/net/unified.sh` ejecuta, cada uno bajo `flock /tmp/haxlite-bench.lock`:
+La tanda del 13-10 ejecutó, cada uno bajo `flock /tmp/haxlite-bench.lock` (entonces con
+`node --experimental-transform-types`, que Node 26 eliminó; hoy el cargador de
+`bench/ts-resolve.mjs` transpila el TypeScript con oxc y basta `node --import`):
 
 ```sh
 npm run -s bench:build
-R="node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs bench/net/run.ts"
+R="node --no-warnings --import ./bench/ts-resolve.mjs bench/net/run.ts"
 I=official,nodehaxball,haxlite:ndc,haxlite:rtc
 flock /tmp/haxlite-bench.lock $R startup --impl $I --reps 10 --max-foreign 50 --attempts 3 --out bench/results/unified-startup.json
 flock /tmp/haxlite-bench.lock $R idle --impl $I --reps 3 --warmup 15 --window 120 --max-foreign 50 --attempts 3 --out bench/results/unified-idle.json
@@ -171,10 +192,146 @@ flock /tmp/haxlite-bench.lock $R game --impl $I --n 4,10,20 --reps 3 --warmup 15
 flock /tmp/haxlite-bench.lock $R rooms --impl $I --k 10 --reps 3 --warmup 15 --window 60 --max-foreign 50 --attempts 3 --out bench/results/unified-rooms.json
 ```
 
-Métricas añadidas al arnés para esta tanda (solo `bench/`, sin tocar las librerías): reparto
-hilo JS / resto (`host.cpuSplit`), despertares (`host.wakeups`, de `voluntary_ctxt_switches` de
-`/proc/self/task/*/status`), tiempo de entrada por cliente (`join[].joinMs`) y versión del
-`node-datachannel` de node-haxball en `info.versions`.
+## Escenarios de producción y Bun
+
+Producción corre haxlite con **Bun 1.x**, `peerBackend: 'rtc'`, **3 procesos pm2 × 4 salas** por
+servidor Linux. Hasta esta pasada nada se medía en Bun. El arnés (`bench/net/run.ts`) suma un
+runtime para el host, tres escenarios y dos métricas nuevas en todas las corridas. Todavía **no
+hay tanda publicada** de estos escenarios: solo pruebas de humo (abajo), que no sirven como
+resultado. Para correrlos todos en la VM: `sh bench/net/extra.sh` (≈ 12 h 30 min con el soak de
+6 h por runtime; `SOAK_MIN=30` para uno corto) y `node bench/net/report.mjs` (tablas de flota,
+soak y red degradada).
+
+### Runtime del host: `--runtime bun` y `haxlite:rtc@bun`
+
+* `--runtime node|bun` elige el runtime del **proceso host** (por defecto `node`); los clientes y
+  el orquestador no cambian. Por implementación, con sufijo: `--impl haxlite:rtc,haxlite:rtc@bun`
+  intercala Node y Bun en la misma tanda (el sufijo manda sobre `--runtime`). En los JSON:
+  `spec.impl` sin sufijo y `spec.runtime`; `report.mjs` muestra la columna «haxlite + rtc (Bun)».
+* El host bajo Bun es el mismo `host-proc.mjs` con el mismo bundle minificado, lanzado con
+  `fork()` y el ejecutable real de Bun (`$BUN_PATH`, si no `bun` del PATH resuelto a su binario:
+  en Windows `bun` es un *shim* `.cmd`). Bun habla el canal IPC de Node, también en Windows.
+* El orquestador también corre en Bun: `bun bench/net/run.ts game --impl haxlite:rtc@bun`.
+* Métricas en Bun: CPU (`process.cpuUsage`), RSS/heap/external (`process.memoryUsage`, el heap es
+  el de JSC) y además `host.jsc` (`heapStats()` de `bun:jsc`: `heapSize`, `objectCount`,
+  `extraMemorySize`, y `memoryUsage().current` de mimalloc). **Sin eventos de GC** (Bun acepta el
+  observador `gc` pero nunca informa: `gcCount`/`gcMs` = `null`, «n/d» en las tablas). El **lag
+  del event loop** en Bun sale de un `setInterval` de 10 ms propio (lag = intervalo − 10 ms,
+  histograma acotado; `eld.method = 'setInterval-10ms'`), porque `monitorEventLoopDelay` de Bun
+  devuelve otra magnitud; en Node sigue `monitorEventLoopDelay`. Hilos, despertares y fds vienen
+  de `/proc` y valen igual en Bun sobre Linux.
+
+### Portabilidad (Windows) y métricas solo de Linux
+
+El arnés corre en Windows y en Linux. La CPU de la máquina (para el ruido ajeno) sale de
+`/proc/stat` o, sin `/proc`, de `os.cpus()`. Reparto por hilo, despertares, número de hilos y fds
+son **solo Linux** (`null` en otro sistema). En Windows la CPU por proceso se contabiliza por
+muestreo del tic de 15,6 ms (también en Node): las cargas bajas (< 2 %) salen subestimadas o en 0,
+y el lag del event loop en Node no baja de la resolución del temporizador (p50 ≈ 5 ms). Para
+publicar, solo Linux.
+
+### Salida por jugador y huecos entre mensajes (todos los escenarios con clientes)
+
+* **Salida por jugador** (`egressPerPlayer` en cada corrida, `udpBytesPerSPerPlayer`,
+  `appBytesPerSPerPlayer`… en el `summary`):
+  * **UDP** (`udpBytesPerS`, `udpPacketsPerS`): contadores del endpoint de haxlite-rtc
+    (`rtc.bytesOutPerS` / `packetsOutPerS`) divididos por los jugadores. **Solo `rtc`**: los demás
+    hosts hacen la red en código nativo sin contadores expuestos (con ndc, `null`). Incluye
+    cabeceras DTLS/SCTP, SACKs, consentimiento ICE y reenvíos. Los contadores de un endpoint
+    compartido por varias salas se cuentan una vez (antes se sumaban una vez por sala: las cifras
+    `udp in/out` de corridas `rooms` con rtc y K > 1 anteriores a este cambio están multiplicadas
+    por K).
+  * **Aplicación** (`appMsgsPerS`, `appBytesPerS`), **para todos los hosts**: mensajes y bytes de
+    data channel que reciben los clientes (los canales que crean se envuelven para contarlos), por
+    jugador y segundo. Es la carga útil (un mensaje SCTP cada uno), no datagramas: el empaquetado
+    (bundling) y las cabeceras no se ven. Por canal en `traffic.byLabel` (las etiquetas son las de
+    node-haxball: `c1`, `c2`, `c3`).
+* **Huecos entre mensajes en el cliente** (`traffic.gapsAll` p50/p99/p99,9/máx, `gapP50Ms`… en el
+  `summary`): tiempo entre dos mensajes consecutivos recibidos por **un mismo cliente** por
+  cualquier canal (lo que espera la vista del jugador), y por canal en `traffic.byLabel[*].gaps`;
+  histogramas de 0,05 ms hasta 2 s en cada proceso de clientes, unidos en el orquestador. Medidos
+  durante la ventana. Incluyen el retraso del propio event loop del cliente (libdatachannel entrega
+  en un hilo nativo y luego pasa al hilo JS). Mide la regularidad de lo que llega (frames/eventos
+  y *heartbeats*), no la de la simulación del host.
+
+### `fleet`: P procesos × R salas × C clientes
+
+```sh
+npm run bench:fleet -- --impl haxlite:rtc,haxlite:rtc@bun                     # 3 × 4 × 4 (por defecto)
+npm run bench:fleet -- --impl haxlite:rtc@bun --procs 1,3 --rooms 4 --clients 4 --window 60
+```
+
+P procesos host a la vez (cada uno con R salas y su propio endpoint UDP), C clientes por sala, todo
+medido en la misma ventana. `host` es la **suma** de los procesos (CPU, RSS medio, heap, GC, fds,
+contadores UDP; RSS máx = suma de máximos, cota superior), el lag es el del **peor** proceso, y
+`hosts[]` guarda cada proceso. Flags: `--procs`, `--rooms`, `--clients` (aceptan listas), más los
+habituales `--warmup`, `--window`, `--reps`. Salida: `bench/results/fleet.json`.
+
+### `soak`: horas con jugadores entrando y saliendo
+
+```sh
+npm run bench:soak -- --impl haxlite:rtc,haxlite:rtc@bun                       # 4 salas × 4 clientes, 6 h por runtime
+npm run bench:soak -- --impl haxlite:rtc@bun --minutes 10 --sample-s 30       # corto
+```
+
+Un proceso host con `--rooms` salas (4) y `--clients` plazas por sala (4). Cada plaza repite: entra,
+juega `--stay-s` (U(20, 90) s), sale, espera `--pause-s` (U(2, 15) s), vuelve a entrar con otro
+nombre; el host da equipo a quien llega y la partida no se detiene. Tras `--warmup` (60 s), una
+muestra cada `--sample-s` (60 s) durante `--minutes` (360): RSS, heap usado/total, external,
+arrayBuffers, **fds** (`/proc/self/fd`, solo Linux), jugadores por sala, sesiones UDP abiertas, y
+el **tamaño de cada Map/Set** de la sala, el transporte, el backend y el endpoint (`maps`,
+p. ej. `endpoint.byUfrag`, `transport.connected`; lo que el bundle expone con su nombre). Cada
+muestra se guarda al llegar (`series` en el JSON, corrida marcada `partial` mientras dura): un soak
+cortado conserva lo medido. Resumen por proceso (`soak[]`): **pendiente MB/h** (mínimos cuadrados)
+de RSS, heap usado, heap total y external; **deriva de fds** (último − primero) y su pendiente por
+hora; deriva de cada mapa. En los clientes: entradas, salidas, fallos, expulsados por el host y
+latencia de entrada (`clients[].churn`). Un mapa o los fds que crecen con las entradas son una fuga;
+la pendiente de RSS solo tiene sentido con horas de datos (con minutos, el calentamiento del JIT y
+del heap la domina). Salida: `bench/results/soak.json`; no se repite por ruido.
+
+### `join-impaired`: entrada con latencia y pérdida (NAT simulado)
+
+```sh
+npm run bench:join-impaired -- --impl haxlite:rtc,haxlite:rtc@bun              # rtt 40 ms, pérdida 0/1/3 %, STUN en frío y en caché, 20 entradas
+npm run bench:join-impaired -- --rtt 40,100 --loss 1 --stun cold --joins 50 --jitter 5
+```
+
+Solo `haxlite:rtc`. El host (`RtcPeerBackend` en ICE completo, ligado a 127.0.0.1) llega a los
+clientes y al servidor STUN **solo a través del NAT de usuario de `test/rtc/nat-sim.ts`**
+(`UdpNat` + `FakeStunServer`, importados del árbol de tests: en Node con el cargador de
+`bench/ts-resolve.mjs`, en Bun directamente), con los candidatos remotos reescritos a sus alias
+como en `test/net/rtc-nat.test.ts`. El arnés inyecta en el reenvío del NAT `--rtt`/2 de retardo
+(± `--jitter`) y `--loss` % de pérdida **en cada sentido**: el RTT host↔cliente y host↔STUN es
+`--rtt`. `--stun cached`: una ronda STUN antes del link y el resultado se reutiliza
+(`gatherRefreshMs` 1 h); `--stun cold`: cada sesión nueva repite la ronda (`gatherRefreshMs` 0),
+es decir, la respuesta sale sin el candidato srflx y lo manda después. `--joins` clientes entran uno
+tras otro (8 s de tiempo límite y hasta 4 intentos cada uno); se informa p50/p90/p99/máx de
+`Room.join` → `onOpen` del intento que entró, los reintentos y las consultas STUN que recibió el
+servidor (`impairStats`). Por defecto el NAT filtra como *full cone*
+(`--nat-filtering endpoint-independent`: los sockets de libdatachannel envían desde direcciones
+distintas de los candidatos que anuncian y un NAT con restricción de puerto sobre loopback los
+descartaría) y su lado externo es 127.0.0.1 (`--nat-outside`). Límites: la señalización por
+WebSocket de la FakeMaster **no** se degrada (solo el camino UDP: ICE, DTLS, SCTP y STUN); la
+pérdida es uniforme e independiente (sin ráfagas); el piso de ≈ 1,06 s es del cliente
+(node-haxball/libdatachannel), igual que en la tabla unificada. No se repite por ruido (mide
+latencia, no CPU). Salida: `bench/results/join-impaired.json`.
+
+### Pruebas de humo (16-10-2026, Windows 10, Node 26.8.1 y Bun 1.4.0)
+
+Para comprobar que todo funciona en los dos runtimes, con tamaños mínimos y con otras cargas en la
+máquina (no son resultados: la CPU en Windows no es fiable y el ruido ajeno fue 100–500 %):
+
+| escenario (humo) | Node | Bun |
+|---|---|---|
+| `startup`, 2 reps | link 16–22 ms, RSS 69 MB | link 22–26 ms, RSS 38–42 MB |
+| `game` N = 4, 8 s | RSS 74 MB, heap 11,4; por jugador 34 msg/s · 507 B/s (app), 31 datagramas/s · 2,55 kB/s (UDP); huecos p50/p99/p99,9 47 / 138 / 170 ms | RSS 53 MB, heap 8,4; 34 msg/s · 510 B/s, 31 datagramas/s · 2,57 kB/s; 50 / 125 / 148 ms |
+| `fleet` 2 × 2 × 2, 8 s | RSS total 146 MB | RSS total 109 MB |
+| `soak` 2 salas × 2 plazas, 1,5 min, muestra cada 10 s | 36 entradas · 33 salidas · 0 fallos, 8 muestras | 37 · 35 · 0, 8 muestras |
+| `join-impaired` rtt 40 ms, 5 entradas: pérdida 0 % frío / caché | p50 1 572 / 1 496 ms; 6 / 1 consultas STUN | p50 1 398 / 1 359 ms; 6 / 1 |
+| ídem, pérdida 3 % frío / caché | p50 1 572 / 1 498, p99 4 546 / 1 789 ms | p50 1 460 / 1 415, p99 1 695 / 2 339 ms |
+
+En `game` con N = 4 también se probaron `haxlite:ndc` y `official` (salida por jugador de
+aplicación 34 / 33 msg/s, UDP n/d), `rooms` K = 2 con `haxlite` y `nodehaxball`, e `idle` en Bun.
 
 ---
 
@@ -185,7 +342,7 @@ hilo JS / resto (`host.cpuSplit`), despertares (`host.wakeups`, de `voluntary_ct
 
 ### Pasada rtc posterior a la tabla: DTLS, endpoint y arranque
 
-Tras la tabla unificada, dos pasadas sobre `haxlite + rtc` (detalle y tablas en
+Tras la tabla unificada del 11-10 (ya sustituida por la del 13-10), dos pasadas sobre `haxlite + rtc` (detalle y tablas en
 [docs/10 §6.3–§6.4](10-haxlite-rtc.md)): bundling y SCTP sin asignaciones (W1) y DTLS/endpoint/
 arranque (W2): **ChaCha20‑Poly1305 en JS** (sin asignaciones, en el sitio; Chromium 141 lo
 negocia; AES‑GCM de node:crypto queda para clientes sin ChaCha20), envío UDP síncrono con búfer
