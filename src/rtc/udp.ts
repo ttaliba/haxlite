@@ -226,7 +226,10 @@ export class UdpIo {
   send(buf: Uint8Array, port: number, address: string): boolean {
     const native = this.native;
     if (native !== null) {
-      if (batchDepth > 0 && buf.length <= BATCH_SLOT) return this.enqueue(buf, port, address);
+      if (batchDepth > 0) {
+        if (buf.length <= BATCH_SLOT) return this.enqueue(buf, port, address);
+        this.flushBatch(); // larger than a slot (rare): sent at once, after what is batched
+      }
       return this.bunSend(native, buf, port, address);
     }
     const req = this.req;

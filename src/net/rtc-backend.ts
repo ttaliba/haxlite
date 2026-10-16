@@ -50,6 +50,7 @@ import { networkInterfaces } from 'node:os';
 import { isIP } from 'node:net';
 import type { RtcCertificate, RtcEndpoint, RtcEndpointStats, RtcSession, SharedEndpointLease } from '../rtc/index.js';
 import { freezeSctpClock, thawSctpClock } from '../rtc/sctp/clock.js';
+import { beginUdpBatch, endUdpBatch } from '../rtc/udp.js';
 import { classifyAddress, type IceCandidatePolicy, type IceServerConfig } from './ice.js';
 import { DEFAULT_ICE_SERVERS } from './constants.js';
 import type { PeerBackend, PeerLink, PeerLinkEvents } from './peer-backend.js';
@@ -176,6 +177,11 @@ export function resolvePublicAddresses(o: RtcBackendOptions): string[] {
  * does not block while an immediate is pending), so no game latency.
  * Scopes still nest (cork/uncork are kept for the PeerBackend contract) but
  * do not flush by themselves; no allocation in steady state.
+ *
+ * On Bun the whole flush is also one UDP batch ({@link beginUdpBatch}): the
+ * datagrams it produces are copied out of the endpoint's seal buffer and
+ * leave per socket in one `sendMany` (`sendmmsg(2)` on Linux) instead of
+ * one `sendto` each. Node has no `sendmmsg`: there it is a no-op.
  */
 class SendBundler {
   /** Corked links (`n` used; slots are cleared, never shrunk: no allocation in steady state). */
@@ -216,6 +222,7 @@ class SendBundler {
     this.flushing = true;
     const l = this.list;
     freezeSctpClock(); // one clock read for every association flushed here
+    beginUdpBatch();
     try {
       // a flush can deliver deferred input → host sends → new corks appended: same pass
       for (let i = 0; i < this.n; i++) {
@@ -228,6 +235,7 @@ class SendBundler {
       this.n = 0;
       this.flushing = false;
       thawSctpClock();
+      endUdpBatch();
     }
   }
 }

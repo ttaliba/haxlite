@@ -14,7 +14,45 @@ const ipv6 = await bound('udp6').then(
   () => false,
 );
 
-describe('UdpIo (direct UDPWrap send/receive)', () => {
+const IS_BUN = typeof (process.versions as Record<string, string | undefined>).bun === 'string';
+
+describe.runIf(IS_BUN)('UdpIo on Bun (real sockets: native send, reload, sendMany)', () => {
+  const open: Socket[] = [];
+  afterEach(() => {
+    for (const s of open.splice(0)) s.close();
+  });
+
+  for (const type of ['udp4', 'udp6'] as const) {
+    it.skipIf(type === 'udp6' && !ipv6)(`${type}: direct and batched sends, direct receive`, async () => {
+      const a = await bound(type);
+      const b = await bound(type);
+      open.push(a, b);
+      const host = type === 'udp4' ? '127.0.0.1' : '::1';
+      const got: [string, string, number][] = [];
+      const errors: Error[] = [];
+      const ioA = new UdpIo(a, () => {}, (e) => errors.push(e));
+      const ioB = new UdpIo(b, (m, address, port) => got.push([m.toString(), address, port]), (e) => errors.push(e));
+      expect(ioA.batches).toBe(true);
+      let emitted = 0;
+      b.on('message', () => emitted++);
+      const buf = Buffer.alloc(64);
+      for (let i = 0; i < 10; i++) expect(ioA.send(buf.subarray(0, buf.write(`d${i}`)), b.address().port, host)).toBe(true);
+      beginUdpBatch();
+      for (let i = 10; i < 200; i++) expect(ioA.send(buf.subarray(0, buf.write(`d${i}`)), b.address().port, host)).toBe(true);
+      endUdpBatch();
+      expect(ioA.batchSends).toBe(3); // 64 + 64 + 62
+      const t0 = Date.now();
+      while (got.length < 200 && Date.now() - t0 < 2000) await tick(10);
+      expect(got.map((g) => g[0])).toEqual(Array.from({ length: 200 }, (_, i) => `d${i}`));
+      expect(got[0]![1]).toBe(host);
+      expect(got[0]![2]).toBe(a.address().port);
+      expect(emitted).toBe(0);
+      expect(errors).toEqual([]);
+    });
+  }
+});
+
+describe.skipIf(IS_BUN)('UdpIo (direct UDPWrap send/receive)', () => {
   const open: Socket[] = [];
   afterEach(() => {
     for (const s of open.splice(0)) s.close();
@@ -285,11 +323,12 @@ describe('UdpIo (Bun native socket, shape-faked)', () => {
     expect(log.many.length).toBe(1); // 64 at once
     expect(log.many[0]!.length).toBe(64);
     const big = Buffer.alloc(4000, 1);
-    io.send(big, 1, '127.0.0.1'); // larger than a ring slot: sent directly
+    io.send(big, 1, '127.0.0.1'); // larger than a ring slot: sent directly, after what is batched
     expect(log.sends.length).toBe(1);
-    endUdpBatch();
     expect(log.many.length).toBe(2);
     expect(log.many[1]!.map((d) => d[0])).toEqual(['d64', 'd65', 'd66', 'd67', 'd68', 'd69']);
+    endUdpBatch();
+    expect(log.many.length).toBe(2);
 
     log.acceptMany = 1; // the kernel takes one, the rest go to dgram's queue
     beginUdpBatch();
