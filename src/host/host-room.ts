@@ -45,6 +45,7 @@ import {
   StopGameEvent,
   TeamColors,
   DiscProp,
+  PAUSED_TICKS,
   createRoomState,
   getPlayer,
   Player,
@@ -1115,9 +1116,10 @@ export class HostRoom {
 
   /**
    * Next frame with work, or Infinity: with ready clients the next heartbeat
-   * and CheckConsistency (and, without a game, the next queued event); with a
-   * game, at least every `maxWakeFrames` (spread evenly inside each
-   * heartbeat period so heartbeats keep their exact frames).
+   * and CheckConsistency (and, without a game or with a fully paused one,
+   * the next queued event); with a running game, at least every
+   * `maxWakeFrames` (spread evenly inside each heartbeat period so
+   * heartbeats keep their exact frames).
    */
   private nextWakeFrame(): number {
     const seq = this.sequencer;
@@ -1130,7 +1132,11 @@ export class HostRoom {
       const cs = seq.lastChecksumFrame + this.csFrames;
       if (cs < next) next = cs;
     }
-    if (this.state.gameState !== null) {
+    const gs = this.state.gameState;
+    // a fully paused game runs no per-frame hooks: no catch-up bound (frames
+    // are still stepped one by one on the next catch-up); the unpause
+    // countdown (counter < PAUSED_TICKS) keeps it
+    if (gs !== null && gs.pauseGameTickCounter !== PAUSED_TICKS) {
       const mw = this.wakeFrames;
       if (!clients) {
         const f = frame + (mw < hb ? mw : hb);
@@ -1147,7 +1153,9 @@ export class HostRoom {
           }
         }
       }
-    } else if (clients && seq.queue.length > 0) {
+    } else if ((clients || gs !== null) && seq.queue.length > 0) {
+      // without a game: the next queued event; paused: also without clients
+      // (a queued unpause must start the countdown without waiting for a message)
       const q = seq.queue[0]!.frame;
       if (q < next) next = q;
     }

@@ -155,6 +155,56 @@ describe('shared host clock', () => {
     host.stop();
   });
 
+  it('paused game: one wake-up per heartbeat; the unpause countdown runs without messages', async () => {
+    const { host, sent, join } = makeRoom();
+    join('a');
+    host.setPlayerTeam(1, 1);
+    host.startGame();
+    let ticks = 0;
+    host.state.hooks.onGameTick = () => ticks++;
+    host.pauseGame(true);
+    await sleep(100);
+    host.update();
+    expect(host.state.gameState!.pauseGameTickCounter).toBe(120);
+    ticks = 0;
+    const w0 = hostClock.wakeups;
+    const t0 = performance.now();
+    const n0 = sent.length;
+    await sleep(1200);
+    const perS = ((hostClock.wakeups - w0) * 1000) / (performance.now() - t0);
+    // heartbeats only (~8.6/s) instead of ~17/s
+    expect(perS).toBeGreaterThan(6);
+    expect(perS).toBeLessThan(11);
+    const hb = heartbeatFrames(sent.slice(n0));
+    expect(hb.slice(1).every((f, i) => f - hb[i]! >= 7)).toBe(true);
+    expect(ticks).toBe(0);
+    host.pauseGame(false); // queued Sb frames ahead: the clock must wake for it
+    const f0 = host.frame;
+    await sleep(2500); // 119 countdown frames (~2 s), then ticks again
+    host.update();
+    const gs = host.state.gameState!;
+    expect(gs.pauseGameTickCounter).toBe(0);
+    // unpause applied at f0 + 2, then 119 countdown steps; every later frame ticked once
+    expect(ticks).toBe(host.frame - f0 - 2 - 119);
+    host.stop();
+  });
+
+  it('paused game without clients: no wake-ups until the queued unpause', async () => {
+    const { host } = makeRoom();
+    let ticks = 0;
+    host.state.hooks.onGameTick = () => ticks++;
+    host.startGame();
+    host.pauseGame(true);
+    await sleep(100);
+    const w0 = hostClock.wakeups;
+    await sleep(300);
+    expect(hostClock.wakeups - w0).toBe(0);
+    host.pauseGame(false);
+    await sleep(2400);
+    expect(ticks).toBeGreaterThan(5); // ran again with no message and no update()
+    host.stop();
+  });
+
   it('rooms share one timer and keep their own cadence', async () => {
     const rooms = [makeRoom(), makeRoom(), makeRoom()];
     for (const r of rooms) {
