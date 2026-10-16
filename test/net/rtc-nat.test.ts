@@ -110,7 +110,9 @@ describe.skipIf(PUBLIC === undefined)("peerBackend 'rtc' behind a simulated NAT 
       const st = inner.stats()!;
       expect(st.open).toBe(3);
       expect(st.ice.checksSucceeded).toBeGreaterThanOrEqual(3);
-      expect(nat.stats.in).toBeGreaterThan(30);
+      // traffic really crossed the NAT (STUN checks, DTLS, SCTP of three peers); loose bound, since
+      // without HelloVerifyRequest each client sends one ClientHello fewer
+      expect(nat.stats.in).toBeGreaterThan(20);
     } finally {
       for (const j of joins) {
         try {
