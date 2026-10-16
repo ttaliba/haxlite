@@ -449,6 +449,15 @@ export class RtcEndpoint {
     return this.gatherer.candidateLines();
   }
 
+  /**
+   * A STUN refresh round runs while the previous result is known: new
+   * sessions get those candidates in their answer, but not
+   * end-of-candidates (a changed srflx follows by trickle).
+   */
+  get refreshingCandidates(): boolean {
+    return this.gatherer.isRefreshing;
+  }
+
   /** Resolves when no STUN gathering round is running (tests / diagnostics). */
   whenGathered(): Promise<void> {
     return this.gatherer.whenIdle();

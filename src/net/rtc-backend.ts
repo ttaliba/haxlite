@@ -407,6 +407,17 @@ export class RtcPeerBackend implements PeerBackend {
   readonly kind = 'rtc';
   /** Only the configured public addresses are ever announced (no host policy filtering). */
   readonly prefiltered = true;
+
+  /**
+   * While the endpoint refreshes its STUN candidates, sessions are answered
+   * with the previous result but not yet complete (a changed srflx is
+   * trickled): the transport must answer at once instead of waiting
+   * `answerIceWaitMs` for the end of gathering. Otherwise (first round)
+   * unchanged: the answer waits for the round.
+   */
+  get answerOnFirstCandidate(): boolean {
+    return this.ep !== null && this.ep.refreshingCandidates;
+  }
   private ep: RtcEndpoint | null = null;
   private readonly owned: boolean;
   private readonly opts: RtcBackendOptions;

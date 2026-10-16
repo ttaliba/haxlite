@@ -496,14 +496,51 @@ describe('RtcEndpoint full ICE (controlled agent)', () => {
     expect(n).toBeGreaterThan(0);
     await sleep(150);
     const s = e.createSession(offerSdp());
-    // the cached result answers at once; the refresh runs in the background
-    expect(s.gatheringComplete).toBe(true);
+    // the cached result is in the answer at once; the refresh runs in the background
+    expect(e.refreshingCandidates).toBe(true);
     expect(s.answerSdp).toContain(`127.0.0.1 ${e.port} typ srflx raddr 0.0.0.0 rport 0`);
+    expect(s.gatheringComplete).toBe(false); // a changed srflx would be trickled
+    const trickled: string[] = [];
+    s.onLocalCandidate = (c) => trickled.push(c);
+    const done = new Promise<void>((r) => (s.onGatheringComplete = r));
     await e.whenGathered();
+    await done;
+    expect(trickled).toEqual([]); // same reflexive address: nothing new
+    expect(e.refreshingCandidates).toBe(false);
     expect(stun.requests).toBeGreaterThan(n);
   });
 
-  it('a stale result whose refresh gets no reply: sessions still answer complete with the cached srflx', async () => {
+  it('a refresh that finds a different srflx trickles it to the sessions answered meanwhile', async () => {
+    const stun = await FakeStunServer.start('127.0.0.1');
+    closers.push(() => stun.close());
+    const e = await setup({ publicAddresses: undefined, iceServers: [stun.url], gatherRefreshMs: 100 });
+    await e.whenGathered();
+    await sleep(150);
+    stun.portOffset = 7; // the NAT's mapping changed
+    const oldSrflx = `candidate:1 1 udp ${candidatePriority(100, 65535)} 127.0.0.1 ${e.port} typ srflx raddr 0.0.0.0 rport 0 generation 0`;
+    const s1 = e.createSession(offerSdp()); // starts the refresh
+    const s2 = e.createSession(offerSdp()); // while it runs
+    const got = new Map<RtcSession, string[]>();
+    const done: Promise<void>[] = [];
+    for (const s of [s1, s2]) {
+      expect(s.localCandidates).toEqual([oldSrflx]); // answered at once with the previous result
+      expect(s.answerSdp).toContain(oldSrflx);
+      expect(s.answerSdp).not.toContain('a=end-of-candidates');
+      got.set(s, []);
+      s.onLocalCandidate = (c) => got.get(s)!.push(c);
+      done.push(new Promise<void>((r) => (s.onGatheringComplete = r)));
+    }
+    await Promise.all(done);
+    const newSrflx = `candidate:1 1 udp ${candidatePriority(100, 65535)} 127.0.0.1 ${e.port + 7} typ srflx raddr 0.0.0.0 rport 0 generation 0`;
+    expect(got.get(s1)).toEqual([newSrflx]);
+    expect(got.get(s2)).toEqual([newSrflx]);
+    // later sessions get the new one in the answer, complete
+    const s3 = e.createSession(offerSdp());
+    expect(s3.gatheringComplete).toBe(true);
+    expect(s3.localCandidates).toEqual([newSrflx]);
+  });
+
+  it('a stale result whose refresh gets no reply: sessions answer at once with the cached srflx, completed by the timeout', async () => {
     const stun = await FakeStunServer.start('127.0.0.1');
     closers.push(() => stun.close());
     const e = await setup({ publicAddresses: undefined, iceServers: [stun.url], gatherRefreshMs: 100 });
@@ -515,17 +552,20 @@ describe('RtcEndpoint full ICE (controlled agent)', () => {
     const s1 = e.createSession(offerSdp()); // starts the refresh
     const s2 = e.createSession(offerSdp()); // while the refresh runs
     for (const s of [s1, s2]) {
-      expect(s.gatheringComplete).toBe(true);
+      expect(s.gatheringComplete).toBe(false);
       expect(s.answerSdp).toContain(srflx);
-      expect(s.answerSdp).toContain('a=end-of-candidates');
+      expect(s.answerSdp).not.toContain('a=end-of-candidates');
     }
     let late = 0;
+    let completed = 0;
     s1.onLocalCandidate = () => late++;
-    s1.onGatheringComplete = () => late++;
+    s1.onGatheringComplete = () => completed++;
     await sleep(50);
     expect(stun.requests).toBeGreaterThan(n); // the refresh did go out
     await e.whenGathered(); // times out without a reply
-    expect(late).toBe(0); // nothing trickled to sessions that were complete
+    expect(late).toBe(0); // nothing new to trickle
+    expect(completed).toBe(1);
+    expect(s1.gatheringComplete).toBe(true);
     // the lost reply keeps the previous srflx
     expect(e.createSession(offerSdp()).answerSdp).toContain(srflx);
   });

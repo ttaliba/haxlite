@@ -228,6 +228,8 @@ export class FakeStunServer {
   requests = 0;
   /** Counts requests but answers none (a lost reply / unreachable server). */
   silent = false;
+  /** Added to the reported port (a NAT that changed its mapping). */
+  portOffset = 0;
   private constructor(
     private readonly sock: Socket,
     readonly address: string,
@@ -249,7 +251,7 @@ export class FakeStunServer {
       out.writeUInt16BE(0x0020, 20);
       out.writeUInt16BE(8, 22);
       out[25] = 1;
-      out.writeUInt16BE(r.port ^ 0x2112, 26);
+      out.writeUInt16BE((r.port + srv.portOffset) ^ 0x2112, 26);
       const ip = r.address.split('.').map(Number);
       for (let i = 0; i < 4; i++) out[28 + i] = ip[i]! ^ [0x21, 0x12, 0xa4, 0x42][i]!;
       sock.send(out, r.port, r.address);

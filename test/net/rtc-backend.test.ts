@@ -214,8 +214,34 @@ describe("peerBackend: 'rtc' with a libdatachannel client", () => {
       expect(stun.requests).toBeGreaterThan(before); // a refresh did start
       // the answer was not held for the refresh (answerIceWaitMs: 500 ms)
       expect(c.answerSdp).toContain('typ srflx');
-      expect(c.answerSdp).toContain('a=end-of-candidates');
+      expect(c.answerSdp).not.toContain('a=end-of-candidates'); // completed by trickle once the refresh ends
       expect(ms).toBeLessThan(450); // 555–577 ms before (the 500 ms answer wait), ≈ 63 ms after
+    } finally {
+      stun.close();
+    }
+  });
+
+  it('a refresh that finds a different srflx: the client answered meanwhile gets it trickled', async () => {
+    const stun = await FakeStunServer.start('127.0.0.1');
+    try {
+      const { t, roomId, backend } = await startHost({
+        rtcEndpoint: { address: '127.0.0.1', iceServers: [stun.url], iceCandidatePolicy: 'public', gatherRefreshMs: 100, shared: false },
+      });
+      await backend.whenListening();
+      const ep = backend.endpoint!;
+      await ep.whenGathered();
+      await new Promise((r) => setTimeout(r, 150)); // stale
+      stun.portOffset = 5; // the mapping changed (the reported port does not reach us: only the trickle is checked)
+      const j = nextJoin(t);
+      const c = join(roomId);
+      await j;
+      await c.whenOpen();
+      expect(c.answerSdp).toContain(`127.0.0.1 ${ep.port} typ srflx`);
+      await ep.whenGathered();
+      for (let i = 0; i < 50 && !c.answerCandidates.some((x) => x.candidate.includes(` ${ep.port + 5} typ srflx`)); i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(c.answerCandidates.map((x) => x.candidate).filter((x) => x.includes(` ${ep.port + 5} typ srflx`))).toHaveLength(1);
     } finally {
       stun.close();
     }

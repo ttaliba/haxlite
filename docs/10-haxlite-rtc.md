@@ -106,9 +106,12 @@ familia, así que la recolección se hace una vez por endpoint:
   (aún sin resultado) quedan con `gatheringComplete = false`: lo nuevo llega por `onLocalCandidate`
   y luego `onGatheringComplete`; el backend lo traduce a los eventos de siempre, y `HostTransport`
   hace con ello lo mismo que con node-datachannel: espera ≤ 500 ms para la respuesta y manda el
-  resto por trickle. Después, toda sesión recibe el último resultado como completo y la respuesta
-  sale en el acto; si ese resultado tiene más de `gatherRefreshMs` (60 s), la sesión dispara una
-  ronda de refresco **en segundo plano** que sirve a las siguientes. (Antes la sesión que disparaba
+  resto por trickle. Después, toda sesión recibe el último resultado y la respuesta sale en el acto;
+  si ese resultado tiene más de `gatherRefreshMs` (60 s), la sesión dispara una ronda de refresco
+  **en segundo plano**. Las sesiones creadas mientras corre llevan el resultado anterior en la
+  respuesta pero sin `a=end-of-candidates` (el backend pide entonces responder con el primer
+  candidato, `answerOnFirstCandidate`): si el refresco encuentra otro srflx se les manda por trickle,
+  y después el fin de la recolección. (Antes la sesión que disparaba
   el refresco esperaba la respuesta STUN, y con un paquete perdido pagaba los 500 ms enteros: entrada
   de 555–577 ms → 63–65 ms en loopback con el refresco sin respuesta.) Sin servidores STUN no hay
   rondas.
@@ -238,8 +241,9 @@ Qué cambia y qué no respecto a node-datachannel (`'ndc'`, por defecto):
   (el backend es `prefiltered`: el endpoint aplica la política a sus candidatos); `portRange` y `rtc`
   (node-datachannel) se ignoran.
 * La respuesta sale **sin la espera de 500 ms** en cuanto hay un resultado STUN (el SDP ya trae
-  los candidatos y `a=end-of-candidates`; los refrescos corren en segundo plano); solo durante la
-  primera ronda, como con `ndc`: ≤ 500 ms y el resto por trickle. Tras enviarla, el `Peer` suelta
+  los candidatos y `a=end-of-candidates`; durante un refresco en segundo plano, sin él y con el srflx
+  nuevo por trickle si cambia); solo durante la primera ronda, como con `ndc`: ≤ 500 ms y el resto
+  por trickle. Tras enviarla, el `Peer` suelta
   su SDP y sus candidatos (≈ 0,5–1 KB por jugador), y la sesión su `answerSdp` al conectar DTLS.
 * **Arranque perezoso**, como `ndc` (que carga node-datachannel con el primer peer): la sala se
   anuncia al maestro en el acto y los módulos rtc, el socket y el certificado se preparan con la
