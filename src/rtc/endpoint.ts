@@ -5,7 +5,7 @@
  * connectivity/consent checks and STUN gathering, ice-agent.ts / gather.ts),
  * DTLS by the remote transport address once ICE has authenticated it.
  */
-import dgram, { type RemoteInfo, type Socket } from 'node:dgram';
+import dgram, { type Socket } from 'node:dgram';
 import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { RtcCertificate } from './cert.js';
@@ -214,7 +214,7 @@ export class RtcEndpoint {
       console.error('[haxlite/rtc] socket error:', err.message);
     };
     this.ios = this.sockets.map((sock) => {
-      const io: UdpIo = new UdpIo(sock, (msg, rinfo) => this.onPacket(io, msg, rinfo), onError);
+      const io: UdpIo = new UdpIo(sock, (msg, address, port) => this.onPacket(io, msg, address, port), onError);
       return io;
     });
     const bound: BoundSocket[] = raw.map((b, i) => ({ sock: this.ios[i]!, family: b.family, bindAddress: b.bindAddress }));
@@ -433,19 +433,19 @@ export class RtcEndpoint {
 
   // ------------------------------------------------------------ demux
 
-  private onPacket(sock: UdpIo, msg: Buffer, rinfo: RemoteInfo): void {
+  private onPacket(sock: UdpIo, msg: Buffer, address: string, port: number): void {
     const c = this.counters;
     c.packetsIn++;
     c.bytesIn += msg.length;
     if (msg.length === 0) return;
     const b0 = msg[0]!;
     if (b0 < 4) {
-      this.onStun(sock, msg, rinfo);
+      this.onStun(sock, msg, address, port);
       return;
     }
     if (b0 >= 20 && b0 <= 63) {
-      const ports = this.byAddress.get(rinfo.address);
-      const v = ports === undefined ? undefined : ports.get(rinfo.port);
+      const ports = this.byAddress.get(address);
+      const v = ports === undefined ? undefined : ports.get(port);
       if (v === undefined || v.sock !== sock) {
         c.dtlsUnknownSource++;
         return;
@@ -456,7 +456,7 @@ export class RtcEndpoint {
     c.unknownPackets++;
   }
 
-  private onStun(sock: UdpIo, msg: Buffer, rinfo: RemoteInfo): void {
+  private onStun(sock: UdpIo, msg: Buffer, address: string, port: number): void {
     const m = this.stunScratch;
     const c = this.counters;
     if (!parseStun(msg, m)) {
@@ -465,7 +465,7 @@ export class RtcEndpoint {
     }
     if (m.type === StunType.BindingSuccess || m.type === StunType.BindingError) {
       // a response to one of our requests (connectivity/consent check, gathering), by transaction id
-      if (this.ice.onResponse(m, sock, rinfo.address, rinfo.port)) c.stunResponses++;
+      if (this.ice.onResponse(m, sock, address, port)) c.stunResponses++;
       else c.stunRejected++;
       return;
     }
@@ -489,7 +489,7 @@ export class RtcEndpoint {
     }
     const ufrag = msg.toString('latin1', m.usernameOffset, m.usernameOffset + colon);
     const s = this.byUfrag.get(ufrag);
-    if (s === undefined || !s.handleBinding(m, sock, rinfo.address, rinfo.port)) {
+    if (s === undefined || !s.handleBinding(m, sock, address, port)) {
       c.stunRejected++;
       return;
     }

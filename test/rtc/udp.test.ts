@@ -1,6 +1,6 @@
-import dgram, { type RemoteInfo, type Socket } from 'node:dgram';
+import dgram, { type Socket } from 'node:dgram';
 import { afterEach, describe, expect, it } from 'vitest';
-import { UdpIo } from '../../src/rtc/udp.js';
+import { UdpIo, beginUdpBatch, endUdpBatch } from '../../src/rtc/udp.js';
 
 const bound = (type: 'udp4' | 'udp6' = 'udp4'): Promise<Socket> =>
   new Promise((resolve, reject) => {
@@ -26,9 +26,9 @@ describe('UdpIo (direct UDPWrap send/receive)', () => {
       const b = await bound(type);
       open.push(a, b);
       const host = type === 'udp4' ? '127.0.0.1' : '::1';
-      const got: [string, RemoteInfo][] = [];
+      const got: [string, string, number][] = [];
       const errors: Error[] = [];
-      const ioA = new UdpIo(a, (m, r) => got.push([m.toString(), r]), (e) => errors.push(e));
+      const ioA = new UdpIo(a, (m, address, port) => got.push([m.toString(), address, port]), (e) => errors.push(e));
       const fromB: string[] = [];
       b.on('message', (m) => fromB.push(m.toString()));
       // dgram's 'message' is bypassed on the wrapped socket
@@ -49,8 +49,8 @@ describe('UdpIo (direct UDPWrap send/receive)', () => {
       await tick(100);
       expect(fromB).toEqual(Array.from({ length: 50 }, (_, i) => `msg ${i}`));
       expect(got.map((g) => g[0])).toEqual(['pong']);
-      expect(got[0]![1].port).toBe(b.address().port);
-      expect(got[0]![1].address).toBe(host);
+      expect(got[0]![2]).toBe(b.address().port);
+      expect(got[0]![1]).toBe(host);
       expect(emitted).toBe(0);
       expect(errors).toEqual([]);
     });
@@ -116,5 +116,204 @@ describe('UdpIo (direct UDPWrap send/receive)', () => {
     io.send(b, 1, '127.0.0.1');
     expect(dgramSends).toBe(2);
     expect(io.directSends).toBe(4);
+  });
+});
+
+/**
+ * A socket shaped like Bun's node:dgram: `socket[kStateSymbol].handle` is a JS
+ * object holding the native `Bun.udpSocket` (`send`, `sendMany`, `reload`),
+ * dgram's send queue and its `drain`. Lets the Bun path run under Node.
+ */
+function fakeBunSocket(opts: { reloadThrows?: boolean } = {}) {
+  type Handlers = {
+    data(s: unknown, buf: Buffer, port: number, address: string, flags?: unknown): void;
+    drain(s: unknown): void;
+    error(err: Error & { syscall?: string; errqueue?: boolean }): void;
+  };
+  const log = {
+    sends: [] as [string, number, string][],
+    many: [] as [string, number, string][][],
+    dgramSends: [] as { bytes: string; buf: Uint8Array }[],
+    drains: 0,
+    accept: true,
+    acceptMany: Infinity,
+    closed: false,
+    handlers: null as Handlers | null,
+  };
+  const native = {
+    send(data: Uint8Array, port: number, address: string) {
+      if (log.closed) throw new Error('Socket is closed');
+      if (!log.accept) return false;
+      log.sends.push([Buffer.from(data).toString(), port, address]);
+      return true;
+    },
+    sendMany(p: unknown[]) {
+      if (log.closed) throw new Error('Socket is closed');
+      expect(p.length % 3).toBe(0);
+      const n = Math.min(p.length / 3, log.acceptMany);
+      const batch: [string, number, string][] = [];
+      for (let i = 0; i < n; i++) batch.push([Buffer.from(p[3 * i] as Uint8Array).toString(), p[3 * i + 1] as number, p[3 * i + 2] as string]);
+      log.many.push(batch);
+      return n;
+    },
+    reload(h: { socket: Handlers }) {
+      if (opts.reloadThrows) throw new Error('nope');
+      expect(typeof h.socket.data).toBe('function');
+      expect(typeof h.socket.drain).toBe('function');
+      expect(typeof h.socket.error).toBe('function');
+      log.handlers = h.socket;
+    },
+  };
+  const handle = {
+    socket: native,
+    sendQueue: undefined as unknown,
+    drain() {
+      log.drains++;
+    },
+  };
+  const listeners: Record<string, ((...a: unknown[]) => void)[]> = {};
+  const sock = {
+    [Symbol('state symbol')]: { handle },
+    on(ev: string, f: (...a: unknown[]) => void) {
+      (listeners[ev] ??= []).push(f);
+      return sock;
+    },
+    emit(ev: string, ...a: unknown[]) {
+      for (const f of listeners[ev] ?? []) f(...a);
+      return true;
+    },
+    send(buf: Uint8Array) {
+      log.dgramSends.push({ bytes: Buffer.from(buf).toString(), buf });
+      handle.sendQueue = [buf];
+    },
+    getSendQueueCount: () => (handle.sendQueue === undefined ? 0 : 1),
+  };
+  return { sock: sock as unknown as Socket, log, handle, listeners };
+}
+
+describe('UdpIo (Bun native socket, shape-faked)', () => {
+  it('receives through reload({ socket }) without rinfo or emit, keeping drain and error', () => {
+    const { sock, log, listeners } = fakeBunSocket();
+    const got: [string, string, number][] = [];
+    const errors: Error[] = [];
+    const io = new UdpIo(sock, (m, address, port) => got.push([m.toString(), address, port]), (e) => errors.push(e));
+    expect(io.batches).toBe(true);
+    expect(listeners.message).toBeUndefined();
+    log.handlers!.data(null, Buffer.from('hi'), 4000, '::1', { ipv6: true });
+    expect(got).toEqual([['hi', '::1', 4000]]);
+    log.handlers!.drain(null);
+    expect(log.drains).toBe(1);
+    // ICMP error-queue reports are not errors; other recv errors are reported as recvmsg
+    log.handlers!.error(Object.assign(new Error('x'), { syscall: 'recv', errqueue: true }));
+    expect(errors).toEqual([]);
+    log.handlers!.error(Object.assign(new Error('y'), { syscall: 'recv' }));
+    log.handlers!.error(new Error('z'));
+    expect(errors.map((e) => [(e as { syscall?: string }).syscall, e.message])).toEqual([
+      ['recvmsg', 'y'],
+      [undefined, 'z'],
+    ]);
+  });
+
+  it('falls back to the dgram message event when reload is not usable', () => {
+    const { sock, listeners } = fakeBunSocket({ reloadThrows: true });
+    const got: [string, string, number][] = [];
+    const io = new UdpIo(sock, (m, address, port) => got.push([m.toString(), address, port]), () => {});
+    expect(io.batches).toBe(false);
+    listeners.message![0]!(Buffer.from('m'), { address: '10.0.0.1', port: 9, family: 'IPv4', size: 1 });
+    expect(got).toEqual([['m', '10.0.0.1', 9]]);
+  });
+
+  it('sends through native.send; refused (backpressure) or behind a queue: dgram', () => {
+    const { sock, log, handle } = fakeBunSocket();
+    const io = new UdpIo(sock, () => {}, () => {});
+    expect(io.send(Buffer.from('a'), 1, '127.0.0.1')).toBe(true);
+    expect(log.sends).toEqual([['a', 1, '127.0.0.1']]);
+    expect(io.directSends).toBe(1);
+    log.accept = false;
+    const b = Buffer.from('b');
+    expect(io.send(b, 2, '::1')).toBe(false); // dgram queued a view: the caller must not reuse b
+    expect(log.dgramSends.map((d) => d.bytes)).toEqual(['b']);
+    log.accept = true;
+    // dgram's queue is not empty: keep the order behind it
+    expect(io.send(Buffer.from('c'), 3, '127.0.0.1')).toBe(false);
+    expect(log.dgramSends.map((d) => d.bytes)).toEqual(['b', 'c']);
+    handle.sendQueue = undefined; // drained
+    expect(io.send(Buffer.from('d'), 4, '127.0.0.1')).toBe(true);
+    expect(log.sends.map((s) => s[0])).toEqual(['a', 'd']);
+    log.closed = true;
+    expect(() => io.send(Buffer.from('e'), 5, '127.0.0.1')).not.toThrow();
+  });
+
+  it('batches into one sendMany with a private copy of every datagram', () => {
+    const { sock, log } = fakeBunSocket();
+    const io = new UdpIo(sock, () => {}, () => {});
+    const scratch = Buffer.alloc(16);
+    const put = (s: string) => scratch.subarray(0, scratch.write(s));
+    beginUdpBatch();
+    beginUdpBatch(); // nested: only the outermost end sends
+    expect(io.send(put('first'), 1, '127.0.0.1')).toBe(true);
+    expect(io.send(put('2nd'), 2, '::1')).toBe(true); // scratch overwritten at once
+    expect(io.send(put('third!'), 3, '127.0.0.1')).toBe(true);
+    endUdpBatch();
+    expect(log.many).toEqual([]);
+    endUdpBatch();
+    expect(log.many).toEqual([
+      [
+        ['first', 1, '127.0.0.1'],
+        ['2nd', 2, '::1'],
+        ['third!', 3, '127.0.0.1'],
+      ],
+    ]);
+    expect(io.batchSends).toBe(1);
+    // a lone datagram goes through send; outside a batch, sends are immediate
+    beginUdpBatch();
+    io.send(put('solo'), 4, '127.0.0.1');
+    expect(log.sends).toEqual([]);
+    endUdpBatch();
+    expect(log.sends).toEqual([['solo', 4, '127.0.0.1']]);
+    io.send(put('now'), 5, '127.0.0.1');
+    expect(log.sends.length).toBe(2);
+    endUdpBatch(); // unbalanced end: harmless
+    expect(log.many.length).toBe(1);
+  });
+
+  it('a full ring is sent mid-batch; oversized datagrams bypass it; a refused tail goes to dgram as copies', () => {
+    const { sock, log } = fakeBunSocket();
+    const io = new UdpIo(sock, () => {}, () => {});
+    beginUdpBatch();
+    for (let i = 0; i < 70; i++) io.send(Buffer.from(`d${i}`), 1000 + i, '127.0.0.1');
+    expect(log.many.length).toBe(1); // 64 at once
+    expect(log.many[0]!.length).toBe(64);
+    const big = Buffer.alloc(4000, 1);
+    io.send(big, 1, '127.0.0.1'); // larger than a ring slot: sent directly
+    expect(log.sends.length).toBe(1);
+    endUdpBatch();
+    expect(log.many.length).toBe(2);
+    expect(log.many[1]!.map((d) => d[0])).toEqual(['d64', 'd65', 'd66', 'd67', 'd68', 'd69']);
+
+    log.acceptMany = 1; // the kernel takes one, the rest go to dgram's queue
+    beginUdpBatch();
+    io.send(Buffer.from('x'), 1, '127.0.0.1');
+    io.send(Buffer.from('y'), 2, '127.0.0.1');
+    io.send(Buffer.from('z'), 3, '127.0.0.1');
+    endUdpBatch();
+    expect(log.many[2]!.map((d) => d[0])).toEqual(['x']);
+    expect(log.dgramSends.map((d) => d.bytes)).toEqual(['y', 'z']);
+    // copies: the ring slots are reused by the next batch, which queues behind dgram's queue
+    beginUdpBatch();
+    io.send(Buffer.from('w'), 4, '127.0.0.1');
+    endUdpBatch();
+    expect(log.dgramSends.map((d) => Buffer.from(d.buf).toString())).toEqual(['y', 'z', 'w']);
+  });
+
+  it('a closed socket drops the batch without throwing', () => {
+    const { sock, log } = fakeBunSocket();
+    const io = new UdpIo(sock, () => {}, () => {});
+    beginUdpBatch();
+    io.send(Buffer.from('a'), 1, '127.0.0.1');
+    io.send(Buffer.from('b'), 1, '127.0.0.1');
+    log.closed = true;
+    expect(() => endUdpBatch()).not.toThrow();
+    expect(log.many).toEqual([]);
   });
 });
