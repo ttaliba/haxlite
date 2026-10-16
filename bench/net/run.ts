@@ -37,6 +37,17 @@
  *        join-impaired: --rtt --loss --jitter 0 --stun --joins --nat-outside 127.0.0.1
  *          --nat-filtering endpoint-independent (nat-sim NatFiltering)
  *
+ * Speed (docs/07-benchmarks.md, "Duración del arnés"):
+ *        --quick  development profile: 2 reps (startup 3), warm-up ≤ 3 s, window 10 s (idle 20),
+ *          --n 4,10 --k 1,5, fleet/soak 2 × 2, soak 3 min, join-impaired 5 joins at loss 0,3;
+ *          output in bench/results/dev/ and marked `info.publishable: false`. NOT PUBLISHABLE.
+ *        --precision P  adaptive reps: after --reps, more interleaved reps for the configs whose
+ *          key metric has a 95 % CI half-width > P % of its mean, up to --max-reps (2 × reps)
+ *        --warmup-mode auto|fixed (auto: stop the warm-up at steady state, ≥ --min-warmup 6 s,
+ *          ≤ --warmup)   --join-concurrency 4 (game, join-impaired: 1)   --settle-ms 250
+ *        --parallel K  (idle, soak, join-impaired only) K configs at once, hosts pinned to their
+ *          own cores on Linux   --pin  pin host / rest cores even without --parallel
+ *
  * Process layout per repetition (each process fresh):
  *   this process ── FakeMaster (HTTP + signaling WS, 127.0.0.1)
  *   host-proc.mjs × procs   the host under test (plain JS, no TS loader); measures itself
@@ -63,9 +74,13 @@ const IS_BUN = typeof (globalThis as Any).Bun !== 'undefined';
 // ------------------------------------------------------------------ args
 const argv = process.argv.slice(2);
 const scenario = argv[0] ?? 'game';
-function flag(name: string, def: string): string {
+/** --quick: development profile (small N, short windows, few reps). Never publishable. */
+const QUICK = argv.includes('--quick');
+/** `quick` is the default under --quick (an explicit flag always wins). */
+function flag(name: string, def: string, quick?: string): string {
   const i = argv.indexOf(`--${name}`);
-  return i >= 0 && argv[i + 1] !== undefined ? argv[i + 1]! : def;
+  if (i >= 0 && argv[i + 1] !== undefined) return argv[i + 1]!;
+  return QUICK && quick !== undefined ? quick : def;
 }
 const list = (s: string) => s.split(',').filter(Boolean);
 const nums = (s: string) => list(s).map(Number);
@@ -74,30 +89,74 @@ const IMPLS = list(flag('impl', DEFAULT_IMPL[scenario] ?? 'haxlite,official,node
 const RUNTIME = flag('runtime', 'node');
 if (RUNTIME !== 'node' && RUNTIME !== 'bun') throw new Error(`--runtime must be node or bun (got ${RUNTIME})`);
 const DEFAULT_REPS: Record<string, string> = { startup: '10', soak: '1', 'join-impaired': '1' };
-const REPS = Number(flag('reps', DEFAULT_REPS[scenario] ?? '3'));
-const WARMUP_S = Number(flag('warmup', scenario === 'idle' ? '10' : scenario === 'soak' ? '60' : '15'));
-const WINDOW_S = Number(flag('window', scenario === 'idle' ? '200' : '60'));
-const NS = nums(flag('n', '4,10,20'));
-const KS = nums(flag('k', '1,5,10'));
+const QUICK_REPS: Record<string, string> = { startup: '3', soak: '1', 'join-impaired': '1' };
+/** --reps: repetitions (the minimum when --precision is on). */
+const REPS = Number(flag('reps', DEFAULT_REPS[scenario] ?? '3', QUICK_REPS[scenario] ?? '2'));
+/**
+ * --precision P (% , 0 = off): after --reps, keep adding interleaved repetitions to the
+ * configurations whose key metric (startup: process start → link; join-impaired: join p50;
+ * otherwise host CPU %) still has a 95 % CI half-width (Student t, of the mean) above P % of
+ * the mean, up to --max-reps (default 2 × reps with precision, = reps without).
+ */
+const PRECISION = Number(flag('precision', '0').replace('%', ''));
+const MAX_REPS = Math.max(REPS, Number(flag('max-reps', String(PRECISION > 0 ? Math.max(2 * REPS, REPS + 2) : REPS))));
+/** --warmup: warm-up seconds (the cap with --warmup-mode auto). */
+const WARMUP_S = Number(flag('warmup', scenario === 'idle' ? '10' : scenario === 'soak' ? '60' : '15', scenario === 'soak' ? '10' : '3'));
+/**
+ * --warmup-mode auto (default): the warm-up ends as soon as the host is in steady state
+ * (two consecutive 3 s blocks of 1 s probes: CPU within 5 % or 0.25 points, RSS within 1 %),
+ * never before --min-warmup (6 s) and never after --warmup. `fixed`: always --warmup.
+ * soak (churn) is always fixed. The warm-up actually used is saved per run (`warmup`).
+ */
+const WARMUP_MODE = flag('warmup-mode', 'auto');
+if (WARMUP_MODE !== 'auto' && WARMUP_MODE !== 'fixed') throw new Error(`--warmup-mode must be auto or fixed (got ${WARMUP_MODE})`);
+const MIN_WARMUP_S = Number(flag('min-warmup', '6', '2'));
+const WINDOW_S = Number(flag('window', scenario === 'idle' ? '200' : '60', scenario === 'idle' ? '20' : '10'));
+const NS = nums(flag('n', '4,10,20', '4,10'));
+const KS = nums(flag('k', '1,5,10', '1,5'));
 const PROCS = nums(flag('procs', '3'));
-const ROOMS_PER_PROC = nums(flag('rooms', '4'));
-const CLIENTS = nums(flag('clients', '4'));
-const SOAK_MIN = Number(flag('minutes', '360'));
-const SAMPLE_S = Number(flag('sample-s', '60'));
+const ROOMS_PER_PROC = nums(flag('rooms', '4', scenario === 'fleet' || scenario === 'soak' ? '2' : undefined));
+const CLIENTS = nums(flag('clients', '4', scenario === 'fleet' || scenario === 'soak' ? '2' : undefined));
+const SOAK_MIN = Number(flag('minutes', '360', '3'));
+const SAMPLE_S = Number(flag('sample-s', '60', '15'));
 const STAY_S = nums(flag('stay-s', '20,90'));
 const PAUSE_S = nums(flag('pause-s', '2,15'));
 const RTT = nums(flag('rtt', '40'));
-const LOSS = nums(flag('loss', '0,1,3'));
+const LOSS = nums(flag('loss', '0,1,3', '0,3'));
 const JITTER = Number(flag('jitter', '0'));
 const STUN = list(flag('stun', 'cold,cached'));
-const JOINS = Number(flag('joins', '20'));
+const JOINS = Number(flag('joins', '20', '5'));
 const NAT_OUTSIDE = flag('nat-outside', '127.0.0.1');
 const NAT_FILTERING = flag('nat-filtering', 'endpoint-independent');
 const MAX_FOREIGN = Number(flag('max-foreign', '100'));
 const ATTEMPTS = Number(flag('attempts', '2'));
 /** --eld 0 disables the event-loop-delay monitor (its 10 ms timer costs CPU too; used to size that overhead). */
 const ELD = flag('eld', '1') !== '0';
-const OUT = flag('out', path.join(ROOT, `bench/results/${scenario}.json`));
+/**
+ * --join-concurrency C: joins in flight per clients process (≤ 10 clients each). Default 4 for
+ * rooms and fleet (set-up only); 1 (sequential, as before) for game, whose join p50/p90 is a
+ * published row, and for join-impaired, whose metric is the latency of one isolated join.
+ * Concurrent joins measure a slightly higher latency (+1–3 % p50 on loopback, more at p90 for
+ * the hosts with a 2 s join); report.mjs marks the join columns of such runs. --quick: 4 (not join-impaired).
+ */
+const JOIN_CONCURRENCY = Number(
+  flag('join-concurrency', scenario === 'game' || scenario === 'join-impaired' ? '1' : '4', scenario === 'join-impaired' ? '1' : '4'),
+);
+/** --settle-ms: pause after a repetition's processes have exited (they are awaited, ≤ 2.5 s). */
+const SETTLE_MS = Number(flag('settle-ms', '250'));
+/**
+ * --parallel K: run up to K configurations of the same repetition at once. Only for the
+ * scenarios whose metrics do not depend on CPU contention (idle: < 1 % of a core per host;
+ * soak: memory slopes; join-impaired: join latency); refused elsewhere. On Linux with
+ * `taskset`, every host gets its own core (see --pin); `machine.foreignPct` then includes the
+ * sibling runs (an upper bound of the foreign load).
+ */
+const PARALLEL = Math.max(1, Number(flag('parallel', '1')));
+const PARALLEL_OK = new Set(['idle', 'soak', 'join-impaired']);
+if (PARALLEL > 1 && !PARALLEL_OK.has(scenario)) throw new Error(`--parallel is only valid for ${[...PARALLEL_OK].join(', ')} (it would skew the CPU of ${scenario})`);
+/** --pin: pin hosts and the rest to separate cores with taskset (Linux; implied by --parallel > 1). */
+const PIN_WANTED = argv.includes('--pin') || PARALLEL > 1;
+const OUT = flag('out', path.join(ROOT, `bench/results/${QUICK ? 'dev/' : ''}${scenario}.json`));
 const CLIENTS_PER_PROC = 10;
 /** Extra node flags for the host process only, e.g. "--cpu-prof --cpu-prof-dir=/tmp/prof" (diagnostics). */
 const HOST_NODE_ARGS = list(flag('host-node-args', '').replace(/ +/g, ','));
@@ -134,6 +193,39 @@ function runtimeVersion(rt: 'node' | 'bun'): string {
 }
 const TS_LOADER = pathToFileURL(path.join(ROOT, 'bench/ts-resolve.mjs')).href;
 
+// ------------------------------------------------------------------ core pinning (Linux, taskset)
+const NCPU = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
+const HAS_TASKSET = ((): boolean => {
+  if (process.platform !== 'linux') return false;
+  try {
+    execFileSync('taskset', ['-p', String(process.pid)], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+const PIN = PIN_WANTED && HAS_TASKSET && NCPU >= 2;
+if (PIN_WANTED && !PIN) console.log(`(--pin/--parallel: no taskset or < 2 CPUs here, processes are not pinned)`);
+/**
+ * Core layout when pinning (`info.cores`): host processes on cores 0 … H−1, one core each
+ * (H = parallel × host processes per run, capped so that ≥ 1 core is left; hosts beyond H
+ * share round-robin), and everything else — this orchestrator, the FakeMaster, the client
+ * processes — on cores H … NCPU−1. 4 vCPU: `--parallel 2` → hosts 0 and 1, rest 2–3;
+ * `--parallel 3` → hosts 0, 1, 2, rest 3; `--pin` alone → host 0, rest 1–3.
+ */
+function coreLayout(hostsPerRun: number): { hostCores: number; rest: string } {
+  const h = Math.max(1, Math.min(PARALLEL * hostsPerRun, NCPU - 1));
+  return { hostCores: h, rest: h === NCPU - 1 ? String(h) : `${h}-${NCPU - 1}` };
+}
+const hostCore = (slot: number, p: number, hostsPerRun: number) => String((slot * hostsPerRun + p) % coreLayout(hostsPerRun).hostCores);
+let pinnedSelfTo = '';
+/** The orchestrator (and the FakeMaster in it) runs on the `rest` cores. */
+function pinSelf(rest: string): void {
+  if (!PIN || pinnedSelfTo === rest) return;
+  execFileSync('taskset', ['-a', '-cp', rest, String(process.pid)], { stdio: 'ignore' });
+  pinnedSelfTo = rest;
+}
+
 // ------------------------------------------------------------------ child helper
 class Child {
   readonly msgs: Any[] = [];
@@ -145,9 +237,12 @@ class Child {
   /** Called for every message (soak: streamed samples). */
   onMessage: ((m: Any) => void) | null = null;
   exited = false;
+  /** Resolves when the process has exited. */
+  readonly exitP: Promise<void>;
   constructor(name: string, proc: ChildProcess) {
     this.name = name;
     this.proc = proc;
+    this.exitP = new Promise<void>((r) => proc.once('exit', () => r()));
     proc.on('message', (m: Any) => {
       if (m?.type === 'error') this.errors.push(m.message);
       this.msgs.push(m);
@@ -171,7 +266,7 @@ class Child {
     name: string,
     script: string,
     args: string[],
-    o: { execArgv?: string[]; runtime?: 'node' | 'bun'; env?: Record<string, string>; tsLoader?: boolean } = {},
+    o: { execArgv?: string[]; runtime?: 'node' | 'bun'; env?: Record<string, string>; tsLoader?: boolean; cores?: string } = {},
   ): Child {
     const bun = o.runtime === 'bun';
     // execArgv: [] → no TypeScript loader in the children (unless tsLoader: join-impaired imports test/rtc/nat-sim.ts).
@@ -179,9 +274,12 @@ class Child {
     // fork() a Bun child: Bun speaks Node's IPC channel (NODE_CHANNEL_FD), also on Windows.
     // A Bun orchestrator forking a Node child: execPath must then be node.
     const execPath = bun ? bunExecutable() : IS_BUN ? 'node' : process.execPath;
+    // Pinned: `taskset -c <cores> <runtime> …` execs the runtime in the same process (same
+    // pid, IPC fd inherited), so every thread it ever creates inherits the mask.
+    const pinned = PIN && o.cores !== undefined;
     const proc = fork(path.join(HERE, script), args, {
-      execArgv,
-      execPath,
+      execArgv: pinned ? ['-c', o.cores!, execPath, ...execArgv] : execArgv,
+      execPath: pinned ? 'taskset' : execPath,
       env: o.env ? { ...process.env, ...o.env } : process.env,
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
@@ -244,8 +342,13 @@ interface RunSpec {
   procs: number;
   rooms: number;
   clientsPerRoom: number;
+  /** warm-up: the cap with warmupMode 'auto' (steady-state detection), the duration with 'fixed' */
   warmupS: number;
+  warmupMode: 'auto' | 'fixed';
+  minWarmupS: number;
   windowS: number;
+  /** joins in flight per clients process */
+  joinConcurrency: number;
   eld: boolean;
   sampleMs: number;
   seed: number;
@@ -386,10 +489,48 @@ function soakSummary(samples: Any[]): Any {
   };
 }
 
-async function runOnce(spec: RunSpec, onProgress: (partial: Any) => void): Promise<Any> {
+/**
+ * Warm-up. 'fixed': sleeps warmupS. 'auto': probes every host once per second (process CPU
+ * and RSS, summed over the hosts) and stops at the first moment, after minWarmupS, when the
+ * last two 3 s blocks agree — CPU % within 5 % (or 0.25 points of a core, the resolution of
+ * 1 s probes at low load) and RSS over the last block within 1 % — or at warmupS otherwise.
+ */
+async function warmUp(hosts: Child[], spec: RunSpec): Promise<Any> {
+  const capMs = spec.warmupS * 1000;
+  if (capMs <= 0) return { mode: 'none', ms: 0 };
+  if (spec.warmupMode === 'fixed' || spec.churn || spec.minWarmupS >= spec.warmupS) {
+    await sleep(capMs);
+    return { mode: 'fixed', ms: capMs };
+  }
+  const B = 3;
+  const t0 = performance.now();
+  const pts: { t: number; cpu: number; rss: number }[] = [];
+  for (;;) {
+    const ps = await Promise.all(hosts.map((h) => h.request({ cmd: 'probe' }, 'probe', 10_000)));
+    const t = performance.now();
+    pts.push({ t, cpu: ps.reduce((a, p) => a + p.cpuMs, 0), rss: ps.reduce((a, p) => a + p.rss, 0) });
+    const el = t - t0;
+    const n = pts.length;
+    if (el >= spec.minWarmupS * 1000 && n >= 2 * B + 1) {
+      const pct = (a: number, b: number) => ((pts[b]!.cpu - pts[a]!.cpu) / (pts[b]!.t - pts[a]!.t)) * 100;
+      const cpuA = pct(n - 1 - 2 * B, n - 1 - B);
+      const cpuB = pct(n - 1 - B, n - 1);
+      const cpuOk = Math.abs(cpuB - cpuA) <= Math.max(0.05 * Math.max(cpuA, cpuB), 0.25);
+      const rssOk = Math.abs(pts[n - 1]!.rss - pts[n - 1 - B]!.rss) <= 0.01 * pts[n - 1 - B]!.rss;
+      if (cpuOk && rssOk) return { mode: 'auto', ms: Math.round(el), steady: true, cpuPctBlocks: [+cpuA.toFixed(3), +cpuB.toFixed(3)] };
+    }
+    if (el >= capMs) return { mode: 'auto', ms: Math.round(el), steady: false };
+    await sleep(Math.min(1000, capMs - el));
+  }
+}
+
+async function runOnce(spec: RunSpec, onProgress: (partial: Any) => void, slot = 0): Promise<Any> {
+  const layout = coreLayout(spec.procs);
+  pinSelf(layout.rest);
   const master = await FakeMaster.start();
   const children: Child[] = [];
   const result: Any = { ...spec };
+  if (PIN) result.cores = { hosts: Array.from({ length: spec.procs }, (_, p) => hostCore(slot, p, spec.procs)), rest: layout.rest };
   try {
     const tFork = performance.now();
     const sysFork = sysBusyMs();
@@ -403,6 +544,7 @@ async function runOnce(spec: RunSpec, onProgress: (partial: Any) => void): Promi
           execArgv: HOST_NODE_ARGS,
           env,
           tsLoader: !!spec.impair,
+          cores: hostCore(slot, p, spec.procs),
         }),
       );
     }
@@ -440,8 +582,8 @@ async function runOnce(spec: RunSpec, onProgress: (partial: Any) => void): Promi
           left -= n;
         }
       }
-      const copts = spec.churn ? [JSON.stringify({ churn: spec.churn })] : [];
-      clients = groups.map((g, i) => Child.spawn(`clients${i}`, 'clients-proc.mjs', [master.hostPort, g.join(','), String(spec.seed * 100 + i + 1), ...copts]));
+      const copts = JSON.stringify({ ...(spec.churn ? { churn: spec.churn } : null), joinConcurrency: spec.joinConcurrency });
+      clients = groups.map((g, i) => Child.spawn(`clients${i}`, 'clients-proc.mjs', [master.hostPort, g.join(','), String(spec.seed * 100 + i + 1), copts], { cores: layout.rest }));
       children.push(...clients);
       const joined = await Promise.all(clients.map((c) => c.wait('joined', 240_000 + (spec.impair ? JOINS * 32_000 : 0))));
       result.join = joined.map((j) => j[0]);
@@ -472,7 +614,7 @@ async function runOnce(spec: RunSpec, onProgress: (partial: Any) => void): Promi
       await Promise.all(clients.map((c) => c.request({ cmd: 'drive' }, 'driving')));
     }
 
-    await sleep(spec.warmupS * 1000);
+    result.warmup = await warmUp(hosts, spec);
     const load0 = os.loadavg();
     const sys0 = sysBusyMs();
     const self0 = process.cpuUsage();
@@ -532,20 +674,22 @@ async function runOnce(spec: RunSpec, onProgress: (partial: Any) => void): Promi
     result.errors = children.flatMap((c) => c.errors.filter((e) => !e.includes('exited')).map((e) => `${c.name}: ${e.slice(0, 500)}`));
     return result;
   } finally {
+    // Wait for the processes to be gone (they exit on 'exit'; SIGKILL after 2 s) instead of
+    // fixed sleeps, then a short settle (--settle-ms) before the next repetition.
     for (const c of children) c.kill();
-    await sleep(500);
+    await Promise.race([Promise.all(children.map((c) => c.exitP)), sleep(2500)]);
     await master.close();
-    await sleep(1500);
+    await sleep(SETTLE_MS);
   }
 }
 
-async function runWithRetry(spec: RunSpec, onProgress: (partial: Any) => void): Promise<Any> {
+async function runWithRetry(spec: RunSpec, onProgress: (partial: Any) => void, slot = 0): Promise<Any> {
   const discarded: Any[] = [];
   const foreignOf = (d: Any) => (spec.windowS <= 1 || spec.impair ? d.startup.foreignPct : d.machine.foreignPct);
   for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
     let r: Any;
     try {
-      r = await runOnce(spec, onProgress);
+      r = await runOnce(spec, onProgress, slot);
     } catch (e) {
       r = { ...spec, failed: String((e as Error).message ?? e).slice(0, 2000) };
       console.log(`    failed: ${r.failed.split('\n')[0]}`);
@@ -573,11 +717,25 @@ async function runWithRetry(spec: RunSpec, onProgress: (partial: Any) => void): 
 }
 
 // ------------------------------------------------------------------ summary helpers
-function stat(xs: number[]): { median: number; min: number; max: number; n: number } {
+/** Student t quantile 0.975 for 1 … 30 degrees of freedom (normal beyond). */
+const T975 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.16, 2.145, 2.131, 2.12, 2.11, 2.101, 2.093, 2.086, 2.08, 2.074, 2.069, 2.064, 2.06, 2.056, 2.052, 2.048, 2.045, 2.042];
+/**
+ * median / min / max over the repetitions, plus the mean and the half-width of its 95 %
+ * confidence interval (Student t; `ci95Pct` = half-width as % of the mean; null with n < 2).
+ */
+function stat(xs: number[]): { median: number; min: number; max: number; n: number; mean: number; ci95: number | null; ci95Pct: number | null } {
   const s = xs.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
   const n = s.length;
   const median = n === 0 ? NaN : n % 2 ? s[(n - 1) / 2]! : (s[n / 2 - 1]! + s[n / 2]!) / 2;
-  return { median, min: s[0] ?? NaN, max: s[n - 1] ?? NaN, n };
+  const mean = n === 0 ? NaN : s.reduce((a, b) => a + b, 0) / n;
+  let ci95: number | null = null;
+  let ci95Pct: number | null = null;
+  if (n >= 2) {
+    const sd = Math.sqrt(s.reduce((a, x) => a + (x - mean) ** 2, 0) / (n - 1));
+    ci95 = (T975[n - 2] ?? 1.96) * (sd / Math.sqrt(n));
+    ci95Pct = mean !== 0 ? (ci95 / Math.abs(mean)) * 100 : ci95 === 0 ? 0 : Infinity;
+  }
+  return { median, min: s[0] ?? NaN, max: s[n - 1] ?? NaN, n, mean, ci95, ci95Pct };
 }
 const MB = 1024 * 1024;
 function joinTimes(r: Any): number[] {
@@ -592,11 +750,21 @@ function quantile(xs: number[], q: number): number {
 }
 /** null (metric not available on this runtime / OS) → NaN, so stat() skips it. */
 const num = (x: Any) => (x === null || x === undefined ? NaN : Number(x));
+/** The metric --precision and the end-of-run noise report look at. */
+const KEY_METRIC: { name: string; of: (r: Any) => number } =
+  scenario === 'startup'
+    ? { name: 'processStartToLinkMs', of: (r) => r.startup.links[0].tLink }
+    : scenario === 'join-impaired'
+      ? { name: 'joinP50Ms', of: (r) => quantile(joinTimes(r), 0.5) }
+      : { name: 'cpuPct', of: (r) => r.host.cpuPct };
 function summarize(runs: Any[]): Any {
   const ok = runs.filter((r) => !r.failed);
   const pick = (f: (r: Any) => number) => stat(ok.map((r) => num(f(r))));
+  const key = { metric: KEY_METRIC.name, ...pick(KEY_METRIC.of) };
+  const warmupMs = pick((r) => r.warmup?.ms);
   if (ok[0]?.impair) {
     return {
+      key,
       reps: ok.length,
       failed: runs.length - ok.length,
       joinP50Ms: pick((r) => quantile(joinTimes(r), 0.5)),
@@ -611,6 +779,8 @@ function summarize(runs: Any[]): Any {
   }
   const ms = (r: Any) => r.host.wallMs;
   return {
+    key,
+    warmupMs,
     reps: ok.length,
     failed: runs.length - ok.length,
     cpuPct: pick((r) => r.host.cpuPct),
@@ -719,21 +889,25 @@ function info(): Any {
     },
     cpuMHz: os.cpus()[0]?.speed,
     command: `${IS_BUN ? 'bun' : 'node --import ./bench/ts-resolve.mjs'} bench/net/run.ts ${argv.join(' ')}`,
+    profile: QUICK ? 'quick' : 'default',
+    publishable: !QUICK,
+    cores: PIN ? { nproc: NCPU, ...coreLayout(scenario === 'fleet' ? Math.max(...PROCS) : 1) } : null,
     params: {
       ELD, IMPLS, RUNTIME, REPS, WARMUP_S, WINDOW_S, NS, KS, MAX_FOREIGN, ATTEMPTS, CLIENTS_PER_PROC, HOST_NODE_ARGS,
       PROCS, ROOMS_PER_PROC, CLIENTS, SOAK_MIN, SAMPLE_S, STAY_S, PAUSE_S, RTT, LOSS, JITTER, STUN, JOINS, NAT_OUTSIDE, NAT_FILTERING,
+      QUICK, PRECISION, MAX_REPS, WARMUP_MODE, MIN_WARMUP_S, JOIN_CONCURRENCY, SETTLE_MS, PARALLEL, PIN,
     },
   };
 }
 
 // ------------------------------------------------------------------ scenarios
 const MB_ = (x: number) => (x / MB).toFixed(1);
-function logRun(run: Any): void {
+function logRun(run: Any, prefix = ''): void {
   if (run.impair) {
     const xs = joinTimes(run);
     const st = run.impairStats?.[0]?.rooms?.[0];
     console.log(
-      `    joined ${xs.length}/${JOINS}  join p50 ${quantile(xs, 0.5).toFixed(0)} p99 ${quantile(xs, 0.99).toFixed(0)} max ${Math.max(...xs).toFixed(0)} ms  ` +
+      `${prefix}    joined ${xs.length}/${JOINS}  join p50 ${quantile(xs, 0.5).toFixed(0)} p99 ${quantile(xs, 0.99).toFixed(0)} max ${Math.max(...xs).toFixed(0)} ms  ` +
         `failures ${run.join.reduce((a: number, j: Any) => a + j.failures, 0)}  stun requests ${st?.stunRequests}  nat dropped ${st?.impair?.dropped}  valid ${run.valid}`,
     );
     return;
@@ -741,13 +915,14 @@ function logRun(run: Any): void {
   const h = run.host;
   const e = run.egressPerPlayer;
   console.log(
-    `    ${h.runtime ?? ''} cpu ${h.cpuPct.toFixed(2)} %  rss ${MB_(h.rssMean)} MB  heap ${MB_(h.heapUsedMean)} MB  ` +
+    `${prefix}    ${h.runtime ?? ''} cpu ${h.cpuPct.toFixed(2)} %  rss ${MB_(h.rssMean)} MB  heap ${MB_(h.heapUsedMean)} MB  ` +
       (h.eld ? `lag p50 ${h.eld.p50.toFixed(2)} p99 ${h.eld.p99.toFixed(2)} max ${h.eld.max.toFixed(1)} ms  ` : '') +
       (h.cpuSplit ? `js ${h.cpuSplit.mainPct.toFixed(2)} other ${h.cpuSplit.otherPct.toFixed(2)}  thr ${h.threadCount} fd ${h.fdCount}  wake ${h.wakeups?.voluntaryPerS}/s  ` : '') +
       (h.gcCount !== null ? `gc ${((h.gcCount / h.wallMs) * 60_000).toFixed(1)}/min ${((h.gcMs / h.wallMs) * 60_000).toFixed(1)} ms/min  ` : 'gc n/a  ') +
       (h.rtc ? `udp in ${h.rtc.packetsInPerS}/s out ${h.rtc.packetsOutPerS}/s  ` : '') +
       (e && run.clientsPerRoom > 0 ? `per player: app ${e.appMsgsPerS} msg/s ${e.appBytesPerS} B/s${e.udpBytesPerS !== null ? `, udp ${e.udpPacketsPerS} pkt/s ${e.udpBytesPerS} B/s` : ''}  gap p50 ${run.traffic.gapsAll.p50} p99 ${run.traffic.gapsAll.p99} p999 ${run.traffic.gapsAll.p999} ms  ` : '') +
       (run.soak ? `soak rss ${run.soak[0].rssSlopeMBph} MB/h heap ${run.soak[0].heapUsedSlopeMBph} MB/h fd drift ${run.soak[0].fdDrift}  ` : '') +
+      (run.warmup?.mode === 'auto' ? `warm-up ${(run.warmup.ms / 1000).toFixed(1)} s${run.warmup.steady ? '' : ' (cap)'}  ` : '') +
       `link ${run.startup.links[0].createToLinkMs.toFixed(0)} ms  foreign ${run.machine.foreignPct.toFixed(0)} %  valid ${run.valid}`,
   );
 }
@@ -758,10 +933,14 @@ async function main(): Promise<void> {
     mkdirSync(path.dirname(OUT), { recursive: true });
     writeFileSync(OUT, JSON.stringify(out, null, 1));
   };
+  const t0 = Date.now();
+  if (QUICK) console.log('*** --quick: development profile (few reps, short windows, small N): NOT PUBLISHABLE ***');
   const configs: { label: string; spec: Omit<RunSpec, 'seed'> }[] = [];
-  const base = (implRt: string) => ({ ...splitImpl(implRt), procs: 1 });
+  const base = (implRt: string) => ({ ...splitImpl(implRt), procs: 1, warmupMode: WARMUP_MODE as 'auto' | 'fixed', minWarmupS: MIN_WARMUP_S, joinConcurrency: JOIN_CONCURRENCY });
   if (scenario === 'startup') {
-    for (const i of IMPLS) configs.push({ label: i, spec: { ...base(i), rooms: 1, clientsPerRoom: 0, warmupS: 0, windowS: 1, eld: false, sampleMs: 1000 } });
+    // The startup metrics are taken at the room link; the 0.25 s window after it only gives
+    // the `host` record its shape (before: 1 s, which no startup table uses).
+    for (const i of IMPLS) configs.push({ label: i, spec: { ...base(i), rooms: 1, clientsPerRoom: 0, warmupS: 0, windowS: 0.25, eld: false, sampleMs: 1000 } });
   } else if (scenario === 'idle') {
     for (const i of IMPLS) configs.push({ label: i, spec: { ...base(i), rooms: 1, clientsPerRoom: 0, warmupS: WARMUP_S, windowS: WINDOW_S, eld: false, sampleMs: 5000 } });
   } else if (scenario === 'game') {
@@ -795,32 +974,69 @@ async function main(): Promise<void> {
     throw new Error(`unknown scenario ${scenario}`);
   }
   // Repetitions are interleaved (rep 1 of every config, then rep 2, …) so slow
-  // drifts of the machine affect all implementations alike.
-  const results = configs.map((c) => ({ label: c.label, spec: c.spec, runs: [] as Any[], summary: null as Any }));
+  // drifts of the machine affect all implementations alike. With --precision, the rounds
+  // after --reps only include the configs whose key metric is not yet precise enough.
+  type Res = { label: string; spec: Omit<RunSpec, 'seed'>; runs: Any[]; summary: Any };
+  const results: Res[] = configs.map((c) => ({ label: c.label, spec: c.spec, runs: [] as Any[], summary: null as Any }));
   out.configs = results;
-  for (let rep = 0; rep < REPS; rep++) {
-    for (const r of results) {
-      console.log(`[${scenario}] ${r.label} rep ${rep + 1}/${REPS}`);
-      // soak: the partial run is saved at every sample (hours-long runs survive a crash)
-      r.runs.push({ partial: true });
-      let lastLog = Date.now();
-      const run = await runWithRetry({ ...r.spec, seed: rep + 1 }, (partial) => {
-        r.runs[r.runs.length - 1] = { ...partial, partial: true };
+  const repsLabel = MAX_REPS > REPS ? `${REPS}–${MAX_REPS}` : `${REPS}`;
+  const needsMore = (r: Res): boolean => {
+    const done = r.runs.length;
+    if (done < REPS) return true;
+    if (done >= MAX_REPS || PRECISION <= 0) return false;
+    const k = r.summary?.key;
+    return !(k && k.n >= 3 && k.ci95Pct !== null && k.ci95Pct <= PRECISION);
+  };
+  const doRun = async (r: Res, slot: number): Promise<void> => {
+    const rep = r.runs.length;
+    const prefix = PARALLEL > 1 ? `[${r.label}] ` : '';
+    console.log(`[${scenario}] ${r.label} rep ${rep + 1}/${repsLabel}${PARALLEL > 1 ? ` (slot ${slot})` : ''}`);
+    // soak: the partial run is saved at every sample (hours-long runs survive a crash)
+    r.runs.push({ partial: true });
+    let lastLog = Date.now();
+    const run = await runWithRetry(
+      { ...r.spec, seed: rep + 1 },
+      (partial) => {
+        r.runs[rep] = { ...partial, partial: true };
         if (Date.now() - lastLog > 600_000) {
           lastLog = Date.now();
           const s = partial.soak?.[0];
-          console.log(`    … ${s?.samples} samples, ${s?.hours} h: rss ${s?.rssEndMB} MB (${s?.rssSlopeMBph} MB/h), fd drift ${s?.fdDrift}`);
+          console.log(`${prefix}    … ${s?.samples} samples, ${s?.hours} h: rss ${s?.rssEndMB} MB (${s?.rssSlopeMBph} MB/h), fd drift ${s?.fdDrift}`);
         }
         save();
-      });
-      r.runs[r.runs.length - 1] = run;
-      r.summary = summarize(r.runs);
-      if (!run.failed) logRun(run);
-      save();
+      },
+      slot,
+    );
+    r.runs[rep] = run;
+    r.summary = summarize(r.runs);
+    if (!run.failed) logRun(run, prefix);
+    save();
+  };
+  for (let round = 0; ; round++) {
+    const todo = results.filter(needsMore);
+    if (todo.length === 0) break;
+    if (round >= REPS) console.log(`[${scenario}] --precision ${PRECISION} %: ${todo.length} config(s) need another repetition`);
+    if (PARALLEL === 1) {
+      for (const r of todo) await doRun(r, 0);
+    } else {
+      // rotate the order every round so that a config does not always share the machine with the same neighbours
+      const rot = round % todo.length;
+      const order = [...todo.slice(rot), ...todo.slice(0, rot)];
+      for (let i = 0; i < order.length; i += PARALLEL) await Promise.all(order.slice(i, i + PARALLEL).map((r, slot) => doRun(r, slot)));
     }
   }
+  out.info.wallS = Math.round((Date.now() - t0) / 1000);
   save();
-  console.log(`wrote ${path.relative(ROOT, OUT)}`);
+  // Noise report: the key metric of every config, mean ± 95 % CI half-width.
+  console.log(`[${scenario}] ${KEY_METRIC.name}: median, mean ± 95 % CI (n)${QUICK ? '   [--quick: NOT PUBLISHABLE]' : ''}`);
+  for (const r of results) {
+    const k = r.summary?.key;
+    if (!k || k.n === 0) continue;
+    const d = KEY_METRIC.name === 'cpuPct' ? 3 : 1;
+    const ci = k.ci95 === null ? 'n/a' : `${k.ci95.toFixed(d)} (${k.ci95Pct.toFixed(1)} %)`;
+    console.log(`    ${r.label.padEnd(36)} ${k.median.toFixed(d)}   ${k.mean.toFixed(d)} ± ${ci}  (n=${k.n})`);
+  }
+  console.log(`wrote ${path.relative(ROOT, OUT)} in ${out.info.wallS} s`);
   process.exit(0);
 }
 await main();
