@@ -45,7 +45,18 @@ let ndcLib: typeof NodeDataChannel | null = null;
 
 /** node-datachannel, loaded on first use (CommonJS build, synchronous). */
 function ndc(): typeof NodeDataChannel {
-  if (ndcLib === null) ndcLib = createRequire(import.meta.url)('node-datachannel') as typeof NodeDataChannel;
+  if (ndcLib === null) {
+    try {
+      ndcLib = createRequire(import.meta.url)('node-datachannel') as typeof NodeDataChannel;
+    } catch (err) {
+      // optionalDependency: absent with `npm install --omit=optional` or when its install failed
+      const e = err as { code?: string; message?: string };
+      if ((e.code === 'MODULE_NOT_FOUND' || e.code === 'ERR_MODULE_NOT_FOUND') && /node-datachannel/.test(String(e.message))) {
+        throw new Error("node-datachannel no está instalado: instálalo o usa peerBackend: 'rtc'", { cause: err });
+      }
+      throw err;
+    }
+  }
   return ndcLib;
 }
 

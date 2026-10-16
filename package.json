@@ -38,8 +38,10 @@
   },
   "dependencies": {
     "json5": "^2.2.3",
-    "node-datachannel": "^0.33.4",
     "ws": "^8.22.0"
+  },
+  "optionalDependencies": {
+    "node-datachannel": "^0.33.4"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

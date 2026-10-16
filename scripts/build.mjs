@@ -24,7 +24,7 @@ execFileSync(process.execPath, [path.join(ROOT, 'node_modules/typescript/bin/tsc
 });
 
 const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
-const deps = Object.keys(pkg.dependencies ?? {});
+const deps = Object.keys({ ...pkg.dependencies, ...pkg.optionalDependencies });
 await build({
   input: { index: path.join(tmp, 'index.js'), 'edge/cli': path.join(tmp, 'edge/cli.js') },
   platform: 'node',
