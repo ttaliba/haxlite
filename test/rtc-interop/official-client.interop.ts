@@ -37,6 +37,7 @@ import { officialClientAvailable, officialContext, openRoomLink } from './harnes
 
 const CLIENT_DIR = process.env.HAXBALL_CLIENT_DIR ?? '';
 const AVAILABLE = officialClientAvailable(CLIENT_DIR) && chromiumAvailable();
+const BATCH_FRAMES = ((n) => (n === 1 || n === 2 ? n : 0))(Number(process.env.HAXLITE_TEST_RTC_BATCH_FRAMES ?? 0));
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -80,7 +81,8 @@ describe.skipIf(!AVAILABLE)('official HaxBall web client (game-min.js) in Chromi
           shutdownWebRtcOnLastStop: false,
           checksumIntervalFrames: 60, // CheckConsistency every second (official: 10 s)
           peerBackend: backend,
-          rtc: { address: '127.0.0.1', publicAddresses: ['127.0.0.1'] },
+          // HAXLITE_TEST_RTC_BATCH_FRAMES=1|2: with frame batching (sendBatchFrames)
+          rtc: { address: '127.0.0.1', publicAddresses: ['127.0.0.1'], ...(BATCH_FRAMES > 0 ? { sendBatchFrames: BATCH_FRAMES } : null) },
           transport: { iceCandidatePolicy: 'all' },
         },
       });
