@@ -55,6 +55,14 @@ const INITIAL_RTO_MS = 200;
 const MAX_TX_PER_PAIR = 15;
 const MAX_TX_PER_SESSION = 120;
 export const MAX_PAIRS = 16;
+/**
+ * Once the session is connected, check transmissions (triggered checks for
+ * NAT rebindings, and their retransmissions) draw from a refilling
+ * allowance instead of the lifetime {@link MAX_TX_PER_SESSION}: per second
+ * and burst, per session (the global budget of the scheduler still applies).
+ */
+const CONNECTED_TX_RATE = 4;
+const CONNECTED_TX_BURST = 10;
 /** Consent freshness (RFC 7675 §5.1): one check every 5 s ± 20 %. */
 const CONSENT_MIN_MS = 4000;
 const CONSENT_JITTER_MS = 2000;
@@ -279,6 +287,9 @@ export class IceAgent {
   private checking = true;
   private closed = false;
   private sentTotal = 0;
+  /** Connected: transmissions allowed now (refilled at {@link CONNECTED_TX_RATE}) and when it was last refilled. */
+  private allowance = CONNECTED_TX_BURST;
+  private allowanceAt = 0;
   private consentKey: string | null = null;
   private nextConsentAt = 0;
 
@@ -327,7 +338,7 @@ export class IceAgent {
       // case: our first check left before the peer had our answer (it could not answer it); the
       // peer's request says it has it now — waiting for the 200 ms RTO would delay the join.
       if (tx.n < TX_PER_CHECK) {
-        if (p.sent < MAX_TX_PER_PAIR && this.sentTotal < MAX_TX_PER_SESSION && this.transmit(p, tx)) {
+        if (p.sent < MAX_TX_PER_PAIR && (!this.checking || this.sentTotal < MAX_TX_PER_SESSION) && this.transmit(p, tx)) {
           tx.rto = INITIAL_RTO_MS;
           tx.nextAt = this.s.o.now() + INITIAL_RTO_MS;
         }
@@ -396,6 +407,8 @@ export class IceAgent {
   /** The session is connected (DTLS up): no new ordinary checks; triggered ones and consent go on. */
   connected(now: number): void {
     this.checking = false;
+    this.allowance = CONNECTED_TX_BURST;
+    this.allowanceAt = now;
     this.nextConsentAt = now + CONSENT_MIN_MS + Math.random() * CONSENT_JITTER_MS;
   }
 
@@ -418,7 +431,7 @@ export class IceAgent {
       tx.rto *= 2;
       tx.nextAt = now + tx.rto;
     }
-    if (now >= this.nextCheckAt && this.sentTotal < MAX_TX_PER_SESSION) {
+    if (now >= this.nextCheckAt && (!this.checking || this.sentTotal < MAX_TX_PER_SESSION)) {
       let p: Pair | null = null;
       while (this.queue.length > 0) {
         const q = this.queue.shift()!;
@@ -445,9 +458,16 @@ export class IceAgent {
         busy = true;
       }
     }
-    if (busy || this.queue.length > 0) return true;
+    if (busy) return true;
+    if (this.checking && this.sentTotal >= MAX_TX_PER_SESSION) {
+      // budget spent before connecting: nothing queued can leave; stop ticking (a request reactivates us)
+      for (const q of this.queue) q.triggered = false;
+      this.queue.length = 0;
+      return false;
+    }
+    if (this.queue.length > 0) return true;
     if (!this.checking) return false;
-    return this.pairs.some((q) => q.state === WAITING && !q.parked) && this.sentTotal < MAX_TX_PER_SESSION;
+    return this.pairs.some((q) => q.state === WAITING && !q.parked);
   }
 
   private startCheck(p: Pair, now: number): boolean {
@@ -472,7 +492,17 @@ export class IceAgent {
   }
 
   private transmit(p: Pair, tx: Transaction): boolean {
+    if (!this.checking) {
+      // connected: a refilling allowance, so that NAT rebindings stay checkable for the whole session
+      const now = this.s.o.now();
+      if (now > this.allowanceAt) {
+        this.allowance = Math.min(CONNECTED_TX_BURST, this.allowance + ((now - this.allowanceAt) * CONNECTED_TX_RATE) / 1000);
+        this.allowanceAt = now;
+      }
+      if (this.allowance < 1) return false;
+    }
     if (!this.s.takeToken()) return false;
+    if (!this.checking) this.allowance--;
     tx.n++;
     p.sent++;
     this.sentTotal++;

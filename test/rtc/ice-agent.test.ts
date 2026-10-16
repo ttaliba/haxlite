@@ -717,4 +717,33 @@ describe('IceAgent (manual clock)', () => {
       h.sched.close();
     }
   });
+
+  it('after connecting, triggered checks use a refilling allowance (the lifetime budget no longer blocks rebindings)', () => {
+    const h = harness();
+    try {
+      (h.agent as unknown as { sentTotal: number }).sentTotal = 1000; // pre-connection budget long spent
+      h.agent.connected(h.now());
+      // a NAT rebinding: a request from a new address must be checked
+      h.agent.onRequest(h.sock, '203.0.113.50', 7000, 1845501695);
+      h.run(40);
+      expect(h.sent.map((x) => x.port)).toEqual([7000]);
+      // a flood of new sources is rate-limited: burst 10, then ~4 transmissions per second
+      for (let i = 0; i < 40; i++) h.agent.onRequest(h.sock, `203.0.113.${100 + i}`, 7000, 1845501695);
+      h.run(1000);
+      expect(h.sent.length).toBeGreaterThan(10);
+      expect(h.sent.length).toBeLessThanOrEqual(10 + 4 + 1);
+      h.run(5000);
+      expect(h.sent.length).toBeLessThanOrEqual(10 + 4 * 6 + 1);
+      expect(h.sent.length).toBeGreaterThan(20);
+      // once those checks are over and the allowance refilled, a later rebinding is checked at once again
+      h.run(40000);
+      h.sent.length = 0;
+      h.agent.onRequest(h.sock, '203.0.113.51', 7001, 1845501695);
+      h.run(20);
+      expect(h.sent.some((x) => x.port === 7001)).toBe(true);
+    } finally {
+      h.agent.close();
+      h.sched.close();
+    }
+  });
 });
