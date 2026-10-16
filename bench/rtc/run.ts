@@ -76,8 +76,8 @@ interface Server {
 async function bundleServer(): Promise<string> {
   const out = path.join(ROOT, 'node_modules/.cache/haxlite-bench-rtc');
   rmSync(out, { recursive: true, force: true });
-  const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as { dependencies?: Record<string, string> };
-  const deps = Object.keys(pkg.dependencies ?? {});
+  const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as { dependencies?: Record<string, string>; optionalDependencies?: Record<string, string> };
+  const deps = [...Object.keys(pkg.dependencies ?? {}), ...Object.keys(pkg.optionalDependencies ?? {})];
   await build({
     input: { 'server-proc': path.join(ROOT, 'bench/rtc/server-proc.ts') },
     platform: 'node',
