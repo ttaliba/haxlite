@@ -7,8 +7,13 @@
  * ChaCha20-Poly1305 records are protected by the allocation-free JS AEAD of
  * ./chacha.ts (in place); AES-GCM uses node:crypto (one native cipher object
  * and fresh buffers per record — AES is never done in JS: not constant time).
+ *
+ * Every fixed key handed to node:crypto (PRF secret, record keys) is a
+ * KeyObject made once: with a Buffer, createHmac/createCipheriv import the
+ * key again on every call (Node 26: ≈ 47 → 4 µs per HMAC, ≈ 54 → 5.5 µs per
+ * AES-GCM record; neutral on Bun).
  */
-import { createCipheriv, createDecipheriv, createHmac } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHmac, createSecretKey, type KeyObject } from 'node:crypto';
 import { ChaCha20Poly1305 } from './chacha.js';
 
 // ---------------------------------------------------------------- PRF
@@ -16,12 +21,13 @@ import { ChaCha20Poly1305 } from './chacha.js';
 /** P_hash(secret, label || seed) truncated to `length` (RFC 5246 §5). */
 export function prf(hash: 'sha256' | 'sha384', secret: Uint8Array, label: string, seed: Uint8Array, length: number): Buffer {
   const labelSeed = Buffer.concat([Buffer.from(label, 'latin1'), seed]);
+  const key = createSecretKey(secret); // imported once for the whole HMAC chain
   const out = Buffer.allocUnsafe(length);
   let a: Buffer = labelSeed; // A(0)
   let off = 0;
   while (off < length) {
-    a = createHmac(hash, secret).update(a).digest(); // A(i)
-    const block = createHmac(hash, secret).update(a).update(labelSeed).digest();
+    a = createHmac(hash, key).update(a).digest(); // A(i)
+    const block = createHmac(hash, key).update(a).update(labelSeed).digest();
     const n = Math.min(block.length, length - off);
     block.copy(out, off, 0, n);
     off += n;
@@ -115,6 +121,8 @@ export type ChaChaImpl = 'js' | 'node';
 export class RecordCipher {
   readonly suite: CipherSuite;
   private readonly key: Buffer;
+  /** {@link key} imported once for node:crypto (null: JS AEAD). */
+  private readonly keyObject: KeyObject | null;
   private readonly iv: Buffer;
   private readonly nonce = Buffer.alloc(12);
   private readonly aad = Buffer.alloc(13);
@@ -126,6 +134,7 @@ export class RecordCipher {
     this.key = key;
     this.iv = iv;
     this.js = suite.cipher === 'chacha20-poly1305' && chacha === 'js' ? new ChaCha20Poly1305(key) : null;
+    this.keyObject = this.js === null ? createSecretKey(key) : null;
   }
 
   /** Bytes added to a plaintext by {@link seal}. */
@@ -196,7 +205,7 @@ export class RecordCipher {
       p += 8;
     }
     // (typed as GCM: the ChaCha20-Poly1305 AEAD API is identical)
-    const c = createCipheriv(this.suite.cipher as 'aes-128-gcm', this.key, this.nonce, { authTagLength: TAG_LENGTH });
+    const c = createCipheriv(this.suite.cipher as 'aes-128-gcm', this.keyObject!, this.nonce, { authTagLength: TAG_LENGTH });
     c.setAAD(this.aad);
     p += c.update(plaintext).copy(out, p);
     const fin = c.final();
@@ -254,7 +263,7 @@ export class RecordCipher {
     }
     this.setAad(type, version, epoch, seqHi, seqLo, ptLen);
     try {
-      const d = createDecipheriv(this.suite.cipher as 'aes-128-gcm', this.key, this.nonce, { authTagLength: TAG_LENGTH });
+      const d = createDecipheriv(this.suite.cipher as 'aes-128-gcm', this.keyObject!, this.nonce, { authTagLength: TAG_LENGTH });
       d.setAuthTag(buf.subarray(off + explicit + ptLen, off + len));
       d.setAAD(this.aad);
       const pt = d.update(buf.subarray(off + explicit, off + explicit + ptLen));
@@ -268,7 +277,7 @@ export class RecordCipher {
     }
   }
 
-  /** Best-effort key hygiene when the session ends. */
+  /** Best-effort key hygiene when the session ends (a KeyObject's native copy cannot be wiped: it goes with the object). */
   wipe(): void {
     this.key.fill(0);
     this.js?.wipe();
