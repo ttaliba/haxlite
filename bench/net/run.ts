@@ -27,7 +27,9 @@
  *          and this orchestrator are not affected). Per implementation:
  *          `--impl haxlite:rtc@bun,haxlite:rtc@node` (a suffix wins over --runtime).
  *          Bun binary: $BUN_PATH, else `bun` on PATH (resolved to the real executable).
- *        --eld 0 (no event-loop monitor: sizes its own CPU overhead)
+ *        --eld 0 (no lag)  --eld-window 10  --eld-method timer|native  --eld-mode separate|inline
+ *          (lag in its own sub-window before the CPU window, same timer method on Node and Bun;
+ *          see ELD below)
  *        --host-node-args "--cpu-prof --cpu-prof-dir=DIR" (diagnostics only, Node hosts)
  *        --max-foreign 100 --attempts 2 (re-run a repetition when other processes
  *        on the machine used more than this % of one core during the window; after
@@ -130,8 +132,25 @@ const NAT_OUTSIDE = flag('nat-outside', '127.0.0.1');
 const NAT_FILTERING = flag('nat-filtering', 'endpoint-independent');
 const MAX_FOREIGN = Number(flag('max-foreign', '100'));
 const ATTEMPTS = Number(flag('attempts', '2'));
-/** --eld 0 disables the event-loop-delay monitor (its 10 ms timer costs CPU too; used to size that overhead). */
+/**
+ * Event-loop lag (game, rooms, fleet, soak). The monitor is a 100 Hz timer in the measured
+ * process (≈ 100 extra wake-ups/s and real CPU), so by default it runs in its OWN sub-window of
+ * --eld-window seconds (10; --quick 3) right after the warm-up and BEFORE the CPU window, which
+ * then runs with no monitor: CPU %, per-thread CPU and wake-ups never include it.
+ *   --eld 0               no lag at all
+ *   --eld-method timer    (default) the same setInterval(10 ms) monitor on Node and Bun: comparable
+ *                native   Node's perf_hooks.monitorEventLoopDelay (Bun falls back to timer)
+ *   --eld-mode separate   (default) sub-window as above
+ *              inline     monitor inside the CPU window (the method before 16-10-2026; diagnostics:
+ *                         it inflates CPU/wake-ups, more on Bun, whose monitor was a JS timer)
+ * Every run records how its lag was measured in host.eld.{method, window, windowMs}.
+ */
 const ELD = flag('eld', '1') !== '0';
+const ELD_WINDOW_S = Number(flag('eld-window', '10', '3'));
+const ELD_METHOD = flag('eld-method', 'timer');
+if (ELD_METHOD !== 'timer' && ELD_METHOD !== 'native') throw new Error(`--eld-method must be timer or native (got ${ELD_METHOD})`);
+const ELD_MODE = flag('eld-mode', 'separate');
+if (ELD_MODE !== 'separate' && ELD_MODE !== 'inline') throw new Error(`--eld-mode must be separate or inline (got ${ELD_MODE})`);
 /**
  * --join-concurrency C: joins in flight per clients process (≤ 10 clients each). Default 4 for
  * rooms and fleet (set-up only); 1 (sequential, as before) for game, whose join p50/p90 is a
@@ -349,7 +368,11 @@ interface RunSpec {
   windowS: number;
   /** joins in flight per clients process */
   joinConcurrency: number;
+  /** measure event-loop lag (how: eldMode / eldMethod / eldWindowS) */
   eld: boolean;
+  eldMode: 'separate' | 'inline';
+  eldMethod: 'timer' | 'native';
+  eldWindowS: number;
   sampleMs: number;
   seed: number;
   /** soak: clients join/leave continuously; samples streamed every sampleMs */
@@ -387,7 +410,9 @@ function aggregateHosts(all: Any[]): Any {
     gcCount: sum((s) => s.gcCount),
     gcMs: sum((s) => s.gcMs),
     // event-loop lag: the worst process
-    eld: all.every((s) => s.eld) ? { p50: max((s) => s.eld.p50), p90: max((s) => s.eld.p90), p99: max((s) => s.eld.p99), max: max((s) => s.eld.max), mean: max((s) => s.eld.mean), worstOf: all.length } : null,
+    eld: all.every((s) => s.eld)
+      ? { method: all[0].eld.method, window: all[0].eld.window, windowMs: max((s) => s.eld.windowMs ?? 0), p50: max((s) => s.eld.p50), p90: max((s) => s.eld.p90), p99: max((s) => s.eld.p99), max: max((s) => s.eld.max), mean: max((s) => s.eld.mean), worstOf: all.length }
+      : null,
     cpuSplit: all.every((s) => s.cpuSplit) ? { mainPct: sum((s) => s.cpuSplit.mainPct), otherPct: sum((s) => s.cpuSplit.otherPct) } : null,
     wakeups: all.every((s) => s.wakeups) ? { voluntaryPerS: sum((s) => s.wakeups.voluntaryPerS), involuntaryPerS: sum((s) => s.wakeups.involuntaryPerS), mainVoluntaryPerS: sum((s) => s.wakeups.mainVoluntaryPerS) } : null,
     threadCount: sum((s) => s.threadCount),
@@ -615,6 +640,13 @@ async function runOnce(spec: RunSpec, onProgress: (partial: Any) => void, slot =
     }
 
     result.warmup = await warmUp(hosts, spec);
+    // Lag sub-window: the monitor runs here, alone, never during the CPU window below.
+    let lagPer: Any[] | null = null;
+    if (spec.eld && spec.eldMode === 'separate' && spec.eldWindowS > 0) {
+      await Promise.all(hosts.map((h) => h.request({ cmd: 'lag-start', method: spec.eldMethod }, 'lag-started')));
+      await sleep(spec.eldWindowS * 1000);
+      lagPer = (await Promise.all(hosts.map((h) => h.request({ cmd: 'lag-stop' }, 'lag')))).map((m) => m.eld);
+    }
     const load0 = os.loadavg();
     const sys0 = sysBusyMs();
     const self0 = process.cpuUsage();
@@ -631,7 +663,7 @@ async function runOnce(spec: RunSpec, onProgress: (partial: Any) => void, slot =
       });
     }
     await Promise.all([
-      ...hosts.map((h) => h.request({ cmd: 'measure-start', eld: spec.eld, sampleMs: spec.sampleMs, stream: !!spec.churn }, 'measuring')),
+      ...hosts.map((h) => h.request({ cmd: 'measure-start', eld: spec.eld && spec.eldMode === 'inline', eldMethod: spec.eldMethod, sampleMs: spec.sampleMs, stream: !!spec.churn }, 'measuring')),
       ...clients.map((c) => c.request({ cmd: 'window' }, 'window')),
     ]);
     const tw0 = performance.now();
@@ -641,6 +673,8 @@ async function runOnce(spec: RunSpec, onProgress: (partial: Any) => void, slot =
     const windowMs = performance.now() - tw0;
     const sys1 = sysBusyMs();
     const self = process.cpuUsage(self0);
+    const lags = lagPer;
+    if (lags) stopped.forEach((s, p) => (s.stats.eld = lags[p] ?? null));
     result.hosts = stopped.length > 1 ? stopped.map((s) => s.stats) : undefined;
     result.host = aggregateHosts(stopped.map((s) => s.stats));
     result.hostPlayersAtEnd = stopped.flatMap((s) => s.players);
@@ -794,6 +828,7 @@ function summarize(runs: Any[]): Any {
     eldP50: pick((r) => r.host.eld?.p50),
     eldP99: pick((r) => r.host.eld?.p99),
     eldMax: pick((r) => r.host.eld?.max),
+    eldHow: [...new Set(ok.map((r) => lagHow(r.host.eld)))].join('; '),
     createToLinkMs: pick((r) => r.startup.links[0].createToLinkMs),
     processStartToLinkMs: pick((r) => r.startup.links[0].tLink),
     forkToLinkMs: pick((r) => r.startup.forkToLinkMs),
@@ -893,7 +928,7 @@ function info(): Any {
     publishable: !QUICK,
     cores: PIN ? { nproc: NCPU, ...coreLayout(scenario === 'fleet' ? Math.max(...PROCS) : 1) } : null,
     params: {
-      ELD, IMPLS, RUNTIME, REPS, WARMUP_S, WINDOW_S, NS, KS, MAX_FOREIGN, ATTEMPTS, CLIENTS_PER_PROC, HOST_NODE_ARGS,
+      ELD, ELD_WINDOW_S, ELD_METHOD, ELD_MODE, IMPLS, RUNTIME, REPS, WARMUP_S, WINDOW_S, NS, KS, MAX_FOREIGN, ATTEMPTS, CLIENTS_PER_PROC, HOST_NODE_ARGS,
       PROCS, ROOMS_PER_PROC, CLIENTS, SOAK_MIN, SAMPLE_S, STAY_S, PAUSE_S, RTT, LOSS, JITTER, STUN, JOINS, NAT_OUTSIDE, NAT_FILTERING,
       QUICK, PRECISION, MAX_REPS, WARMUP_MODE, MIN_WARMUP_S, JOIN_CONCURRENCY, SETTLE_MS, PARALLEL, PIN,
     },
@@ -902,6 +937,12 @@ function info(): Any {
 
 // ------------------------------------------------------------------ scenarios
 const MB_ = (x: number) => (x / MB).toFixed(1);
+/** How a run's lag was measured: method + window (results before 16-10-2026 have no `window`: inside the CPU window). */
+function lagHow(eld: Any): string {
+  if (!eld) return 'off';
+  const m = eld.method === 'setInterval-10ms' ? 'timer 10 ms' : 'native';
+  return eld.window === 'separate' ? `${m}, own ${((eld.windowMs ?? 0) / 1000).toFixed(0)} s sub-window` : `${m}, inside CPU window`;
+}
 function logRun(run: Any, prefix = ''): void {
   if (run.impair) {
     const xs = joinTimes(run);
@@ -916,7 +957,7 @@ function logRun(run: Any, prefix = ''): void {
   const e = run.egressPerPlayer;
   console.log(
     `${prefix}    ${h.runtime ?? ''} cpu ${h.cpuPct.toFixed(2)} %  rss ${MB_(h.rssMean)} MB  heap ${MB_(h.heapUsedMean)} MB  ` +
-      (h.eld ? `lag p50 ${h.eld.p50.toFixed(2)} p99 ${h.eld.p99.toFixed(2)} max ${h.eld.max.toFixed(1)} ms  ` : '') +
+      (h.eld ? `lag p50 ${h.eld.p50.toFixed(2)} p99 ${h.eld.p99.toFixed(2)} max ${h.eld.max.toFixed(1)} ms (${lagHow(h.eld)})  ` : '') +
       (h.cpuSplit ? `js ${h.cpuSplit.mainPct.toFixed(2)} other ${h.cpuSplit.otherPct.toFixed(2)}  thr ${h.threadCount} fd ${h.fdCount}  wake ${h.wakeups?.voluntaryPerS}/s  ` : '') +
       (h.gcCount !== null ? `gc ${((h.gcCount / h.wallMs) * 60_000).toFixed(1)}/min ${((h.gcMs / h.wallMs) * 60_000).toFixed(1)} ms/min  ` : 'gc n/a  ') +
       (h.rtc ? `udp in ${h.rtc.packetsInPerS}/s out ${h.rtc.packetsOutPerS}/s  ` : '') +
@@ -936,7 +977,16 @@ async function main(): Promise<void> {
   const t0 = Date.now();
   if (QUICK) console.log('*** --quick: development profile (few reps, short windows, small N): NOT PUBLISHABLE ***');
   const configs: { label: string; spec: Omit<RunSpec, 'seed'> }[] = [];
-  const base = (implRt: string) => ({ ...splitImpl(implRt), procs: 1, warmupMode: WARMUP_MODE as 'auto' | 'fixed', minWarmupS: MIN_WARMUP_S, joinConcurrency: JOIN_CONCURRENCY });
+  const base = (implRt: string) => ({
+    ...splitImpl(implRt),
+    procs: 1,
+    warmupMode: WARMUP_MODE as 'auto' | 'fixed',
+    minWarmupS: MIN_WARMUP_S,
+    joinConcurrency: JOIN_CONCURRENCY,
+    eldMode: ELD_MODE as 'separate' | 'inline',
+    eldMethod: ELD_METHOD as 'timer' | 'native',
+    eldWindowS: ELD_WINDOW_S,
+  });
   if (scenario === 'startup') {
     // The startup metrics are taken at the room link; the 0.25 s window after it only gives
     // the `host` record its shape (before: 1 s, which no startup table uses).
