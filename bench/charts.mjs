@@ -1,9 +1,15 @@
 // Generates benchmark chart cards (HTML/SVG) and screenshots each one as a PNG.
-// Usage: node bench/charts.mjs docs/img/benchmark [bench/results/quick] [rtc,off,nh]   (needs the Playwright Chromium in /opt/pw-browsers)
-// The third argument picks the libraries shown (keys of LIBS; default: all four).
-import { writeFileSync, mkdirSync } from 'node:fs';
+// Usage: node bench/charts.mjs docs/img/benchmark [bench/results/quick] [rtc,off,nh]
+// The third argument picks the libraries shown (keys of LIBS; default: all four; `rtcbun`
+// = haxlite:rtc@bun, when the results have it). Browser: $CHROME_PATH, else the Playwright
+// Chromium of /opt/pw-browsers, else a local Chrome/Edge (Windows/macOS/Linux). Without a
+// browser only charts.html is written. The cards use the Inter font when installed.
+import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
-const require = createRequire('/home/user/rev-eng-haxball/package.json');
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const require = createRequire(path.join(ROOT, 'package.json'));
 const { chromium } = require('playwright-core');
 
 const OUT = process.argv[2];
@@ -15,7 +21,8 @@ const LIBS = [
   { key: 'ndc', name: 'haxlite + node-datachannel', color: '#eb6834' },
   { key: 'off', name: 'haxball.js (oficial)', color: '#1baf7a' },
   { key: 'nh', name: 'node-haxball', color: '#eda100' },
-].filter((l) => process.argv[4] === undefined || process.argv[4].split(',').includes(l.key));
+  { key: 'rtcbun', name: 'haxlite + WebRTC propio (Bun)', color: '#7a4fd0' },
+].filter((l) => (process.argv[4] === undefined ? l.key !== 'rtcbun' : process.argv[4].split(',').includes(l.key)));
 const HAS_NDC = LIBS.some((l) => l.key === 'ndc');
 const fmt = (v, d) => v.toLocaleString('es-AR', { minimumFractionDigits: d, maximumFractionDigits: d });
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
@@ -100,11 +107,12 @@ function card({ id, title, sub, body, note }) {
 // ---- data: read the quick/unified result files -------------------------------------------
 const { readFileSync } = await import('node:fs');
 const RES = process.argv[3] ?? 'bench/results/quick';
-const IMPL = { 'haxlite:rtc': 'rtc', 'haxlite:ndc': 'ndc', official: 'off', nodehaxball: 'nh' };
+const IMPL = { 'haxlite:rtc': 'rtc', 'haxlite:ndc': 'ndc', official: 'off', nodehaxball: 'nh', 'haxlite:rtc@bun': 'rtcbun' };
 function load(name) {
   const j = JSON.parse(readFileSync(`${RES}-${name}.json`, 'utf8'));
   const out = {};
-  for (const c of j.configs) out[IMPL[c.label.split(' ')[0]]] = c.summary;
+  // spec.runtime (bench --runtime) is absent in results older than it: Node
+  for (const c of j.configs) out[IMPL[c.spec.runtime === 'bun' ? `${c.spec.impl}@bun` : c.spec.impl]] = c.summary;
   return (metric, scale = 1) => Object.fromEntries(Object.entries(out).map(([k, s]) => [k, s[metric].median * scale]));
 }
 const RUN_DATE = (() => {
@@ -226,7 +234,20 @@ td{padding:14px;border-bottom:1px solid ${C.grid};vertical-align:top;color:${C.i
 </style></head><body>${cards.join('\n')}</body></html>`;
 writeFileSync(`${OUT}/charts.html`, html);
 
-const browser = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome' });
+const browserPath = [
+  process.env.CHROME_PATH,
+  '/opt/pw-browsers/chromium-1194/chrome-linux/chrome',
+  'C:/Program Files/Google/Chrome/Application/chrome.exe',
+  'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/usr/bin/google-chrome',
+  '/usr/bin/chromium',
+].find((p) => p && existsSync(p));
+if (!browserPath) {
+  console.log(`no browser found (set CHROME_PATH): wrote only ${OUT}/charts.html`);
+  process.exit(0);
+}
+const browser = await chromium.launch({ executablePath: browserPath });
 const page = await browser.newPage({ viewport: { width: 1500, height: 1000 }, deviceScaleFactor: 2 });
 await page.setContent(html);
 await page.evaluate(() => document.fonts.ready);
