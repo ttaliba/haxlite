@@ -226,6 +226,8 @@ export class UdpNat {
 /** Minimal STUN server (RFC 8489 Binding): answers with XOR-MAPPED-ADDRESS of the source. */
 export class FakeStunServer {
   requests = 0;
+  /** Counts requests but answers none (a lost reply / unreachable server). */
+  silent = false;
   private constructor(
     private readonly sock: Socket,
     readonly address: string,
@@ -238,6 +240,7 @@ export class FakeStunServer {
     sock.on('message', (m, r) => {
       if (m.length < 20 || m.readUInt16BE(0) !== 0x0001 || m.readUInt32BE(4) !== 0x2112a442) return;
       srv.requests++;
+      if (srv.silent) return;
       const out = Buffer.alloc(32);
       out.writeUInt16BE(0x0101, 0);
       out.writeUInt16BE(12, 2);

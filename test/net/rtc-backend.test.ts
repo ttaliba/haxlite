@@ -19,6 +19,7 @@ import {
   type PeerCloseReason,
 } from '../../src/net/index.js';
 import { closeNative } from '../../src/net/webrtc.js';
+import { FakeStunServer } from '../rtc/nat-sim.js';
 
 let master: FakeMaster;
 const transports: HostTransport[] = [];
@@ -166,6 +167,37 @@ describe("peerBackend: 'rtc' with a libdatachannel client", () => {
       [1, 1],
       [2, 2],
     ]);
+  });
+
+  it('a join after gatherRefreshMs answers with the cached srflx at once, even when the refresh gets no reply', async () => {
+    const stun = await FakeStunServer.start('127.0.0.1');
+    try {
+      const { t, roomId, backend } = await startHost({
+        rtcEndpoint: { address: '127.0.0.1', iceServers: [stun.url], iceCandidatePolicy: 'public', gatherRefreshMs: 100, shared: false },
+      });
+      const timeJoin = async () => {
+        const j = nextJoin(t);
+        const t0 = performance.now();
+        const c = join(roomId);
+        await j;
+        await c.whenOpen();
+        return { c, ms: performance.now() - t0 };
+      };
+      // 'public': the loopback host candidate is withheld, the srflx (127.0.0.1) is the only one
+      await timeJoin(); // first round (answer may wait for it)
+      await backend.endpoint!.whenGathered();
+      await new Promise((r) => setTimeout(r, 150)); // stale
+      stun.silent = true; // the refresh round's reply is lost
+      const before = stun.requests;
+      const { c, ms } = await timeJoin();
+      expect(stun.requests).toBeGreaterThan(before); // a refresh did start
+      // the answer was not held for the refresh (answerIceWaitMs: 500 ms)
+      expect(c.answerSdp).toContain('typ srflx');
+      expect(c.answerSdp).toContain('a=end-of-candidates');
+      expect(ms).toBeLessThan(450); // 555–577 ms before (the 500 ms answer wait), ≈ 63 ms after
+    } finally {
+      stun.close();
+    }
   });
 
   it('the client closing one data channel (stream reset) closes the peer at once', async () => {

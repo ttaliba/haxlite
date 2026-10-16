@@ -15,8 +15,10 @@
  * All sessions of an endpoint share one socket per family, so the srflx
  * candidates are per *endpoint*: gathered once at listen and refreshed lazily
  * (when a session is created and the last result is older than
- * `refreshMs`). Sessions created while a gathering is running get the new
- * candidates trickled (`RtcSession.onLocalCandidate` / `onGatheringComplete`).
+ * `refreshMs`). Sessions created while the *first* gathering is running get
+ * the candidates trickled (`RtcSession.onLocalCandidate` /
+ * `onGatheringComplete`); later sessions get the last result at once, even
+ * while a refresh round runs in the background.
  *
  * TURN (`turn:`/`turns:` servers) is not implemented: see docs/10 §7 for the
  * design (one allocation per endpoint, permissions per peer, ChannelData
@@ -363,13 +365,21 @@ export class Gatherer {
    * Candidates for a new session: the current lines and whether they are
    * complete. Starts a refresh round when the last result is stale; register
    * the session with {@link wait} when not complete.
+   *
+   * Only the very first round (nothing gathered yet) leaves a session
+   * incomplete. Once a round has finished, its result is used as complete
+   * while a refresh runs in the background: a join arriving after
+   * `refreshMs` must not wait for a new STUN round trip (the transport holds
+   * an incomplete answer up to `answerIceWaitMs`, the whole 500 ms when a
+   * reply is lost). The reflexive address of the shared socket rarely changes;
+   * when it does, the refreshed candidates serve the following sessions.
    */
   forSession(): { lines: string[]; complete: boolean } {
     if (this.enabled && !this.gathering && !this.closed) {
       const refresh = this.o.refreshMs ?? 60_000;
       if (this.lastDone === 0 || this.host.now() - this.lastDone > refresh) this.start();
     }
-    return { lines: this.lines.slice(), complete: !this.gathering };
+    return { lines: this.lines.slice(), complete: !this.gathering || this.rounds > 0 };
   }
 
   /** `w` gets the result of the running round (no-op when none runs). */
