@@ -295,7 +295,16 @@ export class HostRoom {
   private readonly flushPrivateFn = (): void => this.flushPrivate();
 
   private readonly now: () => number;
+  /** No injected clock: room time = performance.now(), the shared clock's time base. */
+  private readonly realClock: boolean;
+  /**
+   * Room time of frame 0. With the real clock it sits on the process-wide
+   * 60 Hz grid (`gridBase / TICKS_PER_MS`), so rooms due on the same frame
+   * boundary share one wake-up of the shared clock.
+   */
   private readonly startTime: number;
+  /** Index of frame 0 on the process-wide frame grid (real clock), else 0. */
+  private readonly gridBase: number;
   /** Connections by player id (official `yb`). */
   private readonly connections = new Map<number, HostConnection>();
   /** Connections that got their snapshot, in join order (broadcast targets). */
@@ -334,6 +343,7 @@ export class HostRoom {
     const b = (opts.transport as Partial<HostTransport>).backend;
     this.bundle = b !== undefined && b.cork !== undefined && b.uncork !== undefined ? (b as { cork(): void; uncork(): void }) : null;
     this.state = opts.state ?? createHostRoomState();
+    this.realClock = opts.now === undefined;
     this.now = opts.now ?? (() => performance.now());
     this.hbFrames = opts.heartbeatFrames ?? HostDefaults.heartbeatFrames;
     this.csFrames = opts.checksumIntervalFrames ?? HostDefaults.checksumIntervalFrames;
@@ -379,7 +389,12 @@ export class HostRoom {
       const cb = this.onEventApplied;
       if (cb !== null) cb(ev);
     };
-    this.startTime = this.now();
+    const t0 = this.now();
+    // frame 0 starts on the last process-wide frame boundary (frame math
+    // unchanged: the room is at frame 0 now and its first boundary comes in
+    // < 1 frame); startTime never leaves the host (pongs carry frames)
+    this.gridBase = this.realClock ? Math.floor(t0 * TICKS_PER_MS) : 0;
+    this.startTime = this.realClock ? this.gridBase / TICKS_PER_MS : t0;
     this.installRoomHooks();
   }
 
@@ -1107,7 +1122,7 @@ export class HostRoom {
       // setInterval-like cadence; never fire twice in a row after a stall
       let next = this.nextPingAt + this.pingIntervalMs;
       if (next <= now) next = now + this.pingIntervalMs;
-      this.nextPingAt = next;
+      this.nextPingAt = this.onGrid(next);
       this.run(this.pingFn);
     } else {
       this.run(this.catchUpFn);
@@ -1174,6 +1189,13 @@ export class HostRoom {
       hostClock.set(this.clockEntry, Infinity);
       return;
     }
+    if (this.realClock) {
+      // room time is the clock's time base (no clock read); the same frame
+      // boundary is the same double in every room, so they wake together
+      const at = (this.gridBase + frame) / TICKS_PER_MS;
+      hostClock.set(this.clockEntry, ping < at ? ping : at);
+      return;
+    }
     const now = this.now();
     let delay = this.startTime + frame / TICKS_PER_MS - now;
     const pingDelay = ping - now;
@@ -1182,10 +1204,21 @@ export class HostRoom {
     hostClock.set(this.clockEntry, performance.now() + (delay > 0 ? delay : 0));
   }
 
+  /**
+   * Room time `t` rounded up to a process-wide frame boundary (real clock),
+   * so the Ping event shares the wake-up of whatever else is due then. The
+   * 1e-6-frame tolerance keeps a boundary computed with rounding error
+   * (`k / 0.06 + 3000`) from moving to the next one.
+   */
+  private onGrid(t: number): number {
+    if (!this.realClock || t === Infinity) return t;
+    return Math.ceil(t * TICKS_PER_MS - 1e-6) / TICKS_PER_MS;
+  }
+
   /** Starts / stops the 3 s Ping event with the first / last ready client. */
   private updatePingTimer(): void {
     if (this.running && this.ready.length > 0) {
-      if (this.nextPingAt === Infinity) this.nextPingAt = this.now() + this.pingIntervalMs;
+      if (this.nextPingAt === Infinity) this.nextPingAt = this.onGrid(this.now() + this.pingIntervalMs);
     } else {
       this.nextPingAt = Infinity;
     }

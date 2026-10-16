@@ -205,6 +205,45 @@ describe('shared host clock', () => {
     host.stop();
   });
 
+  it('real clock: frame 0 and every wake-up sit on the process-wide 60 Hz grid', async () => {
+    const onGrid = (t: number) => Math.abs(t * 0.06 - Math.round(t * 0.06)) < 1e-6;
+    const rooms = [makeRoom({ pingIntervalMs: 1000 })];
+    await sleep(7);
+    rooms.push(makeRoom({ pingIntervalMs: 1000 }));
+    try {
+      rooms.forEach((r) => {
+        r.join('a');
+        r.host.startGame();
+        const start = (r.host as Any).startTime as number;
+        expect(onGrid(start)).toBe(true);
+        expect(r.host.frame).toBeLessThanOrEqual(1);
+        expect(onGrid((r.host as Any).nextPingAt)).toBe(true);
+      });
+      // the rooms started on different boundaries (7 ms apart: same or next frame) but share the grid
+      const at = () => rooms.map((r) => (r.host as Any).clockEntry.wakeAt as number);
+      for (let i = 0; i < 20; i++) {
+        for (const t of at()) expect(onGrid(t)).toBe(true);
+        await sleep(9);
+      }
+      for (const r of rooms) expect(onGrid((r.host as Any).nextPingAt)).toBe(true);
+    } finally {
+      for (const r of rooms) r.host.stop();
+    }
+  });
+
+  it('injected clock: frame 0 at construction time (no grid)', () => {
+    let t = 1234.5;
+    const { host } = makeRoom({ now: () => t });
+    expect((host as Any).startTime).toBe(1234.5);
+    t += 1000 / 60 - 0.01;
+    host.update();
+    expect(host.frame).toBe(0);
+    t += 0.02;
+    host.update();
+    expect(host.frame).toBe(1);
+    host.stop();
+  });
+
   it('rooms share one timer and keep their own cadence', async () => {
     const rooms = [makeRoom(), makeRoom(), makeRoom()];
     for (const r of rooms) {
