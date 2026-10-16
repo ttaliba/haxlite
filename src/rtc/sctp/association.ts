@@ -32,7 +32,7 @@
  * Packets passed to `opts.send` are views of a shared buffer, valid only
  * during the call (DTLS encrypts them synchronously).
  */
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHmac, createSecretKey, randomBytes, timingSafeEqual, type KeyObject } from 'node:crypto';
 import { sctpChecksumMatches, writeChecksum } from './crc32c.js';
 import { sharedTimers, TimerSlot } from './timers.js';
 import { sctpNow } from './clock.js';
@@ -354,7 +354,8 @@ export class SctpAssociation {
   private readonly initialCwnd: number;
   private readonly rxCap: number;
   private readonly rxMask: number;
-  private readonly cookieKey: Buffer;
+  /** State-cookie HMAC key, a KeyObject: createHmac would re-import a Buffer key at every use. */
+  private readonly cookieKey: KeyObject;
   private readonly onTimerBound: () => void;
   /** Slot in the shared timer heap (default clock and timers), else null. */
   private readonly slot: TimerSlot | null;
@@ -543,7 +544,7 @@ export class SctpAssociation {
     while (cap < (opts.receiveWindowTsns ?? 1024) && cap < 1 << 16) cap <<= 1;
     this.rxCap = cap;
     this.rxMask = cap - 1;
-    this.cookieKey = randomBytes(32);
+    this.cookieKey = createSecretKey(randomBytes(32));
     this.rto = this.rtoInitial;
     this.onTimerBound = () => this.onTimer();
     this.slot = opts.setTimer === undefined && opts.clearTimer === undefined && opts.now === undefined ? new TimerSlot(this.onTimerBound) : null;
