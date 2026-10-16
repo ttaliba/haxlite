@@ -39,7 +39,8 @@ import {
 } from '../../src/net/index.js';
 import { Reader } from '../../src/codec/index.js';
 import { passiveDtlsOffer } from '../../src/net/peer-backend.js';
-import { isLibdatachannelOffer } from '../../src/net/transport.js';
+import { HostTransport, isLibdatachannelOffer, type Peer } from '../../src/net/transport.js';
+import type { PeerBackend, PeerLink } from '../../src/net/peer-backend.js';
 import { officialNet } from './official-net.js';
 
 describe('ip', () => {
@@ -280,6 +281,42 @@ describe('client stack from the offer', () => {
     expect(isLibdatachannelOffer(offer('o=mozilla...THIS_IS_SDPARTA-99.0 7710052215259647220 0 IN IP4 0.0.0.0'))).toBe(false);
     expect(isLibdatachannelOffer(offer('o=rtcx 1 0 IN IP4 127.0.0.1'))).toBe(false);
     expect(isLibdatachannelOffer(offer('o=- 1 0 IN IP4 127.0.0.1') + 'a=x-o=rtc \r\n')).toBe(false);
+  });
+});
+
+describe('broadcastTo with a sendMany backend', () => {
+  it('passes only the open links, reuses one array and keeps no link once sent', () => {
+    const calls: { arr: readonly PeerLink[]; links: PeerLink[]; channel: number }[] = [];
+    const backend: PeerBackend = {
+      kind: 'fake',
+      prefiltered: true,
+      ready: true,
+      start: () => {},
+      stop: () => {},
+      createPeer: () => {
+        throw new Error('unused');
+      },
+      sendMany: (links, channel) => calls.push({ arr: links, links: [...links], channel }),
+    };
+    const t = new HostTransport({ token: 'thr1.test', backend });
+    const link = (): PeerLink => ({ addRemoteCandidate: () => {}, send: () => true, close: () => {} });
+    const target = (state: string, l: PeerLink | null, open = true) => ({
+      peer: { state, link: l, channelOpen: [open, open, open] } as unknown as Peer,
+    });
+    const [a, b, c] = [link(), link(), link()];
+    const data = Uint8Array.of(1);
+    t.broadcastTo([target('joined', a), target('closed', b), target('joined', c), target('joined', link(), false)], 1, data);
+    t.broadcastTo([target('joined', a), target('joined', b), target('joined', c)], 2, data);
+    t.broadcastTo([target('joined', c), target('joined', a)], 0, data);
+    t.broadcastTo([target('closed', a), target('joined', null)], 0, data); // nothing to send
+    expect(calls.map((x) => [x.links, x.channel])).toEqual([
+      [[a, c], 1],
+      [[a, b, c], 2],
+      [[c, a], 0],
+    ]);
+    expect(calls[1]!.arr).toBe(calls[0]!.arr);
+    expect(calls[2]!.arr).toBe(calls[0]!.arr);
+    expect(calls[0]!.arr.every((x) => x === undefined)).toBe(true);
   });
 });
 

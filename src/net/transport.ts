@@ -622,16 +622,22 @@ export class HostTransport {
       for (let i = 0; i < targets.length; i++) this.send(targets[i]!.peer, channel, data);
       return;
     }
+    // Reused by index: `length = 0` would drop V8's backing store and the next
+    // pushes reallocate it (≈ 0.5 KB per broadcast with 20 players). The
+    // length only changes when the number of targets does; the slots are
+    // cleared afterwards so no closed link is kept alive.
     const links = this.linkScratch;
-    links.length = 0;
+    let n = 0;
     for (let i = 0; i < targets.length; i++) {
       const p = targets[i]!.peer;
-      if (p.state !== 'closed' && p.link !== null && p.channelOpen[0]) links.push(p.link);
+      if (p.state !== 'closed' && p.link !== null && p.channelOpen[0]) links[n++] = p.link;
     }
-    if (links.length > 0) many.call(this.backend, links, channel, data);
-    links.length = 0;
+    if (n === 0) return;
+    if (links.length !== n) links.length = n;
+    many.call(this.backend, links as PeerLink[], channel, data);
+    for (let i = 0; i < n; i++) links[i] = undefined;
   }
-  private readonly linkScratch: PeerLink[] = [];
+  private readonly linkScratch: (PeerLink | undefined)[] = [];
 
   /** Sends the same bytes to every joined peer (`Wa.jd`), optionally skipping one. */
   broadcast(channel: number, data: Uint8Array, except: Peer | null = null): void {
