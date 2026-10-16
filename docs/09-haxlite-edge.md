@@ -9,8 +9,10 @@
 > Desde la versión 2 del túnel **ni el edge ni el host necesitan addons nativos**: los jugadores
 > se atienden con haxlite-rtc ([doc 10](10-haxlite-rtc.md): ICE-lite + DTLS 1.2 + SCTP en
 > TypeScript, un único puerto UDP) y el plano de datos host↔edge es nuestra propia asociación
-> SCTP sobre datagramas UDP cifrados con AES-128-GCM (§1.3). node-datachannel queda como opción
-> (`playerBackend: 'ndc'`, `dataPlane: 'webrtc'`) y solo se carga si se usa.
+> SCTP sobre datagramas UDP cifrados con AES-128-GCM o, si ambos lados lo acuerdan,
+> ChaCha20-Poly1305 (§1.3). node-datachannel queda como opción (`playerBackend: 'ndc'`,
+> `dataPlane: 'webrtc'`), es una dependencia opcional y solo se carga si se usa. Host y edge
+> corren en Node ≥ 22 o en Bun.
 >
 > Contexto y alternativas: [08 — Ocultar y proteger la IP](08-ocultar-ip.md). Esto implementa
 > el "algo delante" del nivel 3 de ese informe, pero sin TURN ni proxy UDP: el edge **termina**
@@ -30,7 +32,7 @@
  ┌────┴──────────────┐                                     túnel   │ (el host se conecta
  │ master haxball.com│◀── WS de señalización ──┐  ┌───────────────┘  hacia AFUERA)
  └───────────────────┘   (token, sala, offers) │  │ control: WebSocket (wss, TCP :8443), HMAC + x25519
-                                               │  │ datos:   SCTP sobre UDP+AES-128-GCM (UDP :8443)
+                                               │  │ datos:   SCTP sobre UDP+AEAD (UDP :8443)
                                          ┌─────┴──▼──────────────────────────────┐
                                          │ host haxlite (detrás de NAT, sin       │
                                          │ sockets hacia jugadores): HostRoom,    │
@@ -117,6 +119,7 @@ fatal de tipo `auth`.
 | `WebRtc` | 1 | plano de datos legado: una PeerConnection node-datachannel host↔edge (señalización `TunnelOffer/Answer/Candidate` por el WS) |
 | `RoLanes` | 2 | carriles `ro` (abajo); con `Udp` o `WebRtc` |
 | `Udp` | 4 | **túnel v2** (§1.3), solo en `Auth` versión 2 |
+| `ChaCha` | 8 | con `Udp`: datagramas del túnel v2 con ChaCha20-Poly1305 en vez de AES-128-GCM (§1.3) |
 
 Sin flags de plano concedidos, todo va por el WebSocket: `[0x70+canal][u16 slot][payload]`.
 
@@ -124,7 +127,10 @@ Sin flags de plano concedidos, todo va por el WebSocket: `[0x70+canal][u16 slot]
 manda el byte de versión máxima (entonces `dataPlane: 'udp'` cae al WebSocket, o a la
 PeerConnection si se pidió `'webrtc'`). Un host que pide un plano que el edge no concede
 (`tunnel.udp: false`, `tunnel.allowWebRtc: false`, node-datachannel no instalado) recibe el
-WebSocket (o un error si `fallbackWs: false`).
+WebSocket (o un error si `fallbackWs: false`). `ChaCha` es igual de compatible: un edge anterior
+nunca lo devuelve en `AuthOk` y un host anterior nunca lo pide, así que ambos siguen en
+AES-128-GCM. Como el flag va dentro de `mac2` (pedido) y de `okMac` (concedido), un intermediario
+no puede degradar ni forzar el AEAD.
 
 **Datos** (en cualquier plano UDP): trama `[u16 slot][payload]` — 2 bytes de overhead; el canal
 del túnel **es** el canal del jugador (`ro` 0 ordenado y fiable, `ru` 1 desordenado y fiable,
@@ -158,6 +164,7 @@ estado mínimo.
   okm   = HKDF-SHA256(X25519(priv, pubDelOtro), salt, "haxlite-tunnel/2" ‖ hostPub ‖ edgePub ‖ u32 connId, 64)
   s_h2e = okm[0..32), s_e2h = okm[32..64)                       (un secreto por sentido)
   clave_e = HKDF(s_e, "…key", 16), iv_e = HKDF(s_e, "…iv", 12), s_{e+1} = HKDF(s_e, "…next", 32)
+  con ChaCha: clave_e = HKDF(s_e, "haxlite-tunnel/2 chacha20 key", 32)   (iv y ratchet iguales)
   ```
 
   *Forward secrecy*: las claves privadas x25519 se descartan apenas se calcula el secreto
@@ -167,8 +174,8 @@ estado mínimo.
 * **Datagrama** (ambos sentidos):
 
   ```
-  [u8 tipo][u32 connId][u16 época][u48 seq] [AES-128-GCM(payload)] [tag 16 B]
-   └────────────── 13 B de cabecera = AAD ─┘        nonce = iv_época XOR (0⁶ ‖ seq48)
+  [u8 tipo][u32 connId][u16 época][u48 seq] [AEAD(payload)] [tag 16 B]
+   └────────────── 13 B de cabecera = AAD ─┘  nonce = iv_época XOR (0⁶ ‖ seq48)
   ```
 
   `tipo`: `0xF0` paquete SCTP, `0xF1` Ping `[f64]`, `0xF2` Pong (eco del mismo tamaño), `0xF3`
@@ -178,6 +185,23 @@ estado mínimo.
   **Ratchet** cada 2²⁴ datagramas por sentido: época + 1 con claves derivadas de la anterior
   (que se borra; la previa se acepta 30 s para paquetes reordenados) — muy por debajo de los
   límites de uso de AES-GCM, sin renegociar nada.
+* **AEAD negociable.** AES-128-GCM (`node:crypto`) es el de siempre y el que hablan todos los
+  pares v2. Con `AuthFlag.ChaCha` concedido (§1.2) se usa ChaCha20-Poly1305 con la AEAD en JS de
+  `src/rtc/dtls/chacha.ts`, la misma del DTLS de haxlite-rtc: sella en el buffer de salida y abre
+  en el sitio (un datagrama que no autentica queda intacto). Mismo datagrama, nonce, ventana y
+  ratchet; al rotar de época se borran el secreto y la clave retirados. El host lo pide con
+  `edge.tunnelAead` y el edge lo concede según `tunnel.aead`; con `'auto'` (por defecto en ambos)
+  cada lado quiere el más barato en su runtime: ChaCha20-Poly1305 en Node, AES-128-GCM en Bun. Solo
+  se usa ChaCha si el host lo pide **y** el edge está de acuerdo. Sellar + abrir con buffer
+  reutilizado (µs, 50 / 150 / 300 B):
+
+  | runtime | AES-128-GCM | ChaCha20-Poly1305 (JS) |
+  |---|---|---|
+  | Node 26.8 | 8,96 / 8,82 / 8,97 | **2,48 / 3,95 / 6,01** (cruce hacia ~550 B) |
+  | Bun 1.4 | **2,98 / 3,13 / 3,16** | 3,71 / 6,53 / 10,53 |
+
+  Ping/Pong por el túnel real en Node: 31,3 µs (ChaCha) frente a 52,8 µs (AES-GCM) de CPU por ida y
+  vuelta.
 * **SCTP**: `src/rtc/sctp` (el mismo de haxlite-rtc), el host es el iniciador (`connect()`) y el
   edge el lado pasivo (INIT sin estado, cookie HMAC). Streams = canales del túnel (0 `ro`,
   1 `ru`, 2 `uu` con `maxRetransmits: 0`, 3–17 carriles `ro`), mensajes de hasta 1 MiB, paquetes
@@ -223,6 +247,7 @@ Con `HostTransport` directamente: `new HostTransport({ token, edge: { url, key }
 | `key` | — | `"<keyId>:<secret>"` |
 | `dataPlane` | `'udp'` | `'udp'` = túnel v2 (§1.3, sin addons); `'webrtc'` = PeerConnection node-datachannel (carga el addon); `'ws'` = forzar el WebSocket |
 | `roLanes` | `true` | pedir los carriles `ro` (§1.2); `false` = un solo canal `ro` en el túnel |
+| `tunnelAead` | `'auto'` | solo `dataPlane: 'udp'`: AEAD que se pide para el túnel v2 (§1.3). `'auto'` = ChaCha20-Poly1305 en Node, AES-128-GCM en Bun; `'chacha20-poly1305'` lo pide siempre; `'aes-128-gcm'` nunca. El edge decide; uno anterior concede AES-128-GCM |
 | `fallbackWs` | `true` | si el plano UDP no sube en `dataPlaneTimeoutMs` (o el edge no lo concede), todo por el WebSocket (queda en WS hasta reiniciar la sala) |
 | `bindAddress` | — | dirección local para el WS y el socket UDP del túnel |
 | `iceServers` / `portRange` | ninguno / — | solo `dataPlane: 'webrtc'` |
@@ -256,10 +281,12 @@ Comportamiento:
 
 ## 3. Despliegue del edge en un servidor dedicado
 
-Requisitos: Node ≥ 22, una IP pública (idealmente con mitigación DDoS aguas arriba, ver
+Requisitos: Node ≥ 22 (o Bun), una IP pública (idealmente con mitigación DDoS aguas arriba, ver
 [08 §3 nivel 2](08-ocultar-ip.md)), un nombre DNS para el certificado TLS. **Ningún addon
-nativo** se carga con la configuración por defecto (node-datachannel sigue en `dependencies`
-para `playerBackend: 'ndc'` y el túnel legado, pero ni se importa; §8).
+nativo** se carga con la configuración por defecto (node-datachannel es una
+`optionalDependency` para `playerBackend: 'ndc'` y el túnel legado, pero ni se importa; §8).
+Instalando el paquete ya compilado, `npm install --omit=optional` ni siquiera lo descarga; para
+compilar desde el repositorio hace falta instalado (`tsc` resuelve sus tipos).
 
 ```sh
 git clone … haxlite && cd haxlite && npm ci && npm run build
@@ -391,7 +418,8 @@ Varias salas en un mismo host = varias sesiones de túnel con la misma clave (cu
   producción: aunque las claves del túnel v2 no se pueden derivar sin la API key, el control
   (offers, slots) solo va cifrado con TLS.
 * **Túnel v2 (UDP):**
-  * Confidencialidad e integridad: AES-128-GCM con claves por sesión y por sentido (§1.3);
+  * Confidencialidad e integridad: AES-128-GCM (o ChaCha20-Poly1305 negociado dentro de
+    `mac2`/`okMac`, sin degradación posible en tránsito) con claves por sesión y por sentido (§1.3);
     cabecera autenticada; ventana anti-replay de 1024; ratchet de claves cada 2²⁴ datagramas;
     *forward secrecy* por x25519 efímero.
   * **Sin amplificación ni reflexión:** un datagrama con un `connId` desconocido se descarta
@@ -412,7 +440,9 @@ Varias salas en un mismo host = varias sesiones de túnel con la misma clave (cu
 * **Jugadores con haxlite-rtc (ICE-lite):** el edge **nunca** inicia comprobaciones ICE: un host
   (o un jugador) no puede hacer que el edge mande STUN a ninguna parte. Solo responde Binding
   requests con MESSAGE-INTEGRITY válido para el ufrag de esa sesión, y DTLS solo desde
-  direcciones así validadas (cookie HMAC antes de guardar estado). Con `'ndc'`, como antes: los
+  direcciones así validadas (por eso no hace falta el cookie HelloVerifyRequest: el origen ya
+  está probado antes de guardar estado DTLS, doc 10 §6.7). Sin `webrtc.ipv6` no anuncia ni
+  escucha IPv6. Con `'ndc'`, como antes: los
   candidatos remotos pasan por `remoteCandidatePolicy` (por defecto `'public'`), máximo 32 por
   conexión, y lo único que se puede provocar son binding requests STUN (sin amplificación).
 * **Un host malicioso no puede convertir el edge en un cañón:** cada entrada se valida (tamaños de
@@ -452,7 +482,8 @@ JSON (`--config` o `HAXLITE_EDGE_CONFIG`) + variables de entorno (ganan): `HAXLI
 | `keysFile` | — | JSON (array) o `id:secret` por línea |
 | `playerBackend` | `'rtc'` | `'rtc'` = haxlite-rtc; `'ndc'` = node-datachannel |
 | `webrtc.bindAddress` | todas | dirección local de los jugadores (`'rtc'`: y anunciada si no hay `publicAddresses`) |
-| `webrtc.publicAddresses` | `bindAddress` o IPs públicas de las interfaces | `'rtc'`: las **únicas** direcciones anunciadas |
+| `webrtc.publicAddresses` | `bindAddress` o IPs públicas de las interfaces | `'rtc'`: las **únicas** direcciones anunciadas (las IPv6 solo con `webrtc.ipv6`) |
+| `webrtc.ipv6` | false | anunciar y escuchar IPv6 (`'rtc'`: socket `udp6` y candidatos IPv6; `'ndc'`: libdatachannel no se limita a `0.0.0.0`). Sin ella las IPv6 dadas o detectadas se descartan, y si solo hay IPv6 (lista, `bindAddress` o interfaces) el edge no arranca y el error nombra `webrtc.ipv6`. Por defecto no: +20 B por datagrama ≈ +19 % de salida (doc 10 §2.1) |
 | `webrtc.port` / `webrtc.publicPort` | `portRange[0]` o efímero / el mismo | `'rtc'`: puerto UDP de todos los jugadores |
 | `webrtc.consentTimeoutMs` | 30 000 | `'rtc'`: sin Binding autenticado del navegador en este tiempo → cerrado |
 | `webrtc.portRange` | efímeros | `'ndc'`: rango UDP de jugadores y túneles legados |
@@ -467,6 +498,7 @@ JSON (`--config` o `HAXLITE_EDGE_CONFIG`) + variables de entorno (ganan): `HAXLI
 | `tunnel.publicHost` / `tunnel.publicPort` | el host de la URL del WS / el puerto ligado | destino que se comunica a los hosts en `AuthOk` |
 | `tunnel.maxPps` / `tunnel.maxForeignPps` | 20 000 / 20 | buckets por `connId` (§4) |
 | `tunnel.idleTimeoutMs` | 30 000 | túnel sin datagramas autenticados |
+| `tunnel.aead` | `'auto'` | AEAD que se concede a los hosts que piden ChaCha20-Poly1305 (§1.3): `'auto'` = el más barato en este runtime (Node: ChaCha20-Poly1305, Bun: AES-128-GCM); `'chacha20-poly1305'` lo concede siempre que se pida; `'aes-128-gcm'` nunca. Quien no lo pide recibe AES-128-GCM |
 | `tunnel.allowWebRtc` | true | conceder el túnel legado a quien lo pida (carga node-datachannel en ese momento) |
 | `limits.maxSessions` | 1000 | túneles simultáneos |
 | `limits.maxSessionsPerKey` / `maxPeersPerKey` | 16 / 256 | cuotas por defecto de cada clave |
@@ -514,9 +546,16 @@ handshakes…), `tunnel` (puerto, túneles, datagramas, `unknownConn`, `rateLimi
   jugador y pps por túnel); las estadísticas por clave permiten detectar abusos.
 * Cero asignaciones evitables en los caminos calientes: los encabezados se escriben en un buffer
   *scratch* reutilizado (SCTP copia de forma síncrona); quitar el encabezado es una vista, el
-  multicast entrega **la misma** vista del payload a cada jugador y se parsea en el sitio. Por
-  datagrama del túnel: el buffer de salida (cabecera + cifrado) y el texto plano descifrado (que
-  SCTP entrega por vistas, sin otra copia).
+  multicast entrega **la misma** vista del payload a cada jugador y se parsea en el sitio. En el
+  túnel v2, `TunnelCipher` escribe cabecera (AAD), nonce y tag en buffers *scratch* propios, y el
+  edge sella sus datagramas en **un** buffer reutilizado mientras el envío sea síncrono (si el
+  kernel encola uno, pasa a un buffer nuevo); el socket del túnel en el edge va por `UdpIo`
+  (`src/rtc/udp.ts`, el mismo camino que los jugadores de haxlite-rtc: sin `SendWrap` ni
+  `rinfo` + `emit` por datagrama de `dgram`; en Bun, el socket nativo). Con AES-GCM queda lo que
+  `node:crypto` asigna por operación (objeto `Cipher`, salida y tag: ≈ 1,7–1,9 KB por sellar+abrir
+  en Node); con ChaCha20-Poly1305 solo la vista del texto plano (≈ 120 B). CPU por Ping/Pong en
+  loopback (2 sellados, 2 aperturas, 4 operaciones de socket, AES-GCM): Node 55,9 → 54,7–55,9 µs,
+  Bun 36,3–36,9 → 33,7–34,4 µs.
 * Sin temporizadores en vacío: el ping de keep-alive a los hosts (10 s) solo corre mientras hay
   sesiones; el barrido de negociaciones colgadas (1 s) solo mientras hay alguna negociación
   pendiente; el barrido de túneles UDP solo con túneles; el de haxlite-rtc solo con jugadores. Un
