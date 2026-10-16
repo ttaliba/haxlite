@@ -324,7 +324,26 @@ export class UdpIo {
           this.batchSends++;
         }
       } catch {
-        return; // closed socket: dropped
+        // sendMany throws when the FIRST datagram fails (EACCES, EPERM, ENETUNREACH… for that
+        // peer): one by one instead, so that one bad destination does not drop the whole batch
+        // (and, being first again next time, every batch). A closed socket drops them all.
+        if (n === 1) return;
+        let queued = false;
+        for (let i = 0; i < n; i++) {
+          const buf = p[3 * i] as Buffer;
+          const port = p[3 * i + 1] as number;
+          const address = p[3 * i + 2] as string;
+          if (!queued) {
+            try {
+              if (native.send(buf, port, address)) continue;
+            } catch {
+              continue; // this one is unsendable: dropped, like dgram without a callback
+            }
+            queued = true; // kernel queue full: this one and the rest go to dgram's queue, in order
+          }
+          this.slowSend(Buffer.from(buf), port, address);
+        }
+        return;
       }
     }
     // what the kernel refused goes to dgram's queue, as copies (the ring is reused by the next batch)
