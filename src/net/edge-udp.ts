@@ -202,9 +202,18 @@ export function udpConnId(d: Uint8Array): number {
   return ((d[1]! << 24) | (d[2]! << 16) | (d[3]! << 8) | d[4]!) >>> 0;
 }
 
+/** Smallest reusable output buffer (an MTU-sized SCTP packet + overhead fits). */
+const SCRATCH_SIZE = 2048;
+
 /**
  * Sealing/opening for one tunnel (both directions). Nonces never repeat: one
  * key per direction and epoch, a strictly increasing 48-bit sequence number.
+ *
+ * Allocations per datagram: node:crypto needs a fresh native cipher object
+ * per nonce plus its output and tag Buffers (unavoidable through its API);
+ * everything else is preallocated — the header (AAD), nonce and tag are
+ * written to scratch buffers, and with `reuse` the datagram itself is
+ * written to a buffer kept across calls.
  */
 export class TunnelCipher {
   readonly connId: number;
@@ -215,6 +224,13 @@ export class TunnelCipher {
   private next: RecvEpoch | null = null;
   private readonly rekeyAfter: number;
   private readonly nonce = Buffer.alloc(12);
+  /** Header (AAD) of the datagram being sealed/opened. */
+  private readonly hdr = Buffer.alloc(UDP_HEADER_LENGTH);
+  /** Tag of the datagram being opened. */
+  private readonly tag = Buffer.alloc(UDP_TAG_LENGTH);
+  /** Reusable output (see {@link seal}) and its last exact-length view. */
+  private scratch: Buffer | null = null;
+  private view: Buffer | null = null;
   /** Type of the last datagram {@link open} accepted. */
   lastType = 0;
   /** The last accepted datagram was the newest one seen (eligible to move the peer address). */
@@ -232,8 +248,14 @@ export class TunnelCipher {
     this.rekeyAfter = Math.max(2, opts.rekeyAfterPackets ?? REKEY_AFTER_PACKETS);
   }
 
-  /** Builds an authenticated datagram; null when the sequence space is exhausted (never in practice). */
-  seal(type: number, plain: Uint8Array): Buffer | null {
+  /**
+   * Builds an authenticated datagram; null when the sequence space is
+   * exhausted (never in practice). With `reuse` the result is a view of a
+   * buffer this cipher reuses on the next `reuse` call: only for a
+   * transport that is done with it once its send returns (else call
+   * {@link releaseScratch}); without it, a fresh buffer.
+   */
+  seal(type: number, plain: Uint8Array, reuse = false): Buffer | null {
     if (this.seq >= this.rekeyAfter) {
       if (this.send.epoch >= 0xffff) return null;
       this.send = nextEpoch(this.send);
@@ -244,24 +266,52 @@ export class TunnelCipher {
     if (seq > MAX_SEQ) return null;
     const k = this.send;
     const n = plain.length;
-    const out = Buffer.allocUnsafe(UDP_OVERHEAD + n);
-    out[0] = type;
-    out.writeUInt32BE(this.connId, 1);
-    out.writeUInt16BE(k.epoch, 5);
-    out.writeUIntBE(seq, 7, 6);
+    const total = UDP_OVERHEAD + n;
+    const out = reuse ? this.output(total) : Buffer.allocUnsafe(total);
+    // header: [u8 type][u32 connId][u16 epoch][u48 seq]
+    const h = this.hdr;
+    const id = this.connId;
+    const hi = Math.floor(seq / 0x100000000);
+    const lo = seq >>> 0;
+    h[0] = type;
+    h[1] = id >>> 24;
+    h[2] = id >>> 16;
+    h[3] = id >>> 8;
+    h[4] = id;
+    h[5] = k.epoch >>> 8;
+    h[6] = k.epoch;
+    h[7] = hi >>> 8;
+    h[8] = hi;
+    h[9] = lo >>> 24;
+    h[10] = lo >>> 16;
+    h[11] = lo >>> 8;
+    h[12] = lo;
+    out.set(h, 0);
     const nonce = this.nonce;
-    const iv = k.iv;
-    for (let i = 0; i < 6; i++) nonce[i] = iv[i]!;
-    for (let i = 6; i < 12; i++) nonce[i] = iv[i]! ^ out[i + 1]!;
+    setNonce(nonce, k.iv, h);
     const c = createCipheriv(ALGO, k.key, nonce, { authTagLength: UDP_TAG_LENGTH });
-    c.setAAD(out.subarray(0, UDP_HEADER_LENGTH));
-    if (n > 0) {
-      const ct = c.update(plain);
-      ct.copy(out, UDP_HEADER_LENGTH);
-    }
+    c.setAAD(h);
+    if (n > 0) out.set(c.update(plain), UDP_HEADER_LENGTH);
     c.final();
-    c.getAuthTag().copy(out, UDP_HEADER_LENGTH + n);
+    out.set(c.getAuthTag(), UDP_HEADER_LENGTH + n);
     return out;
+  }
+
+  /** Forgets the reusable output buffer (the transport kept the last one). */
+  releaseScratch(): void {
+    this.scratch = null;
+    this.view = null;
+  }
+
+  private output(total: number): Buffer {
+    let s = this.scratch;
+    if (s === null || s.length < total) {
+      s = this.scratch = Buffer.allocUnsafeSlow(Math.max(SCRATCH_SIZE, total));
+      this.view = null;
+    }
+    let v = this.view;
+    if (v === null || v.length !== total) v = this.view = s.subarray(0, total);
+    return v;
   }
 
   /**
@@ -283,16 +333,19 @@ export class TunnelCipher {
       return null;
     }
     const k = e.keys;
-    const nonce = this.nonce;
-    for (let i = 0; i < 6; i++) nonce[i] = k.iv[i]!;
-    for (let i = 6; i < 12; i++) nonce[i] = k.iv[i]! ^ d[i + 1]!;
+    const h = this.hdr;
+    for (let i = 0; i < UDP_HEADER_LENGTH; i++) h[i] = d[i]!;
     const tagAt = d.length - UDP_TAG_LENGTH;
+    const tag = this.tag;
+    for (let i = 0; i < UDP_TAG_LENGTH; i++) tag[i] = d[tagAt + i]!;
+    const nonce = this.nonce;
+    setNonce(nonce, k.iv, h);
     let pt: Buffer;
     try {
       const dc = createDecipheriv(ALGO, k.key, nonce, { authTagLength: UDP_TAG_LENGTH });
-      dc.setAAD(d.subarray(0, UDP_HEADER_LENGTH));
-      dc.setAuthTag(d.subarray(tagAt));
-      pt = tagAt > UDP_HEADER_LENGTH ? dc.update(d.subarray(UDP_HEADER_LENGTH, tagAt)) : Buffer.alloc(0);
+      dc.setAAD(h);
+      dc.setAuthTag(tag);
+      pt = tagAt > UDP_HEADER_LENGTH ? dc.update(d.subarray(UDP_HEADER_LENGTH, tagAt)) : EMPTY;
       dc.final();
     } catch {
       this.badMac++;
@@ -308,10 +361,16 @@ export class TunnelCipher {
       this.rekeys++;
       newest = true;
     } else if (e === this.prev) newest = false;
-    this.lastType = d[0]!;
+    this.lastType = h[0]!;
     this.lastNewest = newest;
     return pt;
   }
+}
+
+/** nonce = iv XOR (0^6 ‖ seq48), seq48 = header[7..13). */
+function setNonce(nonce: Buffer, iv: Buffer, h: Uint8Array): void {
+  for (let i = 0; i < 6; i++) nonce[i] = iv[i]!;
+  for (let i = 6; i < 12; i++) nonce[i] = iv[i]! ^ h[i + 1]!;
 }
 
 // ------------------------------------------------------------------ plane
@@ -344,8 +403,13 @@ export interface UdpPlaneOptions {
   secrets: TunnelSecrets;
   /** `ro` lanes (1 = the single `ro` channel). */
   lanes: number;
-  /** Puts a sealed datagram on the wire (the edge drops it while the host's address is unknown). */
-  transmit(datagram: Buffer): void;
+  /**
+   * Puts a sealed datagram on the wire (the edge drops it while the host's
+   * address is unknown). Returning `true` promises the buffer is no longer
+   * referenced (sent synchronously, copied or dropped): the plane then
+   * writes the next datagrams into one reused buffer instead of a fresh one each.
+   */
+  transmit(datagram: Buffer): boolean | void;
   events: UdpPlaneEvents;
   /** Tests: ratchet after this many datagrams. */
   rekeyAfterPackets?: number;
@@ -372,7 +436,10 @@ export class UdpTunnelPlane {
   readonly cipher: TunnelCipher;
   readonly role: 'client' | 'server';
   private readonly assoc: SctpAssociation;
-  private readonly transmitFn: (d: Buffer) => void;
+  private readonly transmitFn: (d: Buffer) => boolean | void;
+  /** The transport released the last datagram on return: seal into the cipher's reusable buffer. */
+  private reuse = false;
+  private readonly pingBuf = Buffer.alloc(8);
   private readonly ev: UdpPlaneEvents;
   open = false;
   closed = false;
@@ -423,14 +490,17 @@ export class UdpTunnelPlane {
 
   private sendRaw(type: number, payload: Uint8Array): void {
     if (this.closed) return;
-    const d = this.cipher.seal(type, payload);
+    const reuse = this.reuse;
+    const d = this.cipher.seal(type, payload, reuse);
     if (d === null) {
       this.fail('keys-exhausted');
       return;
     }
     this.c.packetsOut++;
     this.c.bytesOut += d.length;
-    this.transmitFn(d);
+    const released = this.transmitFn(d) === true;
+    if (released) this.reuse = true;
+    else if (reuse) this.cipher.releaseScratch(); // still referenced (queued): next datagrams get a new buffer
   }
 
   /**
@@ -478,9 +548,9 @@ export class UdpTunnelPlane {
 
   /** Keep-alive / RTT probe (8 bytes). */
   ping(): void {
-    const b = Buffer.allocUnsafe(8);
+    const b = this.pingBuf;
     b.writeDoubleBE(performance.now(), 0);
-    this.sendRaw(UdpType.Ping, b);
+    this.sendRaw(UdpType.Ping, b); // sealed into the datagram: the buffer is free again
   }
 
   /** Sends one message on tunnel channel `ch` (copied synchronously). False if not open / buffer full. */

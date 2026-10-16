@@ -14,7 +14,7 @@
  *    is followed, the key ratchet runs while playing.
  */
 import dgram from 'node:dgram';
-import { randomBytes } from 'node:crypto';
+import { createCipheriv, hkdfSync, randomBytes } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { WebSocket, WebSocketServer } from 'ws';
 import { Reader, Writer } from '../../src/codec/index.js';
@@ -104,6 +104,67 @@ describe('tunnel v2 cipher', () => {
     const seq = Array.from({ length: 6 }, () => h2.seal(UdpType.Sctp, Buffer.from([1]))!);
     expect(e2.open(seq[4]!)).toBeNull(); // epoch 2 while the receiver is at 0
     expect(e2.open(seq[0]!)).not.toBeNull();
+  });
+
+  it('wire format matches an independent AES-128-GCM reference, also with the reused output buffer and a 48-bit seq', () => {
+    const s = secrets();
+    const [host, edge] = pair(s, 0xfedcba98, 2 ** 49); // no ratchet: epoch 0 throughout
+    const key = Buffer.from(hkdfSync('sha256', s.h2e, Buffer.alloc(0), 'haxlite-tunnel/2 key', 16));
+    const iv = Buffer.from(hkdfSync('sha256', s.h2e, Buffer.alloc(0), 'haxlite-tunnel/2 iv', 12));
+    const reference = (type: number, seq: number, plain: Buffer): Buffer => {
+      const h = Buffer.alloc(13);
+      h[0] = type;
+      h.writeUInt32BE(0xfedcba98, 1);
+      h.writeUInt16BE(0, 5);
+      h.writeUIntBE(seq, 7, 6);
+      const nonce = Buffer.from(iv);
+      for (let i = 6; i < 12; i++) nonce[i]! ^= h[i + 1]!;
+      const c = createCipheriv('aes-128-gcm', key, nonce, { authTagLength: 16 });
+      c.setAAD(h);
+      const ct = Buffer.concat([c.update(plain), c.final()]);
+      return Buffer.concat([h, ct, c.getAuthTag()]);
+    };
+    let view: Buffer | null = null;
+    for (const [seq, len] of [[0, 0], [1, 50], [0xffffffff, 300], [2 ** 40 + 0x123456789, 1200], [2 ** 48 - 2, 7]] as const) {
+      (host as Any).seq = seq;
+      const plain = randomBytes(len);
+      const fresh = host.seal(UdpType.Sctp, plain)!;
+      expect(fresh.equals(reference(UdpType.Sctp, seq, plain)), `seq ${seq}`).toBe(true);
+      (host as Any).seq = seq;
+      const reused = host.seal(UdpType.Sctp, plain, true)!;
+      expect(reused.equals(fresh)).toBe(true);
+      if (view !== null && view.length > 0) expect(reused.buffer).toBe(view.buffer); // one buffer, reused
+      view = reused;
+      expect(edge.open(Buffer.from(reused))?.equals(plain), `open seq ${seq}`).toBe(true);
+    }
+    // the transport kept it: a new buffer from then on
+    host.releaseScratch();
+    expect(host.seal(UdpType.Ping, Buffer.alloc(8), true)!.buffer).not.toBe(view!.buffer);
+  });
+
+  it('plane: datagrams go into one reused buffer only while transmit() reports them released', () => {
+    const s = secrets();
+    for (const released of [true, false]) {
+      const seen: Buffer[] = [];
+      const plane = new UdpTunnelPlane({
+        role: 'client',
+        connId: 9,
+        secrets: s,
+        lanes: 1,
+        transmit: (d) => {
+          seen.push(d);
+          return released ? true : undefined;
+        },
+        events: { onOpen: () => {}, onMessage: () => {}, onClose: () => {} },
+      });
+      plane.ping();
+      plane.ping();
+      plane.close();
+      expect(seen.length).toBeGreaterThanOrEqual(4); // ping, INIT, ping, ping, ABORT, Close
+      const ids = new Map<ArrayBufferLike, number>();
+      const places = new Set(seen.slice(1).map((d) => `${ids.get(d.buffer) ?? ids.set(d.buffer, ids.size).size - 1}:${d.byteOffset}`));
+      expect(places.size).toBe(released ? 1 : seen.length - 1);
+    }
   });
 
   it('x25519 + HKDF: both ends derive the same keys; a low-order key share is refused', () => {
