@@ -76,9 +76,12 @@ host.start();
 
 * **Bundling scope**: every wake-up, client message and top-level action runs inside the peer
   backend's optional `cork()`/`uncork()` (implemented by the haxlite-rtc backend): all the
-  messages one peer gets from that step (event on `ru`, heartbeat on `uu`, pong, the SACK it is
-  owed…) leave as one SCTP packet / DTLS record / datagram when the step ends, before control
-  returns to the event loop. No latency is added; other backends ignore it.
+  messages one peer gets in that event-loop iteration — from every step that ran in it (event on
+  `ru`, heartbeat on `uu`, pong, the SACK it is owed…) — leave as one SCTP packet / DTLS record /
+  datagram from a single `setImmediate` (check phase, right after poll: no timer, no added
+  wait). Other backends ignore it. Opt-in `rtc.sendBatchFrames: 1 | 2` additionally holds `ru`
+  messages until the next 1- or 2-frame boundary of the same process-wide 60 Hz grid the rooms
+  wake on (docs/10 §6.7).
 * **Heartbeat piggyback** (bundling backends only): after broadcasting a client event, the
   host also sends the heartbeat if its grid point is within `floor((heartbeatFrames - 1) / 3)`
   frames (2 with the default 7); that heartbeat covers the grid point. It leaves in the same
@@ -151,8 +154,9 @@ error), `setDefaultStadium(name)` (throws `Stadium doesn't exist`), `setTeamsLoc
 `startGame`, `stopGame`, `pauseGame(paused)`, `setDiscProperties(index, props)`,
 `setPlayerDiscProperties(id, props)` (`props` use HBInit names incl. `bCoeff`), `reorderPlayers(ids, moveToTop)`,
 `setPassword`, `setRequireRecaptcha`, `setMaxPlayers` (extension), `startRecording()`,
-`stopRecording()` → `.hbr2` bytes | null, `update()` (catch up now). `recorder` is created on
-first use.
+`stopRecording()` → `.hbr2` bytes | null, `stopRecordingAsync()` (extension, also on the HBInit
+RoomObject: same bytes, recording stops at the call, only the deflate runs on the libuv
+threadpool), `update()` (catch up now). `recorder` is created on first use.
 
 **Timing / parity.** Actions run synchronously (the state reflects them on return), except when
 called from inside a room hook / HostRoom callback that fires while events are applied: then

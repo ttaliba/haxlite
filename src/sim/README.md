@@ -25,7 +25,12 @@ import {
   `readStadium(r)` returns the **shared** built-in instance for ids 0..9 (never mutate it; the
   official code shares them too) or a new custom Stadium (geometry prepared, validated: throws
   `InvalidStadiumError`, like the official reader).
-* **Default room stadium**: `defaultStadiums()[0]` (Classic).
+* **Default room stadium**: `defaultStadium(0)` (Classic). `defaultStadium(id)` builds and
+  caches only that stadium (same instance as `defaultStadiums()[id]`, which builds all ten,
+  ~120 KB of heap).
+* **`parseHbs`** tries `JSON.parse` first and loads/uses json5 only when that throws (comments,
+  unquoted keys, trailing commas…): same `Stadium`, same errors for invalid text (51 KB map,
+  Node 26: 5.9 → 0.35 ms steady state).
 * **Game start** (official `Q.eh`): `gs.world = createWorld(stadium)` — geometry arrays are shared
   by reference with the stadium, stadium discs are cloned in order (ball = disc 0). Then append
   player discs (`new Disc()` + fields, as `Q.af` does) yourself.

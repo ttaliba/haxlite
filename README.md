@@ -24,15 +24,18 @@ Todo sale de leer el código, que en ambos casos está minificado; no se captur�
 
 ## haxlite: uso
 
-**haxlite** es un host headless de HaxBall escrito desde cero en TypeScript para Node.js ≥ 22. Habla el protocolo 9 bit a bit con los clientes oficiales del navegador y expone la misma API `HBInit` que la página headless oficial (y que `haxball.js`), sin navegador ni script oficial. Solo depende de `node-datachannel` (WebRTC), `ws` y `json5`.
+**haxlite** es un host headless de HaxBall escrito desde cero en TypeScript. Corre en Node.js ≥ 22 y en Bun (probado con Bun 1.4; donde Bun tiene un camino más barato se usa: `fetch` para el maestro, E/S UDP nativa con `sendMany`, AES‑GCM nativo en DTLS; ver [doc 06 §4.6](docs/06-arquitectura-haxlite.md)). Habla el protocolo 9 bit a bit con los clientes oficiales del navegador y expone la misma API `HBInit` que la página headless oficial (y que `haxball.js`), sin navegador ni script oficial. Depende de `ws` y `json5`; `node-datachannel` (WebRTC nativo) es opcional.
 
 ### Instalación
 
 ```sh
 npm install haxlite          # cuando esté publicado
+npm install haxlite --omit=optional   # sin node-datachannel: solo peerBackend 'rtc' / edge con 'rtc'
 # o, desde este repositorio:
 npm install && npm run build # genera dist/ con los .d.ts
 ```
+
+`node-datachannel` es una `optionalDependency`: solo hace falta con `peerBackend: 'ndc'` (el valor por defecto), los jugadores `'ndc'` del edge o su túnel WebRTC legado; si falta y se necesita, la negociación falla con «node-datachannel no está instalado: instálalo o usa peerBackend: 'rtc'». Un proyecto TypeScript con `skipLibCheck: false` puede ver TS2307 sin él, porque algunos `.d.ts` importan sus tipos.
 
 ### Token
 
@@ -77,7 +80,7 @@ Diferencias deliberadas:
 | `clearBans()` | vacía la lista de bans | vacía los bans de `kickPlayer(…, true)`; los bans de `room.haxlite.bans` (IP, rango, auth) se quitan con `room.haxlite.bans.clear()` |
 | Varias salas | una por página (`Can't init twice`) | varias por proceso |
 | Cierre | no existe | `room.haxlite.stop()` / `close()` |
-| Temporizadores | `setInterval` de 50 ms siempre | un temporizador alineado al siguiente frame con trabajo; sala vacía sin partida = 0 % CPU |
+| Temporizadores | `setInterval` de 50 ms siempre | un temporizador por proceso en una rejilla de 60 Hz compartida por todas las salas (≈ 17 despertares/s con partidas en curso, sean cuantas sean); sala vacía sin partida = 0 % CPU |
 
 ### Extensiones (`room.haxlite` y `config.haxlite`)
 
@@ -112,7 +115,9 @@ room.haxlite.getPlayerConnection(id); // { auth, conn, ip, srflxIps, ping }
 | `haxlite.onBeforeOperation(ev, byId, frame)` | ve cada evento de cliente (después del filtro de chat) antes de aplicarlo: `false` lo descarta, puede modificarlo, lanzar expulsa al emisor. Se llama también para cada input: debe ser barato |
 | `haxlite.onRecaptcha` / `useRecaptchaToken(r)` | el maestro pide captcha (token caducado al reconectar): se recibe la `sitekey` y se reintenta con la respuesta |
 | `haxlite.stop()` / `close()` | cierra temporizadores, señalización y conexiones; con la última sala del proceso libera node-datachannel para que Node termine solo (`shutdownWebRtcOnLastStop`) |
-| `haxlite.peerBackend: 'rtc'`, `haxlite.rtc: { port, publicAddresses, iceLite }` | jugadores sobre haxlite-rtc (TypeScript puro, un puerto UDP, sin hilos nativos, −35 % de CPU con 20 jugadores); ICE completo con STUN, funciona también tras NAT sin configurar (`publicAddresses` opcional). Por defecto `'ndc'` (node-datachannel). `haxlite.rtcPort`, `haxlite.rtcStats()`. Ver [docs/10 §3](docs/10-haxlite-rtc.md) |
+| `haxlite.peerBackend: 'rtc'`, `haxlite.rtc: { port, publicAddresses, iceLite, ipv6, sendBatchFrames }` | jugadores sobre haxlite-rtc (TypeScript puro, un puerto UDP, sin hilos nativos, −35 % de CPU con 20 jugadores); ICE completo con STUN, funciona también tras NAT sin configurar (`publicAddresses` opcional). Solo IPv4 salvo `ipv6: true` (una cabecera IPv6 son 20 B más: ≈ +19 % de salida). `sendBatchFrames: 1 \| 2` agrupa las difusiones de eventos de cliente por frame: −23 a −44 % de bytes en el cable por jugador a cambio de n × 8,3 ms de media en las entradas ajenas (por defecto 0). Por defecto `'ndc'` (node-datachannel). `haxlite.rtcPort`, `haxlite.rtcStats()`. Ver [docs/10 §3](docs/10-haxlite-rtc.md) y [§6.7](docs/10-haxlite-rtc.md) |
+| `haxlite.edge: { url, key, tunnelAead }` | jugadores en un [haxlite Edge](docs/09-haxlite-edge.md) remoto: la IP del host nunca llega a un jugador. `tunnelAead` (`'auto'`): AEAD del túnel UDP, ChaCha20‑Poly1305 en Node, AES‑128‑GCM en Bun, si el edge lo concede |
+| `room.stopRecordingAsync()` | como `stopRecording()` (mismos bytes, la grabación se detiene en la llamada), pero el deflate corre en el *threadpool* de libuv: una grabación de ~1 h bloquea el bucle ~3 ms en vez de ~280 ms. Extensión: la API oficial solo tiene la versión síncrona |
 | `haxlite.setDiscPropertiesFor(viewerId, disco, props, {force})`, `clearDiscOverrides(viewerId)`, `getDiscPropertiesFor`, `hasPrivateView`, `onPrivateViewEnd` | **visuales privados**: cambia un disco solo en el mundo de un jugador (niebla / visión, marcador de tarea) sin desincronizar a nadie. El disco debe ser "solo visual" (de estadio, no el 0, sin *joints*, `cGroup` 0) salvo `force`. El host simula el mundo de ese jugador y le manda su propio hash de *CheckConsistency*. Se descarta al parar/empezar el juego, cambiar de estadio o salir el jugador. Ver [docs/04 §7.4](docs/04-netcode-y-sincronizacion.md) y [`examples/among-us-vision.mjs`](examples/among-us-vision.mjs) |
 | `haxlite.hidePlayerFor(viewerId, playerId)`, `showPlayerFor`, `setPlayerHiddenFor(v, p, oculto)`, `isPlayerHiddenFor`, `getHiddenPlayersFor` | **jugadores ocultos**: el jugador desaparece por completo solo para ese espectador (sin disco, nombre, avatar ni flecha de borde en el cliente oficial, con cualquier zoom) y sigue jugando normal para los demás. Sirve para fantasmas o para la visión por zonas. En el mundo del espectador su disco pasa a posición NaN y `cGroup` 0, y el host simula ese mundo (sin desincronizar). Se vuelve a ocultar tras cada reaparición. Lo que el oculto cambia en la sala se copia a ese mundo (f32). Al mostrarlo, la vista converge. Termina con el juego o al salir uno de los dos. **No es seguridad**: un cliente modificado sigue pudiendo saber dónde está. Ver [docs/04 §7.4](docs/04-netcode-y-sincronizacion.md) y [`examples/among-us-vision.mjs`](examples/among-us-vision.mjs) |
 | `haxlite.setMaxPlayers(n)`, `haxlite.roomLink`, `haxlite.frame`, `haxlite.onError` | utilidades |
@@ -123,7 +128,7 @@ room.haxlite.getPlayerConnection(id); // { auth, conn, ip, srflxIps, ping }
 Los clientes oficiales se adaptan a ambos ajustes sin cambios, porque el host les comunica el retardo en cada *pong* y ellos avanzan según los *heartbeats* que reciben.
 
 * **`inputDelayFrames`** (por defecto 2, como el oficial): frames entre "ahora" y el frame en que se aplica el input de un cliente. Con más retardo llegan menos inputs tarde (que el host re-sella y provocan correcciones) en enlaces con *jitter*, a cambio de más latencia de control. Con menos, la respuesta es más inmediata.
-* **`heartbeatFrames`** (por defecto 7): cada cuántos frames el host envía el *heartbeat* (mensaje 3). Los clientes solo avanzan su estado confirmado al recibirlo y extrapolan desde él, así que bajar a 2–3 acorta la extrapolación y reduce las correcciones visibles de los demás jugadores. Cuesta unos 9 bytes por cliente y *heartbeat*.
+* **`heartbeatFrames`** (por defecto 7): cada cuántos frames el host envía el *heartbeat* (mensaje 3; el oficial, por su bucle de 50 ms, da huecos de 7 a 9; haxlite usa una rejilla exacta, y con `'rtc'` adelanta hasta 2 frames el heartbeat para que viaje con un evento: 5 a 9, [docs/04 §4.3](docs/04-netcode-y-sincronizacion.md)). Los clientes solo avanzan su estado confirmado al recibirlo y extrapolan desde él, así que bajar a 2–3 acorta la extrapolación y reduce las correcciones visibles de los demás jugadores. Cuesta unos 9 bytes por cliente y *heartbeat*.
 * **`checksumIntervalFrames`** (600): periodo del *CheckConsistency* que detecta desincronización.
 
 ### Uso avanzado
