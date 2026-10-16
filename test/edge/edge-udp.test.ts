@@ -14,7 +14,7 @@
  *    is followed, the key ratchet runs while playing.
  */
 import dgram from 'node:dgram';
-import { randomBytes } from 'node:crypto';
+import { createCipheriv, getCiphers, hkdfSync, randomBytes } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { WebSocket, WebSocketServer } from 'ws';
 import { Reader, Writer } from '../../src/codec/index.js';
@@ -29,6 +29,12 @@ import {
   UdpTunnelPlane,
   UdpType,
   deriveTunnelSecrets,
+  grantTunnelAead,
+  grantedTunnelAead,
+  preferredTunnelAead,
+  tunnelAeadFlag,
+  tunnelAeadRequest,
+  type TunnelAead,
   udpConnId,
   x25519Generate,
   x25519Shared,
@@ -41,14 +47,17 @@ function secrets(): TunnelSecrets {
   return { h2e: randomBytes(32), e2h: randomBytes(32) };
 }
 
-function pair(s = secrets(), connId = 0x01020304, rekey?: number): [TunnelCipher, TunnelCipher] {
-  const o = rekey !== undefined ? { rekeyAfterPackets: rekey } : {};
+const AEADS: TunnelAead[] = ['aes-128-gcm', 'chacha20-poly1305'];
+
+function pair(s = secrets(), connId = 0x01020304, rekey?: number, aead?: TunnelAead): [TunnelCipher, TunnelCipher] {
+  const o = { ...(rekey !== undefined ? { rekeyAfterPackets: rekey } : null), ...(aead !== undefined ? { aead } : null) };
   return [new TunnelCipher(connId, s.h2e, s.e2h, o), new TunnelCipher(connId, s.e2h, s.h2e, o)];
 }
 
-describe('tunnel v2 cipher', () => {
+describe.each(AEADS)('tunnel v2 cipher (%s)', (aead) => {
   it('round trip, header layout, tampering, wrong direction, replay window', () => {
-    const [host, edge] = pair();
+    const [host, edge] = pair(secrets(), 0x01020304, undefined, aead);
+    expect(host.aead).toBe(aead);
     const d = host.seal(UdpType.Sctp, Buffer.from('hello'))!;
     expect(d.length).toBe(13 + 5 + 16);
     expect(d[0]).toBe(UdpType.Sctp);
@@ -74,7 +83,7 @@ describe('tunnel v2 cipher', () => {
     expect(rejected).toBe(d2.length);
     expect(edge.open(d2)).not.toBeNull(); // the genuine one still passes once
     // another tunnel's keys
-    const [other] = pair(secrets());
+    const [other] = pair(secrets(), 0x01020304, undefined, aead);
     expect(edge.open(other.seal(UdpType.Sctp, Buffer.from('x'))!)).toBeNull();
     expect(edge.badMac).toBeGreaterThan(0);
     // reordering inside the window is fine, each datagram once; too old is dropped
@@ -90,7 +99,7 @@ describe('tunnel v2 cipher', () => {
   });
 
   it('epoch ratchet: keys change every N datagrams, reordered previous-epoch datagrams still accepted', () => {
-    const [host, edge] = pair(secrets(), 7, 4);
+    const [host, edge] = pair(secrets(), 7, 4, aead);
     const out: Buffer[] = [];
     for (let i = 0; i < 20; i++) out.push(host.seal(UdpType.Sctp, Buffer.from([i]))!);
     expect(out.map((d) => d.readUInt16BE(5))).toEqual([0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4]);
@@ -100,10 +109,149 @@ describe('tunnel v2 cipher', () => {
     expect(edge.rekeys).toBe(4);
     expect(host.rekeys).toBe(4);
     // two epochs ahead (skipped key) or long gone: dropped
-    const [h2, e2] = pair(secrets(), 7, 2);
+    const [h2, e2] = pair(secrets(), 7, 2, aead);
     const seq = Array.from({ length: 6 }, () => h2.seal(UdpType.Sctp, Buffer.from([1]))!);
     expect(e2.open(seq[4]!)).toBeNull(); // epoch 2 while the receiver is at 0
     expect(e2.open(seq[0]!)).not.toBeNull();
+  });
+
+});
+
+describe('tunnel v2 cipher', () => {
+  it('wire format matches an independent AES-128-GCM reference, also with the reused output buffer and a 48-bit seq', () => {
+    const s = secrets();
+    const [host, edge] = pair(s, 0xfedcba98, 2 ** 49); // no ratchet: epoch 0 throughout
+    const key = Buffer.from(hkdfSync('sha256', s.h2e, Buffer.alloc(0), 'haxlite-tunnel/2 key', 16));
+    const iv = Buffer.from(hkdfSync('sha256', s.h2e, Buffer.alloc(0), 'haxlite-tunnel/2 iv', 12));
+    const reference = (type: number, seq: number, plain: Buffer): Buffer => {
+      const h = Buffer.alloc(13);
+      h[0] = type;
+      h.writeUInt32BE(0xfedcba98, 1);
+      h.writeUInt16BE(0, 5);
+      h.writeUIntBE(seq, 7, 6);
+      const nonce = Buffer.from(iv);
+      for (let i = 6; i < 12; i++) nonce[i]! ^= h[i + 1]!;
+      const c = createCipheriv('aes-128-gcm', key, nonce, { authTagLength: 16 });
+      c.setAAD(h);
+      const ct = Buffer.concat([c.update(plain), c.final()]);
+      return Buffer.concat([h, ct, c.getAuthTag()]);
+    };
+    let view: Buffer | null = null;
+    for (const [seq, len] of [[0, 0], [1, 50], [0xffffffff, 300], [2 ** 40 + 0x123456789, 1200], [2 ** 48 - 2, 7]] as const) {
+      (host as Any).seq = seq;
+      const plain = randomBytes(len);
+      const fresh = host.seal(UdpType.Sctp, plain)!;
+      expect(fresh.equals(reference(UdpType.Sctp, seq, plain)), `seq ${seq}`).toBe(true);
+      (host as Any).seq = seq;
+      const reused = host.seal(UdpType.Sctp, plain, true)!;
+      expect(reused.equals(fresh)).toBe(true);
+      if (view !== null && view.length > 0) expect(reused.buffer).toBe(view.buffer); // one buffer, reused
+      view = reused;
+      expect(edge.open(Buffer.from(reused))?.equals(plain), `open seq ${seq}`).toBe(true);
+    }
+    // the transport kept it: a new buffer from then on
+    host.releaseScratch();
+    expect(host.seal(UdpType.Ping, Buffer.alloc(8), true)!.buffer).not.toBe(view!.buffer);
+  });
+
+  it.skipIf(!getCiphers().includes('chacha20-poly1305'))('ChaCha20-Poly1305: matches node:crypto both ways, opens in place, no allocation but the view', () => {
+    const s = secrets();
+    const [host, edge] = pair(s, 0x0badf00d, 2 ** 49, 'chacha20-poly1305');
+    const key = Buffer.from(hkdfSync('sha256', s.h2e, Buffer.alloc(0), 'haxlite-tunnel/2 chacha20 key', 32));
+    const iv = Buffer.from(hkdfSync('sha256', s.h2e, Buffer.alloc(0), 'haxlite-tunnel/2 iv', 12));
+    const reference = (type: number, seq: number, plain: Buffer): Buffer => {
+      const h = Buffer.alloc(13);
+      h[0] = type;
+      h.writeUInt32BE(0x0badf00d, 1);
+      h.writeUIntBE(seq, 7, 6);
+      const nonce = Buffer.from(iv);
+      for (let i = 6; i < 12; i++) nonce[i]! ^= h[i + 1]!;
+      const c = createCipheriv('chacha20-poly1305', key, nonce, { authTagLength: 16 });
+      c.setAAD(h, { plaintextLength: plain.length });
+      const ct = Buffer.concat([c.update(plain), c.final()]);
+      return Buffer.concat([h, ct, c.getAuthTag()]);
+    };
+    for (const [seq, len] of [[0, 0], [1, 1], [2, 63], [3, 64], [4, 65], [0xffffffff, 300], [2 ** 40 + 77, 1200]] as const) {
+      (host as Any).seq = seq;
+      const plain = randomBytes(len);
+      const d = host.seal(UdpType.Sctp, plain, true)!;
+      const ref = reference(UdpType.Sctp, seq, plain);
+      expect(d.equals(ref), `seq ${seq} len ${len}`).toBe(true);
+      // a datagram sealed by node:crypto opens here, in place
+      const pt = edge.open(ref)!;
+      expect(pt.equals(plain)).toBe(true);
+      if (len > 0) {
+        expect(pt.buffer).toBe(ref.buffer);
+        expect(pt.byteOffset).toBe(ref.byteOffset + 13);
+      }
+    }
+    // a failed open leaves the datagram untouched
+    (host as Any).seq = 2 ** 40 + 100;
+    const d = Buffer.from(host.seal(UdpType.Sctp, Buffer.from('abc'))!);
+    const bad = Buffer.from(d);
+    bad[d.length - 1]! ^= 1;
+    const copy = Buffer.from(bad);
+    expect(edge.open(bad)).toBeNull();
+    expect(bad.equals(copy)).toBe(true);
+    expect(edge.open(d)?.toString()).toBe('abc');
+  });
+
+  it('a host and an edge on different AEADs never open each other (AES-128-GCM vs ChaCha20-Poly1305)', () => {
+    const s = secrets();
+    const aes = new TunnelCipher(5, s.h2e, s.e2h);
+    const chacha = new TunnelCipher(5, s.e2h, s.h2e, { aead: 'chacha20-poly1305' });
+    expect(aes.aead).toBe('aes-128-gcm'); // the default: what every v2 peer speaks
+    expect(chacha.open(aes.seal(UdpType.Sctp, Buffer.from('x'))!)).toBeNull();
+    expect(aes.open(chacha.seal(UdpType.Sctp, Buffer.from('x'))!)).toBeNull();
+    expect(aes.badMac + chacha.badMac).toBe(2);
+    expect(() => new TunnelCipher(5, s.h2e, s.e2h, { aead: 'aes-256-gcm' as TunnelAead })).toThrow();
+  });
+
+  it('AEAD negotiation: ChaCha20-Poly1305 only when both ends prefer it; old peers stay on AES-128-GCM', () => {
+    // host side: what to ask for
+    expect(tunnelAeadRequest('aes-128-gcm')).toBe(0);
+    expect(tunnelAeadRequest('chacha20-poly1305')).toBe(AuthFlag.ChaCha);
+    expect(tunnelAeadRequest('auto')).toBe(preferredTunnelAead() === 'chacha20-poly1305' ? AuthFlag.ChaCha : 0);
+    expect(preferredTunnelAead(false)).toBe('chacha20-poly1305'); // Node
+    expect(preferredTunnelAead(true)).toBe('aes-128-gcm'); // Bun
+    // edge side: a host that did not ask (every host before the flag) gets AES-128-GCM, whatever the edge prefers
+    const old = AuthFlag.Udp | AuthFlag.RoLanes;
+    for (const opt of ['auto', 'aes-128-gcm', 'chacha20-poly1305'] as const) expect(grantTunnelAead(old, opt)).toBe('aes-128-gcm');
+    const asks = old | AuthFlag.ChaCha;
+    expect(grantTunnelAead(asks, 'chacha20-poly1305')).toBe('chacha20-poly1305');
+    expect(grantTunnelAead(asks, 'aes-128-gcm')).toBe('aes-128-gcm');
+    expect(grantTunnelAead(asks, 'auto')).toBe(preferredTunnelAead());
+    // host side: an edge before the flag echoes only Udp | RoLanes → AES-128-GCM
+    expect(grantedTunnelAead(old)).toBe('aes-128-gcm');
+    expect(grantedTunnelAead(old | tunnelAeadFlag('chacha20-poly1305'))).toBe('chacha20-poly1305');
+    expect(tunnelAeadFlag('aes-128-gcm')).toBe(0);
+    // the flag does not collide with the planes/lanes an old edge interprets
+    expect(AuthFlag.ChaCha & (AuthFlag.WebRtc | AuthFlag.RoLanes | AuthFlag.Udp)).toBe(0);
+  });
+
+  it('plane: datagrams go into one reused buffer only while transmit() reports them released', () => {
+    const s = secrets();
+    for (const released of [true, false]) {
+      const seen: Buffer[] = [];
+      const plane = new UdpTunnelPlane({
+        role: 'client',
+        connId: 9,
+        secrets: s,
+        lanes: 1,
+        transmit: (d) => {
+          seen.push(d);
+          return released ? true : undefined;
+        },
+        events: { onOpen: () => {}, onMessage: () => {}, onClose: () => {} },
+      });
+      plane.ping();
+      plane.ping();
+      plane.close();
+      expect(seen.length).toBeGreaterThanOrEqual(4); // ping, INIT, ping, ping, ABORT, Close
+      const ids = new Map<ArrayBufferLike, number>();
+      const places = new Set(seen.slice(1).map((d) => `${ids.get(d.buffer) ?? ids.set(d.buffer, ids.size).size - 1}:${d.byteOffset}`));
+      expect(places.size).toBe(released ? 1 : seen.length - 1);
+    }
   });
 
   it('x25519 + HKDF: both ends derive the same keys; a low-order key share is refused', () => {
@@ -124,7 +272,7 @@ describe('tunnel v2 cipher', () => {
 });
 
 describe('tunnel v2 plane (SCTP over the cipher)', () => {
-  it('ro ordered, ru reliable, uu unreliable, ro lanes, over a 10 % lossy reordering link', async () => {
+  it.each(AEADS)('ro ordered, ru reliable, uu unreliable, ro lanes, over a 10 % lossy reordering link (%s)', async (aead) => {
     const s = secrets();
     let rnd = 12345;
     const random = () => ((rnd = (rnd * 1103515245 + 12345) >>> 0) / 4294967296);
@@ -141,6 +289,7 @@ describe('tunnel v2 plane (SCTP over the cipher)', () => {
       connId: 9,
       secrets: s,
       lanes: 4,
+      aead,
       transmit: link(() => server),
       events: { onOpen: () => opened++, onMessage: () => {}, onClose: () => {} },
     });
@@ -149,6 +298,7 @@ describe('tunnel v2 plane (SCTP over the cipher)', () => {
       connId: 9,
       secrets: s,
       lanes: 4,
+      aead,
       transmit: link(() => client),
       events: { onOpen: () => opened++, onMessage: (ch, d) => got.push({ ch, v: d[0]! | (d[1]! << 8) }), onClose: () => {} },
     });

@@ -1,6 +1,7 @@
 /**
  * haxlite Edge tunnel v2 data plane: our own SCTP association
- * (src/rtc/sctp) over AES-128-GCM-sealed UDP datagrams. Shared by the host
+ * (src/rtc/sctp) over AEAD-sealed UDP datagrams (AES-128-GCM, or
+ * ChaCha20-Poly1305 when both ends agree: {@link TunnelAead}). Shared by the host
  * (`edge-client.ts`, SCTP initiator) and the edge (`src/edge`, SCTP passive
  * side). No WebRTC and no native addon. See docs/09-haxlite-edge.md §1.3.
  *
@@ -15,6 +16,7 @@
  *                      info = "haxlite-tunnel/2" ‖ hostPub ‖ edgePub ‖ u32 connId, 64)
  * s_h2e  = okm[0..32)   s_e2h = okm[32..64)        (one secret per direction)
  * key_e  = HKDF(s_e, "haxlite-tunnel/2 key", 16)   iv_e = HKDF(s_e, "haxlite-tunnel/2 iv", 12)
+ *          (ChaCha20-Poly1305: key_e = HKDF(s_e, "haxlite-tunnel/2 chacha20 key", 32))
  * s_e+1  = HKDF(s_e, "haxlite-tunnel/2 next", 32)  (ratchet every 2^24 datagrams; old keys erased)
  * ```
  *
@@ -24,7 +26,7 @@
  * Datagram (both directions):
  *
  * ```
- * [u8 type][u32 connId][u16 epoch][u48 seq] [AES-128-GCM(payload)] [16 B tag]
+ * [u8 type][u32 connId][u16 epoch][u48 seq] [AEAD(payload)] [16 B tag]
  *  └──────────────── 13 B header = AAD ──┘
  * nonce = iv_epoch XOR (0^6 ‖ seq48)
  * ```
@@ -44,6 +46,8 @@ import {
   hkdfSync,
   type KeyObject,
 } from 'node:crypto';
+import { ChaCha20Poly1305 } from '../rtc/dtls/chacha.js';
+import { AuthFlag } from './edge-protocol.js';
 import { SctpAssociation, type SctpChannelConfig } from '../rtc/sctp/index.js';
 
 /** Datagram types (cleartext, authenticated). Outside RFC 7983's STUN/DTLS/TURN/RTP ranges. */
@@ -94,6 +98,58 @@ export const TUNNEL_SCTP_TUNING = {
 const EMPTY = Buffer.alloc(0);
 const SPKI_X25519_PREFIX = Buffer.from('302a300506032b656e032100', 'hex');
 const ALGO = 'aes-128-gcm';
+
+/**
+ * Datagram AEAD of a tunnel. `'aes-128-gcm'` (node:crypto) is protocol v2's
+ * original and the default; `'chacha20-poly1305'` (the allocation-free, in
+ * place JS AEAD of src/rtc/dtls/chacha.ts) is used only when both ends
+ * agreed on it (`AuthFlag.ChaCha`, see edge-protocol.ts). Same datagram
+ * layout, nonce construction, replay window and ratchet; only the key
+ * (32 B, its own HKDF label) and the cipher differ.
+ */
+export type TunnelAead = 'aes-128-gcm' | 'chacha20-poly1305';
+
+const IS_BUN = typeof (process.versions as Record<string, string | undefined>).bun === 'string';
+
+/**
+ * This runtime's cheaper tunnel AEAD. Node: ChaCha20-Poly1305 in JS (no
+ * native cipher object and no Buffers per datagram, where node:crypto's
+ * AES-GCM costs ~4 µs per seal or open, mostly the per-datagram cipher
+ * object). Bun: AES-128-GCM — its node:crypto is cheap and JSC runs the JS
+ * ChaCha slower than V8.
+ */
+export function preferredTunnelAead(bun = IS_BUN): TunnelAead {
+  return bun ? 'aes-128-gcm' : 'chacha20-poly1305';
+}
+
+/** Tunnel AEAD setting of either end: `'auto'` = {@link preferredTunnelAead}. */
+export type TunnelAeadOption = TunnelAead | 'auto';
+
+/** Host: the AEAD flag to add to a v2 `Auth` that asks for {@link AuthFlag.Udp} (0 = AES-128-GCM). */
+export function tunnelAeadRequest(option: TunnelAeadOption = 'auto'): number {
+  const want = option === 'auto' ? preferredTunnelAead() : option;
+  return want === 'chacha20-poly1305' ? AuthFlag.ChaCha : 0;
+}
+
+/**
+ * Edge: the AEAD for a host that asked for `requested` flags (granting the
+ * UDP plane). ChaCha20-Poly1305 only when the host asked for it and this
+ * end's setting agrees; otherwise AES-128-GCM (what every v2 peer speaks).
+ */
+export function grantTunnelAead(requested: number, option: TunnelAeadOption = 'auto'): TunnelAead {
+  if ((requested & AuthFlag.ChaCha) === 0) return 'aes-128-gcm';
+  return (option === 'auto' ? preferredTunnelAead() : option) === 'chacha20-poly1305' ? 'chacha20-poly1305' : 'aes-128-gcm';
+}
+
+/** The flag that announces `aead` in `AuthOk`. */
+export function tunnelAeadFlag(aead: TunnelAead): number {
+  return aead === 'chacha20-poly1305' ? AuthFlag.ChaCha : 0;
+}
+
+/** Host: the AEAD the edge granted (its `AuthOk` flags). */
+export function grantedTunnelAead(granted: number): TunnelAead {
+  return (granted & AuthFlag.ChaCha) !== 0 ? 'chacha20-poly1305' : 'aes-128-gcm';
+}
 
 // ------------------------------------------------------------------ keys
 
@@ -151,16 +207,32 @@ function expand(secret: Uint8Array, label: string, n: number): Buffer {
 interface EpochKeys {
   epoch: number;
   secret: Buffer;
-  key: KeyObject;
+  /** AES-128-GCM key (null with ChaCha20-Poly1305). */
+  key: KeyObject | null;
+  /** ChaCha20-Poly1305 AEAD (null with AES-128-GCM). */
+  chacha: ChaCha20Poly1305 | null;
   iv: Buffer;
 }
 
-function epochKeys(secret: Buffer, epoch: number): EpochKeys {
-  return { epoch, secret, key: createSecretKey(expand(secret, 'haxlite-tunnel/2 key', 16)), iv: expand(secret, 'haxlite-tunnel/2 iv', 12) };
+function epochKeys(secret: Buffer, epoch: number, aead: TunnelAead): EpochKeys {
+  const iv = expand(secret, 'haxlite-tunnel/2 iv', 12);
+  if (aead === 'chacha20-poly1305') {
+    const raw = expand(secret, 'haxlite-tunnel/2 chacha20 key', 32);
+    const chacha = new ChaCha20Poly1305(raw);
+    raw.fill(0);
+    return { epoch, secret, key: null, chacha, iv };
+  }
+  return { epoch, secret, key: createSecretKey(expand(secret, 'haxlite-tunnel/2 key', 16)), chacha: null, iv };
 }
 
 function nextEpoch(k: EpochKeys): EpochKeys {
-  return epochKeys(expand(k.secret, 'haxlite-tunnel/2 next', 32), k.epoch + 1);
+  return epochKeys(expand(k.secret, 'haxlite-tunnel/2 next', 32), k.epoch + 1, k.chacha !== null ? 'chacha20-poly1305' : 'aes-128-gcm');
+}
+
+/** Best-effort erasure of a retired epoch's key material. */
+function wipe(k: EpochKeys): void {
+  k.chacha?.wipe();
+  k.secret.fill(0);
 }
 
 /** Receive state of one epoch: key + sliding replay window. */
@@ -202,12 +274,24 @@ export function udpConnId(d: Uint8Array): number {
   return ((d[1]! << 24) | (d[2]! << 16) | (d[3]! << 8) | d[4]!) >>> 0;
 }
 
+/** Smallest reusable output buffer (an MTU-sized SCTP packet + overhead fits). */
+const SCRATCH_SIZE = 2048;
+
 /**
  * Sealing/opening for one tunnel (both directions). Nonces never repeat: one
  * key per direction and epoch, a strictly increasing 48-bit sequence number.
+ *
+ * Allocations per datagram: with AES-128-GCM, node:crypto needs a fresh
+ * native cipher object per nonce plus its output and tag Buffers
+ * (unavoidable through its API); everything else is preallocated — the
+ * header (AAD), nonce and tag are written to scratch buffers, and with
+ * `reuse` the datagram itself is written to a buffer kept across calls.
+ * With ChaCha20-Poly1305 nothing but the plaintext view: sealed in the
+ * output buffer, opened in place.
  */
 export class TunnelCipher {
   readonly connId: number;
+  readonly aead: TunnelAead;
   private send: EpochKeys;
   private seq = 0;
   private cur: RecvEpoch;
@@ -215,6 +299,13 @@ export class TunnelCipher {
   private next: RecvEpoch | null = null;
   private readonly rekeyAfter: number;
   private readonly nonce = Buffer.alloc(12);
+  /** Header (AAD) of the datagram being sealed/opened. */
+  private readonly hdr = Buffer.alloc(UDP_HEADER_LENGTH);
+  /** Tag of the datagram being opened. */
+  private readonly tag = Buffer.alloc(UDP_TAG_LENGTH);
+  /** Reusable output (see {@link seal}) and its last exact-length view. */
+  private scratch: Buffer | null = null;
+  private view: Buffer | null = null;
   /** Type of the last datagram {@link open} accepted. */
   lastType = 0;
   /** The last accepted datagram was the newest one seen (eligible to move the peer address). */
@@ -225,18 +316,28 @@ export class TunnelCipher {
   /** Epoch ratchets (send + receive). */
   rekeys = 0;
 
-  constructor(connId: number, sendSecret: Buffer, recvSecret: Buffer, opts: { rekeyAfterPackets?: number } = {}) {
+  constructor(connId: number, sendSecret: Buffer, recvSecret: Buffer, opts: { rekeyAfterPackets?: number; aead?: TunnelAead } = {}) {
     this.connId = connId >>> 0;
-    this.send = epochKeys(Buffer.from(sendSecret), 0);
-    this.cur = new RecvEpoch(epochKeys(Buffer.from(recvSecret), 0));
+    const aead = (this.aead = opts.aead ?? 'aes-128-gcm');
+    if (aead !== 'aes-128-gcm' && aead !== 'chacha20-poly1305') throw new Error(`unknown tunnel AEAD ${String(aead)}`);
+    this.send = epochKeys(Buffer.from(sendSecret), 0, aead);
+    this.cur = new RecvEpoch(epochKeys(Buffer.from(recvSecret), 0, aead));
     this.rekeyAfter = Math.max(2, opts.rekeyAfterPackets ?? REKEY_AFTER_PACKETS);
   }
 
-  /** Builds an authenticated datagram; null when the sequence space is exhausted (never in practice). */
-  seal(type: number, plain: Uint8Array): Buffer | null {
+  /**
+   * Builds an authenticated datagram; null when the sequence space is
+   * exhausted (never in practice). With `reuse` the result is a view of a
+   * buffer this cipher reuses on the next `reuse` call: only for a
+   * transport that is done with it once its send returns (else call
+   * {@link releaseScratch}); without it, a fresh buffer.
+   */
+  seal(type: number, plain: Uint8Array, reuse = false): Buffer | null {
     if (this.seq >= this.rekeyAfter) {
       if (this.send.epoch >= 0xffff) return null;
-      this.send = nextEpoch(this.send);
+      const old = this.send;
+      this.send = nextEpoch(old);
+      wipe(old);
       this.seq = 0;
       this.rekeys++;
     }
@@ -244,29 +345,65 @@ export class TunnelCipher {
     if (seq > MAX_SEQ) return null;
     const k = this.send;
     const n = plain.length;
-    const out = Buffer.allocUnsafe(UDP_OVERHEAD + n);
-    out[0] = type;
-    out.writeUInt32BE(this.connId, 1);
-    out.writeUInt16BE(k.epoch, 5);
-    out.writeUIntBE(seq, 7, 6);
+    const total = UDP_OVERHEAD + n;
+    const out = reuse ? this.output(total) : Buffer.allocUnsafe(total);
+    // header: [u8 type][u32 connId][u16 epoch][u48 seq]
+    const h = this.hdr;
+    const id = this.connId;
+    const hi = Math.floor(seq / 0x100000000);
+    const lo = seq >>> 0;
+    h[0] = type;
+    h[1] = id >>> 24;
+    h[2] = id >>> 16;
+    h[3] = id >>> 8;
+    h[4] = id;
+    h[5] = k.epoch >>> 8;
+    h[6] = k.epoch;
+    h[7] = hi >>> 8;
+    h[8] = hi;
+    h[9] = lo >>> 24;
+    h[10] = lo >>> 16;
+    h[11] = lo >>> 8;
+    h[12] = lo;
+    out.set(h, 0);
     const nonce = this.nonce;
-    const iv = k.iv;
-    for (let i = 0; i < 6; i++) nonce[i] = iv[i]!;
-    for (let i = 6; i < 12; i++) nonce[i] = iv[i]! ^ out[i + 1]!;
-    const c = createCipheriv(ALGO, k.key, nonce, { authTagLength: UDP_TAG_LENGTH });
-    c.setAAD(out.subarray(0, UDP_HEADER_LENGTH));
-    if (n > 0) {
-      const ct = c.update(plain);
-      ct.copy(out, UDP_HEADER_LENGTH);
+    setNonce(nonce, k.iv, h);
+    const chacha = k.chacha;
+    if (chacha !== null) {
+      if (n > 0) out.set(plain, UDP_HEADER_LENGTH);
+      chacha.seal(nonce, h, 0, UDP_HEADER_LENGTH, out, UDP_HEADER_LENGTH, n, out, UDP_HEADER_LENGTH + n);
+      return out;
     }
+    const c = createCipheriv(ALGO, k.key!, nonce, { authTagLength: UDP_TAG_LENGTH });
+    c.setAAD(h);
+    if (n > 0) out.set(c.update(plain), UDP_HEADER_LENGTH);
     c.final();
-    c.getAuthTag().copy(out, UDP_HEADER_LENGTH + n);
+    out.set(c.getAuthTag(), UDP_HEADER_LENGTH + n);
     return out;
+  }
+
+  /** Forgets the reusable output buffer (the transport kept the last one). */
+  releaseScratch(): void {
+    this.scratch = null;
+    this.view = null;
+  }
+
+  private output(total: number): Buffer {
+    let s = this.scratch;
+    if (s === null || s.length < total) {
+      s = this.scratch = Buffer.allocUnsafeSlow(Math.max(SCRATCH_SIZE, total));
+      this.view = null;
+    }
+    let v = this.view;
+    if (v === null || v.length !== total) v = this.view = s.subarray(0, total);
+    return v;
   }
 
   /**
    * Authenticates and decrypts a datagram addressed to this tunnel. Returns
-   * the plaintext (a fresh buffer) or null (malformed, replayed, bad MAC).
+   * the plaintext or null (malformed, replayed, bad MAC; `d` untouched).
+   * AES-128-GCM: a fresh buffer. ChaCha20-Poly1305: decrypted in place, a
+   * view of `d` (whose ciphertext is overwritten: `d` must be the caller's).
    */
   open(d: Uint8Array, now: number = performance.now()): Buffer | null {
     if (d.length < UDP_OVERHEAD || udpConnId(d) !== this.connId) return null;
@@ -283,25 +420,39 @@ export class TunnelCipher {
       return null;
     }
     const k = e.keys;
-    const nonce = this.nonce;
-    for (let i = 0; i < 6; i++) nonce[i] = k.iv[i]!;
-    for (let i = 6; i < 12; i++) nonce[i] = k.iv[i]! ^ d[i + 1]!;
     const tagAt = d.length - UDP_TAG_LENGTH;
+    const nonce = this.nonce;
+    setNonce(nonce, k.iv, d);
     let pt: Buffer;
-    try {
-      const dc = createDecipheriv(ALGO, k.key, nonce, { authTagLength: UDP_TAG_LENGTH });
-      dc.setAAD(d.subarray(0, UDP_HEADER_LENGTH));
-      dc.setAuthTag(d.subarray(tagAt));
-      pt = tagAt > UDP_HEADER_LENGTH ? dc.update(d.subarray(UDP_HEADER_LENGTH, tagAt)) : Buffer.alloc(0);
-      dc.final();
-    } catch {
-      this.badMac++;
-      return null;
+    const chacha = k.chacha;
+    if (chacha !== null) {
+      const n = tagAt - UDP_HEADER_LENGTH;
+      if (!chacha.open(nonce, d, 0, UDP_HEADER_LENGTH, d, UDP_HEADER_LENGTH, n, d, tagAt)) {
+        this.badMac++;
+        return null;
+      }
+      pt = n > 0 ? Buffer.from(d.buffer, d.byteOffset + UDP_HEADER_LENGTH, n) : EMPTY;
+    } else {
+      const h = this.hdr;
+      for (let i = 0; i < UDP_HEADER_LENGTH; i++) h[i] = d[i]!;
+      const tag = this.tag;
+      for (let i = 0; i < UDP_TAG_LENGTH; i++) tag[i] = d[tagAt + i]!;
+      try {
+        const dc = createDecipheriv(ALGO, k.key!, nonce, { authTagLength: UDP_TAG_LENGTH });
+        dc.setAAD(h);
+        dc.setAuthTag(tag);
+        pt = tagAt > UDP_HEADER_LENGTH ? dc.update(d.subarray(UDP_HEADER_LENGTH, tagAt)) : EMPTY;
+        dc.final();
+      } catch {
+        this.badMac++;
+        return null;
+      }
     }
     let newest = e.accept(seq);
     if (e === this.next) {
       // the peer ratcheted: previous epoch kept a little for reordered packets, older keys erased
       cur.retiredAt = now;
+      if (this.prev !== null) wipe(this.prev.keys);
       this.prev = cur;
       this.cur = e;
       this.next = null;
@@ -312,6 +463,12 @@ export class TunnelCipher {
     this.lastNewest = newest;
     return pt;
   }
+}
+
+/** nonce = iv XOR (0^6 ‖ seq48), seq48 = header[7..13). */
+function setNonce(nonce: Buffer, iv: Buffer, h: Uint8Array): void {
+  for (let i = 0; i < 6; i++) nonce[i] = iv[i]!;
+  for (let i = 6; i < 12; i++) nonce[i] = iv[i]! ^ h[i + 1]!;
 }
 
 // ------------------------------------------------------------------ plane
@@ -344,9 +501,16 @@ export interface UdpPlaneOptions {
   secrets: TunnelSecrets;
   /** `ro` lanes (1 = the single `ro` channel). */
   lanes: number;
-  /** Puts a sealed datagram on the wire (the edge drops it while the host's address is unknown). */
-  transmit(datagram: Buffer): void;
+  /**
+   * Puts a sealed datagram on the wire (the edge drops it while the host's
+   * address is unknown). Returning `true` promises the buffer is no longer
+   * referenced (sent synchronously, copied or dropped): the plane then
+   * writes the next datagrams into one reused buffer instead of a fresh one each.
+   */
+  transmit(datagram: Buffer): boolean | void;
   events: UdpPlaneEvents;
+  /** Datagram AEAD both ends agreed on (default AES-128-GCM, see {@link TunnelAead}). */
+  aead?: TunnelAead;
   /** Tests: ratchet after this many datagrams. */
   rekeyAfterPackets?: number;
   /** SCTP overrides (benchmarks). */
@@ -372,7 +536,10 @@ export class UdpTunnelPlane {
   readonly cipher: TunnelCipher;
   readonly role: 'client' | 'server';
   private readonly assoc: SctpAssociation;
-  private readonly transmitFn: (d: Buffer) => void;
+  private readonly transmitFn: (d: Buffer) => boolean | void;
+  /** The transport released the last datagram on return: seal into the cipher's reusable buffer. */
+  private reuse = false;
+  private readonly pingBuf = Buffer.alloc(8);
   private readonly ev: UdpPlaneEvents;
   open = false;
   closed = false;
@@ -388,6 +555,7 @@ export class UdpTunnelPlane {
     const client = o.role === 'client';
     this.cipher = new TunnelCipher(o.connId, client ? o.secrets.h2e : o.secrets.e2h, client ? o.secrets.e2h : o.secrets.h2e, {
       rekeyAfterPackets: o.rekeyAfterPackets,
+      aead: o.aead,
     });
     const onError = (err: unknown) => {
       try {
@@ -423,14 +591,17 @@ export class UdpTunnelPlane {
 
   private sendRaw(type: number, payload: Uint8Array): void {
     if (this.closed) return;
-    const d = this.cipher.seal(type, payload);
+    const reuse = this.reuse;
+    const d = this.cipher.seal(type, payload, reuse);
     if (d === null) {
       this.fail('keys-exhausted');
       return;
     }
     this.c.packetsOut++;
     this.c.bytesOut += d.length;
-    this.transmitFn(d);
+    const released = this.transmitFn(d) === true;
+    if (released) this.reuse = true;
+    else if (reuse) this.cipher.releaseScratch(); // still referenced (queued): next datagrams get a new buffer
   }
 
   /**
@@ -478,9 +649,9 @@ export class UdpTunnelPlane {
 
   /** Keep-alive / RTT probe (8 bytes). */
   ping(): void {
-    const b = Buffer.allocUnsafe(8);
+    const b = this.pingBuf;
     b.writeDoubleBE(performance.now(), 0);
-    this.sendRaw(UdpType.Ping, b);
+    this.sendRaw(UdpType.Ping, b); // sealed into the datagram: the buffer is free again
   }
 
   /** Sends one message on tunnel channel `ch` (copied synchronously). False if not open / buffer full. */

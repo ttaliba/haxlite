@@ -17,12 +17,13 @@
  *   known connection id are bounded);
  * * a tunnel that sends nothing authenticated for `idleTimeoutMs` is closed.
  */
-import type { RemoteInfo, Socket } from 'node:dgram';
+import type { Socket } from 'node:dgram';
 import { createRequire } from 'node:module';
 import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { TokenBucket } from '../net/rate-limit.js';
-import { UdpTunnelPlane, udpConnId, type TunnelSecrets, type UdpPlaneEvents } from '../net/edge-udp.js';
+import { UdpIo } from '../rtc/udp.js';
+import { UdpTunnelPlane, udpConnId, type TunnelAead, type TunnelAeadOption, type TunnelSecrets, type UdpPlaneEvents } from '../net/edge-udp.js';
 
 export interface EdgeTunnelOptions {
   /** Accept tunnel v2 (UDP) data planes. Default true. */
@@ -47,6 +48,21 @@ export interface EdgeTunnelOptions {
   idleTimeoutMs?: number;
   /** Accept the legacy WebRTC (node-datachannel) tunnel from hosts that ask for it (loads the addon then). Default true. */
   allowWebRtc?: boolean;
+  /**
+   * Datagram AEAD granted to hosts that ask for ChaCha20-Poly1305
+   * (`AuthFlag.ChaCha`): `'auto'` (default) = this runtime's cheaper one
+   * (Node: ChaCha20-Poly1305, Bun: AES-128-GCM); `'aes-128-gcm'` never
+   * grants it. Hosts that do not ask always get AES-128-GCM.
+   */
+  aead?: TunnelAeadOption;
+}
+
+/** Per-tunnel options of {@link EdgeUdpServer.open}. */
+export interface EdgeUdpConnOptions {
+  /** Negotiated datagram AEAD (default AES-128-GCM). */
+  aead?: TunnelAead;
+  /** Tests: ratchet after this many datagrams. */
+  rekeyAfterPackets?: number;
 }
 
 export interface EdgeTunnelStats {
@@ -105,7 +121,7 @@ export class EdgeUdpConn {
   closed = false;
 
   /** @internal use {@link EdgeUdpServer.open} */
-  constructor(server: EdgeUdpServer, connId: number, secrets: TunnelSecrets, lanes: number, events: UdpPlaneEvents, extra: { rekeyAfterPackets?: number }) {
+  constructor(server: EdgeUdpServer, connId: number, secrets: TunnelSecrets, lanes: number, events: UdpPlaneEvents, extra: EdgeUdpConnOptions) {
     this.server = server;
     this.connId = connId;
     const pps = server.maxPps;
@@ -120,17 +136,19 @@ export class EdgeUdpConn {
       lanes,
       transmit: (d) => {
         const a = this.addr;
-        if (a !== null) this.server.sendTo(d, a.address, a.port); // never to an unauthenticated address
+        if (a === null) return true; // never to an unauthenticated address
+        return this.server.sendTo(d, a.address, a.port);
       },
       events,
       ...(extra.rekeyAfterPackets !== undefined ? { rekeyAfterPackets: extra.rekeyAfterPackets } : null),
+      ...(extra.aead !== undefined ? { aead: extra.aead } : null),
     });
   }
 
   /** A datagram carrying this connection id. */
-  onDatagram(msg: Buffer, rinfo: RemoteInfo, now: number): void {
+  onDatagram(msg: Buffer, address: string, port: number, now: number): void {
     const a = this.addr;
-    const fromPeer = a !== null && a.port === rinfo.port && a.address === rinfo.address;
+    const fromPeer = a !== null && a.port === port && a.address === address;
     if (!(fromPeer ? this.own : this.foreign).take(now)) {
       this.server.counters.rateLimited++;
       return;
@@ -142,7 +160,7 @@ export class EdgeUdpConn {
     }
     if (!fromPeer && this.plane.cipher.lastNewest) {
       if (a !== null) this.server.counters.migrations++;
-      this.addr = { address: rinfo.address, port: rinfo.port };
+      this.addr = { address, port };
     }
     this.plane.dispatch(pt);
   }
@@ -171,8 +189,11 @@ export class EdgeUdpServer {
   readonly port: number;
   readonly maxPps: number;
   readonly maxForeignPps: number;
+  /** AEAD setting for hosts that ask for ChaCha20-Poly1305 ({@link EdgeTunnelOptions.aead}). */
+  readonly aead: TunnelAeadOption;
   private readonly idleMs: number;
   private readonly sock: Socket;
+  private readonly io: UdpIo;
   private readonly conns = new Map<number, EdgeUdpConn>();
   private sweepTimer: NodeJS.Timeout | null = null;
   private closed = false;
@@ -184,8 +205,9 @@ export class EdgeUdpServer {
     this.maxPps = Math.max(1, o.maxPps ?? 20_000);
     this.maxForeignPps = Math.max(1, o.maxForeignPps ?? 20);
     this.idleMs = o.idleTimeoutMs ?? 30_000;
-    sock.on('message', (msg: Buffer, rinfo: RemoteInfo) => this.onPacket(msg, rinfo));
-    sock.on('error', () => {
+    this.aead = o.aead ?? 'auto';
+    // the runtime's send/receive paths without dgram's per-datagram garbage (src/rtc/udp.ts)
+    this.io = new UdpIo(sock, (msg, address, port) => this.onPacket(msg, address, port), () => {
       /* ICMP errors etc.: never fatal for a shared socket */
     });
   }
@@ -203,7 +225,7 @@ export class EdgeUdpServer {
   }
 
   /** Registers a new tunnel with a fresh random connection id. */
-  open(secretsFor: (connId: number) => TunnelSecrets, lanes: number, events: UdpPlaneEvents, extra: { rekeyAfterPackets?: number } = {}): EdgeUdpConn {
+  open(secretsFor: (connId: number) => TunnelSecrets, lanes: number, events: UdpPlaneEvents, extra: EdgeUdpConnOptions = {}): EdgeUdpConn {
     if (this.closed) throw new Error('tunnel socket closed');
     let id = 0;
     while (id === 0 || this.conns.has(id)) id = randomBytes(4).readUInt32BE(0);
@@ -225,18 +247,18 @@ export class EdgeUdpServer {
     }
   }
 
-  /** @internal */ sendTo(d: Buffer, address: string, port: number): void {
+  /** @internal True when `d` is no longer referenced (sent, copied or dropped). */ sendTo(d: Buffer, address: string, port: number): boolean {
     const c = this.counters;
     c.datagramsOut++;
     c.bytesOut += d.length;
     try {
-      this.sock.send(d, port, address);
+      return this.io.send(d, port, address);
     } catch {
-      /* closed */
+      return true; // closed
     }
   }
 
-  private onPacket(msg: Buffer, rinfo: RemoteInfo): void {
+  private onPacket(msg: Buffer, address: string, port: number): void {
     const c = this.counters;
     c.datagramsIn++;
     c.bytesIn += msg.length;
@@ -246,7 +268,7 @@ export class EdgeUdpServer {
       c.unknownConn++;
       return;
     }
-    conn.onDatagram(msg, rinfo, performance.now());
+    conn.onDatagram(msg, address, port, performance.now());
   }
 
   private sweep(): void {
