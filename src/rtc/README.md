@@ -3,7 +3,8 @@
 Minimal pure-TypeScript WebRTC **data-channel** stack for HaxBall hosts (haxlite Edge,
 dedicated hosts, and hosts behind NAT: full ICE with STUN gathering). Replaces
 node-datachannel/libdatachannel there. No native addons:
-`node:dgram` + `node:crypto` only (Node ≥ 22).
+`node:dgram` + `node:crypto` only (Node ≥ 22, or Bun: on Bun the UDP I/O goes through the
+native socket inside `dgram`, see Design notes).
 
 Scope (HaxBall needs nothing else): the browser is always the **offerer** and the DTLS
 **client**; we are an **ICE-lite**, **DTLS 1.2 server**, **SCTP** endpoint with the three
@@ -32,11 +33,12 @@ import { RtcEndpoint, RtcCertificate, acquireSharedEndpoint } from './rtc/index.
 const ep = await RtcEndpoint.listen({
   port: 40000,                    // default 0 (ephemeral)
   address: '0.0.0.0',             // bind address; default: wildcard of the family of publicAddresses
+  ipv6: false,                    // default false: IPv4 only (no udp6, no IPv6 candidates, no AAAA); IPv6 headers cost ≈ +19 % egress
   publicAddresses: ['203.0.113.7'], // optional (full ICE): host candidates instead of the interfaces; required with iceLite
   iceServers: ['stun:stun.l.google.com:19302'], // srflx gathering (default none; TURN entries ignored)
   candidatePolicy: 'public',      // interface addresses announced / remote classes checked ('public' | 'private' | 'all' | fn)
   iceLite: false,                 // true: a=ice-lite, no checks, no gathering
-  gatherRefreshMs: 60_000,        // srflx result reused for this long
+  gatherRefreshMs: 60_000,        // older srflx result → refreshed in the background (sessions still get it at once)
   publicPort: 40000,              // optional: advertised port when a 1:1 NAT maps it (default: bound port)
   certificate: RtcCertificate.generate(), // optional; default: RtcCertificate.processDefault() (one per process, generated synchronously)
   certificateFile: '/var/lib/haxlite/dtls.pem', // optional: load/persist the identity (RtcCertificate.loadOrCreate)
@@ -47,7 +49,7 @@ const ep = await RtcEndpoint.listen({
 });
 
 const s = ep.createSession(offerSdp);   // throws RtcSdpError on an unusable offer
-s.answerSdp;            // answer with the known candidates (a=end-of-candidates once gathering is complete)
+s.answerSdp;            // answer with the known candidates (a=end-of-candidates once gathering is complete); '' once DTLS connects
 s.localCandidates;      // ['candidate:1 1 udp 2130706431 203.0.113.7 40000 typ host', …] (no "a=")
 s.mid;                  // mid of the data m-line (for trickle signaling)
 s.addRemoteCandidate('candidate:…');  // full ICE: our checks go there (ICE-lite: hint only)
@@ -117,16 +119,25 @@ assoc.close()         // no onClose afterwards
   nominates (= `remoteAddress`). NAT rebinding: only through a new authenticated binding.
   Consent: the browser keeps sending bindings (~every 2.5–5 s); none for `idleTimeoutMs` →
   close.
-* **DTLS 1.2 server** (RFC 6347, `dtls/server.ts`): HMAC cookie (HelloVerifyRequest, bound to
-  the remote address and the ClientHello parameters) before any handshake state;
-  `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` preferred — Chromium 141 offers and
-  negotiates it — then AES_128_GCM / AES_256_GCM (all three exercised against OpenSSL;
-  `cipherSuites` changes the order). ChaCha20-Poly1305 records use `dtls/chacha.ts`: a pure-JS,
+* **DTLS 1.2 server** (RFC 6347, `dtls/server.ts`): no HelloVerifyRequest by default — the
+  first ClientHello gets flight 4 (RFC 6347 §4.2.1 allows it; the cookie only proves address
+  ownership, and the endpoint only routes DTLS from addresses validated by authenticated STUN):
+  one client RTT less per join. A retransmitted ClientHello re-sends flight 4 unchanged
+  (rate-limited); an unsolicited cookie is ignored. `DtlsServerOptions.helloVerify: true` keeps
+  the HMAC cookie exchange (bound to the remote address and the ClientHello parameters) for uses
+  outside ICE. Suite preference depends on the runtime (`defaultSuites` in `dtls/crypto.ts`):
+  Node prefers `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` — Chromium 141 offers and
+  negotiates it — then AES_128_GCM / AES_256_GCM; Bun prefers AES_128_GCM (its native AES-GCM
+  is ~3× cheaper than the JS ChaCha20 there), then ChaCha20, AES_256_GCM (all three exercised
+  against OpenSSL; `cipherSuites` changes the order). `chacha: 'node'` falls back to the JS AEAD
+  on Bun (no `chacha20-poly1305` in its node:crypto). ChaCha20-Poly1305 records use `dtls/chacha.ts`: a pure-JS,
   constant-time (ARX + 13-bit-limb Poly1305, no secret-dependent branches or tables),
   allocation-free AEAD that encrypts the record in the shared send buffer and decrypts in place
   in the received datagram (tag verified first); RFC 8439 vectors + millions of random cases
   against node:crypto in test/rtc/chacha.test.ts. AES-GCM stays on node:crypto (one native
-  cipher object per record; AES is never done in JS). x25519 preferred / secp256r1;
+  cipher object per record, key kept as a `KeyObject`; AES is never done in JS). HMAC keys (STUN
+  MESSAGE-INTEGRITY local/remote, the PRF secret, the SCTP state cookie) are `KeyObject`s too:
+  on Node 26 that is 6–11× cheaper per operation, neutral on Bun (docs/10 §6.7). x25519 preferred / secp256r1;
   extended_master_secret **required** (RFC 7627, fatal handshake_failure otherwise);
   renegotiation_info (initial handshake only, renegotiation refused); mandatory client
   certificate whose hash must equal the SDP `a=fingerprint` (constant-time compare; fatal
@@ -138,12 +149,18 @@ assoc.close()         // no onClose afterwards
   ClientHello included, bounded sizes); alerts; close_notify both ways. No resumption, no
   compression, no DTLS 1.0.
 * **DTLS 1.3**: Chromium 141 with `WebRTC-ForceDtls13` offers 1.3 via `supported_versions`;
-  we answer a plain DTLS 1.2 ServerHello (no downgrade sentinel: we are not 1.3-capable) after
-  a HelloVerifyRequest, and Chromium connects with 1.2 (test/rtc/chromium-dtls.test.ts).
-* Self-signed ECDSA P-256 certificate built with a minimal DER encoder (`cert.ts`); key
-  generation and signing on the libuv thread pool (`generateAsync`), one per process by default.
-* Hot path without per-packet garbage of our own: sends are synchronous (dgram `lookup` option =
-  literal pass-through, no `dns.lookup`/`nextTick` per datagram), records are sealed into one
-  endpoint-wide scratch buffer (replaced if the kernel ever queues a send) and sent through cached
-  exact-length views; received records are decrypted in place and handed to SCTP as
-  `(datagram, off, len)`. What remains is Node's own `dgram` bookkeeping per datagram.
+  we answer a plain DTLS 1.2 ServerHello (no downgrade sentinel: we are not 1.3-capable), and
+  Chromium connects with 1.2 (test/rtc/chromium-dtls.test.ts; also with the dtls13 interop
+  condition after the HelloVerifyRequest was dropped).
+* Self-signed ECDSA P-256 certificate built with a minimal DER encoder (`cert.ts`), one per
+  process by default, generated synchronously (≈ 1 ms; `generateAsync` remains). `loadOrCreate`
+  uses synchronous file I/O too: an idle room never starts the libuv thread pool for it.
+* Hot path without per-packet garbage of our own: sends are synchronous, records are sealed into
+  one endpoint-wide scratch buffer (replaced if the kernel ever queues a send) and sent through
+  cached exact-length views; received records are decrypted in place and handed to SCTP as
+  `(datagram, off, len)`. UDP I/O (`udp.ts`, `UdpIo`): on Node it talks to the socket's
+  `UDPWrap` with one reused `SendWrap` (falls back to `dgram` if the internals differ); what
+  remains is the `Buffer` + `rinfo` Node creates per received datagram. On Bun it uses the
+  native socket held inside `dgram` (direct `send`, `reload` receive handler without `rinfo`),
+  and `beginUdpBatch()`/`endUdpBatch()` collect the datagrams of one bundler flush in a per-socket
+  ring (64 × 2 KiB) sent with one `sendMany` (`sendmmsg` on Linux); a no-op on Node.

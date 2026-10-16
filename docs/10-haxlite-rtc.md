@@ -52,9 +52,9 @@ oficial (`ro` id 0 fiable y ordenado, `ru` id 1 fiable y desordenado, `uu` id 2 
 | Capa | Qué hace | Detalles |
 |---|---|---|
 | SDP (`sdp.ts`) | Lee la oferta, escribe la respuesta | `a=setup:passive`, los candidatos del endpoint (host + srflx; con `iceLite`, `a=ice-lite` y solo `host` de `publicAddresses`), `a=end-of-candidates` si la recolección terminó, `a=max-message-size:262144` |
-| Recolección (`gather.ts`) | Candidatos locales, por endpoint | `host`: direcciones de las interfaces del socket filtradas por la política (o `publicAddresses` tal cual); `srflx`: Binding STUN a cada `iceServers` desde el socket compartido, con `raddr 0.0.0.0 rport 0`. Resultado cacheado `gatherRefreshMs` (60 s); las sesiones creadas durante una ronda reciben el resto por trickle (§2.1) |
+| Recolección (`gather.ts`) | Candidatos locales, por endpoint | `host`: direcciones de las interfaces del socket filtradas por la política (o `publicAddresses` tal cual); `srflx`: Binding STUN a cada `iceServers` desde el socket compartido, con `raddr 0.0.0.0 rport 0`. Solo IPv4 salvo `ipv6: true`. Resultado cacheado y refrescado en segundo plano cada `gatherRefreshMs` (60 s); solo las sesiones creadas durante la **primera** ronda reciben el resto por trickle (§2.1) |
 | ICE (`stun.ts`, `session.ts`, `ice-agent.ts`) | Responde Binding requests **y envía las suyas** | USERNAME `nuestroUfrag:suyoUfrag`, MESSAGE‑INTEGRITY (HMAC‑SHA1) y FINGERPRINT obligatorios, rol *controlling* del navegador. Cada origen autenticado queda *validado* (y es un candidato prflx con *triggered check*); USE‑CANDIDATE nomina. Checks propios a cada candidato remoto (oferta + trickle) con ICE‑CONTROLLED, validación simétrica, retransmisión acotada. Consentimiento: checks propios cada 5 s ± 20 % (RFC 7675) además de los del navegador; sin ninguno respondido/recibido en `idleTimeoutMs` (30 s) se cierra. Cambio de NAT solo con un Binding autenticado nuevo |
-| DTLS 1.2 (`dtls/`) | Servidor DTLS (RFC 6347) | Cookie HMAC (HelloVerifyRequest) antes de guardar estado; preferencia `ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (AEAD en JS puro, sin asignaciones, cifra/descifra en el sitio: `dtls/chacha.ts`, §6.3), luego AES_128_GCM y AES_256_GCM (`node:crypto`), configurable con `cipherSuites`; x25519 / P‑256; *extended master secret* obligatorio; certificado del cliente obligatorio y comparado (tiempo constante) con el `a=fingerprint` de la oferta; CertificateVerify comprobado; ventana anti‑replay de 64; retransmisión 1 s → 8 s; fragmentación y reensamblado; `close_notify`. Un Chromium que ofrece DTLS 1.3 recibe un ServerHello 1.2 y conecta |
+| DTLS 1.2 (`dtls/`) | Servidor DTLS (RFC 6347) | Sin HelloVerifyRequest: el primer ClientHello recibe el flight 4 (el demux solo entrega DTLS desde direcciones validadas por STUN autenticado, §6.7); preferencia por runtime: en Node `ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (AEAD en JS puro, sin asignaciones, cifra/descifra en el sitio: `dtls/chacha.ts`, §6.4), luego AES_128_GCM y AES_256_GCM (`node:crypto`); en Bun AES_128_GCM primero; configurable con `cipherSuites`; x25519 / P‑256; *extended master secret* obligatorio; certificado del cliente obligatorio y comparado (tiempo constante) con el `a=fingerprint` de la oferta; CertificateVerify comprobado; ventana anti‑replay de 64; retransmisión 1 s → 8 s; fragmentación y reensamblado; `close_notify`. Un Chromium que ofrece DTLS 1.3 recibe un ServerHello 1.2 y conecta |
 | SCTP (`sctp/association.ts`) | Asociación SCTP sobre DTLS | RFC 9260, PR‑SCTP (RFC 3758) para `uu`, *stream reset* (RFC 6525) para cerrar canales, *zero checksum* (RFC 9653). Cookie de estado HMAC (INIT sin estado). Sin Nagle: un `send` sale en el acto si las ventanas lo permiten; los envíos hechos dentro de `onMessage` se agrupan en un paquete junto con el SACK. Un solo temporizador por asociación. Ruta caliente sin asignaciones (arena FIFO de bytes, anillos tipados indexados por TSN); `input` nunca lanza |
 | Certificado (`cert.ts`) | ECDSA P‑256 autofirmado | Codificador DER mínimo |
 
@@ -91,19 +91,27 @@ familia, así que la recolección se hace una vez por endpoint:
 * `host`: con `publicAddresses`, esas direcciones tal cual (como antes); si no, las direcciones de
   las interfaces del socket (todas las de la familia si el *bind* es comodín, si no la dirección de
   *bind*) filtradas por `candidatePolicy` (= `iceCandidatePolicy` del transporte, por defecto
-  `'public'`: nunca se anuncian loopback, RFC 1918, CGNAT, ULA ni link‑local — doc 08). IPv6 se usa
-  si la máquina tiene una IPv6 global (socket `udp6` además del `udp4`); link‑local nunca.
+  `'public'`: nunca se anuncian loopback, RFC 1918, CGNAT, ULA ni link‑local — doc 08). **IPv6 es
+  opcional** (`ipv6: true`, por defecto `false`): con ella, si la máquina tiene una IPv6 global se
+  abre un socket `udp6` además del `udp4` (link‑local nunca); sin ella el endpoint es solo IPv4 (sin
+  `udp6`, sin candidatos IPv6, sin consultas AAAA). Motivo: la cabecera IPv6 son 20 B más que la
+  IPv4, ≈ +19 % de salida con los datagramas pequeños de HaxBall, y los navegadores prefieren el
+  par IPv6 cuando se les ofrecen ambos.
 * `srflx`: un Binding STUN sin autenticar (RFC 8489) desde el propio socket compartido a cada
-  servidor STUN de `iceServers` (resueltos con DNS, A y AAAA), retransmitido a 0, 250 y 750 ms,
+  servidor STUN de `iceServers` (resueltos con DNS: A, y AAAA solo con `ipv6`), retransmitido a 0, 250 y 750 ms,
   abandonado a los 1,5 s. La XOR‑MAPPED‑ADDRESS es la dirección pública del socket en el NAT: es la
   **autodetección de la IP pública** que antes faltaba. Se escribe con `raddr 0.0.0.0 rport 0` (no
   se filtra la base privada), y se omite si coincide con un candidato host (IP pública sin NAT).
-* Una ronda arranca al escuchar. Una sesión nueva usa el resultado si tiene menos de
-  `gatherRefreshMs` (60 s); si no, dispara otra ronda, y la sesión se crea con lo conocido y
-  `gatheringComplete = false`: lo nuevo llega por `onLocalCandidate` y luego `onGatheringComplete`.
-  El backend lo traduce a los eventos de siempre, y `HostTransport` hace con ello lo mismo que con
-  node-datachannel: espera ≤ 500 ms para la respuesta y manda el resto por trickle. Con resultado
-  fresco, la respuesta sale en el acto como antes. Sin servidores STUN no hay rondas.
+* Una ronda arranca al escuchar. Solo las sesiones creadas mientras corre esa **primera** ronda
+  (aún sin resultado) quedan con `gatheringComplete = false`: lo nuevo llega por `onLocalCandidate`
+  y luego `onGatheringComplete`; el backend lo traduce a los eventos de siempre, y `HostTransport`
+  hace con ello lo mismo que con node-datachannel: espera ≤ 500 ms para la respuesta y manda el
+  resto por trickle. Después, toda sesión recibe el último resultado como completo y la respuesta
+  sale en el acto; si ese resultado tiene más de `gatherRefreshMs` (60 s), la sesión dispara una
+  ronda de refresco **en segundo plano** que sirve a las siguientes. (Antes la sesión que disparaba
+  el refresco esperaba la respuesta STUN, y con un paquete perdido pagaba los 500 ms enteros: entrada
+  de 555–577 ms → 63–65 ms en loopback con el refresco sin respuesta.) Sin servidores STUN no hay
+  rondas.
 
 **Lista de comprobaciones (por sesión).** Cada candidato remoto (líneas `a=candidate` de la oferta y
 trickle por `addRemoteCandidate`; solo UDP, componente 1, literales IP: un nombre mDNS `*.local` no se
@@ -202,15 +210,17 @@ new HostTransport({ token, peerBackend: 'rtc', rtcEndpoint: { port: 40000, publi
 | `iceLite` | `false` | modo anterior: `a=ice-lite`, sin recolección ni checks propios (el servidor tiene que ser alcanzable directamente) |
 | `iceServers` | los de `HostTransport.iceServers` (por defecto `stun:stun.l.google.com:19302`, como `ndc`); `[]` si hay `publicAddresses` | servidores STUN para los candidatos srflx (cadenas `stun:host:puerto`, objetos de node-datachannel o `RTCIceServer`). Las entradas TURN se ignoran (§2.1) |
 | `iceCandidatePolicy` | la de `HostTransport.iceCandidatePolicy`, si no `'public'` | qué direcciones de interfaz se anuncian y a qué clases de dirección remota se mandan checks (§2.1). No se aplica a `publicAddresses` |
-| `gatherRefreshMs` | 60 000 | antigüedad máxima del resultado STUN para una sesión nueva (si no, nueva ronda y trickle) |
+| `gatherRefreshMs` | 60 000 | antigüedad a partir de la cual una sesión nueva dispara un refresco STUN en segundo plano (la sesión usa el resultado anterior) |
+| `ipv6` | `false` | usar IPv6: socket `udp6` si hay IPv6 global, candidatos IPv6 (interfaces, `publicAddresses`, srflx) y consultas AAAA. Sin ella se omiten las IPv6 de `publicAddresses` (una lista solo IPv6 es un error), `'::'` es el comodín IPv4 y otra IPv6 literal en `address` es un error (§2.1) |
 | `port` | 0 (efímero) | puerto UDP único para todos los jugadores |
-| `address` | comodín de cada familia de `publicAddresses` (sin ellas: `0.0.0.0`, y `::` si hay IPv6 global) | dirección de *bind* |
+| `address` | comodín de cada familia de `publicAddresses` (sin ellas: `0.0.0.0`, y `::` si `ipv6` y hay IPv6 global) | dirección de *bind* |
 | `publicPort` | el puerto real | puerto anunciado si un NAT 1:1 lo traduce |
 | `idleTimeoutMs` / `handshakeTimeoutMs` / `maxSessions` | 30 s / 20 s / 10 000 | del endpoint; las de `HostTransport` (10 s de apertura, 10 s de inactividad, 16 negociaciones, `maxPlayers`) actúan antes |
-| `certificate` | uno por proceso (`RtcCertificate.processDefault()`, clave generada en el *thread pool*) | certificado DTLS |
-| `certificateFile` | — | PEM (certificado + clave, modo 0600) donde guardar/cargar la identidad DTLS: huella estable entre reinicios y sin generar claves al arrancar (`RtcCertificate.loadOrCreate`) |
-| `shared` | `true` | todas las salas del proceso con la misma configuración (puerto —también 0—, direcciones, certificado, tiempos, suites) comparten **un** endpoint y un socket UDP (refcontado, `src/rtc/shared.ts`); `false` = endpoint propio |
-| `cipherSuites` | `['chacha20', 'aes128gcm', 'aes256gcm']` | preferencia DTLS del servidor (nombres IANA, ids o cortos); un cliente sin ChaCha20 negocia AES-GCM |
+| `certificate` | uno por proceso (`RtcCertificate.processDefault()`, clave generada de forma síncrona, ≈ 1 ms, sin despertar el *thread pool* de libuv) | certificado DTLS |
+| `certificateFile` | — | PEM (certificado + clave, modo 0600) donde guardar/cargar la identidad DTLS: huella estable entre reinicios y sin generar claves al arrancar (`RtcCertificate.loadOrCreate`, E/S síncrona, escritura atómica vía `.tmp` + rename) |
+| `shared` | `true` | todas las salas del proceso con la misma configuración (puerto —también 0—, direcciones, `ipv6`, certificado, tiempos, suites) comparten **un** endpoint y un socket UDP (refcontado, `src/rtc/shared.ts`); `false` = endpoint propio |
+| `cipherSuites` | Node: `['chacha20', 'aes128gcm', 'aes256gcm']`; Bun: `['aes128gcm', 'chacha20', 'aes256gcm']` | preferencia DTLS del servidor (nombres IANA, ids o cortos); un cliente sin la primera negocia la siguiente. En Bun, sin ChaCha20 nativo en `node:crypto`, el AES‑GCM nativo es más barato que la ChaCha20 en JS (§6.7) |
+| `sendBatchFrames` | `0` | `1` o `2`: retiene los mensajes de `ru` (difusión de eventos de cliente) por jugador hasta la siguiente frontera de la rejilla de 60 Hz del proceso múltiplo de n; menos datagramas a cambio de n × 8,3 ms de media (máx. n × 16,7 ms) en las entradas ajenas (§6.7). Por sala, también con endpoint compartido |
 | `endpoint` | — | un `RtcEndpoint` ya abierto (el backend no lo cierra) |
 
 Qué cambia y qué no respecto a node-datachannel (`'ndc'`, por defecto):
@@ -222,9 +232,10 @@ Qué cambia y qué no respecto a node-datachannel (`'ndc'`, por defecto):
 * **`iceServers` e `iceCandidatePolicy`** del transporte son los valores por defecto de los de `rtc`
   (el backend es `prefiltered`: el endpoint aplica la política a sus candidatos); `portRange` y `rtc`
   (node-datachannel) se ignoran.
-* La respuesta sale **sin la espera de 500 ms** cuando el resultado STUN está fresco (el SDP ya trae
-  los candidatos y `a=end-of-candidates`); si hay una ronda en curso, como con `ndc`: ≤ 500 ms y el
-  resto por trickle.
+* La respuesta sale **sin la espera de 500 ms** en cuanto hay un resultado STUN (el SDP ya trae
+  los candidatos y `a=end-of-candidates`; los refrescos corren en segundo plano); solo durante la
+  primera ronda, como con `ndc`: ≤ 500 ms y el resto por trickle. Tras enviarla, el `Peer` suelta
+  su SDP y sus candidatos (≈ 0,5–1 KB por jugador), y la sesión su `answerSdp` al conectar DTLS.
 * **Arranque perezoso**, como `ndc` (que carga node-datachannel con el primer peer): la sala se
   anuncia al maestro en el acto y los módulos rtc, el socket y el certificado se preparan con la
   primera oferta, con `whenListening()` (HBInit lo llama al recibir el enlace y resuelve cuando el
@@ -232,18 +243,27 @@ Qué cambia y qué no respecto a node-datachannel (`'ndc'`, por defecto):
   ocurra. Una oferta que llega antes se contesta en cuanto escucha (`DeferredRtcPeerLink`).
 * `room.haxlite.rtcStats()` da los contadores del endpoint **compartido** (todas las salas que
   lo usan).
-* Los tres canales abren a la vez. **`challengeDelayMs` se mantiene en 40 ms** también con `rtc`:
-  protege al *cliente*. Medido con node-haxball (libdatachannel), 30 entradas por configuración:
+* Los tres canales abren a la vez. **`challengeDelayMs` por defecto depende del cliente**: 0 para
+  los navegadores (como el host oficial) y 10 ms para las ofertas de libdatachannel (línea de
+  origen `o=rtc`: bots node-haxball), en ambos backends; un valor explícito se aplica a todos.
+  Protege a *ese* cliente. Medido con node-haxball (libdatachannel), 30 entradas por configuración:
   `rtc` con 0 ms falla **29/30** (el desafío llega con la asociación SCTP, antes de que el cliente
   dé sus canales por abiertos, y lo descarta); con 10 ms y 40 ms, 0/30 (`ndc`: 5/30 con 0 ms, 0/30
-  con 10 y 40). Los navegadores no lo necesitan (el host oficial manda el desafío sin espera).
+  con 10 y 40). Antes eran 40 ms para todos: la entrada `rtc` con un cliente libdatachannel bajó de
+  63–65 a 31–33 ms (loopback) y la de un navegador, 40 ms.
 * Un `dc.close()` de un canal en el navegador (reset de stream) llega como
   `RtcSession.onChannelClose(id)` → `onChannelClosed` del backend → el peer se cierra en el acto,
   igual que el evento `closed` de un DataChannel de node-datachannel.
 * En reposo: sin sesiones el endpoint no tiene temporizadores (su barrido de 1 Hz se apaga en el
   siguiente tick); queda solo el socket UDP. `room.haxlite.stop()` espera a que se libere.
 * node-datachannel ya **no se carga** si no se usa (`src/net/webrtc.ts` lo importa al crear la
-  primera PeerConnection): un proceso solo-`rtc` no tiene hilos nativos de WebRTC.
+  primera PeerConnection): un proceso solo-`rtc` no tiene hilos nativos de WebRTC. Es una
+  `optionalDependency`: con `npm install --omit=optional` (o si falla su binario precompilado) haxlite
+  se instala igual; si algo lo necesita y falta, la negociación de ese peer falla con «node-datachannel
+  no está instalado: instálalo o usa peerBackend: 'rtc'» (en el host llega a `onError`).
+* **IPv6** solo con `rtc: { ipv6: true }` (§2.1). Con `ndc` el interruptor es
+  `HostTransportOptions.rtc.ipv6` (`NdcRtcConfig`): sin él y sin `bindAddress` propio,
+  libdatachannel se enlaza a `0.0.0.0` y no se manda por trickle ningún candidato IPv6.
 
 **Recomendación**: `rtc` funciona ahora en las mismas situaciones que `ndc` (IP pública, NAT 1:1,
 NAT doméstico o de nube con filtrado dependiente de dirección/puerto, NAT simétrico del lado del host,
@@ -276,7 +296,7 @@ Cada escenario corre con cada backend (`ndc`, `rtc`) y cada condición:
 |---|---|---|
 | `loopback4` | `127.0.0.1` | Chromium por defecto (candidatos host ofuscados con mDNS, como un usuario real) |
 | `eth4` | primera IPv4 no interna (aquí `192.0.2.2`) | ídem |
-| `loopback6` | `::1` | ídem — **se salta si la máquina no tiene IPv6** (esta VM no tiene `::1`) |
+| `loopback6` | `::1` | ídem, con `ipv6: true` en ambos backends — **se salta si la máquina no tiene IPv6** (esta VM no tiene `::1`) |
 | `lossy` | `127.0.0.1` a través del proxy: **5 % de pérdida, 5 ms + U(0, 30 ms) de retardo**, 2 % de reordenación forzada (+25 ms), 1 % de duplicación, en cada sentido | ídem |
 | `dtls13` | `127.0.0.1` | Chromium con `--force-fieldtrials=WebRTC-ForceDtls13/Enabled/` (ofrece DTLS 1.3) |
 
@@ -578,6 +598,7 @@ síncrono— son de la pasada paralela de W2 y entran en la columna «después»
   añadida**. Envíos fuera de ámbito (desafío, kick desde código de usuario) se agrupan con un único
   `setImmediate` (misma iteración). Cerrar un enlace vacía antes su lote (el kick precede al
   ABORT). Mientras está corchada, la asociación difiere también el SACK de fin de `input`.
+  (Después pasó a **un vaciado por iteración del event loop**, §6.7.)
 - **Recepción sin asignaciones**: opción `transientDelivery` de `SctpAssociation` (la sesión la
   activa): un mensaje no fragmentado se copia a un búfer de trabajo por asociación y se entrega
   como vista cacheada de su longitud, válida solo durante `onMessage`. `HostTransport` copia el
@@ -675,7 +696,7 @@ backend `rtc`):
 - **Endpoint compartido por defecto** (`src/rtc/shared.ts`, opción `rtc.shared`, por defecto
   `true`): las salas de un proceso con la misma configuración comparten un endpoint refcontado (un
   socket UDP); el último en salir lo cierra. 10 salas = 1 socket.
-- **Arranque**: certificado por proceso generado en el *thread pool* (`processDefault`, opcional
+- **Arranque**: certificado por proceso (`processDefault`; hoy generado de forma síncrona, §6.7; opcional
   `certificateFile` en disco); el backend anuncia la sala en el acto y levanta módulos, socket y
   certificado de forma perezosa (§3). Antes, `start()` cargaba los módulos rtc (~5 ms), generaba
   la clave (~3–7 ms la primera vez) y abría el socket **antes** de hablar con el maestro.
@@ -835,6 +856,99 @@ Lectura y límites:
   loopback, que incluye la entrega al receptor); un *input* reenviado a 20 peers son ~0,15 ms de
   llamadas al sistema en el mismo turno. Lo demás (ChaCha, SCTP, juego) es < 2 % por función.
 
+### 6.7 Pasada de rendimiento: Bun, entrada, envío
+
+haxlite corre en Node ≥ 22 y en Bun (medido con Bun 1.4). Esta pasada ajusta haxlite-rtc a los dos
+runtimes y recorta la entrada y los datagramas. Micro‑medidas de los commits («mejor de», Windows
+salvo que se diga otra cosa); los resultados del host completo están en [docs/07](07-benchmarks.md).
+
+**DTLS sin HelloVerifyRequest** (`dtls/server.ts`). RFC 6347 §4.2.1 permite omitir el intercambio de
+cookie, cuyo único fin es probar que el cliente es dueño de su dirección de origen. Aquí eso ya está
+probado: `RtcEndpoint` solo entrega DTLS a una sesión desde direcciones validadas por STUN
+autenticado (Binding con USERNAME, MESSAGE‑INTEGRITY y FINGERPRINT correctos, o respuesta autenticada
+a nuestro check); el resto cuenta como `dtlsUnknownSource`. El edge usa el mismo `RtcEndpoint` y
+`DtlsServer` no se instancia en ningún otro sitio. El primer ClientHello recibe el flight 4: un RTT
+menos por entrada y dos HMAC menos por sesión. Un ClientHello retransmitido solo retransmite el
+flight 4 tal cual (como mucho uno cada 250 ms); un cookie no pedido se ignora. `helloVerify: true`
+(opción de `DtlsServer`; `RtcEndpoint` no la expone) conserva el intercambio para usos fuera de ICE.
+Interop: Chrome real (loopback4, lossy, dtls13), libdatachannel y OpenSSL sin fallos nuevos.
+
+**Suites por runtime** (`defaultSuites` en `dtls/crypto.ts`; `cipherSuites` sigue mandando):
+
+| runtime | orden por defecto | sellar + abrir 300 B |
+|---|---|---|
+| Node | ChaCha20‑Poly1305, AES‑128‑GCM, AES‑256‑GCM | ChaCha JS más barata (tabla de §6.4) |
+| Bun | AES‑128‑GCM, ChaCha20‑Poly1305, AES‑256‑GCM | AES‑128‑GCM 2,95 µs frente a 10,2 µs de la ChaCha JS |
+
+Bun no tiene `chacha20-poly1305` en `node:crypto`: `chacha: 'node'` (opción de `DtlsServer`) cae a la
+AEAD en JS en vez de lanzar «Unknown cipher». Con AES‑GCM se acepta el nonce explícito de 8 B por
+registro a cambio de CPU.
+
+**Claves como `KeyObject`**: `createHmac`/`createCipheriv` con una clave `Buffer` la importan en cada
+llamada. Ahora se crean una vez con `createSecretKey` las claves MESSAGE‑INTEGRITY de STUN (local y
+remota), el secreto del PRF de DTLS, las claves AES‑GCM de los registros y la del state cookie de
+SCTP. Mismos bytes (vectores de RFC 5769, PRF de referencia).
+
+| operación | Node 26.8 | Bun 1.4 |
+|---|---:|---:|
+| verificar + responder un Binding (`checkIntegrity` + `buildBindingSuccess`) | 97,0 → 8,7 µs | 2,86 → 2,94 µs |
+| PRF, bloque de claves de 88 B | 252 → 26,8 µs | 8,5 → 8,3 µs |
+| sellar un registro AES‑128‑GCM de 300 B | 54,2 → 5,6 µs | 1,45 → 1,31 µs |
+| state cookie SCTP (crear clave + firmar + verificar) | 94,2 → 15,3 µs | 4,07 → 4,11 µs |
+
+**E/S UDP en Bun** (`src/rtc/udp.ts`). En Node el camino no cambia (`UDPWrap`, §6.6). En Bun,
+`UdpIo` toma el socket nativo que `dgram` guarda dentro (detección por forma; si falta algo, sigue
+por `dgram`): envío síncrono con `send(buf, port, ip)` (si devuelve `false`, el datagrama va a la
+cola de `dgram` y todo pasa por ella hasta vaciarla, para no desordenar) y recepción con `reload`
+directa al endpoint, sin `rinfo` ni `emit`. Además, cada vaciado del bundler abre un lote UDP: los
+registros sellados se copian a un anillo por socket (64 × 2 KiB) y salen en un `sendMany` (`sendmmsg`
+en Linux: una llamada al sistema por vaciado en vez de una por jugador). Loopback, 200 B, envío +
+recepción por `UdpIo`: Bun `dgram` 10,31 µs/datagrama → nativo 9,61 (−7 %) → nativo + `sendMany`
+9,38 (−9 %); Node 11,3 sin cambios. La ganancia de `sendmmsg` no se pudo medir (Windows no lo tiene).
+
+**Bundling por iteración del event loop** (`src/net/rtc-backend.ts`). El `SendBundler` ya no vacía
+al cerrar cada ámbito de cork, sino una vez por iteración, en un `setImmediate` (fase *check*, justo
+después de *poll*: sin temporizador ni espera). Lo que varios ámbitos de la misma iteración mandan a
+un peer (p. ej. los broadcasts de todas las entradas que libuv entregó en una misma fase *poll*) sale
+en un único paquete SCTP. 20 jugadores: datagramas de salida 2 480 → 1 915/s y, como los navegadores
+confirman cada segundo paquete, de entrada 1 390 → 1 115/s. `flushRtcBundles()` vacía a mano (arneses
+síncronos). Con el *piggyback* del host ([`src/host/README.md`](../src/host/README.md)) el heartbeat
+inminente viaja en el mismo paquete que el evento de cliente.
+
+**Agrupado por frame opcional** (`rtc: { sendBatchFrames: 1 | 2 }`, por defecto 0 = sin cambios, sin
+temporizadores ni objetos). Un `SendInput` son 17 B de carga y ~105 B en el cable (DATA 16 + carga
+con relleno 20 + cabecera SCTP 12 + DTLS 13 + tag 16 + IP/UDP 28), y las entradas llegan repartidas en
+el tiempo, así que el bundling por iteración apenas las junta. Con n = 1 o 2, los mensajes de `ru`
+(difusión de eventos de cliente: entradas, chat, acciones) se retienen por jugador y salen en la
+siguiente frontera de la rejilla de 60 Hz del proceso cuyo índice es múltiplo de n (la misma
+rejilla y el mismo despertar que los heartbeats de las salas), un paquete SCTP por jugador hasta la
+MTU. `ro` (snapshot, eventos del host, kicks) y `uu` (heartbeats, pongs) nunca se retienen: salen en
+su iteración llevándose delante lo retenido (mismo orden por jugador; el ping mostrado no cambia).
+`close()` y `flushRtcBundles()` vacían también lo retenido. **Coste**: las entradas ajenas llegan de
+media n × 8,3 ms más tarde (máx. n × 16,7 ms).
+
+Bun 1.4, Windows, 1 sala, clientes node-haxball a ~6,45 entradas/s, 20 s × 2 (valores por jugador y
+segundo; bytes = carga UDP, cable = + 28 B por datagrama):
+
+| jugadores | variante | datagramas/s | bytes/s | cable B/s | SACKs entrantes/s |
+|---:|---|---:|---:|---:|---:|
+| 12 | 0 (por defecto) | 72,0 | 6 599 | 8 614 | 45,4 |
+| 12 | 1 frame | 46,8 (−35 %) | 5 365 | 6 674 (−23 %) | 33,3 |
+| 12 | 2 frames | 34,5 (−52 %) | 4 764 | 5 729 (−33 %) | 31,5 |
+| 20 | 0 (por defecto) | 114,2 | 10 414 | 13 610 | 64,5 |
+| 20 | 1 frame | 58,1 (−49 %) | 7 660 | 9 287 (−32 %) | 37,3 |
+| 20 | 2 frames | 37,4 (−67 %) | 6 614 | 7 660 (−44 %) | 32,7 |
+
+CPU del host (máquina compartida, ruidosa): 2,0–3,5 % / 1,1–2,0 % / 1,0–2,0 %; 0 desconexiones.
+`HAXLITE_TEST_RTC_BATCH_FRAMES=1|2` corre las suites rtc (proyecto vitest `rtc` y la sala del interop
+con el cliente oficial) con el agrupado activado.
+
+**Entrada y memoria por jugador.** Además del DTLS sin cookie: refresco STUN en segundo plano (§2.1),
+`challengeDelayMs` 0 / 10 ms según el cliente (§3), el `Peer` suelta SDP y candidatos al mandar la
+respuesta y `RtcSession.answerSdp` pasa a ser un getter que devuelve `''` una vez conectado DTLS (o
+cerrada la sesión). Certificado: `processDefault()` y `loadOrCreate` son síncronos (≈ 1–3 ms una vez),
+así una sala inactiva no arranca los 4 hilos del *thread pool* de libuv.
+
 ## 7. Limitaciones
 
 - **Sin TURN** (§2.1): con el host tras un NAT simétrico **y** el jugador también, no hay camino
@@ -849,13 +963,13 @@ Lectura y límites:
 - **El navegador siempre ofrece** y es cliente DTLS; haxlite-rtc no puede iniciar conexiones.
 - **DTLS 1.2 únicamente** (los navegadores con DTLS 1.3 negocian 1.2, comprobado con el field
   trial de Chromium); sin reanudación de sesión.
-- Todo corre en el hilo principal de Node: el cifrado (ChaCha20‑Poly1305 en JS, o AES‑GCM de
+- Todo corre en el hilo principal (Node o Bun): el cifrado (ChaCha20‑Poly1305 en JS, o AES‑GCM de
   `node:crypto`) y el SCTP compiten con la lógica del host (ver CPU en §6).
-- Cada datagrama pasa por `dgram` de Node, que asigna objetos JS por envío (≈ 260 B) y por
-  recepción (≈ 350 B, el `Buffer` y el `rinfo`): con miles de datagramas/s es la basura que queda
-  (§6.3), y no se puede evitar sin un addon nativo.
+- En Node, cada datagrama recibido sigue creando en C++ un `Buffer` y un `rinfo` (`UDPWrap::OnRecv`,
+  §6.6): con miles de datagramas/s es la basura que queda, y no se puede evitar sin un addon nativo.
+  En Bun la recepción va directa del socket nativo al endpoint (§6.7).
 - **Interoperabilidad verificada solo con Chromium 141** (§5). Firefox, Safari y móviles están
-  pendientes (§5.2). IPv6 no se pudo probar en esta VM.
+  pendientes (§5.2). IPv6 (opcional, `ipv6: true`) no se pudo probar en esta VM.
 - La IP pública se autodetecta por STUN (el maestro no la da: el protocolo no la transmite).
 
 **Propuesta (no aplicada) sobre el `peerBackend` por defecto.** Con ICE completo `rtc` cubre lo que
