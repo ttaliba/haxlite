@@ -1,7 +1,7 @@
 # 06 — Arquitectura de haxlite
 
 > haxlite es una reimplementación *clean-room*, ligera y en TypeScript de un **host** de HaxBall
-> (sala *headless*) para Node.js ≥ 22. Debe interoperar bit a bit con los clientes oficiales del
+> (sala *headless*) para Node.js ≥ 22 y Bun (§4.6). Debe interoperar bit a bit con los clientes oficiales del
 > navegador (protocolo 9) y ofrecer una API compatible con `HBInit` (la del headless oficial, como
 > `mertushka/haxball.js`). Este documento fija los límites entre módulos, las reglas de código
 > que todos seguimos y cómo usar los oráculos de prueba.
@@ -26,7 +26,7 @@
         aplicar evento /  │ tick                          │ mensajes decodificados
                    ┌──────▼────────── src/room ──┐  ┌─────┴─────────── src/net ──────────┐
                    │ RoomState, Player, reglas,   │  │ master HTTP, señalización WS,      │
-                   │ eventos 0..23, serialización │  │ WebRTC (node-datachannel), auth,   │
+                   │ eventos 0..23, serialización │  │ WebRTC (haxlite-rtc o ndc), auth,  │
                    │ del estado, checksum (B)     │  │ bans, límites de tasa (C)          │
                    └──────┬───────────────────────┘  └────────────────────────────────────┘
                           │ World, Stadium
@@ -68,7 +68,11 @@ con las firmas que los demás módulos esperan (`stepWorld`, `writeStadium`, `re
 modelo y avisando del cambio.
 
 Scripts: `npm run build` (tsc → `dist/`), `npm run typecheck`, `npm test` (vitest). Dependencias
-de ejecución: `node-datachannel`, `ws`, `json5` y nada más (zlib y webcrypto vienen de Node).
+de ejecución: `ws` y `json5` (zlib y webcrypto vienen del runtime); `node-datachannel` es una
+`optionalDependency` que solo se carga con `peerBackend: 'ndc'`, los jugadores `'ndc'` del edge o
+el túnel WebRTC legado (`npm install --omit=optional` para despliegues solo `rtc`; si falta y se
+necesita, error claro «node-datachannel no está instalado…»). Algunos `.d.ts` importan tipos de
+node-datachannel: un consumidor TypeScript con `skipLibCheck: false` y sin el paquete ve TS2307.
 `node-haxball`, `haxball.js` y `pako` (transitiva) son **solo** de desarrollo.
 
 ## 3. El modelo compartido (`src/model.ts`)
@@ -149,7 +153,12 @@ de ejecución: `node-datachannel`, `ws`, `json5` y nada más (zlib y webcrypto v
 3. Deflate: `deflateRaw` usa `node:zlib` con los parámetros de pako (nivel 6). **Los bytes
    comprimidos pueden diferir de pako** (≈40 % de los casos medidos), pero ningún hash cubre bytes
    comprimidos y haxball.js ejecuta el host oficial con esta misma sustitución, así que no afecta a
-   la interoperabilidad. `inflateRaw(data, 51200)` reproduce el límite de señalización.
+   la interoperabilidad. `inflateRaw(data, 51200)` reproduce el límite de señalización. En Bun,
+   `deflateRaw` usa `Bun.deflateSync` solo donde su salida es byte a byte la de `deflateRawSync`
+   (entrada ≤ 64 KB, niveles 1–9, salida < 16 KB, un único chunk de node:zlib; si no, rehace con
+   node:zlib): mismos bytes que antes en todos los casos (snapshots, estadios y señalización van por
+   la ruta rápida). `deflateRawAsync` hace el mismo deflate en el *threadpool* (replays con
+   `stopAsync`).
 4. Las extensiones de node-haxball (eventos 24–26, campos extra en `SendChatIndicator`) **nunca**
    se envían.
 
@@ -171,6 +180,24 @@ de ejecución: `node-datachannel`, `ws`, `json5` y nada más (zlib y webcrypto v
    de casos borde.
 4. Aleatoriedad en tests solo con `prng(seed)` (mulberry32) de `test/oracle` → reproducible.
 5. Al encontrar una divergencia, reducirla a un test mínimo y dejarlo en el repo.
+
+### 4.6 Runtimes: Node y Bun
+
+El mismo `dist/` corre en Node ≥ 22 y en Bun (medido con Bun 1.4; benchmarks en
+[07](07-benchmarks.md)). El código detecta el runtime solo donde el camino más barato difiere; la
+salida en la red es la misma:
+
+| Dónde | Node | Bun |
+|---|---|---|
+| Cliente HTTP del maestro (`src/net/master-http.ts`) | `node:http(s)`, cargado en la primera petición | `fetch` nativo si no hay `agent` ni variables `HTTP(S)_PROXY`/`ALL_PROXY` (si las hay, `node:http` como en Node). Diferencias: Bun añade `User-Agent: Bun/<v>`, `Accept` y `Accept-Encoding` (cuerpo descomprimido de forma transparente), sus mensajes de error de red y un timeout que acota la petición entera |
+| E/S UDP de haxlite-rtc y del socket del túnel v2 en el edge (`src/rtc/udp.ts`) | `UDPWrap` del socket con un `SendWrap` reutilizado | socket nativo dentro de `dgram` (envío directo, recepción por `reload`) y un `sendMany` por vaciado del bundler (`sendmmsg` en Linux) |
+| Suites DTLS por defecto | ChaCha20‑Poly1305 (JS) primero | AES‑128‑GCM (nativo) primero; `chacha: 'node'` cae a la AEAD JS |
+| AEAD del túnel v2 con `'auto'` | ChaCha20‑Poly1305 | AES‑128‑GCM |
+| Holgura del reloj del host | +1 ms por temporizador (el de libuv puede disparar hasta ~1 ms antes) | 0 (Bun no dispara antes) |
+| `deflateRaw` | `node:zlib` | `Bun.deflateSync` cuando da los mismos bytes (§4.3) |
+
+`node:http(s)` del `EdgeServer` y de `ws` tampoco se cargan en Bun con un host normal (arranque del
+paquete en Bun: 42,7 → 29,6 ms, RSS −3,6 MB).
 
 ## 5. `src/codec` (API)
 
