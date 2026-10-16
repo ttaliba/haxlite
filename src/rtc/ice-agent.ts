@@ -238,6 +238,8 @@ interface Pair {
   sent: number;
   /** In the triggered queue. */
   triggered: boolean;
+  /** Learned from a request (peer-reflexive), not from a signaled candidate. */
+  learned: boolean;
   tx: Transaction | null;
 }
 
@@ -312,8 +314,9 @@ export class IceAgent {
     if (this.closed) return;
     let p = this.find(sock, address, port);
     if (p === null) {
-      if (this.pairs.length >= MAX_PAIRS) return;
+      if (this.pairs.length >= MAX_PAIRS && !this.evictForLearned()) return;
       p = this.insert(sock, address, port, priority >>> 0);
+      p.learned = true;
     }
     const tx = p.tx;
     if (p.state === IN_PROGRESS && tx !== null) {
@@ -346,6 +349,32 @@ export class IceAgent {
   recheck(sock: UdpIo, address: string, port: number): void {
     const p = this.find(sock, address, port);
     if (p !== null && p.state === SUCCEEDED) p.state = WAITING;
+  }
+
+  /**
+   * The check list is full and a request came from a new address: frees the
+   * slot of a pair that is neither in progress, queued nor succeeded —
+   * failed before waiting, signaled before learned, lowest priority first.
+   * Otherwise (e.g. 16+ signaled candidates, the client behind a symmetric
+   * NAT) the address the client really uses could never be checked, hence
+   * never validated. False when every pair is in use.
+   */
+  private evictForLearned(): boolean {
+    let best = -1;
+    let bestRank = -1;
+    for (let i = 0; i < this.pairs.length; i++) {
+      const q = this.pairs[i]!;
+      if (q.tx !== null || q.triggered || (q.state !== FAILED && q.state !== WAITING)) continue;
+      const rank = (q.state === FAILED ? 2 : 0) + (q.learned ? 0 : 1);
+      if (rank >= bestRank) {
+        // the list is sorted by priority: on a tie the later (lower-priority) pair goes
+        best = i;
+        bestRank = rank;
+      }
+    }
+    if (best < 0) return false;
+    this.pairs.splice(best, 1);
+    return true;
   }
 
   /** The session is connected (DTLS up): no new ordinary checks; triggered ones and consent go on. */
@@ -527,7 +556,7 @@ export class IceAgent {
   }
 
   private insert(sock: UdpIo, address: string, port: number, remotePriority: number): Pair {
-    const p: Pair = { sock, address, port, remotePriority, prio: pairPriority(remotePriority), state: WAITING, sent: 0, triggered: false, tx: null };
+    const p: Pair = { sock, address, port, remotePriority, prio: pairPriority(remotePriority), state: WAITING, sent: 0, triggered: false, learned: false, tx: null };
     let i = 0;
     while (i < this.pairs.length && this.pairs[i]!.prio >= p.prio) i++;
     this.pairs.splice(i, 0, p);

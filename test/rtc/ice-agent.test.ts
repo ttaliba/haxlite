@@ -14,7 +14,8 @@ import { RtcEndpoint, rawDataLayer, type RtcSession } from '../../src/rtc/index.
 import { formatFingerprint } from '../../src/rtc/sdp.js';
 import { StunMessage, StunType, buildBindingError, buildBindingRequest, buildBindingSuccess, checkFingerprint, checkIntegrity, parseStun } from '../../src/rtc/stun.js';
 import { Gatherer, candidatePriority, classifyIp, formatCandidates, hostAddresses, policyAllows, stunServers } from '../../src/rtc/gather.js';
-import { MAX_PAIRS, _pairPriority } from '../../src/rtc/ice-agent.js';
+import { IceAgent, IceScheduler, MAX_PAIRS, _pairPriority } from '../../src/rtc/ice-agent.js';
+import { parseCandidate } from '../../src/rtc/sdp.js';
 import { clientHelloDatagram, ecClientCert } from './dtls-helpers.js';
 import { FakeStunServer } from './nat-sim.js';
 
@@ -440,6 +441,30 @@ describe('RtcEndpoint full ICE (controlled agent)', () => {
     expect(s.remoteAddress).toEqual({ address: '127.0.0.1', port: spoofed.port });
   });
 
+  it('a request from a new address when the check list is full still gets a check (peer-reflexive replaces a waiting pair)', async () => {
+    const e = await setup();
+    const dead = await Promise.all(Array.from({ length: MAX_PAIRS }, () => client()));
+    const s = e.createSession(offerSdp(dead.map((x) => cand('127.0.0.1', x.port))));
+    const creds = answerCreds(s.answerSdp);
+    const real = await client();
+    real.s.send(
+      buildBindingRequest({ txid: randomBytes(12), username: `${creds.ufrag}:${CLIENT_UFRAG}`, key: Buffer.from(creds.pwd), priority: 1845501695, useCandidate: true }),
+      e.port,
+      '127.0.0.1',
+    );
+    expect(parse((await real.box.next())!.buf).type).toBe(StunType.BindingSuccess);
+    const check = await real.box.next(500);
+    expect(check).not.toBeNull();
+    const m = expectCheck(check!.buf, creds.ufrag);
+    const agent = (s as unknown as { agent: IceAgent }).agent;
+    expect(agent.describe().length).toBe(MAX_PAIRS);
+    expect(agent.describe().some((p) => p.port === real.port)).toBe(true);
+    real.s.send(buildBindingSuccess(m.transactionId(), '127.0.0.1', e.port, Buffer.from(CLIENT_PWD)), e.port, '127.0.0.1');
+    await sleep(50);
+    expect(s.remoteAddress).toEqual({ address: '127.0.0.1', port: real.port }); // validated and nominated
+    s.close();
+  });
+
   it('ICE-lite sends no checks at all', async () => {
     const e = await setup({ iceLite: true });
     const c = await client();
@@ -568,5 +593,57 @@ describe('RtcEndpoint full ICE (controlled agent)', () => {
     expect(s1.gatheringComplete).toBe(true);
     // the lost reply keeps the previous srflx
     expect(e.createSession(offerSdp()).answerSdp).toContain(srflx);
+  });
+});
+
+describe('IceAgent (manual clock)', () => {
+  const CHECK_TIMEOUT = 6200;
+  function harness() {
+    let t = 1_000_000;
+    const sock = { tag: 'sock' } as unknown as UdpIo;
+    const sent: { address: string; port: number; buf: Buffer }[] = [];
+    const sched = new IceScheduler({
+      send: (_s, buf, address, port) => sent.push({ address, port, buf: Buffer.from(buf) }),
+      now: () => t,
+      sockets: [{ sock, family: 4, bindAddress: '0.0.0.0' }],
+      policy: 'public',
+    });
+    const agent = new IceAgent(sched, {
+      localUfrag: 'ours',
+      remoteUfrag: CLIENT_UFRAG,
+      remoteKey: Buffer.from(CLIENT_PWD),
+      onCheckSucceeded() {},
+      onConsent() {},
+    });
+    const run = (ms: number) => {
+      for (let i = 0; i < ms; i += 20) {
+        t += 20;
+        agent.tick(t);
+      }
+    };
+    return { sock, sent, sched, agent, run, now: () => t };
+  }
+
+  it('full check list: a peer-reflexive address replaces a failed signaled pair, never an in-progress one', () => {
+    const h = harness();
+    try {
+      for (let i = 0; i < MAX_PAIRS; i++) h.agent.addRemote(parseCandidate(cand(`198.51.100.${i + 1}`, 5000))!);
+      h.run(400); // all 16 checks in progress
+      expect(h.agent.describe().every((p) => p.state === 'in-progress')).toBe(true);
+      h.agent.onRequest(h.sock, '203.0.113.9', 6000, 1845501695);
+      expect(h.agent.describe().some((p) => p.port === 6000)).toBe(false); // nothing replaceable
+      h.run(CHECK_TIMEOUT + 200);
+      expect(h.agent.describe().every((p) => p.state === 'failed')).toBe(true);
+      h.sent.length = 0;
+      h.agent.onRequest(h.sock, '203.0.113.9', 6000, 1845501695);
+      const pairs = h.agent.describe();
+      expect(pairs.length).toBe(MAX_PAIRS);
+      expect(pairs.some((p) => p.address === '198.51.100.16')).toBe(false); // the lowest-priority failed one went
+      h.run(40);
+      expect(h.sent.map((x) => x.port)).toEqual([6000]); // triggered check to the new address
+    } finally {
+      h.agent.close();
+      h.sched.close();
+    }
   });
 });
