@@ -240,7 +240,7 @@ describe.skipIf(!hasOpenssl)('DTLS server ↔ openssl s_client -dtls1_2', () => 
     let n = 0;
     h = await startDtlsHarness({
       fingerprint: ec.sha256,
-      // drop the 2nd and 3rd client datagrams (the cookie ClientHello, then its retransmission)
+      // drop the 2nd and 3rd client datagrams (flight 5 / its retransmission: no HelloVerifyRequest by default)
       mangle: (d) => (++n === 2 || n === 3 ? [] : [d]),
     });
     const r = await runOpenssl(h.port, certArgs(), ['late'], 15_000);
@@ -248,12 +248,13 @@ describe.skipIf(!hasOpenssl)('DTLS server ↔ openssl s_client -dtls1_2', () => 
   }, 30_000);
 });
 
-describe('DTLS cookie exchange and negotiation (hand-built ClientHello)', () => {
+describe('DTLS ClientHello handling and negotiation (hand-built ClientHello)', () => {
   const cert = RtcCertificate.generate();
-  function server() {
+  function server(o: { helloVerify?: boolean; suites?: number[] } = {}) {
     const sent: Buffer[] = [];
     const closes: string[] = [];
     const s = new DtlsServer({
+      ...o,
       certificate: cert,
       remoteFingerprint: { algorithm: 'sha-256', digest: new Uint8Array(32) },
       send: (d) => sent.push(d),
@@ -275,8 +276,59 @@ describe('DTLS cookie exchange and negotiation (hand-built ClientHello)', () => 
     return f.subarray(15, 15 + f[14]!);
   };
 
-  it('requires a valid cookie before allocating any state', () => {
+  it('answers the first ClientHello with flight 4 directly (no HelloVerifyRequest round trip)', () => {
     const { s, sent } = server();
+    s.handleDatagram(clientHelloDatagram({ recordSeq: 7 }).datagram, '1.2.3.4|5');
+    expect(s.state).toBe('handshake');
+    expect(sent.flatMap(hsTypes)).toEqual([2, 11, 12, 13, 14]);
+    const sh = parseRecords(sent[0]!)[0]!;
+    expect(sh.fragment.readUInt16BE(4)).toBe(0); // ServerHello message_seq = the ClientHello's (0)
+    expect(sh.fragment.readUInt16BE(12)).toBe(0xfefd);
+    s.close();
+  });
+
+  it('a retransmitted ClientHello only retransmits flight 4 (idempotent, rate-limited)', () => {
+    const { s, sent, closes } = server();
+    const ch = clientHelloDatagram();
+    s.handleDatagram(ch.datagram, 'p');
+    const first = sent.length;
+    const flight = sent.flatMap(hsTypes);
+    const serverRandom = Buffer.from(parseRecords(sent[0]!)[0]!.fragment.subarray(14, 46));
+    s.handleDatagram(ch.datagram, 'p'); // the client's retransmission timer fired
+    expect(s.state).toBe('handshake');
+    expect(sent.slice(first).flatMap(hsTypes)).toEqual(flight);
+    // the same ServerHello (no new negotiation, no new ECDHE key)
+    expect(parseRecords(sent[first]!)[0]!.fragment.subarray(14, 46)).toEqual(serverRandom);
+    const second = sent.length;
+    s.handleDatagram(ch.datagram, 'p'); // a burst of duplicates is not amplified
+    s.handleDatagram(ch.datagram, 'p');
+    expect(sent.length).toBe(second);
+    expect(closes).toEqual([]);
+    s.close();
+  });
+
+  it('ignores a cookie the client sends unasked', () => {
+    const { s, sent } = server();
+    s.handleDatagram(clientHelloDatagram({ cookie: Buffer.alloc(32, 1) }).datagram, 'p');
+    expect(s.state).toBe('handshake');
+    expect(sent.flatMap(hsTypes)).toEqual([2, 11, 12, 13, 14]);
+    s.close();
+  });
+
+  it('default suite preference picks ChaCha20-Poly1305 on Node; an explicit list overrides it', () => {
+    const offer = { suites: [0xc02b, 0xc02c, 0xcca9] }; // browser-like order: the server's preference decides
+    const a = server();
+    a.s.handleDatagram(clientHelloDatagram(offer).datagram, 'p');
+    expect(a.s.suite?.id).toBe(defaultSuites()[0]);
+    a.s.close();
+    const b = server({ suites: [0xc02c, 0xcca9] });
+    b.s.handleDatagram(clientHelloDatagram(offer).datagram, 'p');
+    expect(b.s.suite?.id).toBe(0xc02c);
+    b.s.close();
+  });
+
+  it('helloVerify: requires a valid cookie before allocating any state', () => {
+    const { s, sent } = server({ helloVerify: true });
     const ch = clientHelloDatagram({ recordSeq: 7 });
     s.handleDatagram(ch.datagram, '1.2.3.4|5');
     expect(sent).toHaveLength(1);
@@ -309,14 +361,11 @@ describe('DTLS cookie exchange and negotiation (hand-built ClientHello)', () => 
     s.close();
   });
 
-  /** Runs the cookie round trip and returns what the server sent for the second ClientHello. */
+  /** Sends one ClientHello and returns what the server answered. */
   function negotiate(o: Parameters<typeof clientHelloDatagram>[0]) {
     const x = server();
-    const ch = clientHelloDatagram(o);
-    x.s.handleDatagram(ch.datagram, 'p');
-    const cookie = cookieOf(x.sent[0]!);
-    x.s.handleDatagram(clientHelloDatagram({ ...o, random: ch.random, cookie, messageSeq: 1 }).datagram, 'p');
-    return { ...x, reply: x.sent.slice(1) };
+    x.s.handleDatagram(clientHelloDatagram(o).datagram, 'p');
+    return { ...x, reply: x.sent };
   }
   const alertOf = (d: Buffer) => {
     const r = parseRecords(d)[0]!;
@@ -352,7 +401,7 @@ describe('DTLS cookie exchange and negotiation (hand-built ClientHello)', () => 
   });
 
   it('reassembles a fragmented ClientHello (large DTLS 1.3/PQ hellos), in any order', () => {
-    const { s, sent } = server();
+    const { s, sent } = server({ helloVerify: true });
     const whole = clientHelloDatagram({ recordSeq: 3 });
     const fragment = (d: Buffer, cut: number) => {
       // split the single handshake message of record `d` into two records at body offset `cut`
@@ -383,6 +432,16 @@ describe('DTLS cookie exchange and negotiation (hand-built ClientHello)', () => 
     for (const f of fragment(second.datagram, 70)) s.handleDatagram(f, 'p');
     expect(s.state).toBe('handshake');
     s.close();
+
+    // default (no cookie): the reassembled ClientHello is answered with flight 4 directly
+    const d = server();
+    const [a2, b2] = fragment(clientHelloDatagram({ recordSeq: 3 }).datagram, 55);
+    d.s.handleDatagram(b2!, 'p');
+    expect(d.sent).toHaveLength(0);
+    d.s.handleDatagram(a2!, 'p');
+    expect(d.s.state).toBe('handshake');
+    expect(d.sent.flatMap(hsTypes)).toEqual([2, 11, 12, 13, 14]);
+    d.s.close();
   });
 
   it('ignores garbage without answering', () => {

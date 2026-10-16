@@ -6,8 +6,6 @@
  *
  * ```
  * ClientHello            →
- *                        ←  HelloVerifyRequest (stateless HMAC cookie)
- * ClientHello + cookie   →
  *                        ←  ServerHello, Certificate, ServerKeyExchange,
  *                           CertificateRequest, ServerHelloDone      (flight 4)
  * Certificate, ClientKeyExchange, CertificateVerify,
@@ -15,6 +13,11 @@
  *                        ←  [ChangeCipherSpec], Finished             (flight 6)
  * ```
  *
+ * * No HelloVerifyRequest by default (RFC 6347 §4.2.1 lets the server skip
+ *   it): the endpoint only routes DTLS from transport addresses that passed
+ *   an authenticated STUN exchange (ICE), which already proves the address
+ *   is the peer's — the cookie round trip would only delay every join by one
+ *   RTT. Opt-in with {@link DtlsServerOptions.helloVerify}.
  * * ECDHE (x25519 preferred, secp256r1) with ECDSA P-256 server
  *   certificate; AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305.
  * * extended_master_secret (RFC 7627) is mandatory (browsers always send it).
@@ -31,6 +34,7 @@ import {
   createECDH,
   createHash,
   createHmac,
+  createSecretKey,
   createPublicKey,
   diffieHellman,
   generateKeyPairSync,
@@ -112,7 +116,7 @@ const FP_HASHES: Record<string, string> = { 'sha-224': 'sha224', 'sha-256': 'sha
 
 /** Largest handshake message we reassemble (a client certificate chain). */
 const MAX_HANDSHAKE_MESSAGE = 16 * 1024;
-/** Largest (fragmented) ClientHello we reassemble before the cookie exchange. */
+/** Largest (fragmented) ClientHello we reassemble in the listen state. */
 const MAX_CLIENT_HELLO = 8 * 1024;
 /** How far ahead of the next expected message_seq fragments are buffered. */
 const MAX_SEQ_AHEAD = 8;
@@ -156,6 +160,14 @@ export interface DtlsServerOptions {
   suites?: readonly number[];
   /** ChaCha20-Poly1305 implementation (default 'js', allocation-free; 'node' is 'js' on Bun). */
   chacha?: ChaChaImpl;
+  /**
+   * Stateless cookie exchange (HelloVerifyRequest, RFC 6347 §4.2.1) before
+   * any handshake state is allocated: proves the client owns its source
+   * address. Default false — set it only when datagrams can reach
+   * {@link DtlsServer.handleDatagram} from addresses ICE did not authenticate
+   * (RtcEndpoint never does that). Costs the client one extra round trip.
+   */
+  helloVerify?: boolean;
 }
 
 interface Reassembly {
@@ -351,10 +363,11 @@ export class DtlsServer {
 
   private readonly opts: DtlsServerOptions;
   private readonly mtu: number;
-  private readonly cookieSecret = randomBytes(32);
+  /** HelloVerifyRequest cookie key (made on first use: only with {@link DtlsServerOptions.helloVerify}). */
+  private cookieKey: KeyObject | null = null;
   private readonly suitePrefs: readonly number[];
 
-  // handshake state (allocated after a valid cookie)
+  // handshake state (allocated on the first acceptable ClientHello)
   private clientRandom: Buffer | null = null;
   private serverRandom: Buffer | null = null;
   private ecdhe: Ecdhe | null = null;
@@ -400,7 +413,8 @@ export class DtlsServer {
 
   /**
    * One UDP datagram from the (ICE-validated) peer. `peerKey` identifies the
-   * transport address and is bound into the HelloVerifyRequest cookie.
+   * transport address and is bound into the HelloVerifyRequest cookie (only
+   * used with {@link DtlsServerOptions.helloVerify}).
    */
   handleDatagram(buf: Uint8Array, peerKey: string): void {
     let off = 0;
@@ -651,7 +665,7 @@ export class DtlsServer {
   // ------------------------------------------------------------ ClientHello / cookie
 
   private computeCookie(ch: ClientHello, peerKey: string): Buffer {
-    const h = createHmac('sha256', this.cookieSecret);
+    const h = createHmac('sha256', (this.cookieKey ??= createSecretKey(randomBytes(32))));
     h.update(peerKey);
     h.update(u16(ch.version));
     h.update(ch.random);
@@ -669,12 +683,16 @@ export class DtlsServer {
       this.badRecords++;
       return; // stateless: never answer garbage
     }
-    const cookie = this.computeCookie(ch, peerKey);
-    if (ch.cookie.length !== cookie.length || !timingSafeEqual(ch.cookie, cookie)) {
-      this.sendHelloVerifyRequest(cookie, msgSeq, recSeqHi, recSeqLo);
-      return;
+    if (this.opts.helloVerify === true) {
+      const cookie = this.computeCookie(ch, peerKey);
+      if (ch.cookie.length !== cookie.length || !timingSafeEqual(ch.cookie, cookie)) {
+        this.sendHelloVerifyRequest(cookie, msgSeq, recSeqHi, recSeqLo);
+        return;
+      }
     }
-    // Valid cookie: allocate the handshake.
+    // Allocate the handshake and answer with flight 4 (ServerHello's message_seq = the
+    // ClientHello's: 0 without HelloVerifyRequest). A retransmitted ClientHello then has
+    // msgSeq < nextReceiveSeq and only retransmits flight 4 (handleHandshakeRecord).
     this.state = 'handshake';
     this.helloReassembly = null;
     this.nextReceiveSeq = msgSeq + 1;
