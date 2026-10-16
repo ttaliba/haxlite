@@ -10,6 +10,7 @@
  *    real `peerBackend: 'rtc'` wiring will live in src/net).
  */
 import { existsSync } from 'node:fs';
+import { isIP } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import type { PeerBackend, PeerLink, PeerLinkEvents } from '../../../src/net/peer-backend.js';
 import type { RtcEndpoint, RtcEndpointOptions, RtcSession } from '../../../src/rtc/index.js';
@@ -27,7 +28,7 @@ export interface BackendHandle {
 }
 
 export interface BackendOptions {
-  /** The only address the server advertises/binds for ICE (IP literal). */
+  /** The only address the server advertises/binds for ICE (IP literal; an IPv6 one turns `ipv6` on in both backends). */
   address: string;
   /** haxlite-rtc: UDP port (0 = ephemeral). */
   port?: number;
@@ -56,7 +57,9 @@ export async function createBackend(kind: BackendKind, o: BackendOptions): Promi
   if (kind === 'ndc') {
     const { LocalPeerBackend } = await import('../../../src/net/peer-backend.js');
     const { shutdownWebRtc } = await import('../../../src/net/webrtc.js');
-    const backend = new LocalPeerBackend({ rtc: { iceServers: [], bindAddress: o.address, maxMessageSize: 262144, ...o.ndc } });
+    // ipv6: without it IPv6 candidates are not trickled (src/net/webrtc.ts NdcRtcConfig)
+    const ipv6 = isIP(o.address) === 6 ? { ipv6: true } : null;
+    const backend = new LocalPeerBackend({ rtc: { iceServers: [], bindAddress: o.address, maxMessageSize: 262144, ...ipv6, ...o.ndc } });
     return {
       kind,
       backend,
@@ -71,6 +74,8 @@ export async function createBackend(kind: BackendKind, o: BackendOptions): Promi
     port: o.port ?? 0,
     address: o.address,
     publicAddresses: [o.address],
+    // IPv6 is opt-in: listen() rejects an IPv6 bind address / drops IPv6 publicAddresses without it
+    ...(isIP(o.address) === 6 ? { ipv6: true } : null),
     ...(o.idleTimeoutMs !== undefined ? { idleTimeoutMs: o.idleTimeoutMs } : null),
     ...o.rtc,
   });
