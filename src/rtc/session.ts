@@ -353,14 +353,16 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
     if (v === null) {
       v = { session: this, sock, address, port, key: `${address}|${port}` };
       if (this.validated.length >= MAX_VALIDATED) {
-        // keep the nominated one, drop the oldest other
-        const idx = this.validated.findIndex((x) => x !== this.nominated);
+        // drop the oldest one that is neither nominated, the handshake's address nor the data destination
+        const idx = this.validated.findIndex((x) => x !== this.nominated && x !== this.dtlsFrom && x !== this.dest);
         const [old] = this.validated.splice(idx < 0 ? 0 : idx, 1);
         // its 5-tuple must not keep routing DTLS here (nor keep this session reachable after close)
         if (old !== undefined) {
           this.host.unbindAddress(old);
-          this.dropped(old);
+          if (this.dtlsFrom === old) this.dtlsFrom = null;
           if (this.dest === old) this.dest = null;
+          // full ICE: not re-checked by the ordinary loop (that would evict another one in turn), only on a new request
+          if (this.agent !== null) this.agent.park(old.sock, old.address, old.port);
         }
       }
       this.validated.push(v);

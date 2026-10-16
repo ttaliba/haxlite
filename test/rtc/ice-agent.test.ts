@@ -441,6 +441,54 @@ describe('RtcEndpoint full ICE (controlled agent)', () => {
     expect(s.remoteAddress).toEqual({ address: '127.0.0.1', port: spoofed.port });
   });
 
+  it('evicting a validated address for capacity: no re-check churn, and never the handshake address', async () => {
+    const e = await setup();
+    // clients that answer every check of ours
+    const responders = await Promise.all(Array.from({ length: 11 }, () => client()));
+    const checksTo = new Map<number, number>();
+    for (const r of responders) {
+      r.s.on('message', (buf) => {
+        if (buf[0]! >= 4) return;
+        const m = parse(buf);
+        if (m.type !== StunType.BindingRequest) return;
+        checksTo.set(r.port, (checksTo.get(r.port) ?? 0) + 1);
+        r.s.send(buildBindingSuccess(m.transactionId(), '127.0.0.1', e.port, Buffer.from(CLIENT_PWD)), e.port, '127.0.0.1');
+      });
+    }
+    const [a, ...rest] = responders;
+    const s = e.createSession(offerSdp([cand('127.0.0.1', a!.port)]));
+    await sleep(100);
+    expect(s.remoteAddress).toEqual({ address: '127.0.0.1', port: a!.port });
+    // the handshake starts from `a`: it is the address of the flights
+    a!.s.send(clientHelloDatagram().datagram, e.port, '127.0.0.1');
+    await sleep(50);
+    const impl = s as unknown as { validated: { port: number }[]; dtlsFrom: { port: number } | null };
+    expect(impl.dtlsFrom?.port).toBe(a!.port);
+    // ten more validated addresses: two evictions (cap 8), never `a`
+    for (const r of rest) s.addRemoteCandidate(cand('127.0.0.1', r.port));
+    await sleep(1500);
+    expect(e.stats().ice.checksSucceeded).toBe(11);
+    expect(impl.validated.length).toBe(8);
+    expect(impl.validated.some((v) => v.port === a!.port)).toBe(true);
+    expect(impl.dtlsFrom?.port).toBe(a!.port);
+    // each address was checked once: the evicted ones are not re-checked by the ordinary loop
+    for (const r of responders) expect(checksTo.get(r.port)).toBe(1);
+    // ...but a new request from an evicted one triggers a check (and validates it again)
+    const creds = answerCreds(s.answerSdp);
+    const evicted = rest.find((r) => !impl.validated.some((v) => v.port === r.port))!;
+    expect(evicted).toBeDefined();
+    evicted.s.send(
+      buildBindingRequest({ txid: randomBytes(12), username: `${creds.ufrag}:${CLIENT_UFRAG}`, key: Buffer.from(creds.pwd), priority: 1845501695 }),
+      e.port,
+      '127.0.0.1',
+    );
+    await sleep(150);
+    expect(checksTo.get(evicted.port)).toBe(2);
+    expect(impl.validated.some((v) => v.port === evicted.port)).toBe(true);
+    expect(impl.dtlsFrom?.port).toBe(a!.port);
+    s.close();
+  });
+
   it('a request from a new address when the check list is full still gets a check (peer-reflexive replaces a waiting pair)', async () => {
     const e = await setup();
     const dead = await Promise.all(Array.from({ length: MAX_PAIRS }, () => client()));
@@ -641,6 +689,29 @@ describe('IceAgent (manual clock)', () => {
       expect(pairs.some((p) => p.address === '198.51.100.16')).toBe(false); // the lowest-priority failed one went
       h.run(40);
       expect(h.sent.map((x) => x.port)).toEqual([6000]); // triggered check to the new address
+    } finally {
+      h.agent.close();
+      h.sched.close();
+    }
+  });
+
+  it('a parked (capacity-evicted) pair is not re-checked by the ordinary loop, only after a request', () => {
+    const h = harness();
+    try {
+      h.agent.addRemote(parseCandidate(cand('198.51.100.1', 5000))!);
+      h.run(40);
+      expect(h.sent.length).toBe(1);
+      const m = parse(h.sent[0]!.buf);
+      // a symmetric authenticated success
+      h.sched.onResponse(parse(buildBindingSuccess(m.transactionId(), '192.0.2.1', 3478, Buffer.from(CLIENT_PWD))), h.sock, '198.51.100.1', 5000);
+      expect(h.agent.describe()[0]!.state).toBe('succeeded');
+      h.agent.park(h.sock, '198.51.100.1', 5000);
+      h.sent.length = 0;
+      h.run(1000);
+      expect(h.sent.length).toBe(0);
+      h.agent.onRequest(h.sock, '198.51.100.1', 5000, 1845501695);
+      h.run(40);
+      expect(h.sent.length).toBe(1);
     } finally {
       h.agent.close();
       h.sched.close();

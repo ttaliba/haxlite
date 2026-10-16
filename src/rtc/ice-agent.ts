@@ -240,6 +240,8 @@ interface Pair {
   triggered: boolean;
   /** Learned from a request (peer-reflexive), not from a signaled candidate. */
   learned: boolean;
+  /** Skipped by the ordinary check loop (evicted from the session's validated set): only a request triggers a check. */
+  parked: boolean;
   tx: Transaction | null;
 }
 
@@ -318,6 +320,7 @@ export class IceAgent {
       p = this.insert(sock, address, port, priority >>> 0);
       p.learned = true;
     }
+    p.parked = false;
     const tx = p.tx;
     if (p.state === IN_PROGRESS && tx !== null) {
       // RFC 8445 §7.3.1.4: retransmit the in-progress check at once and reset its timer. Typical
@@ -349,6 +352,19 @@ export class IceAgent {
   recheck(sock: UdpIo, address: string, port: number): void {
     const p = this.find(sock, address, port);
     if (p !== null && p.state === SUCCEEDED) p.state = WAITING;
+  }
+
+  /**
+   * The session evicted (sock, address, port) from its validated set for
+   * capacity: like {@link recheck}, but the ordinary check loop leaves it
+   * alone (re-checking it would only evict another address in turn) — only
+   * a new request from there triggers a check.
+   */
+  park(sock: UdpIo, address: string, port: number): void {
+    const p = this.find(sock, address, port);
+    if (p === null) return;
+    p.parked = true;
+    if (p.state === SUCCEEDED) p.state = WAITING;
   }
 
   /**
@@ -414,7 +430,7 @@ export class IceAgent {
       }
       if (p === null && this.checking) {
         for (const q of this.pairs) {
-          if (q.state === WAITING && q.tx === null) {
+          if (q.state === WAITING && q.tx === null && !q.parked) {
             p = q;
             break;
           }
@@ -431,7 +447,7 @@ export class IceAgent {
     }
     if (busy || this.queue.length > 0) return true;
     if (!this.checking) return false;
-    return this.pairs.some((q) => q.state === WAITING) && this.sentTotal < MAX_TX_PER_SESSION;
+    return this.pairs.some((q) => q.state === WAITING && !q.parked) && this.sentTotal < MAX_TX_PER_SESSION;
   }
 
   private startCheck(p: Pair, now: number): boolean {
@@ -556,7 +572,7 @@ export class IceAgent {
   }
 
   private insert(sock: UdpIo, address: string, port: number, remotePriority: number): Pair {
-    const p: Pair = { sock, address, port, remotePriority, prio: pairPriority(remotePriority), state: WAITING, sent: 0, triggered: false, learned: false, tx: null };
+    const p: Pair = { sock, address, port, remotePriority, prio: pairPriority(remotePriority), state: WAITING, sent: 0, triggered: false, learned: false, parked: false, tx: null };
     let i = 0;
     while (i < this.pairs.length && this.pairs[i]!.prio >= p.prio) i++;
     this.pairs.splice(i, 0, p);
