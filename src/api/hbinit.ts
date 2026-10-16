@@ -657,6 +657,9 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     stopRecording() {
       return host.stopRecording();
     },
+    stopRecordingAsync() {
+      return host.stopRecordingAsync();
+    },
     CollisionFlags,
     InputFlags,
     get onRoomLink() {

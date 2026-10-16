@@ -268,6 +268,7 @@ describe('HBInit facade (official API)', () => {
       expect(room.getScores()).toBeNull();
       const replay = room.stopRecording()!;
       expect(room.stopRecording()).toBeNull();
+      expect(await room.stopRecordingAsync()).toBeNull();
       // node-haxball reads our replay; our player re-simulates it
       const data = env.nh.Replay.readAll(Uint8Array.from(replay));
       expect(data.version).toBe(3);

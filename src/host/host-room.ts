@@ -523,6 +523,19 @@ export class HostRoom {
     return this.recorder.stop(this.sequencer.frame);
   }
 
+  /**
+   * {@link stopRecording} with the deflate on the libuv threadpool instead of
+   * the event loop (a long match is several MB of events): same bytes. The
+   * recording stops synchronously (later events are not recorded and
+   * {@link startRecording} may follow at once); only the compression is
+   * deferred. Resolves null if not recording.
+   */
+  stopRecordingAsync(): Promise<Uint8Array | null> {
+    if (this.rec === null || !this.rec.isRecording) return Promise.resolve(null);
+    if (!this.sequencer.busy) this.catchUp();
+    return this.recorder.stopAsync(this.sequencer.frame);
+  }
+
   // ================================================================ host actions
 
   /** Emits any event as the host (official `oc`). The event object is consumed. */
