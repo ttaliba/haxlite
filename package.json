@@ -1,6 +1,6 @@
 {
   "name": "haxlite",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Clean-room, ultra-lightweight TypeScript reimplementation of a HaxBall headless host (protocol v9) with an HBInit-compatible API.",
   "type": "module",
   "private": true,
