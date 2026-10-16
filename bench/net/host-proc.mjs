@@ -13,9 +13,22 @@
 // 30, same geo, default stadium (Classic), score/time limit 0 (set before
 // starting the game) and default network settings (incl. default STUN list).
 //
-// IPC in : {cmd:'game'} | {cmd:'measure-start', eld, sampleMs} | {cmd:'measure-stop'} | {cmd:'players'}
+// IPC in : {cmd:'game'} | {cmd:'measure-start', eld, sampleMs, stream} | {cmd:'measure-stop'} | {cmd:'players'}
+//          {cmd:'auto-teams'} (soak: new players get a team, game kept running) | {cmd:'impair-stats'}
 // IPC out: {type:'link', room, id, tCreate, tLink} | {type:'game', players} |
-//          {type:'stats', …} | {type:'players', counts} | {type:'error', message}
+//          {type:'stats', …} | {type:'players', counts} | {type:'error', message} |
+//          {type:'sample', …} (measure-start with stream: one per sampleMs) | {type:'impair-stats', …}
+//
+// Runtime: Node (default) or Bun (`bun bench/net/host-proc.mjs …`, run.ts --runtime bun).
+// Under Bun there are no GC events (gcCount/gcMs = null), the event-loop lag
+// comes from a 10 ms timer of our own (see eldMonitor) and `bun:jsc` heapStats
+// are added to the stats. /proc metrics (threads, wake-ups, fds) are Linux only (null elsewhere).
+//
+// HAXLITE_BENCH_IMPAIR (join-impaired scenario, haxlite:rtc only) = JSON
+// {rttMs, lossPct, jitterMs, stun:'cold'|'cached', outside, filtering}: the host's endpoint
+// binds 127.0.0.1 and reaches clients and the STUN server only through the
+// userspace NAT of test/rtc/nat-sim.ts, whose forwarding gets rttMs/2 of delay
+// (± jitterMs) and lossPct % loss in each direction.
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { Session } from 'node:inspector';
 import { createRequire } from 'node:module';
@@ -26,6 +39,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const T_START = performance.now(); // ms since process start (performance.timeOrigin)
 const require = createRequire(import.meta.url);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const IS_BUN = typeof globalThis.Bun !== 'undefined';
+const JSC = IS_BUN ? await import('bun:jsc') : null;
+const IMPAIR = process.env.HAXLITE_BENCH_IMPAIR ? JSON.parse(process.env.HAXLITE_BENCH_IMPAIR) : null;
 
 const [impl, masterHostPort, roomsArg] = process.argv.slice(2);
 const ROOMS = Number(roomsArg ?? 1);
@@ -122,14 +138,17 @@ async function haxliteFactory() {
   // A variant with an explicit `dist` (per-module tsc build) is loaded module by module.
   // A variant `bundle` (directory of another `scripts/build.mjs --out` build) is loaded instead (A/B of bundles).
   const bundle = path.resolve(ROOT, variant.bundle ?? 'node_modules/.cache/haxlite-bench/bundle', 'index.js');
-  const { HostRoom, createHostRoomState, HostTransport } =
+  const mod =
     !variant.dist && existsSync(bundle)
       ? await import(pathToFileURL(bundle).href)
       : {
           ...(await import(pathToFileURL(path.join(dist, 'host/index.js')).href)),
+          net: await import(pathToFileURL(path.join(dist, 'net/index.js')).href),
           ...(await import(pathToFileURL(path.join(dist, 'net/index.js')).href)),
         };
-  return (i, onLink) => {
+  const { HostRoom, createHostRoomState, HostTransport } = mod;
+  return async (i, onLink) => {
+    const imp = IMPAIR ? await impairedBackend(mod.net.RtcPeerBackend, i) : null;
     const transport = new HostTransport({
       token: `thr1.bench${i}`,
       masterUrl: `http://${masterHostPort}/rs/`,
@@ -137,18 +156,35 @@ async function haxliteFactory() {
       maxPlayers: MAX_PLAYERS,
       roomInfo: { name: `bench ${i}`, flag: GEO.code, lat: GEO.lat, lon: GEO.lon },
       ...variant.transport,
+      ...(imp ? { backend: imp.backend } : null),
     });
     // HAXLITE_HOST_OPTS (diagnostics only, never set for the published results):
     // extra HostRoom options, e.g. '{"heartbeatFrames":9}'.
     const extra = process.env.HAXLITE_HOST_OPTS ? JSON.parse(process.env.HAXLITE_HOST_OPTS) : {};
     const host = new HostRoom({ transport, state: createHostRoomState({ roomName: `bench ${i}`, noPlayer: true }), ...extra });
     host.onError = (e) => send({ type: 'error', message: `haxlite onError: ${e?.stack ?? e}` });
-    host.onRoomLink = (link) => onLink(link);
-    host.start();
+    if (imp) {
+      // The link is reported once the endpoint listens and the first STUN round is
+      // done: no join pays the endpoint start-up; `cold` re-runs the round per session.
+      let link = null;
+      let ready = false;
+      host.onRoomLink = (l) => (ready ? onLink(l) : (link = l));
+      host.start();
+      await imp.inner.whenListening();
+      await imp.inner.endpoint.whenGathered();
+      ready = true;
+      if (link !== null) onLink(link);
+    } else {
+      host.onRoomLink = (link) => onLink(link);
+      host.start();
+    }
     return {
       players: () => host.getPlayerList().map((p) => p.id),
+      // objects whose Map/Set sizes the soak scenario follows (see mapSizes)
+      internals: () => ({ host, transport, backend: transport.backend, endpoint: transport.backend?.endpoint ?? imp?.inner.endpoint ?? null }),
+      impairStats: imp ? () => imp.stats() : null,
       // haxlite-rtc endpoint counters (UDP datagrams in/out), null for other backends
-      rtcStats: () => transport.backend?.stats?.() ?? null,
+      rtcStats: () => (imp ? imp.inner.stats() : (transport.backend?.stats?.() ?? null)),
       setTeam: (id, t) => host.setPlayerTeam(id, t),
       startGame: () => {
         host.setScoreLimit(0);
@@ -157,6 +193,78 @@ async function haxliteFactory() {
       },
     };
   };
+}
+
+/**
+ * join-impaired: RtcPeerBackend (full ICE, bound to 127.0.0.1, STUN through the
+ * NAT) wrapped like test/net/rtc-nat.test.ts (each remote candidate rewritten to
+ * its NAT alias), with delay/loss injected into the NAT's forwarding.
+ */
+async function impairedBackend(RtcPeerBackend, i) {
+  if (!impl.startsWith('haxlite:rtc')) throw new Error('join-impaired needs impl haxlite:rtc');
+  const { UdpNat, FakeStunServer } = await import(pathToFileURL(path.join(ROOT, 'test/rtc/nat-sim.ts')).href);
+  const outside = IMPAIR.outside ?? '127.0.0.1';
+  const stun = await FakeStunServer.start(outside);
+  // Full-cone filtering by default: the clients' libdatachannel sockets send from
+  // other addresses than the candidates they announce (LAN interfaces vs
+  // loopback), which a port-restricted NAT on loopback would drop.
+  const nat = new UdpNat({ insideAddress: '127.0.0.1', outsideAddress: outside, filtering: IMPAIR.filtering ?? 'endpoint-independent' });
+  const imp = { delayed: 0, dropped: 0 };
+  const oneWay = (IMPAIR.rttMs ?? 0) / 2;
+  const jitter = IMPAIR.jitterMs ?? 0;
+  const loss = (IMPAIR.lossPct ?? 0) / 100;
+  // UdpNat's sockets call this.fromInside / this.fromOutside: instance overrides apply.
+  for (const k of ['fromInside', 'fromOutside']) {
+    const orig = nat[k].bind(nat);
+    nat[k] = (a, msg, from) => {
+      if (loss > 0 && Math.random() < loss) {
+        imp.dropped++;
+        return;
+      }
+      const d = oneWay + (jitter > 0 ? (Math.random() * 2 - 1) * jitter : 0);
+      if (d <= 0) return orig(a, msg, from);
+      imp.delayed++;
+      setTimeout(() => orig(a, msg, from), d);
+    };
+  }
+  const alias = await nat.alias({ address: stun.address, port: stun.port });
+  const inner = new RtcPeerBackend(
+    { address: '127.0.0.1', shared: false, gatherRefreshMs: IMPAIR.stun === 'cold' ? 0 : 3_600_000 },
+    { iceServers: [`stun:${alias.address}:${alias.port}`] },
+  );
+  const backend = {
+    kind: 'rtc-nat',
+    get prefiltered() {
+      return inner.prefiltered;
+    },
+    get ready() {
+      return inner.ready;
+    },
+    start: (h) => inner.start(h),
+    stop: () => {
+      inner.stop();
+      nat.close();
+      stun.close();
+    },
+    cork: () => inner.cork(),
+    uncork: () => inner.uncork(),
+    createPeer(id, offerSdp, ev) {
+      const link = inner.createPeer(id, offerSdp, ev);
+      return {
+        addRemoteCandidate: (c, mid) => void nat.rewriteCandidate(c).then((r) => r !== null && link.addRemoteCandidate(r, mid)),
+        send: (ch, d) => link.send(ch, d),
+        close: () => link.close(),
+      };
+    },
+  };
+  const stats = () => ({
+    room: i,
+    stunRequests: stun.requests,
+    nat: { ...nat.stats },
+    impair: { ...imp },
+    localCandidates: inner.endpoint?.localCandidates ?? [],
+  });
+  return { inner, backend, stats };
 }
 
 async function officialFactory() {
@@ -330,6 +438,7 @@ function countFds() {
  * plus involuntary ones, total and for the JS main thread.
  */
 function wakeups(before, after, wallMs) {
+  if (after.size === 0) return null; // no /proc (not Linux)
   let vcs = 0;
   let nvcs = 0;
   let mainVcs = 0;
@@ -346,6 +455,7 @@ function wakeups(before, after, wallMs) {
 
 /** CPU % of the JS main thread vs every other thread (libuv/V8 workers + native WebRTC threads). */
 function cpuSplit(before, after, wallMs) {
+  if (after.size === 0) return null;
   let main = 0;
   let other = 0;
   for (const [tid, t] of after) {
@@ -358,6 +468,7 @@ function cpuSplit(before, after, wallMs) {
 }
 
 function threadBreakdown(before, after, wallMs) {
+  if (after.size === 0) return null;
   const byName = {};
   for (const [tid, t] of after) {
     const d = t.ticks - (before.get(tid)?.ticks ?? 0);
@@ -369,17 +480,105 @@ function threadBreakdown(before, after, wallMs) {
   return pct;
 }
 
-function startMeasure({ eld = true, sampleMs = 1000 } = {}) {
-  const h = eld ? monitorEventLoopDelay({ resolution: 10 }) : null;
-  h?.enable();
-  const gc = { count: 0, ms: 0 };
-  const obs = new PerformanceObserver((list) => {
-    for (const e of list.getEntries()) {
-      gc.count++;
-      gc.ms += e.duration;
+/**
+ * Event-loop lag monitor. Node: perf_hooks.monitorEventLoopDelay (10 ms
+ * resolution; its values are the interval between the monitor's timer
+ * callbacks, lag = value − 10 ms). Bun's monitorEventLoopDelay has different
+ * semantics, so under Bun a 10 ms setInterval of our own measures the same
+ * thing (lag = interval − 10 ms), into a bounded 0.01 ms-bin histogram.
+ */
+function eldMonitor() {
+  if (!IS_BUN) {
+    const h = monitorEventLoopDelay({ resolution: 10 });
+    h.enable();
+    const lag = (ns) => Math.max(0, ns / 1e6 - 10);
+    return {
+      stop() {
+        h.disable();
+        return { method: 'monitorEventLoopDelay', p50: lag(h.percentile(50)), p90: lag(h.percentile(90)), p99: lag(h.percentile(99)), max: lag(h.max), mean: lag(h.mean), samples: h.count };
+      },
+    };
+  }
+  const BIN = 0.01;
+  const bins = new Uint32Array(200_000); // up to 2 s, overflow in the last bin
+  let n = 0;
+  let sum = 0;
+  let max = 0;
+  let last = performance.now();
+  const t = setInterval(() => {
+    const now = performance.now();
+    const lag = Math.max(0, now - last - 10);
+    last = now;
+    bins[Math.min(bins.length - 1, Math.floor(lag / BIN))]++;
+    n++;
+    sum += lag;
+    if (lag > max) max = lag;
+  }, 10);
+  const pct = (q) => {
+    let target = Math.ceil(n * q);
+    for (let i = 0; i < bins.length; i++) if ((target -= bins[i]) <= 0) return i * BIN;
+    return max;
+  };
+  return {
+    stop() {
+      clearInterval(t);
+      return { method: 'setInterval-10ms', p50: pct(0.5), p90: pct(0.9), p99: pct(0.99), max, mean: n ? sum / n : NaN, samples: n };
+    },
+  };
+}
+
+/** `bun:jsc` heap figures (Bun only; JSC has no V8-style heap spaces nor GC events). */
+function jscHeap() {
+  if (!JSC) return null;
+  const h = JSC.heapStats();
+  const m = JSC.memoryUsage?.();
+  return { heapSize: h.heapSize, heapCapacity: h.heapCapacity, extraMemorySize: h.extraMemorySize, objectCount: h.objectCount, mallocCurrent: m?.current ?? null };
+}
+
+/**
+ * Sizes of the Map/Set fields (and arrays) of each room's host, transport,
+ * backend and endpoint (only what the build exposes; the bundle keeps property
+ * names), summed over rooms; a shared endpoint is counted once. For the soak
+ * scenario: a size that grows with churn is a leak.
+ */
+function mapSizes() {
+  const out = {};
+  const seen = new Set();
+  for (const r of rooms) {
+    const objs = r.internals?.();
+    if (!objs) continue;
+    for (const [name, o] of Object.entries(objs)) {
+      if (!o || typeof o !== 'object' || seen.has(o)) continue;
+      seen.add(o);
+      for (const k of Object.keys(o)) {
+        let v;
+        try {
+          v = o[k];
+        } catch {
+          continue;
+        }
+        const size = v instanceof Map || v instanceof Set ? v.size : Array.isArray(v) ? v.length : null;
+        if (size !== null) out[`${name}.${k}`] = (out[`${name}.${k}`] ?? 0) + size;
+      }
     }
-  });
-  obs.observe({ entryTypes: ['gc'] });
+  }
+  return out;
+}
+
+function startMeasure({ eld = true, sampleMs = 1000, stream = false } = {}) {
+  const h = eld ? eldMonitor() : null;
+  // GC events: Node only (Bun's PerformanceObserver accepts 'gc' but never reports any)
+  const gc = IS_BUN ? null : { count: 0, ms: 0 };
+  let obs = null;
+  if (gc) {
+    obs = new PerformanceObserver((list) => {
+      for (const e of list.getEntries()) {
+        gc.count++;
+        gc.ms += e.duration;
+      }
+    });
+    obs.observe({ entryTypes: ['gc'] });
+  }
   const m = {
     h,
     obs,
@@ -397,8 +596,23 @@ function startMeasure({ eld = true, sampleMs = 1000 } = {}) {
     const cpu = process.cpuUsage();
     const mem = process.memoryUsage();
     const d = cpu.user - m.last.cpu.user + (cpu.system - m.last.cpu.system);
-    m.samples.push({ t: t - m.t0, cpuPct: (d / 1000 / (t - m.last.t)) * 100, rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external });
+    const s = { t: t - m.t0, cpuPct: (d / 1000 / (t - m.last.t)) * 100, rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external };
+    m.samples.push(s);
     m.last = { t, cpu };
+    if (stream) {
+      // soak: the long-run series goes to the orchestrator as it is taken (saved progressively)
+      send({
+        type: 'sample',
+        ...s,
+        arrayBuffers: mem.arrayBuffers,
+        fds: countFds(),
+        players: rooms.map((r) => r.players().length),
+        maps: mapSizes(),
+        rtc: rtcTotals(true),
+        jsc: jscHeap(),
+        gcCount: gc?.count ?? null,
+      });
+    }
   }, sampleMs);
   meas = m;
 }
@@ -411,27 +625,13 @@ function stopMeasure() {
   const cpu = process.cpuUsage(m.cpu0);
   const threads1 = threadTicks();
   const mem = process.memoryUsage();
-  m.obs.disconnect();
+  m.obs?.disconnect();
   const wallMs = t1 - m.t0;
   const rss = m.samples.map((s) => s.rss).concat(mem.rss);
   const heap = m.samples.map((s) => s.heapUsed).concat(mem.heapUsed);
   const mean = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : NaN);
-  let eld = null;
-  if (m.h) {
-    m.h.disable();
-    // Histogram values are the interval between the monitor's 10 ms timer
-    // callbacks; lag = value − 10 ms.
-    const lag = (ns) => Math.max(0, ns / 1e6 - 10);
-    eld = {
-      p50: lag(m.h.percentile(50)),
-      p90: lag(m.h.percentile(90)),
-      p99: lag(m.h.percentile(99)),
-      max: lag(m.h.max),
-      mean: lag(m.h.mean),
-      samples: m.h.count,
-    };
-  }
   return {
+    runtime: IS_BUN ? `bun ${globalThis.Bun.version}` : `node ${process.version}`,
     wallMs,
     cpuUserMs: cpu.user / 1000,
     cpuSystemMs: cpu.system / 1000,
@@ -447,13 +647,14 @@ function stopMeasure() {
     heapTotalEnd: mem.heapTotal,
     externalEnd: mem.external,
     arrayBuffersEnd: mem.arrayBuffers,
-    gcCount: m.gc.count,
-    gcMs: m.gc.ms,
-    eld,
+    gcCount: m.gc?.count ?? null,
+    gcMs: m.gc?.ms ?? null,
+    eld: m.h?.stop() ?? null,
+    jsc: jscHeap(),
     threadsPct: threadBreakdown(m.threads0, threads1, wallMs),
     cpuSplit: cpuSplit(m.threads0, threads1, wallMs),
     wakeups: wakeups(m.threads0, threads1, wallMs),
-    threadCount: threads1.size,
+    threadCount: threads1.size || null,
     fdCount: countFds(),
     cpuPctSeries: m.samples.map((s) => +s.cpuPct.toFixed(3)),
   };
@@ -461,16 +662,26 @@ function stopMeasure() {
 
 // ------------------------------------------------------------- main
 
-/** Summed haxlite-rtc endpoint counters of every room (null when no room uses peerBackend 'rtc'). */
-function rtcTotals() {
+/** Summed haxlite-rtc endpoint counters of every room (null when no room uses peerBackend 'rtc'); a shared endpoint is counted once. */
+function rtcTotals(withSessions = false) {
   let out = null;
+  const seen = new Set();
   for (const r of rooms) {
     const st = r.rtcStats?.();
     if (!st) continue;
-    out ??= { packetsIn: 0, packetsOut: 0, bytesOut: 0 };
+    // rooms sharing one endpoint return the same counters: count them once
+    const ep = r.internals?.().endpoint ?? st;
+    if (seen.has(ep)) continue;
+    seen.add(ep);
+    out ??= { packetsIn: 0, packetsOut: 0, bytesIn: 0, bytesOut: 0, ...(withSessions ? { sessions: 0, open: 0 } : null) };
     out.packetsIn += st.packetsIn;
     out.packetsOut += st.packetsOut;
+    out.bytesIn += st.bytesIn ?? 0;
     out.bytesOut += st.bytesOut;
+    if (withSessions) {
+      out.sessions += st.sessions ?? 0;
+      out.open += st.open ?? 0;
+    }
   }
   return out;
 }
@@ -496,6 +707,28 @@ for (let i = 0; i < ROOMS; i++) {
   rooms.push(await create(i, onLink));
 }
 
+/** soak: every player gets a team on arrival (alternating), the game keeps running with score/time limit 0. */
+let autoTeams = null;
+function startAutoTeams() {
+  if (autoTeams) return;
+  const assigned = rooms.map(() => new Set());
+  const tick = () => {
+    rooms.forEach((r, k) => {
+      const ids = r.players();
+      const live = new Set(ids);
+      for (const id of assigned[k]) if (!live.has(id)) assigned[k].delete(id);
+      for (const id of ids) {
+        if (assigned[k].has(id)) continue;
+        r.setTeam(id, assigned[k].size % 2 === 0 ? 1 : 2);
+        assigned[k].add(id);
+      }
+    });
+  };
+  for (const r of rooms) r.startGame();
+  tick();
+  autoTeams = setInterval(tick, 500);
+}
+
 process.on('message', (msg) => {
   try {
     switch (msg.cmd) {
@@ -513,6 +746,13 @@ process.on('message', (msg) => {
         send({ type: 'game', players: counts });
         break;
       }
+      case 'auto-teams':
+        startAutoTeams();
+        send({ type: 'auto-teams' });
+        break;
+      case 'impair-stats':
+        send({ type: 'impair-stats', rooms: rooms.map((r) => r.impairStats?.() ?? null), rtc: rtcTotals(true) });
+        break;
       case 'measure-start':
         profileStart();
         startMeasure(msg);
@@ -525,8 +765,9 @@ process.on('message', (msg) => {
         const rtc1 = rtcTotals();
         if (rtc0 !== null && rtc1 !== null) {
           const perS = (k) => +(((rtc1[k] - rtc0[k]) / stats.wallMs) * 1000).toFixed(1);
-          stats.rtc = { packetsInPerS: perS('packetsIn'), packetsOutPerS: perS('packetsOut'), bytesOutPerS: perS('bytesOut') };
+          stats.rtc = { packetsInPerS: perS('packetsIn'), packetsOutPerS: perS('packetsOut'), bytesInPerS: perS('bytesIn'), bytesOutPerS: perS('bytesOut') };
         }
+        stats.maps = mapSizes();
         send({ type: 'stats', stats, players: rooms.map((r) => r.players().length) });
         profileStop();
         break;

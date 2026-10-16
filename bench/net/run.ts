@@ -3,34 +3,54 @@
  * (haxball.js) vs node-haxball as host, fully offline through the FakeMaster.
  *
  *   npm run bench:build                      # compile haxlite (src/) for the host process
- *   node --experimental-transform-types --import ./bench/ts-resolve.mjs bench/net/run.ts <scenario> [flags]
+ *   node --no-warnings --import ./bench/ts-resolve.mjs bench/net/run.ts <scenario> [flags]
+ *   bun bench/net/run.ts <scenario> [flags]  # the orchestrator under Bun works too
  *
  * Scenarios (see docs/07-benchmarks.md):
  *   startup   time from process start / room creation to "room link ready"
  *   idle      public room, 0 players (CPU %, RSS/heap, no event-loop monitor)
  *   game      N connected node-haxball clients playing a running game
  *   rooms     K rooms in one host process, 4 clients each
+ *   soak      R rooms in one process (--rooms 4), C clients per room (--clients 4)
+ *             joining and leaving continuously, for --minutes (360); one sample
+ *             every --sample-s (60): RSS, heap, external, fds (Linux), internal
+ *             Map/Set sizes; slope MB/h and fd drift
+ *   fleet     P host processes (--procs 3) × R rooms (--rooms 4) × C clients
+ *             (--clients 4), measured together; CPU/RSS summed over processes
+ *   join-impaired  haxlite:rtc behind the userspace NAT of test/rtc/nat-sim.ts with
+ *             --rtt 40 ms and --loss 0,1,3 % (each direction), --stun cold,cached:
+ *             join latency p50/p99 of --joins 20 sequential clients
  *
  * Flags: --impl haxlite,official,nodehaxball  --reps 3  --warmup 15  --window 60
  *        --n 4,10,20 (game)  --k 1,5,10 (rooms)  --out bench/results/<scenario>.json
+ *        --runtime node|bun  runtime of the HOST process (default node; clients
+ *          and this orchestrator are not affected). Per implementation:
+ *          `--impl haxlite:rtc@bun,haxlite:rtc@node` (a suffix wins over --runtime).
+ *          Bun binary: $BUN_PATH, else `bun` on PATH (resolved to the real executable).
  *        --eld 0 (no event-loop monitor: sizes its own CPU overhead)
- *        --host-node-args "--cpu-prof --cpu-prof-dir=DIR" (diagnostics only)
+ *        --host-node-args "--cpu-prof --cpu-prof-dir=DIR" (diagnostics only, Node hosts)
  *        --max-foreign 100 --attempts 2 (re-run a repetition when other processes
  *        on the machine used more than this % of one core during the window; after
  *        `attempts` tries the least noisy one is kept and flagged `noisy`)
+ *        soak: --rooms --clients --minutes --sample-s --stay-s 20,90 --pause-s 2,15
+ *        fleet: --procs --rooms --clients (accept lists: --procs 1,3)
+ *        join-impaired: --rtt --loss --jitter 0 --stun --joins --nat-outside 127.0.0.1
+ *          --nat-filtering endpoint-independent (nat-sim NatFiltering)
  *
  * Process layout per repetition (each process fresh):
  *   this process ── FakeMaster (HTTP + signaling WS, 127.0.0.1)
- *   host-proc.mjs   the host under test (plain JS, no TS loader); measures itself
+ *   host-proc.mjs × procs   the host under test (plain JS, no TS loader); measures itself
  *   clients-proc.mjs × ceil(clients/10)   node-haxball clients (never counted)
+ *
+ * Machine-wide CPU (foreign load): /proc/stat on Linux, os.cpus() elsewhere.
  */
-import { fork, type ChildProcess } from 'node:child_process';
+import { fork, execFileSync, execSync, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { execSync } from 'node:child_process';
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { FakeMaster } from '../../test/fake-master/index.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -38,6 +58,7 @@ const ROOT = path.resolve(HERE, '../..');
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Any = any;
+const IS_BUN = typeof (globalThis as Any).Bun !== 'undefined';
 
 // ------------------------------------------------------------------ args
 const argv = process.argv.slice(2);
@@ -47,12 +68,31 @@ function flag(name: string, def: string): string {
   return i >= 0 && argv[i + 1] !== undefined ? argv[i + 1]! : def;
 }
 const list = (s: string) => s.split(',').filter(Boolean);
-const IMPLS = list(flag('impl', scenario === 'rooms' ? 'haxlite' : 'haxlite,official,nodehaxball'));
-const REPS = Number(flag('reps', scenario === 'startup' ? '10' : '3'));
-const WARMUP_S = Number(flag('warmup', scenario === 'idle' ? '10' : '15'));
+const nums = (s: string) => list(s).map(Number);
+const DEFAULT_IMPL: Record<string, string> = { rooms: 'haxlite', soak: 'haxlite:rtc', fleet: 'haxlite:rtc', 'join-impaired': 'haxlite:rtc' };
+const IMPLS = list(flag('impl', DEFAULT_IMPL[scenario] ?? 'haxlite,official,nodehaxball'));
+const RUNTIME = flag('runtime', 'node');
+if (RUNTIME !== 'node' && RUNTIME !== 'bun') throw new Error(`--runtime must be node or bun (got ${RUNTIME})`);
+const DEFAULT_REPS: Record<string, string> = { startup: '10', soak: '1', 'join-impaired': '1' };
+const REPS = Number(flag('reps', DEFAULT_REPS[scenario] ?? '3'));
+const WARMUP_S = Number(flag('warmup', scenario === 'idle' ? '10' : scenario === 'soak' ? '60' : '15'));
 const WINDOW_S = Number(flag('window', scenario === 'idle' ? '200' : '60'));
-const NS = list(flag('n', '4,10,20')).map(Number);
-const KS = list(flag('k', '1,5,10')).map(Number);
+const NS = nums(flag('n', '4,10,20'));
+const KS = nums(flag('k', '1,5,10'));
+const PROCS = nums(flag('procs', '3'));
+const ROOMS_PER_PROC = nums(flag('rooms', '4'));
+const CLIENTS = nums(flag('clients', '4'));
+const SOAK_MIN = Number(flag('minutes', '360'));
+const SAMPLE_S = Number(flag('sample-s', '60'));
+const STAY_S = nums(flag('stay-s', '20,90'));
+const PAUSE_S = nums(flag('pause-s', '2,15'));
+const RTT = nums(flag('rtt', '40'));
+const LOSS = nums(flag('loss', '0,1,3'));
+const JITTER = Number(flag('jitter', '0'));
+const STUN = list(flag('stun', 'cold,cached'));
+const JOINS = Number(flag('joins', '20'));
+const NAT_OUTSIDE = flag('nat-outside', '127.0.0.1');
+const NAT_FILTERING = flag('nat-filtering', 'endpoint-independent');
 const MAX_FOREIGN = Number(flag('max-foreign', '100'));
 const ATTEMPTS = Number(flag('attempts', '2'));
 /** --eld 0 disables the event-loop-delay monitor (its 10 ms timer costs CPU too; used to size that overhead). */
@@ -62,20 +102,56 @@ const CLIENTS_PER_PROC = 10;
 /** Extra node flags for the host process only, e.g. "--cpu-prof --cpu-prof-dir=/tmp/prof" (diagnostics). */
 const HOST_NODE_ARGS = list(flag('host-node-args', '').replace(/ +/g, ','));
 
+/** `haxlite:rtc@bun` → { impl: 'haxlite:rtc', runtime: 'bun' }. */
+function splitImpl(s: string): { impl: string; runtime: 'node' | 'bun' } {
+  const at = s.lastIndexOf('@');
+  const rt = at > 0 ? s.slice(at + 1) : RUNTIME;
+  if (rt !== 'node' && rt !== 'bun') throw new Error(`unknown runtime in ${s}`);
+  return { impl: at > 0 ? s.slice(0, at) : s, runtime: rt };
+}
+
+// ------------------------------------------------------------------ runtimes
+let bunPath: string | null = null;
+/** The real Bun executable (on Windows `bun` on PATH is a .cmd shim that fork() cannot start). */
+function bunExecutable(): string {
+  if (bunPath !== null) return bunPath;
+  if (process.env.BUN_PATH) return (bunPath = process.env.BUN_PATH);
+  if (IS_BUN) return (bunPath = process.execPath);
+  try {
+    bunPath = execSync('bun -e "console.log(process.execPath)"', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    throw new Error('Bun not found: install it or set BUN_PATH');
+  }
+  return bunPath;
+}
+function runtimeVersion(rt: 'node' | 'bun'): string {
+  if (rt === 'node') return IS_BUN ? 'node (see info.node)' : process.version;
+  try {
+    return `bun ${execFileSync(bunExecutable(), ['--version'], { encoding: 'utf8' }).trim()}`;
+  } catch {
+    return 'bun (unknown)';
+  }
+}
+const TS_LOADER = pathToFileURL(path.join(ROOT, 'bench/ts-resolve.mjs')).href;
+
 // ------------------------------------------------------------------ child helper
 class Child {
   readonly msgs: Any[] = [];
   readonly errors: string[] = [];
   readonly tail: string[] = [];
+  readonly name: string;
+  readonly proc: ChildProcess;
   private waiters: (() => void)[] = [];
+  /** Called for every message (soak: streamed samples). */
+  onMessage: ((m: Any) => void) | null = null;
   exited = false;
-  constructor(
-    readonly name: string,
-    readonly proc: ChildProcess,
-  ) {
+  constructor(name: string, proc: ChildProcess) {
+    this.name = name;
+    this.proc = proc;
     proc.on('message', (m: Any) => {
       if (m?.type === 'error') this.errors.push(m.message);
       this.msgs.push(m);
+      this.onMessage?.(m);
       for (const w of this.waiters.splice(0)) w();
     });
     const keep = (d: Buffer) => {
@@ -84,15 +160,32 @@ class Child {
     };
     proc.stdout?.on('data', keep);
     proc.stderr?.on('data', keep);
+    proc.on('error', (e) => this.errors.push(`${name}: ${e.message}`));
     proc.on('exit', (code) => {
       this.exited = true;
       this.errors.push(`${name} exited (${code})`);
       for (const w of this.waiters.splice(0)) w();
     });
   }
-  static spawn(name: string, script: string, args: string[], execArgv: string[] = []): Child {
-    // execArgv: [] → no TypeScript loader in the children.
-    return new Child(name, fork(path.join(HERE, script), args, { execArgv, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }));
+  static spawn(
+    name: string,
+    script: string,
+    args: string[],
+    o: { execArgv?: string[]; runtime?: 'node' | 'bun'; env?: Record<string, string>; tsLoader?: boolean } = {},
+  ): Child {
+    const bun = o.runtime === 'bun';
+    // execArgv: [] → no TypeScript loader in the children (unless tsLoader: join-impaired imports test/rtc/nat-sim.ts).
+    const execArgv = bun ? [] : [...(o.tsLoader ? ['--no-warnings', '--import', TS_LOADER] : []), ...(o.execArgv ?? [])];
+    // fork() a Bun child: Bun speaks Node's IPC channel (NODE_CHANNEL_FD), also on Windows.
+    // A Bun orchestrator forking a Node child: execPath must then be node.
+    const execPath = bun ? bunExecutable() : IS_BUN ? 'node' : process.execPath;
+    const proc = fork(path.join(HERE, script), args, {
+      execArgv,
+      execPath,
+      env: o.env ? { ...process.env, ...o.env } : process.env,
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    return new Child(name, proc);
   }
   send(m: Any): void {
     if (!this.exited) this.proc.send(m);
@@ -128,17 +221,27 @@ class Child {
 }
 
 // ------------------------------------------------------------------ system CPU (to detect foreign load)
-function procStat(): { busy: number; total: number } {
-  const cpu = readFileSync('/proc/stat', 'utf8').split('\n')[0]!.trim().split(/\s+/).slice(1).map(Number);
-  const idle = cpu[3]! + cpu[4]!;
-  const total = cpu.reduce((a, b) => a + b, 0);
-  return { busy: total - idle, total };
+const HAS_PROC_STAT = existsSync('/proc/stat');
+/** Busy CPU time of the whole machine so far, in ms (all cores). */
+function sysBusyMs(): number {
+  if (HAS_PROC_STAT) {
+    const cpu = readFileSync('/proc/stat', 'utf8').split('\n')[0]!.trim().split(/\s+/).slice(1).map(Number);
+    const idle = cpu[3]! + cpu[4]!;
+    const total = cpu.reduce((a, b) => a + b, 0);
+    return (total - idle) * 10; // USER_HZ = 100
+  }
+  // Windows / macOS: per-core times in ms (coarser, but the same meaning)
+  let busy = 0;
+  for (const c of os.cpus()) busy += c.times.user + c.times.nice + c.times.sys + c.times.irq;
+  return busy;
 }
-const CLK_TCK = 100;
 
 // ------------------------------------------------------------------ one repetition
 interface RunSpec {
   impl: string;
+  runtime: 'node' | 'bun';
+  /** host processes (fleet; 1 otherwise) */
+  procs: number;
   rooms: number;
   clientsPerRoom: number;
   warmupS: number;
@@ -146,32 +249,178 @@ interface RunSpec {
   eld: boolean;
   sampleMs: number;
   seed: number;
+  /** soak: clients join/leave continuously; samples streamed every sampleMs */
+  churn?: { stayS: number[]; pauseS: number[] } | null;
+  /** join-impaired */
+  impair?: { rttMs: number; lossPct: number; jitterMs: number; stun: string; outside: string; filtering: string } | null;
 }
 
-async function runOnce(spec: RunSpec): Promise<Any> {
+/** Sums the per-process stats of a fleet into one `host`-shaped record (CPU/memory/GC add up). */
+function aggregateHosts(all: Any[]): Any {
+  if (all.length === 1) return all[0];
+  const sum = (f: (s: Any) => number | null | undefined) => {
+    const xs = all.map(f);
+    return xs.some((x) => x === null || x === undefined) ? null : (xs as number[]).reduce((a, b) => a + b, 0);
+  };
+  const max = (f: (s: Any) => number) => Math.max(...all.map(f));
+  const r1 = (x: number | null) => (x === null ? null : +x.toFixed(1));
+  const out: Any = {
+    runtime: all[0].runtime,
+    processes: all.length,
+    wallMs: max((s) => s.wallMs),
+    cpuUserMs: sum((s) => s.cpuUserMs),
+    cpuSystemMs: sum((s) => s.cpuSystemMs),
+    cpuPct: sum((s) => s.cpuPct),
+    rssStart: sum((s) => s.rssStart),
+    rssEnd: sum((s) => s.rssEnd),
+    rssMean: sum((s) => s.rssMean),
+    rssMax: sum((s) => s.rssMax), // upper bound: per-process maxima need not coincide
+    heapUsedStart: sum((s) => s.heapUsedStart),
+    heapUsedEnd: sum((s) => s.heapUsedEnd),
+    heapUsedMean: sum((s) => s.heapUsedMean),
+    heapUsedMax: sum((s) => s.heapUsedMax),
+    heapTotalEnd: sum((s) => s.heapTotalEnd),
+    externalEnd: sum((s) => s.externalEnd),
+    gcCount: sum((s) => s.gcCount),
+    gcMs: sum((s) => s.gcMs),
+    // event-loop lag: the worst process
+    eld: all.every((s) => s.eld) ? { p50: max((s) => s.eld.p50), p90: max((s) => s.eld.p90), p99: max((s) => s.eld.p99), max: max((s) => s.eld.max), mean: max((s) => s.eld.mean), worstOf: all.length } : null,
+    cpuSplit: all.every((s) => s.cpuSplit) ? { mainPct: sum((s) => s.cpuSplit.mainPct), otherPct: sum((s) => s.cpuSplit.otherPct) } : null,
+    wakeups: all.every((s) => s.wakeups) ? { voluntaryPerS: sum((s) => s.wakeups.voluntaryPerS), involuntaryPerS: sum((s) => s.wakeups.involuntaryPerS), mainVoluntaryPerS: sum((s) => s.wakeups.mainVoluntaryPerS) } : null,
+    threadCount: sum((s) => s.threadCount),
+    fdCount: sum((s) => s.fdCount),
+    rtc: all.every((s) => s.rtc)
+      ? { packetsInPerS: r1(sum((s) => s.rtc.packetsInPerS)), packetsOutPerS: r1(sum((s) => s.rtc.packetsOutPerS)), bytesInPerS: r1(sum((s) => s.rtc.bytesInPerS)), bytesOutPerS: r1(sum((s) => s.rtc.bytesOutPerS)) }
+      : null,
+  };
+  return out;
+}
+
+/** Merges the clients' sparse gap histograms / message counters into per-label totals. */
+function mergeTraffic(reports: Any[]): Any {
+  const by: Record<string, { msgs: number; bytes: number; binMs: number; n: number; max: number; bins: Map<number, number> }> = {};
+  let wallMs = 0;
+  for (const r of reports) {
+    const t = r.traffic;
+    if (!t) continue;
+    wallMs = Math.max(wallMs, t.wallMs);
+    for (const [label, x] of Object.entries<Any>(t.byLabel)) {
+      const m = (by[label] ??= { msgs: 0, bytes: 0, binMs: x.gaps.binMs, n: 0, max: 0, bins: new Map() });
+      m.msgs += x.msgs;
+      m.bytes += x.bytes;
+      m.n += x.gaps.n;
+      m.max = Math.max(m.max, x.gaps.max);
+      for (const [b, c] of x.gaps.bins) m.bins.set(b, (m.bins.get(b) ?? 0) + c);
+    }
+  }
+  const out: Any = { wallMs, byLabel: {} };
+  for (const [label, m] of Object.entries(by)) out.byLabel[label] = { msgs: m.msgs, bytes: m.bytes, gaps: histPct(m.bins, m.n, m.max, m.binMs) };
+  // headline: gap between consecutive messages of one client on any channel, pooled over the clients
+  const any = new Map<number, number>();
+  let anyN = 0;
+  let anyMax = 0;
+  let binMs = 0.05;
+  for (const r of reports) {
+    const g = r.traffic?.anyGaps;
+    if (!g) continue;
+    binMs = g.binMs;
+    anyN += g.n;
+    anyMax = Math.max(anyMax, g.max);
+    for (const [b, c] of g.bins) any.set(b, (any.get(b) ?? 0) + c);
+  }
+  out.gapsAll = histPct(any, anyN, anyMax, binMs);
+  out.msgs = Object.values(by).reduce((a, m) => a + m.msgs, 0);
+  out.bytes = Object.values(by).reduce((a, m) => a + m.bytes, 0);
+  return out;
+}
+function histPct(bins: Map<number, number>, n: number, max: number, binMs: number): Any {
+  const sorted = [...bins.entries()].sort((a, b) => a[0] - b[0]);
+  const q = (p: number) => {
+    let target = Math.ceil(n * p);
+    // the clients' last bin (≥ 2 s) collects the overflow: report the true maximum there
+    for (const [b, c] of sorted) if ((target -= c) <= 0) return (b + 1) * binMs >= 2000 ? +max.toFixed(3) : +((b + 0.5) * binMs).toFixed(3);
+    return max;
+  };
+  return { n, p50: q(0.5), p99: q(0.99), p999: q(0.999), max: +max.toFixed(3) };
+}
+
+/** Linear regression slope of y over x (least squares). */
+function slope(xs: number[], ys: number[]): number {
+  const n = xs.length;
+  if (n < 2) return NaN;
+  const mx = xs.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < n; i++) {
+    num += (xs[i]! - mx) * (ys[i]! - my);
+    den += (xs[i]! - mx) ** 2;
+  }
+  return den === 0 ? NaN : num / den;
+}
+
+/** Soak series → slopes (per hour) and drifts, per host process. */
+function soakSummary(samples: Any[]): Any {
+  if (samples.length < 2) return { samples: samples.length };
+  const h = samples.map((s) => s.t / 3_600_000);
+  const sl = (f: (s: Any) => number) => +slope(h, samples.map(f)).toFixed(3);
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  const fds = samples.map((s) => s.fds).filter((x) => x !== null);
+  const mapsDrift: Record<string, number> = {};
+  for (const k of Object.keys(last.maps ?? {})) mapsDrift[k] = (last.maps[k] ?? 0) - (first.maps?.[k] ?? 0);
+  return {
+    samples: samples.length,
+    hours: +(h[h.length - 1]! - h[0]!).toFixed(3),
+    rssSlopeMBph: sl((s) => s.rss / MB),
+    heapUsedSlopeMBph: sl((s) => s.heapUsed / MB),
+    heapTotalSlopeMBph: sl((s) => s.heapTotal / MB),
+    externalSlopeMBph: sl((s) => s.external / MB),
+    rssStartMB: +(first.rss / MB).toFixed(1),
+    rssEndMB: +(last.rss / MB).toFixed(1),
+    fdStart: fds.length ? fds[0] : null,
+    fdEnd: fds.length ? fds[fds.length - 1] : null,
+    fdDrift: fds.length ? fds[fds.length - 1] - fds[0] : null,
+    fdSlopePerH: fds.length >= 2 ? +slope(h.filter((_, i) => samples[i].fds !== null), fds).toFixed(2) : null,
+    mapsDrift,
+  };
+}
+
+async function runOnce(spec: RunSpec, onProgress: (partial: Any) => void): Promise<Any> {
   const master = await FakeMaster.start();
   const children: Child[] = [];
   const result: Any = { ...spec };
   try {
     const tFork = performance.now();
-    const sysFork = procStat();
+    const sysFork = sysBusyMs();
     const selfFork = process.cpuUsage();
-    const host = Child.spawn('host', 'host-proc.mjs', [spec.impl, master.hostPort, String(spec.rooms)], HOST_NODE_ARGS);
-    children.push(host);
-    const links = await host.wait('link', 60_000, spec.rooms);
+    const env: Record<string, string> = spec.impair ? { HAXLITE_BENCH_IMPAIR: JSON.stringify(spec.impair) } : {};
+    const hosts: Child[] = [];
+    for (let p = 0; p < spec.procs; p++) {
+      hosts.push(
+        Child.spawn(`host${p}`, 'host-proc.mjs', [spec.impl, master.hostPort, String(spec.rooms)], {
+          runtime: spec.runtime,
+          execArgv: HOST_NODE_ARGS,
+          env,
+          tsLoader: !!spec.impair,
+        }),
+      );
+    }
+    children.push(...hosts);
+    const linksPer = await Promise.all(hosts.map((h) => h.wait('link', 60_000, spec.rooms)));
     const tLinked = performance.now();
-    const sysLinked = procStat();
+    const sysLinked = sysBusyMs();
     const selfLinked = process.cpuUsage(selfFork);
+    const links = linksPer[0]!;
+    const hostsCpuAtLink = linksPer.reduce((a, ls) => a + Math.max(...ls.map((l: Any) => l.cpuMs)), 0);
     result.startup = {
-      forkToLinkMs: performance.now() - tFork, // only meaningful for rooms = 1
-      links: links.map((l) => ({ room: l.room, tStart: l.tStart, tLoad: l.tLoad, tCreate: l.tCreate, tLink: l.tLink, createToLinkMs: l.tLink - l.tCreate, cpuMs: l.cpuMs, rss: l.rss, heapUsed: l.heapUsed })),
+      forkToLinkMs: tLinked - tFork, // only meaningful for rooms = 1
+      links: links.map((l: Any) => ({ room: l.room, tStart: l.tStart, tLoad: l.tLoad, tCreate: l.tCreate, tLink: l.tLink, createToLinkMs: l.tLink - l.tCreate, cpuMs: l.cpuMs, rss: l.rss, heapUsed: l.heapUsed })),
       // other processes' CPU between fork and the last link (% of one core)
-      foreignPct: Math.max(
-        0,
-        (((sysLinked.busy - sysFork.busy) * (1000 / CLK_TCK) - links[links.length - 1].cpuMs - (selfLinked.user + selfLinked.system) / 1000) / (tLinked - tFork)) * 100,
-      ),
+      foreignPct: Math.max(0, ((sysLinked - sysFork - hostsCpuAtLink - (selfLinked.user + selfLinked.system) / 1000) / (tLinked - tFork)) * 100),
     };
-    const ids: string[] = links.sort((a, b) => a.room - b.room).map((l) => l.id);
+    // room ids of every process, process by process
+    const ids: string[] = linksPer.flatMap((ls) => [...ls].sort((a, b) => a.room - b.room).map((l: Any) => l.id));
 
     let clients: Child[] = [];
     if (spec.clientsPerRoom > 0) {
@@ -191,46 +440,95 @@ async function runOnce(spec: RunSpec): Promise<Any> {
           left -= n;
         }
       }
-      clients = groups.map((g, i) => Child.spawn(`clients${i}`, 'clients-proc.mjs', [master.hostPort, g.join(','), String(spec.seed * 100 + i + 1)]));
+      const copts = spec.churn ? [JSON.stringify({ churn: spec.churn })] : [];
+      clients = groups.map((g, i) => Child.spawn(`clients${i}`, 'clients-proc.mjs', [master.hostPort, g.join(','), String(spec.seed * 100 + i + 1), ...copts]));
       children.push(...clients);
-      const joined = await Promise.all(clients.map((c) => c.wait('joined', 240_000)));
+      const joined = await Promise.all(clients.map((c) => c.wait('joined', 240_000 + (spec.impair ? JOINS * 32_000 : 0))));
       result.join = joined.map((j) => j[0]);
-      const expected = spec.rooms * spec.clientsPerRoom;
+      if (spec.impair) {
+        // join-impaired: only the join latency matters
+        result.impairStats = await Promise.all(hosts.map((h) => h.request({ cmd: 'impair-stats' }, 'impair-stats')));
+        result.errors = children.flatMap((c) => c.errors.filter((e) => !e.includes('exited')).map((e) => `${c.name}: ${e.slice(0, 500)}`));
+        result.valid = hosts.every((h) => h.errors.length === 0);
+        return result;
+      }
+      const expected = spec.rooms * spec.clientsPerRoom * spec.procs;
       const total = result.join.reduce((a: number, j: Any) => a + j.joined, 0);
       if (total !== expected) throw new Error(`only ${total}/${expected} clients joined`);
-      // the host must see everybody before teams are assigned
-      const t0 = Date.now();
-      for (;;) {
-        const p = await host.request({ cmd: 'players' }, 'players');
-        if (p.counts.every((c: number) => c === spec.clientsPerRoom)) break;
-        if (Date.now() - t0 > 20_000) throw new Error(`host sees ${p.counts} players`);
-        await sleep(200);
+      if (spec.churn) {
+        // soak: teams are given as players arrive, the game runs from the start
+        await Promise.all(hosts.map((h) => h.request({ cmd: 'auto-teams' }, 'auto-teams')));
+      } else {
+        // the host must see everybody before teams are assigned
+        const t0 = Date.now();
+        for (;;) {
+          const ps = await Promise.all(hosts.map((h) => h.request({ cmd: 'players' }, 'players')));
+          if (ps.every((p) => p.counts.every((c: number) => c === spec.clientsPerRoom))) break;
+          if (Date.now() - t0 > 20_000) throw new Error(`hosts see ${ps.map((p) => p.counts).join(' / ')} players`);
+          await sleep(200);
+        }
+        result.game = await Promise.all(hosts.map((h) => h.request({ cmd: 'game' }, 'game')));
       }
-      result.game = await host.request({ cmd: 'game' }, 'game');
       await Promise.all(clients.map((c) => c.request({ cmd: 'drive' }, 'driving')));
     }
 
     await sleep(spec.warmupS * 1000);
     const load0 = os.loadavg();
-    const sys0 = procStat();
+    const sys0 = sysBusyMs();
     const self0 = process.cpuUsage();
-    await host.request({ cmd: 'measure-start', eld: spec.eld, sampleMs: spec.sampleMs }, 'measuring');
+    if (spec.churn) {
+      result.series = hosts.map(() => [] as Any[]);
+      hosts.forEach((h, p) => {
+        h.onMessage = (m) => {
+          if (m.type !== 'sample') return;
+          const { type: _t, ...s } = m;
+          result.series[p].push(s);
+          result.soak = result.series.map(soakSummary);
+          onProgress(result);
+        };
+      });
+    }
+    await Promise.all([
+      ...hosts.map((h) => h.request({ cmd: 'measure-start', eld: spec.eld, sampleMs: spec.sampleMs, stream: !!spec.churn }, 'measuring')),
+      ...clients.map((c) => c.request({ cmd: 'window' }, 'window')),
+    ]);
+    const tw0 = performance.now();
     await sleep(spec.windowS * 1000);
-    const stats = await host.request({ cmd: 'measure-stop' }, 'stats');
+    const stopped = await Promise.all(hosts.map((h) => h.request({ cmd: 'measure-stop' }, 'stats')));
     const reports = await Promise.all(clients.map((c) => c.request({ cmd: 'stop' }, 'report')));
-    const sys1 = procStat();
+    const windowMs = performance.now() - tw0;
+    const sys1 = sysBusyMs();
     const self = process.cpuUsage(self0);
-    result.host = stats.stats;
-    result.hostPlayersAtEnd = stats.players;
-    result.clients = reports.map(({ frames, ...r }: Any) => ({ ...r, minFrame: Math.min(...frames), maxFrame: Math.max(...frames) }));
+    result.hosts = stopped.length > 1 ? stopped.map((s) => s.stats) : undefined;
+    result.host = aggregateHosts(stopped.map((s) => s.stats));
+    result.hostPlayersAtEnd = stopped.flatMap((s) => s.players);
+    result.clients = reports.map(({ frames, traffic: _t, ...r }: Any) => ({ ...r, minFrame: Math.min(...frames), maxFrame: Math.max(...frames) }));
+    result.traffic = mergeTraffic(reports);
+    // Per-player egress of the host: UDP level (haxlite-rtc endpoint counters) and
+    // application level (messages/bytes the clients received), divided by the players.
+    // churn: the mean number of connected players over the samples
+    const series: Any[] = spec.churn ? (result.series as Any[][]).flat() : [];
+    const players = spec.churn
+      ? series.reduce((a, s) => a + s.players.reduce((x: number, y: number) => x + y, 0), 0) / Math.max(1, series.length / spec.procs) || 1
+      : (result.hostPlayersAtEnd as number[]).reduce((a, b) => a + b, 0) || spec.procs * spec.rooms * spec.clientsPerRoom;
+    const tw = result.traffic.wallMs || windowMs;
+    result.egressPerPlayer = {
+      players: +players.toFixed(2),
+      udpBytesPerS: result.host.rtc ? +(result.host.rtc.bytesOutPerS / players).toFixed(1) : null,
+      udpPacketsPerS: result.host.rtc ? +(result.host.rtc.packetsOutPerS / players).toFixed(2) : null,
+      appBytesPerS: +((result.traffic.bytes / players / tw) * 1000).toFixed(1),
+      appMsgsPerS: +((result.traffic.msgs / players / tw) * 1000).toFixed(2),
+    };
+    if (spec.churn) result.soak = result.series.map(soakSummary);
     // Everything that ran on the machine during the window minus our own processes
     // (host, clients, this orchestrator incl. the FakeMaster) = foreign load.
-    const sysBusyPct = ((sys1.busy - sys0.busy) / CLK_TCK / (spec.windowS + 0.0)) * 100; // % of ONE core
-    const oursPct = stats.stats.cpuPct + reports.reduce((a: number, r: Any) => a + r.cpuPct, 0) + ((self.user + self.system) / 1000 / (spec.windowS * 1000)) * 100;
+    const sysBusyPct = ((sys1 - sys0) / windowMs) * 100; // % of ONE core
+    const oursPct = result.host.cpuPct + reports.reduce((a: number, r: Any) => a + r.cpuPct, 0) + ((self.user + self.system) / 1000 / windowMs) * 100;
     result.machine = { loadavgStart: load0, loadavgEnd: os.loadavg(), sysBusyPct, foreignPct: Math.max(0, sysBusyPct - oursPct) };
     const disconnected = result.clients.reduce((a: number, r: Any) => a + r.disconnected, 0);
-    result.valid =
-      disconnected === 0 && (stats.players as number[]).every((c) => c === spec.clientsPerRoom) && host.errors.length === 0;
+    result.valid = spec.churn
+      ? hosts.every((h) => h.errors.length === 0)
+      : disconnected === 0 && (result.hostPlayersAtEnd as number[]).every((c) => c === spec.clientsPerRoom) && hosts.every((h) => h.errors.length === 0);
     result.errors = children.flatMap((c) => c.errors.filter((e) => !e.includes('exited')).map((e) => `${c.name}: ${e.slice(0, 500)}`));
     return result;
   } finally {
@@ -241,21 +539,22 @@ async function runOnce(spec: RunSpec): Promise<Any> {
   }
 }
 
-async function runWithRetry(spec: RunSpec): Promise<Any> {
+async function runWithRetry(spec: RunSpec, onProgress: (partial: Any) => void): Promise<Any> {
   const discarded: Any[] = [];
+  const foreignOf = (d: Any) => (spec.windowS <= 1 || spec.impair ? d.startup.foreignPct : d.machine.foreignPct);
   for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
     let r: Any;
     try {
-      r = await runOnce(spec);
+      r = await runOnce(spec, onProgress);
     } catch (e) {
       r = { ...spec, failed: String((e as Error).message ?? e).slice(0, 2000) };
       console.log(`    failed: ${r.failed.split('\n')[0]}`);
       discarded.push(r);
       continue;
     }
-    const foreign = spec.windowS <= 1 ? r.startup.foreignPct : r.machine.foreignPct;
-    if (foreign > MAX_FOREIGN) {
-      console.log(`    noisy (foreign load ${foreign.toFixed(0)} % of a core), repeating`);
+    // soak: hours of data are never thrown away for noise; join-impaired measures latency, not CPU
+    if (!spec.churn && !spec.impair && foreignOf(r) > MAX_FOREIGN) {
+      console.log(`    noisy (foreign load ${foreignOf(r).toFixed(0)} % of a core), repeating`);
       discarded.push({ ...r, discardedAsNoisy: true });
       await sleep(5_000);
       continue;
@@ -266,7 +565,6 @@ async function runWithRetry(spec: RunSpec): Promise<Any> {
   // Machine never got quiet enough: keep the least noisy valid attempt, flagged.
   const noisy = discarded.filter((d) => d.discardedAsNoisy);
   if (noisy.length > 0) {
-    const foreignOf = (d: Any) => (spec.windowS <= 1 ? d.startup.foreignPct : d.machine.foreignPct);
     const best = noisy.reduce((a, b) => (foreignOf(b) < foreignOf(a) ? b : a));
     console.log(`    keeping least noisy attempt (foreign ${foreignOf(best).toFixed(0)} %)`);
     return { ...best, discardedAsNoisy: false, noisy: true, discarded: discarded.filter((d) => d !== best) };
@@ -292,9 +590,26 @@ function quantile(xs: number[], q: number): number {
   const lo = Math.floor(i);
   return s[lo]! + (s[Math.min(lo + 1, s.length - 1)]! - s[lo]!) * (i - lo);
 }
+/** null (metric not available on this runtime / OS) → NaN, so stat() skips it. */
+const num = (x: Any) => (x === null || x === undefined ? NaN : Number(x));
 function summarize(runs: Any[]): Any {
   const ok = runs.filter((r) => !r.failed);
-  const pick = (f: (r: Any) => number) => stat(ok.map(f));
+  const pick = (f: (r: Any) => number) => stat(ok.map((r) => num(f(r))));
+  if (ok[0]?.impair) {
+    return {
+      reps: ok.length,
+      failed: runs.length - ok.length,
+      joinP50Ms: pick((r) => quantile(joinTimes(r), 0.5)),
+      joinP90Ms: pick((r) => quantile(joinTimes(r), 0.9)),
+      joinP99Ms: pick((r) => quantile(joinTimes(r), 0.99)),
+      joinMaxMs: pick((r) => Math.max(...joinTimes(r))),
+      joined: pick((r) => r.join.reduce((a: number, j: Any) => a + j.joined, 0)),
+      joinFailures: pick((r) => r.join.reduce((a: number, j: Any) => a + j.failures, 0)),
+      stunRequests: pick((r) => r.impairStats.reduce((a: number, h: Any) => a + h.rooms.reduce((b: number, x: Any) => b + (x?.stunRequests ?? 0), 0), 0)),
+      allValid: ok.every((r) => r.valid),
+    };
+  }
+  const ms = (r: Any) => r.host.wallMs;
   return {
     reps: ok.length,
     failed: runs.length - ok.length,
@@ -304,11 +619,11 @@ function summarize(runs: Any[]): Any {
     rssGrowthMB: pick((r) => (r.host.rssEnd - r.host.rssStart) / MB),
     heapUsedMeanMB: pick((r) => r.host.heapUsedMean / MB),
     heapUsedMaxMB: pick((r) => r.host.heapUsedMax / MB),
-    gcPerMin: pick((r) => (r.host.gcCount / r.host.wallMs) * 60_000),
-    gcMsPerMin: pick((r) => (r.host.gcMs / r.host.wallMs) * 60_000),
-    eldP50: pick((r) => r.host.eld?.p50 ?? NaN),
-    eldP99: pick((r) => r.host.eld?.p99 ?? NaN),
-    eldMax: pick((r) => r.host.eld?.max ?? NaN),
+    gcPerMin: pick((r) => (r.host.gcCount === null ? NaN : (r.host.gcCount / ms(r)) * 60_000)),
+    gcMsPerMin: pick((r) => (r.host.gcMs === null ? NaN : (r.host.gcMs / ms(r)) * 60_000)),
+    eldP50: pick((r) => r.host.eld?.p50),
+    eldP99: pick((r) => r.host.eld?.p99),
+    eldMax: pick((r) => r.host.eld?.max),
     createToLinkMs: pick((r) => r.startup.links[0].createToLinkMs),
     processStartToLinkMs: pick((r) => r.startup.links[0].tLink),
     forkToLinkMs: pick((r) => r.startup.forkToLinkMs),
@@ -316,17 +631,29 @@ function summarize(runs: Any[]): Any {
     cpuToLinkMs: pick((r) => r.startup.links[0].cpuMs),
     rssAtLinkMB: pick((r) => r.startup.links[0].rss / MB),
     heapAtLinkMB: pick((r) => r.startup.links[0].heapUsed / MB),
-    clientsCpuPct: pick((r) => r.clients?.reduce((a: number, c: Any) => a + c.cpuPct, 0) ?? NaN),
-    mainThreadCpuPct: pick((r) => r.host.cpuSplit?.mainPct ?? NaN),
-    otherThreadsCpuPct: pick((r) => r.host.cpuSplit?.otherPct ?? NaN),
-    threadCount: pick((r) => r.host.threadCount ?? NaN),
-    fdCount: pick((r) => r.host.fdCount ?? NaN),
-    wakeupsPerS: pick((r) => r.host.wakeups?.voluntaryPerS ?? NaN),
-    mainWakeupsPerS: pick((r) => r.host.wakeups?.mainVoluntaryPerS ?? NaN),
+    clientsCpuPct: pick((r) => r.clients?.reduce((a: number, c: Any) => a + c.cpuPct, 0)),
+    mainThreadCpuPct: pick((r) => r.host.cpuSplit?.mainPct),
+    otherThreadsCpuPct: pick((r) => r.host.cpuSplit?.otherPct),
+    threadCount: pick((r) => r.host.threadCount),
+    fdCount: pick((r) => r.host.fdCount),
+    wakeupsPerS: pick((r) => r.host.wakeups?.voluntaryPerS),
+    mainWakeupsPerS: pick((r) => r.host.wakeups?.mainVoluntaryPerS),
     // per-client Room.join → onOpen (successful attempt), median / p90 over the clients of a rep
     joinP50Ms: pick((r) => quantile(joinTimes(r), 0.5)),
     joinP90Ms: pick((r) => quantile(joinTimes(r), 0.9)),
-    joinFailures: pick((r) => r.join?.reduce((a: number, j: Any) => a + j.failures, 0) ?? NaN),
+    joinFailures: pick((r) => r.join?.reduce((a: number, j: Any) => a + j.failures, 0)),
+    // per-player egress (UDP: haxlite-rtc only; app: every host, measured by the clients)
+    udpBytesPerSPerPlayer: pick((r) => r.egressPerPlayer?.udpBytesPerS),
+    udpPacketsPerSPerPlayer: pick((r) => r.egressPerPlayer?.udpPacketsPerS),
+    appBytesPerSPerPlayer: pick((r) => r.egressPerPlayer?.appBytesPerS),
+    appMsgsPerSPerPlayer: pick((r) => r.egressPerPlayer?.appMsgsPerS),
+    // inter-arrival gap of consecutive messages at a client (all channels pooled)
+    gapP50Ms: pick((r) => r.traffic?.gapsAll?.p50),
+    gapP99Ms: pick((r) => r.traffic?.gapsAll?.p99),
+    gapP999Ms: pick((r) => r.traffic?.gapsAll?.p999),
+    rssSlopeMBph: pick((r) => r.soak?.[0]?.rssSlopeMBph),
+    heapUsedSlopeMBph: pick((r) => r.soak?.[0]?.heapUsedSlopeMBph),
+    fdDrift: pick((r) => r.soak?.[0]?.fdDrift),
     foreignPct: pick((r) => r.machine.foreignPct),
     noisyReps: ok.filter((r) => r.noisy).length,
     allValid: ok.every((r) => r.valid),
@@ -360,11 +687,22 @@ function info(): Any {
   } catch {
     /* not built */
   }
-  const pkg = (p: string) => JSON.parse(readFileSync(path.join(ROOT, 'node_modules', p, 'package.json'), 'utf8')).version;
+  const req = createRequire(path.join(ROOT, 'package.json'));
+  const pkg = (p: string, from?: string) => {
+    try {
+      const r = from ? createRequire(req.resolve(`${from}/package.json`)) : req;
+      return JSON.parse(readFileSync(r.resolve(`${p}/package.json`), 'utf8')).version;
+    } catch {
+      return null;
+    }
+  };
+  const runtimes = [...new Set(IMPLS.map((i) => splitImpl(i).runtime))];
   return {
     date: new Date().toISOString(),
-    node: process.version,
-    v8: process.versions.v8,
+    node: IS_BUN ? null : process.version,
+    v8: IS_BUN ? null : process.versions.v8,
+    orchestrator: IS_BUN ? `bun ${(globalThis as Any).Bun.version}` : `node ${process.version}`,
+    hostRuntimes: Object.fromEntries(runtimes.map((rt) => [rt, runtimeVersion(rt)])),
     platform: `${os.type()} ${os.release()} ${os.arch()}`,
     cpu: os.cpus()[0]?.model,
     nproc: os.cpus().length,
@@ -376,16 +714,44 @@ function info(): Any {
       'haxball.js': pkg('haxball.js'),
       'node-haxball': pkg('node-haxball'),
       'node-datachannel': pkg('node-datachannel'),
-      'node-haxball/node-datachannel': pkg('node-haxball/node_modules/node-datachannel'),
-      '@webrtc-node/webrtc': pkg('@webrtc-node/webrtc'),
+      'node-haxball/node-datachannel': pkg('node-datachannel', 'node-haxball'),
+      '@webrtc-node/webrtc': pkg('@webrtc-node/webrtc', 'haxball.js') ?? pkg('@webrtc-node/webrtc'),
     },
     cpuMHz: os.cpus()[0]?.speed,
-    command: `node --experimental-transform-types --import ./bench/ts-resolve.mjs bench/net/run.ts ${argv.join(' ')}`,
-    params: { ELD, IMPLS, REPS, WARMUP_S, WINDOW_S, NS, KS, MAX_FOREIGN, ATTEMPTS, CLIENTS_PER_PROC, HOST_NODE_ARGS },
+    command: `${IS_BUN ? 'bun' : 'node --import ./bench/ts-resolve.mjs'} bench/net/run.ts ${argv.join(' ')}`,
+    params: {
+      ELD, IMPLS, RUNTIME, REPS, WARMUP_S, WINDOW_S, NS, KS, MAX_FOREIGN, ATTEMPTS, CLIENTS_PER_PROC, HOST_NODE_ARGS,
+      PROCS, ROOMS_PER_PROC, CLIENTS, SOAK_MIN, SAMPLE_S, STAY_S, PAUSE_S, RTT, LOSS, JITTER, STUN, JOINS, NAT_OUTSIDE, NAT_FILTERING,
+    },
   };
 }
 
 // ------------------------------------------------------------------ scenarios
+const MB_ = (x: number) => (x / MB).toFixed(1);
+function logRun(run: Any): void {
+  if (run.impair) {
+    const xs = joinTimes(run);
+    const st = run.impairStats?.[0]?.rooms?.[0];
+    console.log(
+      `    joined ${xs.length}/${JOINS}  join p50 ${quantile(xs, 0.5).toFixed(0)} p99 ${quantile(xs, 0.99).toFixed(0)} max ${Math.max(...xs).toFixed(0)} ms  ` +
+        `failures ${run.join.reduce((a: number, j: Any) => a + j.failures, 0)}  stun requests ${st?.stunRequests}  nat dropped ${st?.impair?.dropped}  valid ${run.valid}`,
+    );
+    return;
+  }
+  const h = run.host;
+  const e = run.egressPerPlayer;
+  console.log(
+    `    ${h.runtime ?? ''} cpu ${h.cpuPct.toFixed(2)} %  rss ${MB_(h.rssMean)} MB  heap ${MB_(h.heapUsedMean)} MB  ` +
+      (h.eld ? `lag p50 ${h.eld.p50.toFixed(2)} p99 ${h.eld.p99.toFixed(2)} max ${h.eld.max.toFixed(1)} ms  ` : '') +
+      (h.cpuSplit ? `js ${h.cpuSplit.mainPct.toFixed(2)} other ${h.cpuSplit.otherPct.toFixed(2)}  thr ${h.threadCount} fd ${h.fdCount}  wake ${h.wakeups?.voluntaryPerS}/s  ` : '') +
+      (h.gcCount !== null ? `gc ${((h.gcCount / h.wallMs) * 60_000).toFixed(1)}/min ${((h.gcMs / h.wallMs) * 60_000).toFixed(1)} ms/min  ` : 'gc n/a  ') +
+      (h.rtc ? `udp in ${h.rtc.packetsInPerS}/s out ${h.rtc.packetsOutPerS}/s  ` : '') +
+      (e && run.clientsPerRoom > 0 ? `per player: app ${e.appMsgsPerS} msg/s ${e.appBytesPerS} B/s${e.udpBytesPerS !== null ? `, udp ${e.udpPacketsPerS} pkt/s ${e.udpBytesPerS} B/s` : ''}  gap p50 ${run.traffic.gapsAll.p50} p99 ${run.traffic.gapsAll.p99} p999 ${run.traffic.gapsAll.p999} ms  ` : '') +
+      (run.soak ? `soak rss ${run.soak[0].rssSlopeMBph} MB/h heap ${run.soak[0].heapUsedSlopeMBph} MB/h fd drift ${run.soak[0].fdDrift}  ` : '') +
+      `link ${run.startup.links[0].createToLinkMs.toFixed(0)} ms  foreign ${run.machine.foreignPct.toFixed(0)} %  valid ${run.valid}`,
+  );
+}
+
 async function main(): Promise<void> {
   const out: Any = { scenario, info: info(), configs: [] };
   const save = () => {
@@ -393,14 +759,38 @@ async function main(): Promise<void> {
     writeFileSync(OUT, JSON.stringify(out, null, 1));
   };
   const configs: { label: string; spec: Omit<RunSpec, 'seed'> }[] = [];
+  const base = (implRt: string) => ({ ...splitImpl(implRt), procs: 1 });
   if (scenario === 'startup') {
-    for (const impl of IMPLS) configs.push({ label: impl, spec: { impl, rooms: 1, clientsPerRoom: 0, warmupS: 0, windowS: 1, eld: false, sampleMs: 1000 } });
+    for (const i of IMPLS) configs.push({ label: i, spec: { ...base(i), rooms: 1, clientsPerRoom: 0, warmupS: 0, windowS: 1, eld: false, sampleMs: 1000 } });
   } else if (scenario === 'idle') {
-    for (const impl of IMPLS) configs.push({ label: impl, spec: { impl, rooms: 1, clientsPerRoom: 0, warmupS: WARMUP_S, windowS: WINDOW_S, eld: false, sampleMs: 5000 } });
+    for (const i of IMPLS) configs.push({ label: i, spec: { ...base(i), rooms: 1, clientsPerRoom: 0, warmupS: WARMUP_S, windowS: WINDOW_S, eld: false, sampleMs: 5000 } });
   } else if (scenario === 'game') {
-    for (const n of NS) for (const impl of IMPLS) configs.push({ label: `${impl} N=${n}`, spec: { impl, rooms: 1, clientsPerRoom: n, warmupS: WARMUP_S, windowS: WINDOW_S, eld: ELD, sampleMs: 1000 } });
+    for (const n of NS) for (const i of IMPLS) configs.push({ label: `${i} N=${n}`, spec: { ...base(i), rooms: 1, clientsPerRoom: n, warmupS: WARMUP_S, windowS: WINDOW_S, eld: ELD, sampleMs: 1000 } });
   } else if (scenario === 'rooms') {
-    for (const k of KS) for (const impl of IMPLS) configs.push({ label: `${impl} K=${k}`, spec: { impl, rooms: k, clientsPerRoom: 4, warmupS: WARMUP_S, windowS: WINDOW_S, eld: ELD, sampleMs: 1000 } });
+    for (const k of KS) for (const i of IMPLS) configs.push({ label: `${i} K=${k}`, spec: { ...base(i), rooms: k, clientsPerRoom: 4, warmupS: WARMUP_S, windowS: WINDOW_S, eld: ELD, sampleMs: 1000 } });
+  } else if (scenario === 'soak') {
+    for (const r of ROOMS_PER_PROC)
+      for (const c of CLIENTS)
+        for (const i of IMPLS)
+          configs.push({
+            label: `${i} R=${r} C=${c} ${SOAK_MIN} min`,
+            spec: { ...base(i), rooms: r, clientsPerRoom: c, warmupS: WARMUP_S, windowS: SOAK_MIN * 60, eld: ELD, sampleMs: SAMPLE_S * 1000, churn: { stayS: STAY_S, pauseS: PAUSE_S } },
+          });
+  } else if (scenario === 'fleet') {
+    for (const p of PROCS)
+      for (const r of ROOMS_PER_PROC)
+        for (const c of CLIENTS)
+          for (const i of IMPLS)
+            configs.push({ label: `${i} P=${p} R=${r} C=${c}`, spec: { ...base(i), procs: p, rooms: r, clientsPerRoom: c, warmupS: WARMUP_S, windowS: WINDOW_S, eld: ELD, sampleMs: 1000 } });
+  } else if (scenario === 'join-impaired') {
+    for (const rtt of RTT)
+      for (const loss of LOSS)
+        for (const stun of STUN)
+          for (const i of IMPLS)
+            configs.push({
+              label: `${i} rtt=${rtt} loss=${loss}% stun=${stun}`,
+              spec: { ...base(i), rooms: 1, clientsPerRoom: JOINS, warmupS: 0, windowS: 0, eld: false, sampleMs: 1000, impair: { rttMs: rtt, lossPct: loss, jitterMs: JITTER, stun, outside: NAT_OUTSIDE, filtering: NAT_FILTERING } },
+            });
   } else {
     throw new Error(`unknown scenario ${scenario}`);
   }
@@ -411,20 +801,21 @@ async function main(): Promise<void> {
   for (let rep = 0; rep < REPS; rep++) {
     for (const r of results) {
       console.log(`[${scenario}] ${r.label} rep ${rep + 1}/${REPS}`);
-      const run = await runWithRetry({ ...r.spec, seed: rep + 1 });
-      r.runs.push(run);
+      // soak: the partial run is saved at every sample (hours-long runs survive a crash)
+      r.runs.push({ partial: true });
+      let lastLog = Date.now();
+      const run = await runWithRetry({ ...r.spec, seed: rep + 1 }, (partial) => {
+        r.runs[r.runs.length - 1] = { ...partial, partial: true };
+        if (Date.now() - lastLog > 600_000) {
+          lastLog = Date.now();
+          const s = partial.soak?.[0];
+          console.log(`    … ${s?.samples} samples, ${s?.hours} h: rss ${s?.rssEndMB} MB (${s?.rssSlopeMBph} MB/h), fd drift ${s?.fdDrift}`);
+        }
+        save();
+      });
+      r.runs[r.runs.length - 1] = run;
       r.summary = summarize(r.runs);
-      if (!run.failed) {
-        const h = run.host;
-        console.log(
-          `    cpu ${h.cpuPct.toFixed(2)} %  rss ${(h.rssMean / MB).toFixed(1)} MB  heap ${(h.heapUsedMean / MB).toFixed(1)} MB  ` +
-            (h.eld ? `lag p50 ${h.eld.p50.toFixed(2)} p99 ${h.eld.p99.toFixed(2)} max ${h.eld.max.toFixed(1)} ms  ` : '') +
-            (h.cpuSplit ? `js ${h.cpuSplit.mainPct.toFixed(2)} other ${h.cpuSplit.otherPct.toFixed(2)}  thr ${h.threadCount} fd ${h.fdCount}  wake ${h.wakeups?.voluntaryPerS}/s  ` : '') +
-            `gc ${((h.gcCount / h.wallMs) * 60_000).toFixed(1)}/min ${((h.gcMs / h.wallMs) * 60_000).toFixed(1)} ms/min  ` +
-            (h.rtc ? `udp in ${h.rtc.packetsInPerS}/s out ${h.rtc.packetsOutPerS}/s  ` : '') +
-            `link ${run.startup.links[0].createToLinkMs.toFixed(0)} ms  foreign ${run.machine.foreignPct.toFixed(0)} %  valid ${run.valid}`,
-        );
-      }
+      if (!run.failed) logRun(run);
       save();
     }
   }
@@ -432,5 +823,4 @@ async function main(): Promise<void> {
   console.log(`wrote ${path.relative(ROOT, OUT)}`);
   process.exit(0);
 }
-
 await main();
