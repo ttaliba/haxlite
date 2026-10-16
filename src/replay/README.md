@@ -77,7 +77,9 @@ This is exactly the official `Ma.rg` loop (`apply → Ab(ev)` … `Ca.Da(1)`, `d
    returns the same file without stopping (autosave); `recorder.cancel()` drops it.
    `recorder.stopAsync(frame)` / `snapshotAsync(frame)` return the same bytes but
    deflate on the libuv threadpool (a 7.6 MB body: ~270 ms of event loop -> ~3 ms);
-   recording stops synchronously.
+   recording stops synchronously. `HostRoom.stopRecordingAsync()` and the HBInit
+   `room.stopRecordingAsync()` (a haxlite extension: the official API only has the
+   synchronous `stopRecording`) expose it.
 
 6. Room teardown: `recorder.cancel()` (restores the goal hook; no output).
 

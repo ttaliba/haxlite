@@ -226,12 +226,16 @@ Los eventos administrativos (`delay=false`) se aplican **en el frame actual del 
 Da() {
   n = ((performance.now() - this.Lf) * 0.06 | 0) - this.da;  // frames que "debería" llevar
   if (n > 0) this.rg(n);                                     // catch-up: simula TODOS los frames atrasados de golpe
-  if (this.da - this.df >= 7)  this.Zd();                    // heartbeat (tipo 3) cada ≥7 frames ≈ 117 ms
+  if (this.da - this.df >= 7)  this.Zd();                    // heartbeat (tipo 3) cada ≥7 frames (7–9: 117–150 ms)
   if (this.da - this.cf >= 600) { this.Zd(); this.Wh(); }    // checksum cada 600 frames = 10 s
 }
 ```
 
 No hay límite de frames en el *catch-up* del host: si el proceso se congela, al volver simula de golpe todo lo pendiente.
+
+**Cadencia real de los heartbeats.** `Da()` corre cada 50 ms (3 frames) y en cada mensaje, así que el heartbeat sale en el primer `Da()` con `da − df ≥ 7`: huecos de **7 a 9 frames** (117–150 ms), no exactamente 7. Además el host manda uno tras cada evento propio (`oc` → `Zd()`, §11).
+
+**haxlite** (`src/host`, detalles en `src/host/README.md`) no tiene un bucle de 50 ms por sala: un único temporizador por proceso despierta en una rejilla absoluta de 60 Hz compartida por todas las salas. Los heartbeats salen en los frames con `(base + frame) % heartbeatFrames === 0`, así que sin *bundling* la cadencia es **exactamente** `heartbeatFrames` (7). Con el backend `rtc`, que agrupa los envíos de una iteración del event loop en un paquete por jugador, el heartbeat que vence en ≤ `floor((heartbeatFrames − 1) / 3)` frames (2) se adelanta y viaja con la difusión del evento de cliente: huecos de **5 a 9 frames**, casi ninguno en un datagrama propio. Catch-ups, `CheckConsistency` y el Ping van en la misma rejilla (≈ 17 despertares/s por proceso con partidas en curso, sin importar cuántas salas); una partida en pausa total no fuerza catch-ups (solo heartbeats). Los clientes oficiales no dependen de la cadencia: solo avanzan al recibir cada heartbeat (§5.1).
 
 ---
 
@@ -265,7 +269,7 @@ A$(n) { this.D1(n); this.UW -= n; }
 Puntos clave:
 
 1. **El reloj del cliente no avanza el estado autoritativo.** `LM()` del cliente (`api.js:2894`) solo recalcula `UW` (cuántos frames va el host "por delante"). El único camino a `D1()` es `V1()` → `A$()`.
-2. **Comprobación de completitud por contador.** Como los eventos viajan por `ru` (fiable pero **desordenado**) y los heartbeats por `uu` (pueden perderse o llegar antes que los eventos), el cliente solo avanza hasta `Y5` cuando el número de eventos que conoce con frame menor que `Y5` coincide con el contador del host. Si falta alguno, espera al siguiente heartbeat. Si se pierde un heartbeat, el siguiente llega unos 7 frames después.
+2. **Comprobación de completitud por contador.** Como los eventos viajan por `ru` (fiable pero **desordenado**) y los heartbeats por `uu` (pueden perderse o llegar antes que los eventos), el cliente solo avanza hasta `Y5` cuando el número de eventos que conoce con frame menor que `Y5` coincide con el contador del host. Si falta alguno, espera al siguiente heartbeat. Si se pierde un heartbeat, el siguiente llega 7–9 frames después (§4.3).
 3. **No hay "eventos tardíos" en el cliente.** Por construcción el cliente nunca ha simulado más allá de un frame cuyo conjunto de eventos esté completo, así que nunca necesita rebobinar. Si por un error llegara un evento con `dM < j`, se quedaría atascado en la cabeza de la cola (`D1` solo consume `a.dM == this.j`) y bloquearía los demás. Por eso node-haxball expone `room.clearEvents()` ("*can be useful when the game engine is stuck*", README; implementado como `this.I.eW.ME.length = 0`, `api.js:6783`).
 4. `s$` (tipo 6) aplica eventos **fuera de la secuencia** (chat o anuncio privado). Solo son válidos si no tocan el estado simulado. Con `executeEventWithTarget` el propio README advierte: "*It will probably cause 'intentional' desync*". Medido en §7.4.
 
@@ -354,7 +358,7 @@ Retardo efectivo de cada vía (aproximado):
 
 - **Input propio → pantalla propia**: unos 0 ms gracias a la predicción, salvo el handicap.
 - **Input propio → estado confirmado del host**: one-way + `Sb` frames (unos 33 ms en el headless).
-- **Distancia de extrapolación de un cliente** ≈ (`hostAhora` − `j`) + `Sb` + RTT/2 ≈ RTT + `Sb` + (0…7 frames de heartbeat). Tope: 120 frames.
+- **Distancia de extrapolación de un cliente** ≈ (`hostAhora` − `j`) + `Sb` + RTT/2 ≈ RTT + `Sb` + (0…9 frames de heartbeat). Tope: 120 frames.
 
 ---
 
@@ -635,7 +639,7 @@ Cada **3 s** el host crea un evento `Ping` (tipo 17, solo host) con el `ad` de c
 | Eventos cliente → host (incluido **input**) | `ro` (fiable y ordenado) | SCTP lo retransmite. El input llega más tarde y el host lo **re-sella** a un frame futuro (§4.1). No se pierde ningún input, pero puede perder su frame "ideal". Como el input solo se envía al cambiar, un cambio perdido para siempre dejaría al jugador con la tecla pegada; la fiabilidad lo evita. |
 | Eventos host → clientes | `ru` (fiable y desordenado) | Se retransmiten. El orden lo da `(frame, orden)` y no el transporte. Un evento atrasado bloquea el avance del estado confirmado hasta que llega (comprobación por contador), pero la extrapolación sigue mostrando movimiento. |
 | CheckConsistency, snapshot inicial, expulsión | `ro` | Fiable. |
-| Heartbeats (tipo 3) | `uu` (no fiable) | Se ignora: el siguiente llega unos 7 frames después. Solo retrasa la confirmación. |
+| Heartbeats (tipo 3) | `uu` (no fiable) | Se ignora: el siguiente llega 7–9 frames después (§4.3). Solo retrasa la confirmación. |
 | Ping / respuesta de ping | `uu` | La muestra se pierde. `Qi` purga los pings antiguos. |
 
 Tolerancia a la desconexión: el host corta un peer que lleva 10 s sin mandar nada (`Ya`, `this.Qh=1E4`), y el cliente aborta si no recibe el estado inicial en 10 s (`$.VG = EWG.wE(…,1e4)`, `api.js:2872`).
@@ -737,7 +741,7 @@ CLIENTE:
 
 ## 13. Implicaciones de diseño
 
-- **Ancho de banda mínimo**: durante el juego solo viajan cambios de teclas (unos pocos bytes), heartbeats cada ~117 ms y pings. No hay estado de discos en la red. Por eso un host doméstico puede sostener muchas salas o jugadores.
+- **Ancho de banda mínimo**: durante el juego solo viajan cambios de teclas (unos pocos bytes), heartbeats cada 117–150 ms y pings. No hay estado de discos en la red. Por eso un host doméstico puede sostener muchas salas o jugadores.
 - **Coste de CPU en el cliente**: re-simular hasta 120 frames por cada frame de render en el peor caso (ping alto).
 - **El jugador con lag perjudica sobre todo su propia experiencia**: sus inputs se re-sellan más tarde, pero los demás nunca esperan por él. No es un lockstep "estricto" que bloquee a todos.
 - **Confianza**: el host no reconcilia estado, así que un cliente con física modificada solo se desincroniza a sí mismo y queda señalado por `SetPlayerSync`. En cambio, el host tiene autoridad total: puede inyectar o alterar eventos, falsear pings, etc., como demuestra node-haxball.
