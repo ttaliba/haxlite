@@ -42,7 +42,18 @@ import {
   parseEdgeKey,
   roLaneChannel,
 } from './edge-protocol.js';
-import { UdpTunnelPlane, deriveTunnelSecrets, x25519Generate, x25519Shared, type UdpPlaneStats, type X25519Pair } from './edge-udp.js';
+import {
+  UdpTunnelPlane,
+  deriveTunnelSecrets,
+  grantedTunnelAead,
+  tunnelAeadRequest,
+  x25519Generate,
+  x25519Shared,
+  type TunnelAead,
+  type TunnelAeadOption,
+  type UdpPlaneStats,
+  type X25519Pair,
+} from './edge-udp.js';
 import type { NdcTunnelPlane } from './edge-ndc.js';
 
 /** Data plane of a tunnel: `'udp'` (v2, default), `'webrtc'` (legacy node-datachannel), `'ws'`. */
@@ -74,6 +85,13 @@ export interface EdgeOptions {
    * (ignored by edges that don't support it).
    */
   roLanes?: boolean;
+  /**
+   * `dataPlane: 'udp'` only: datagram AEAD to ask the edge for. `'auto'`
+   * (default) asks for ChaCha20-Poly1305 where it is the cheaper one (Node;
+   * on Bun AES-128-GCM); the edge grants it only if it agrees, else (and
+   * with edges that predate it) AES-128-GCM.
+   */
+  tunnelAead?: TunnelAeadOption;
   /** Local address for the outbound WebSocket and the tunnel's UDP socket / PeerConnection. */
   bindAddress?: string;
   /** `dataPlane: 'webrtc'` only: STUN/TURN for the tunnel PeerConnection (default none: the edge is public). */
@@ -695,7 +713,7 @@ class TunnelSession {
       let flags = 0;
       let hostPub: Buffer | null = null;
       if (this.mode === 'udp') {
-        flags = AuthFlag.Udp | lanes;
+        flags = AuthFlag.Udp | lanes | tunnelAeadRequest(o.tunnelAead);
         this.x25519 = x25519Generate();
         hostPub = this.x25519.publicKey;
       } else if (this.mode === 'webrtc') flags = AuthFlag.WebRtc | lanes;
@@ -749,7 +767,7 @@ class TunnelSession {
       if (port === 0 || connId === 0) throw new Error('bad UDP tunnel endpoint');
       this.mode = 'udp';
       this.startPing();
-      this.startUdpPlane(edgePub, connId, udpHost.length > 0 ? udpHost : urlHost(o.url), port);
+      this.startUdpPlane(edgePub, connId, udpHost.length > 0 ? udpHost : urlHost(o.url), port, grantedTunnelAead(granted));
       return;
     }
     this.x25519 = null;
@@ -800,7 +818,7 @@ class TunnelSession {
   }
 
   /** Tunnel v2: SCTP (we initiate) over AES-GCM datagrams from one connected UDP socket. */
-  private startUdpPlane(edgePub: Uint8Array, connId: number, host: string, port: number): void {
+  private startUdpPlane(edgePub: Uint8Array, connId: number, host: string, port: number, aead: TunnelAead): void {
     this.armDataPlaneDeadline();
     const o = this.backend.opts;
     const x = this.x25519!;
@@ -846,6 +864,7 @@ class TunnelSession {
         connId,
         secrets,
         lanes: this.lanes,
+        aead,
         transmit: (d) => {
           try {
             sock.send(d);

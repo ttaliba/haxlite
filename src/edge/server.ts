@@ -70,7 +70,7 @@ import {
   edgeMacEqual,
   roLaneChannel,
 } from '../net/edge-protocol.js';
-import { deriveTunnelSecrets, x25519Generate, x25519Shared } from '../net/edge-udp.js';
+import { deriveTunnelSecrets, grantTunnelAead, tunnelAeadFlag, x25519Generate, x25519Shared } from '../net/edge-udp.js';
 import { NdcPlayers, RtcPlayers, resolveEdgePublicAddresses, type EdgePlayerBackendKind, type EdgePlayers } from './players.js';
 import { EdgeUdpServer, type EdgeTunnelOptions, type EdgeTunnelStats, type EdgeUdpConn } from './tunnel-udp.js';
 
@@ -966,7 +966,8 @@ class EdgeSession {
     this.wsData = plane === 'ws';
     if (plane !== 'ws' && (flags & AuthFlag.RoLanes) !== 0) this.lanes = EDGE_RO_LANES;
     const lanesFlag = this.lanes > 1 ? AuthFlag.RoLanes : 0;
-    const granted = plane === 'udp' ? AuthFlag.Udp | lanesFlag : plane === 'webrtc' ? AuthFlag.WebRtc | lanesFlag : 0;
+    const aead = plane === 'udp' ? grantTunnelAead(flags, this.edge.udp!.aead) : 'aes-128-gcm';
+    const granted = plane === 'udp' ? AuthFlag.Udp | lanesFlag | tunnelAeadFlag(aead) : plane === 'webrtc' ? AuthFlag.WebRtc | lanesFlag : 0;
     const w = this.control(EdgeMsg.AuthOk);
     w.u32(this.id);
     w.u16(Math.min(lim.maxPeersPerSession, 0xffff));
@@ -994,7 +995,7 @@ class EdgeSession {
           if (this.udpConn === conn) this.close(EdgeCloseCode.Timeout, `tunnel ${reason}`);
         },
         onError: (err) => this.edge.log(`session ${this.id}: tunnel: ${(err as Error)?.message ?? err}`),
-      });
+      }, { aead });
       this.udpConn = conn;
       this.plane = { ready: () => conn.plane.open, send: (ch, f) => conn.plane.send(ch, f) };
       const t = this.edge.opts.tunnel ?? {};
