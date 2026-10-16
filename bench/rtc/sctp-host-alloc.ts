@@ -3,7 +3,7 @@
  * SctpAssociation + the rtc backend's RtcPeerLink / per-scope bundling, with
  * HaxBall-like traffic and no network (in-process "browsers").
  *
- *   flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings \
+ *   flock /tmp/haxlite-bench.lock node --no-warnings \
  *     --import ./bench/ts-resolve.mjs bench/rtc/sctp-host-alloc.ts [--peers 20] [--seconds 120] [--no-bundle]
  *     [--const-clock] [--depth 3] [--show-other] [--warmup-frames 20000]
  *
