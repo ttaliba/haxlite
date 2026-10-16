@@ -14,8 +14,13 @@
 // The global `performance` (Node >= 16, Bun): no node:perf_hooks import at
 // load time (Node loads its perf internals on the first performance.now()).
 
-/** See {@link SharedClock} `armAt`. */
-const TIMER_SLACK_MS = 1;
+/**
+ * Extra ms added to every timer (see {@link SharedClock} `armAt`). Node can
+ * fire up to ~1 ms early; Bun keeps its timers on a sub-millisecond
+ * monotonic clock and never fired early in our samples (0 of 1000, earliest
+ * fire 0.014 ms after the target), so it needs none.
+ */
+export const TIMER_SLACK_MS = (process.versions as { bun?: string }).bun !== undefined ? 0 : 1;
 
 /** What the clock knows about a room (one per HostRoom, allocated once). */
 export class ClockEntry {
@@ -96,7 +101,7 @@ export class SharedClock {
     // counts timers on libuv's millisecond clock, which truncates (and may
     // use the coarse monotonic clock), so a timer can fire up to ~1 ms before
     // `at`; an early fire costs a second wake-up 1 ms later. TIMER_SLACK_MS
-    // avoids that at the price of ~1 ms of extra latency.
+    // avoids that at the price of ~1 ms of extra latency (0 on Bun).
     const d = Math.ceil(at - performance.now()) + TIMER_SLACK_MS;
     this.timer = setTimeout(this.onTimer, d > 1 ? d : 1);
   }

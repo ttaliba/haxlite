@@ -30,9 +30,9 @@ import {
   type HostTransportOptions,
   type JoinRequest,
 } from '../net/index.js';
-import { HostRoom, createHostRoomState, type DiscPropsInput } from '../host/index.js';
+import { HostRoom, createHostRoomState, defaultStadiumByName, type DiscPropsInput } from '../host/index.js';
 import type { Player } from '../room/index.js';
-import { defaultStadiums, parseHbs, type Stadium } from '../sim/index.js';
+import { parseHbs, type Stadium } from '../sim/index.js';
 import type {
   AnnouncementSound,
   AnnouncementStyle,
@@ -579,8 +579,8 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
       defer(() => host.setStadium(s));
     },
     setDefaultStadium(stadiumName: string) {
-      const s = defaultStadiums().find((st) => st.name === stadiumName);
-      if (s === undefined) throw new Error("Stadium doesn't exist");
+      const s = defaultStadiumByName(stadiumName);
+      if (s === null) throw new Error("Stadium doesn't exist");
       defer(() => host.setStadium(s));
     },
     setDiscProperties(discIndex: number, properties: DiscPropertiesUpdate) {

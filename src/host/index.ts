@@ -6,10 +6,12 @@
  * See src/host/README.md (facade contract) and docs/04.
  */
 export {
+  DEFAULT_STADIUM_NAMES,
   HostConnection,
   HostDefaults,
   HostRoom,
   createHostRoomState,
+  defaultStadiumByName,
   type DiscProperties,
   type DiscPropsInput,
   type HostRoomOptions,
