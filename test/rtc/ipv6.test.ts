@@ -5,6 +5,8 @@
  */
 import dgram from 'node:dgram';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { HostTransportOptions } from '../../src/net/transport.js';
+import type { HaxliteConfig } from '../../src/api/types.js';
 
 const calls: { host: string; opts: { family?: number; all?: boolean } }[] = [];
 vi.mock('node:dns', async (importOriginal) => {
@@ -65,5 +67,11 @@ describe('IPv6 opt-in', () => {
     expect(isIpv6Candidate('candidate:1 1 UDP 2122317823 2001:db8::1 5000 typ host')).toBe(true);
     expect(isIpv6Candidate('a=candidate:2 1 UDP 1686052607 203.0.113.7 5000 typ srflx raddr 0.0.0.0 rport 0')).toBe(false);
     expect(isIpv6Candidate('candidate:3 1 udp 2113937151 0a1b2c3d.local 5000 typ host')).toBe(false);
+  });
+
+  it('ipv6 type-checks in the options of both backends (transport and HBInit)', () => {
+    const t = { rtc: { ipv6: true, enableIceUdpMux: false }, rtcEndpoint: { ipv6: true } } satisfies Partial<HostTransportOptions>;
+    const r = { peerBackend: 'rtc', rtc: { ipv6: true } } satisfies HaxliteConfig;
+    expect(t.rtc.ipv6 && t.rtcEndpoint.ipv6 && r.rtc.ipv6).toBe(true);
   });
 });
