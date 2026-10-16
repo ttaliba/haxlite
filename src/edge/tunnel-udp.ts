@@ -17,11 +17,12 @@
  *   known connection id are bounded);
  * * a tunnel that sends nothing authenticated for `idleTimeoutMs` is closed.
  */
-import type { RemoteInfo, Socket } from 'node:dgram';
+import type { Socket } from 'node:dgram';
 import { createRequire } from 'node:module';
 import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { TokenBucket } from '../net/rate-limit.js';
+import { UdpIo } from '../rtc/udp.js';
 import { UdpTunnelPlane, udpConnId, type TunnelSecrets, type UdpPlaneEvents } from '../net/edge-udp.js';
 
 export interface EdgeTunnelOptions {
@@ -120,7 +121,8 @@ export class EdgeUdpConn {
       lanes,
       transmit: (d) => {
         const a = this.addr;
-        if (a !== null) this.server.sendTo(d, a.address, a.port); // never to an unauthenticated address
+        if (a === null) return true; // never to an unauthenticated address
+        return this.server.sendTo(d, a.address, a.port);
       },
       events,
       ...(extra.rekeyAfterPackets !== undefined ? { rekeyAfterPackets: extra.rekeyAfterPackets } : null),
@@ -128,9 +130,9 @@ export class EdgeUdpConn {
   }
 
   /** A datagram carrying this connection id. */
-  onDatagram(msg: Buffer, rinfo: RemoteInfo, now: number): void {
+  onDatagram(msg: Buffer, address: string, port: number, now: number): void {
     const a = this.addr;
-    const fromPeer = a !== null && a.port === rinfo.port && a.address === rinfo.address;
+    const fromPeer = a !== null && a.port === port && a.address === address;
     if (!(fromPeer ? this.own : this.foreign).take(now)) {
       this.server.counters.rateLimited++;
       return;
@@ -142,7 +144,7 @@ export class EdgeUdpConn {
     }
     if (!fromPeer && this.plane.cipher.lastNewest) {
       if (a !== null) this.server.counters.migrations++;
-      this.addr = { address: rinfo.address, port: rinfo.port };
+      this.addr = { address, port };
     }
     this.plane.dispatch(pt);
   }
@@ -173,6 +175,7 @@ export class EdgeUdpServer {
   readonly maxForeignPps: number;
   private readonly idleMs: number;
   private readonly sock: Socket;
+  private readonly io: UdpIo;
   private readonly conns = new Map<number, EdgeUdpConn>();
   private sweepTimer: NodeJS.Timeout | null = null;
   private closed = false;
@@ -184,8 +187,8 @@ export class EdgeUdpServer {
     this.maxPps = Math.max(1, o.maxPps ?? 20_000);
     this.maxForeignPps = Math.max(1, o.maxForeignPps ?? 20);
     this.idleMs = o.idleTimeoutMs ?? 30_000;
-    sock.on('message', (msg: Buffer, rinfo: RemoteInfo) => this.onPacket(msg, rinfo));
-    sock.on('error', () => {
+    // the runtime's send/receive paths without dgram's per-datagram garbage (src/rtc/udp.ts)
+    this.io = new UdpIo(sock, (msg, address, port) => this.onPacket(msg, address, port), () => {
       /* ICMP errors etc.: never fatal for a shared socket */
     });
   }
@@ -225,18 +228,18 @@ export class EdgeUdpServer {
     }
   }
 
-  /** @internal */ sendTo(d: Buffer, address: string, port: number): void {
+  /** @internal True when `d` is no longer referenced (sent, copied or dropped). */ sendTo(d: Buffer, address: string, port: number): boolean {
     const c = this.counters;
     c.datagramsOut++;
     c.bytesOut += d.length;
     try {
-      this.sock.send(d, port, address);
+      return this.io.send(d, port, address);
     } catch {
-      /* closed */
+      return true; // closed
     }
   }
 
-  private onPacket(msg: Buffer, rinfo: RemoteInfo): void {
+  private onPacket(msg: Buffer, address: string, port: number): void {
     const c = this.counters;
     c.datagramsIn++;
     c.bytesIn += msg.length;
@@ -246,7 +249,7 @@ export class EdgeUdpServer {
       c.unknownConn++;
       return;
     }
-    conn.onDatagram(msg, rinfo, performance.now());
+    conn.onDatagram(msg, address, port, performance.now());
   }
 
   private sweep(): void {
