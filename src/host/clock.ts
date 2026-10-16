@@ -11,7 +11,8 @@
  * Times are `performance.now()` milliseconds. Rooms with an injected clock
  * convert their own delay to this time base before calling {@link set}.
  */
-import { performance } from 'node:perf_hooks';
+// The global `performance` (Node >= 16, Bun): no node:perf_hooks import at
+// load time (Node loads its perf internals on the first performance.now()).
 
 /** See {@link SharedClock} `armAt`. */
 const TIMER_SLACK_MS = 1;

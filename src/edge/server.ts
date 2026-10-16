@@ -23,9 +23,11 @@ import { createRequire } from 'node:module';
 // CJS require on purpose: the ESM facade of node:http(s) evaluates the lazy
 // `WebSocket`/`CloseEvent`/`MessageEvent` getters, loading undici (~35 ms of startup);
 // the one of node:fs evaluates `fs.promises` (fs/promises, readline…: ~10 ms).
+// node:http(s) are required on first use: this module is in the chunk every
+// `import 'haxlite'` loads, and a host never creates an EdgeServer.
 const require = createRequire(import.meta.url);
-const http = require('node:http') as typeof import('node:http');
-const https = require('node:https') as typeof import('node:https');
+const http = (): typeof import('node:http') => require('node:http') as typeof import('node:http');
+const https = (): typeof import('node:https') => require('node:https') as typeof import('node:https');
 const { readFileSync } = require('node:fs') as typeof import('node:fs');
 import { randomBytes } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
@@ -359,10 +361,10 @@ export class EdgeServer {
       this.server = opts.server;
       this.ownsServer = false;
     } else if (opts.tls) {
-      this.server = https.createServer({ cert: readFileSync(opts.tls.certFile), key: readFileSync(opts.tls.keyFile) });
+      this.server = https().createServer({ cert: readFileSync(opts.tls.certFile), key: readFileSync(opts.tls.keyFile) });
       this.ownsServer = true;
     } else {
-      this.server = http.createServer();
+      this.server = http().createServer();
       this.ownsServer = true;
     }
     this.wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: EdgeLimits.maxWsMessage + 4096 });
@@ -449,14 +451,14 @@ export class EdgeServer {
   url(host?: string): string {
     const a = this.address;
     const h = host ?? (a.address === '0.0.0.0' || a.address === '::' ? '127.0.0.1' : a.address);
-    const scheme = this.server instanceof https.Server ? 'wss' : 'ws';
+    const scheme = this.server instanceof https().Server ? 'wss' : 'ws';
     return `${scheme}://${h.includes(':') ? `[${h}]` : h}:${a.port}${this.opts.path ?? EDGE_DEFAULT_PATH}`;
   }
 
   /** Re-reads the TLS certificate/key files (e.g. after a Let's Encrypt renewal). */
   reloadTls(): void {
     const t = this.opts.tls;
-    if (!t || !(this.server instanceof https.Server)) return;
+    if (!t || !(this.server instanceof https().Server)) return;
     this.server.setSecureContext({ cert: readFileSync(t.certFile), key: readFileSync(t.keyFile) });
     this.log('TLS certificate reloaded');
   }

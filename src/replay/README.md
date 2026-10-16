@@ -33,7 +33,8 @@ index of the tick being processed. Events scheduled for frame F are applied whil
 `frame === F`, then `stepRoom(rs)` runs (still `frame === F`), then `frame++`.
 This is exactly the official `Ma.rg` loop (`apply → Ab(ev)` … `Ca.Da(1)`, `da++`).
 
-1. **One recorder per room**, created once and reused (keeps its buffers):
+1. **One recorder per room**, created once and reused (keeps its buffers while they
+   stay at their initial size; a long recording's event log is released at stop):
    `readonly recorder = new ReplayRecorder();`
 
 2. **`startRecording()`** (HBInit, returns nothing):
@@ -74,6 +75,9 @@ This is exactly the official `Ma.rg` loop (`apply → Ab(ev)` … `Ca.Da(1)`, `d
    ```
    The returned array is a fresh copy owned by the caller. `recorder.snapshot(frame)`
    returns the same file without stopping (autosave); `recorder.cancel()` drops it.
+   `recorder.stopAsync(frame)` / `snapshotAsync(frame)` return the same bytes but
+   deflate on the libuv threadpool (a 7.6 MB body: ~270 ms of event loop -> ~3 ms);
+   recording stops synchronously.
 
 6. Room teardown: `recorder.cancel()` (restores the goal hook; no output).
 

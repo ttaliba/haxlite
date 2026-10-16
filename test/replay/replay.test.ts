@@ -13,10 +13,11 @@
  *       same metadata, and re-simulation reaches the same states;
  *   (c) our ReplayPlayer reproduces the same states (seek forward/back).
  */
+import { deflateRawSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 import { inflateRaw, xorInt32Words } from '../../src/codec/index.js';
 import { defaultStadiums, parseHbs } from '../../src/sim/index.js';
-import { decodeEvent, roomStateChecksum } from '../../src/room/index.js';
+import { SendChatEvent, decodeEvent, encodeEvent, roomStateChecksum } from '../../src/room/index.js';
 import { ReplayPlayer, ReplayRecorder, readReplay, replayBody, writeReplay } from '../../src/replay/index.js';
 import { OurRoom, RandomDriver, compareBytes } from '../room/harness.js';
 import type { Pair } from '../room/harness.js';
@@ -296,6 +297,56 @@ describe('ReplayRecorder unit behaviour', () => {
     expect(player.rs.gameState).toBeNull();
     expect(player.finish().gameState).not.toBeNull();
     expectSameBytes(new OurRoom(player.rs).stateBytes(), room.stateBytes(), 'state at stop');
+  });
+
+  it('stop/snapshot bytes = header + deflateRawSync(markers ++ events); async variants give the same bytes; grown writers are dropped', async () => {
+    const room = new RecordingOurRoom();
+    const rec = room.recorder;
+    const clock = { frame: 0 };
+    rec.start(room.rs, 0, clock);
+    room.applyEventBytes(new Uint8Array([7]), 0); // StartGame
+    const chat = (i: number) => encodeEvent(SendChatEvent.create(`message ${i} ${'x'.repeat(i % 37)}`));
+    let goals = 0;
+    for (let i = 0; i < 3000; i++) {
+      room.step();
+      clock.frame = room.frame;
+      if (i % 2 === 0) room.applyEventBytes(chat(i), 0);
+      if (i % 500 === 499) {
+        room.rs.hooks.onGoalMarker!(((i % 2) + 1) as 1 | 2);
+        goals++;
+      }
+      if (i === 1000) {
+        // a snapshot in the middle must not change what follows
+        const s1 = rec.snapshot(room.frame);
+        const s2 = await rec.snapshotAsync(room.frame);
+        expect(hex(s2)).toBe(hex(s1));
+      }
+    }
+    expect(rec.bodyLength).toBeGreaterThan(16384);
+    const body = (rec as unknown as { body(): Uint8Array }).body().slice();
+    expect(body.length).toBe(rec.bodyLength);
+    const snap = rec.snapshot(room.frame);
+    const snapAsync = await rec.snapshotAsync(room.frame);
+    const final = await rec.stopAsync(room.frame);
+    expect(rec.isRecording).toBe(false);
+    expect(hex(snapAsync)).toBe(hex(snap));
+    expect(hex(final)).toBe(hex(snap));
+    // what the recorder always produced: one deflate of markers ++ events at level 6
+    const expected = deflateRawSync(body, { level: 6, memLevel: 8, windowBits: 15 });
+    expect(Buffer.from(final.subarray(12)).equals(expected)).toBe(true);
+    expect(readReplay(final).goalMarkers.length).toBe(goals);
+    expect(readReplay(final).events.length).toBe(1 + 1500);
+    // the event log (> 16 KB) is released; the small marker writer is kept for reuse
+    expect((rec as unknown as { events: unknown }).events).toBeNull();
+    expect((rec as unknown as { markers: unknown }).markers).not.toBeNull();
+    expect(rec.bodyLength).toBe(body.length);
+    expect(() => rec.stopAsync(0)).toThrow(/not recording/);
+    // the recorder still works after dropping its writers
+    rec.start(room.rs, room.frame);
+    room.applyEventBytes(chat(1), 0);
+    const again = readReplay(rec.stop(room.frame + 2));
+    expect(again.totalFrames).toBe(2);
+    expect(again.events.length).toBe(1);
   });
 
   it('rejects bad magic, other versions and corrupt bodies', () => {

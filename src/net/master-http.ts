@@ -4,15 +4,22 @@
  *
  * Uses node:http/https so an `agent` (e.g. an HTTP(S)/SOCKS proxy agent) can
  * be plugged in; the base URL is configurable for tests, proxies and custom
- * backends.
+ * backends. node:http(s) is loaded on the first request that needs it.
+ *
+ * On Bun, without `agent` and without proxy environment variables, requests go
+ * through the built-in `fetch` instead and node:http(s) is never loaded
+ * (import of the package: ~13 ms and ~3.6 MB RSS less). Same method, URL,
+ * body, our headers, timeout (`MasterError('network', 'timeout')`), no
+ * redirects followed (a 3xx is an `http` error, as with node:http), same error
+ * kinds. Differences: Bun's fetch adds `User-Agent: Bun/<v>` (override it with
+ * `headers`), `Accept` (any type) and `Accept-Encoding` (the body is decompressed
+ * transparently), network error messages are Bun's, and the timeout bounds the
+ * whole request instead of socket inactivity. Bun's fetch would honour
+ * HTTP(S)_PROXY / ALL_PROXY while node:http ignores them: when any is set, the
+ * node:http path is used, so the master is reached exactly as before.
  */
 import type { Agent } from 'node:http';
 import { createRequire } from 'node:module';
-// CJS require on purpose: the ESM facade of node:http(s) evaluates the lazy
-// `WebSocket`/`CloseEvent`/`MessageEvent` getters, loading undici (~35 ms of startup).
-const require = createRequire(import.meta.url);
-const http = require('node:http') as typeof import('node:http');
-const https = require('node:https') as typeof import('node:https');
 import { DEFAULT_MASTER_URL } from './constants.js';
 import { parseRoomList, type ListedRoom } from './room-info.js';
 
@@ -130,12 +137,32 @@ async function requestJson(
   return json.data;
 }
 
+// CJS require on purpose: the ESM facade of node:http(s) evaluates the lazy
+// `WebSocket`/`CloseEvent`/`MessageEvent` getters, loading undici (~35 ms of startup).
+let httpMod: typeof import('node:http') | null = null;
+let httpsMod: typeof import('node:https') | null = null;
+function nodeHttp(secure: boolean): typeof import('node:http') | typeof import('node:https') {
+  const require = createRequire(import.meta.url);
+  if (secure) return (httpsMod ??= require('node:https') as typeof import('node:https'));
+  return (httpMod ??= require('node:http') as typeof import('node:http'));
+}
+
+const isBun = typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined';
+const PROXY_ENV = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'];
+function useFetch(opts: MasterHttpOptions): boolean {
+  if (!isBun || opts.agent !== undefined || typeof globalThis.fetch !== 'function') return false;
+  const env = process.env;
+  for (const k of PROXY_ENV) if (env[k]) return false;
+  return true;
+}
+
 function request(method: string, path: string, opts: MasterHttpOptions, body?: string, contentType?: string): Promise<RawResponse> {
   const url = new URL(path, opts.masterUrl ?? DEFAULT_MASTER_URL);
-  const mod = url.protocol === 'https:' ? https : http;
   const headers: Record<string, string> = { ...opts.headers };
   if (contentType) headers['Content-Type'] = contentType;
+  if (useFetch(opts)) return requestFetch(method, path, url, headers, opts.timeoutMs ?? 15_000, body);
   if (body !== undefined) headers['Content-Length'] = String(Buffer.byteLength(body));
+  const mod = nodeHttp(url.protocol === 'https:');
   return new Promise<RawResponse>((resolve, reject) => {
     const req = mod.request(url, { method, headers, agent: opts.agent }, (res) => {
       const chunks: Buffer[] = [];
@@ -155,4 +182,30 @@ function request(method: string, path: string, opts: MasterHttpOptions, body?: s
     if (body !== undefined) req.write(body);
     req.end();
   });
+}
+
+/** Bun: the same request through the built-in fetch (see the header comment). */
+async function requestFetch(method: string, path: string, url: URL, headers: Record<string, string>, timeoutMs: number, body?: string): Promise<RawResponse> {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  const fail = (e: unknown): MasterError => new MasterError('network', ac.signal.aborted ? 'timeout' : String((e as Error)?.message ?? e));
+  try {
+    let res: Response;
+    try {
+      res = await fetch(url, { method, headers, body, redirect: 'manual', signal: ac.signal });
+    } catch (e) {
+      throw fail(e);
+    }
+    let data: ArrayBuffer;
+    try {
+      data = await res.arrayBuffer();
+    } catch (e) {
+      throw fail(e);
+    }
+    const status = res.status;
+    if (status < 200 || status >= 300) throw new MasterError('http', `${path}: status ${status}`, { status });
+    return { status, body: new Uint8Array(data) };
+  } finally {
+    clearTimeout(timer);
+  }
 }

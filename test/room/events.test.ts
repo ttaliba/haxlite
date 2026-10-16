@@ -262,6 +262,28 @@ describe('event codecs 0..23 vs oracles', () => {
     checkCase({ ev, nh: null });
   });
 
+  it('SetStadium: the deflated stadium is computed once per stadium object and reused', () => {
+    const [a, b] = defaultStadiums();
+    const ev = SetStadiumEvent.create(a!);
+    const first = encodeEvent(ev);
+    const fresh = encodeEvent(SetStadiumEvent.create(a!));
+    expect(hex(first)).toBe(hex(fresh));
+    // second write: same bytes, from the cache (same backing array)
+    const w1 = new Writer();
+    ev.write(w1);
+    const w2 = new Writer();
+    ev.write(w2);
+    expect(hex(w2.finish())).toBe(hex(w1.finish()));
+    expect((ev as unknown as { packed: Uint8Array }).packed.byteLength).toBe(w1.length - 2);
+    expect((ev as unknown as { packed: Uint8Array }).packed.buffer.byteLength).toBe(w1.length - 2);
+    // assigning another stadium invalidates the cache
+    ev.stadium = b!;
+    expect(hex(encodeEvent(ev))).toBe(hex(encodeEvent(SetStadiumEvent.create(b!))));
+    // a decoded event re-encodes its own stadium
+    const back = decodeEvent(first) as SetStadiumEvent;
+    expect(hex(encodeEvent(back))).toBe(hex(first));
+  });
+
   it('readers reject what the official reader rejects', () => {
     // chat > 140 units
     const w = new Writer();

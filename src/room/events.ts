@@ -468,6 +468,15 @@ export class SetGamePlayLimitEvent extends RoomEvent {
 /** 11 — off `V`. Payload: u16 n + deflateRaw(stadium). Admin-only filter, 10 / 2000 ms. */
 export class SetStadiumEvent extends RoomEvent {
   stadium: Stadium | null = null;
+  /**
+   * Deflated stadium of the first {@link write}, reused by the next ones (the
+   * broadcast and the replay recorder write the same event: ~270 µs each for a
+   * 12 KB stadium). Nothing in haxlite mutates a Stadium once it is in an
+   * event; one changed afterwards (by the caller) would desync clients anyway.
+   * Keyed by the stadium object, so assigning `stadium` invalidates it.
+   */
+  private packed: Uint8Array | null = null;
+  private packedFor: Stadium | null = null;
   get type(): EventType {
     return EventType.SetStadium;
   }
@@ -477,15 +486,21 @@ export class SetStadiumEvent extends RoomEvent {
     return e;
   }
   write(w: Writer): void {
-    const tmp = new Writer(1024);
-    writeStadium(tmp, this.stadium!);
-    const packed = deflateRaw(tmp.finish());
+    let packed = this.packed;
+    if (packed === null || this.packedFor !== this.stadium) {
+      const tmp = new Writer(1024);
+      writeStadium(tmp, this.stadium!);
+      // exact-size copy: node:zlib's result can be a view over a 16 KB chunk
+      packed = this.packed = deflateRaw(tmp.finish()).slice();
+      this.packedFor = this.stadium;
+    }
     w.u16(packed.length);
     w.bytes(packed);
   }
   read(r: Reader): void {
     const raw = inflateRaw(r.bytes(r.u16()));
     this.stadium = readStadium(new Reader(raw));
+    this.packed = this.packedFor = null;
   }
   apply(rs: RoomState): void {
     if (!isHostOrAdmin(rs, this.byId)) return;
