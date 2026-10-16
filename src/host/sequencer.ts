@@ -767,11 +767,17 @@ export class Sequencer {
   }
 }
 
-/** Removes the first `n` items in place (splice would allocate its result array). */
+/**
+ * Removes the first `n` items in place (splice would allocate its result
+ * array). Trims with `pop()`, not `length = len - n`: on V8, setting the
+ * length (to 0 in particular, the common case when the queue drains) drops
+ * the backing store, so the next push reallocates it (~500 B per refill of
+ * a 20-event queue; JSC keeps it either way).
+ */
 function dropFirst<T>(list: T[], n: number): void {
   const len = list.length;
   for (let i = n; i < len; i++) list[i - n] = list[i]!;
-  list.length = len - n;
+  for (let i = 0; i < n; i++) list.pop();
 }
 
 /** Message 6 `[6][u8 type][payload]`: an event for one client, outside the sequence (official `Ef`). */
