@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { MAX_WORLD_DISCS, discLimitViolation } from '../../src/host/sequencer.js';
-import { SetPlayerTeamEvent, StartGameEvent } from '../../src/room/index.js';
+import { AutoTeamsEvent, SetPlayerTeamEvent, StartGameEvent } from '../../src/room/index.js';
 import type { RoomState } from '../../src/room/index.js';
 
 /** Just the fields discLimitViolation reads. */
@@ -26,5 +26,17 @@ describe('world disc limit (u8 count on the wire)', () => {
     (withDisc.players[0] as { disc: unknown }).disc = {};
     expect(discLimitViolation(withDisc, SetPlayerTeamEvent.create(1, 2))).toBeNull();
     expect(discLimitViolation(room(200, [1, 0], 201), SetPlayerTeamEvent.create(2, 1))).toBeNull();
+  });
+
+  it('counts the two spectators AutoTeams moves when the teams are even', () => {
+    // even teams, 2+ spectators: two discs
+    expect(discLimitViolation(room(200, [1, 2, 0, 0], 253), new AutoTeamsEvent())).toBeNull();
+    expect(discLimitViolation(room(200, [1, 2, 0, 0], 254), new AutoTeamsEvent())).toMatch(/256/);
+    // uneven teams: one disc
+    expect(discLimitViolation(room(200, [1, 0, 0], 254), new AutoTeamsEvent())).toBeNull();
+    expect(discLimitViolation(room(200, [1, 0, 0], 255), new AutoTeamsEvent())).toMatch(/256/);
+    // even teams and a single spectator, or no spectators: nothing moves
+    expect(discLimitViolation(room(200, [1, 2, 0], 255), new AutoTeamsEvent())).toBeNull();
+    expect(discLimitViolation(room(200, [1, 2], 255), new AutoTeamsEvent())).toBeNull();
   });
 });

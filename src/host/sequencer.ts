@@ -57,7 +57,10 @@ export function discLimitViolation(rs: RoomState, ev: RoomEvent): string | null 
   }
   if (ev.type === EventType.AutoTeams) {
     const gs = rs.gameState;
-    if (gs !== null && gs.world.discs.length >= MAX_WORLD_DISCS) return `autoTeams: the world already has ${gs.world.discs.length} discs (max ${MAX_WORLD_DISCS})`;
+    if (gs === null) return null;
+    const added = autoTeamsAdds(rs);
+    const n = gs.world.discs.length + added;
+    if (added > 0 && n > MAX_WORLD_DISCS) return `autoTeams: ${gs.world.discs.length} discs + ${added} = ${n} (max ${MAX_WORLD_DISCS})`;
     return null;
   }
   if (ev.type === EventType.StartGame) {
@@ -67,6 +70,27 @@ export function discLimitViolation(rs: RoomState, ev: RoomEvent): string | null 
     if (n > MAX_WORLD_DISCS) return `startGame: ${rs.stadium.discs.length} stadium discs + players in teams = ${n} (max ${MAX_WORLD_DISCS})`;
   }
   return null;
+}
+
+/**
+ * Players AutoTeams would move into a team in `rs` (= discs it adds with a
+ * running game; `AutoTeamsEvent.apply`): two spectators when the teams are
+ * even and there are at least two, one when they are uneven, else none.
+ */
+function autoTeamsAdds(rs: RoomState): number {
+  let specs = 0;
+  let red = 0;
+  let blue = 0;
+  const players = rs.players;
+  for (let i = 0; i < players.length; i++) {
+    const t = players[i]!.team;
+    if (t === 0) ++specs;
+    else if (t === 1) ++red;
+    else if (t === 2) ++blue;
+  }
+  if (specs === 0) return 0;
+  if (red === blue) return specs >= 2 ? 2 : 0;
+  return 1;
 }
 
 /** Fixed-size moving average (official `$a`): ring of samples, running sum. */
