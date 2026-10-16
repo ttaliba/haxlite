@@ -364,6 +364,23 @@ function polyPadded(m: Uint8Array, off: number, len: number): void {
   }
 }
 
+/**
+ * Absorbs the 13-byte DTLS 1.2 AAD — epoch(2) || seq(6) || type(1) ||
+ * version(2) || length(2), big-endian (RFC 6347 §4.1.2.1) — zero-padded to
+ * one block, as {@link polyPadded} would from a buffer.
+ */
+function polyDtlsAad(type: number, version: number, epoch: number, seqHi: number, seqLo: number, length: number): void {
+  const b = PB;
+  b[0] = epoch >>> 8; b[1] = epoch;
+  b[2] = seqHi >>> 8; b[3] = seqHi;
+  b[4] = seqLo >>> 24; b[5] = seqLo >>> 16; b[6] = seqLo >>> 8; b[7] = seqLo;
+  b[8] = type;
+  b[9] = version >>> 8; b[10] = version;
+  b[11] = length >>> 8; b[12] = length;
+  b[13] = 0; b[14] = 0; b[15] = 0;
+  polyBlocks(b, 0, 16);
+}
+
 /** Absorbs le64(aadLen) || le64(ctLen) (both < 2^32 here). */
 function polyLengths(aadLen: number, ctLen: number): void {
   const b = PB;
@@ -530,6 +547,58 @@ export class ChaCha20Poly1305 {
     polyPadded(buf, off, len);
     polyLengths(aadLen, len);
     if (!polyFinish(null, tag, tagOff)) return false;
+    chachaXor(this.k, 1, n0, n1, n2, buf, off, len);
+    return true;
+  }
+
+  /**
+   * {@link seal} for a DTLS 1.2 record (RFC 7905): the nonce as three
+   * little-endian words, the 13-byte AAD from its fields (length = `len`),
+   * the tag written right after the ciphertext (buf[off+len…]). Same bytes
+   * as {@link seal} with those buffers, without building them.
+   */
+  sealDtls(
+    n0: number,
+    n1: number,
+    n2: number,
+    type: number,
+    version: number,
+    epoch: number,
+    seqHi: number,
+    seqLo: number,
+    buf: Uint8Array,
+    off: number,
+    len: number,
+  ): void {
+    chachaBlock(this.k, 0, n0, n1, n2);
+    polyInit();
+    chachaXor(this.k, 1, n0, n1, n2, buf, off, len);
+    polyDtlsAad(type, version, epoch, seqHi, seqLo, len);
+    polyPadded(buf, off, len);
+    polyLengths(13, len);
+    polyFinish(buf, null, off + len);
+  }
+
+  /** {@link open} for a DTLS 1.2 record, the counterpart of {@link sealDtls} (tag at buf[off+len…]). */
+  openDtls(
+    n0: number,
+    n1: number,
+    n2: number,
+    type: number,
+    version: number,
+    epoch: number,
+    seqHi: number,
+    seqLo: number,
+    buf: Uint8Array,
+    off: number,
+    len: number,
+  ): boolean {
+    chachaBlock(this.k, 0, n0, n1, n2);
+    polyInit();
+    polyDtlsAad(type, version, epoch, seqHi, seqLo, len);
+    polyPadded(buf, off, len);
+    polyLengths(13, len);
+    if (!polyFinish(null, buf, off + len)) return false;
     chachaXor(this.k, 1, n0, n1, n2, buf, off, len);
     return true;
   }

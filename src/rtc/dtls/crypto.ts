@@ -152,6 +152,10 @@ export class RecordCipher {
   private readonly aad = Buffer.alloc(13);
   /** Allocation-free AEAD for ChaCha20-Poly1305 (null: node:crypto). */
   private readonly js: ChaCha20Poly1305 | null;
+  /** JS AEAD: the 12-byte IV as little-endian words (the nonce is built from them as integers). */
+  private ivw0 = 0;
+  private ivw1 = 0;
+  private ivw2 = 0;
 
   constructor(suite: CipherSuite, key: Buffer, iv: Buffer, chacha: ChaChaImpl = 'js') {
     this.suite = suite;
@@ -159,6 +163,11 @@ export class RecordCipher {
     this.iv = iv;
     this.js = suite.cipher === 'chacha20-poly1305' && (chacha === 'js' || !hasNativeChaCha()) ? new ChaCha20Poly1305(key) : null;
     this.keyObject = this.js === null ? createSecretKey(key) : null;
+    if (this.js !== null) {
+      this.ivw0 = le32(iv, 0);
+      this.ivw1 = le32(iv, 4);
+      this.ivw2 = le32(iv, 8);
+    }
   }
 
   /** Bytes added to a plaintext by {@link seal}. */
@@ -214,15 +223,17 @@ export class RecordCipher {
     out: Buffer,
     off: number,
   ): number {
-    this.setNonce(epoch, seqHi, seqLo);
     const len = plaintext.length;
-    this.setAad(type, version, epoch, seqHi, seqLo, len);
     const js = this.js;
     if (js !== null) {
-      if (plaintext.buffer !== out.buffer || plaintext.byteOffset !== out.byteOffset + off) out.set(plaintext, off);
-      js.seal(this.nonce, this.aad, 0, 13, out, off, len, out, off + len);
+      // (offsets first: `.buffer` is a native getter, materializing an ArrayBuffer on JSC)
+      if (plaintext.byteOffset !== out.byteOffset + off || plaintext.buffer !== out.buffer) out.set(plaintext, off);
+      // nonce = iv XOR (0^32 || epoch || seq) as little-endian words; AAD from the fields (RFC 7905 §2)
+      js.sealDtls(this.ivw0, this.ivw1 ^ nonceWord1(epoch, seqHi), this.ivw2 ^ bswap32(seqLo), type, version, epoch, seqHi, seqLo, out, off, len);
       return len + TAG_LENGTH;
     }
+    this.setNonce(epoch, seqHi, seqLo);
+    this.setAad(type, version, epoch, seqHi, seqLo, len);
     let p = off;
     if (this.suite.explicitNonce === 8) {
       this.nonce.copy(out, p, 4, 12);
@@ -271,9 +282,7 @@ export class RecordCipher {
     if (ptLen < 0) return -1;
     const js = this.js;
     if (js !== null) {
-      this.setNonce(epoch, seqHi, seqLo);
-      this.setAad(type, version, epoch, seqHi, seqLo, ptLen);
-      if (!js.open(this.nonce, this.aad, 0, 13, buf, off, ptLen, buf, off + ptLen)) return -1;
+      if (!js.openDtls(this.ivw0, this.ivw1 ^ nonceWord1(epoch, seqHi), this.ivw2 ^ bswap32(seqLo), type, version, epoch, seqHi, seqLo, buf, off, ptLen)) return -1;
       this.plainBuf = buf;
       this.plainOff = off;
       return ptLen;
@@ -305,7 +314,23 @@ export class RecordCipher {
   wipe(): void {
     this.key.fill(0);
     this.js?.wipe();
+    this.ivw0 = this.ivw1 = this.ivw2 = 0;
   }
+}
+
+/** Little-endian 32-bit word of b[o, o+4). */
+function le32(b: Uint8Array, o: number): number {
+  return b[o]! | (b[o + 1]! << 8) | (b[o + 2]! << 16) | (b[o + 3]! << 24);
+}
+
+/** Nonce bytes 4..7 XOR part, epoch(2) || seqHi(2) big-endian, as a little-endian word. */
+function nonceWord1(epoch: number, seqHi: number): number {
+  return (epoch >>> 8) | ((epoch & 0xff) << 8) | ((seqHi >>> 8) << 16) | ((seqHi & 0xff) << 24);
+}
+
+/** Byte swap: seqLo big-endian, read as a little-endian word. */
+function bswap32(x: number): number {
+  return (x >>> 24) | ((x >>> 8) & 0xff00) | ((x & 0xff00) << 8) | ((x & 0xff) << 24);
 }
 
 // ---------------------------------------------------------------- anti-replay
