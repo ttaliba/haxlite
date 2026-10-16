@@ -67,6 +67,7 @@ export function sharedEndpointKey(o: RtcEndpointOptions): string {
     o.maxMessageSize ?? null,
     o.socketBufferSize ?? null,
     o.cipherSuites ?? null,
+    o.helloVerify ?? null,
   ]);
 }
 

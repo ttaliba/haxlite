@@ -13,11 +13,13 @@
  *                        ←  [ChangeCipherSpec], Finished             (flight 6)
  * ```
  *
- * * No HelloVerifyRequest by default (RFC 6347 §4.2.1 lets the server skip
- *   it): the endpoint only routes DTLS from transport addresses that passed
- *   an authenticated STUN exchange (ICE), which already proves the address
- *   is the peer's — the cookie round trip would only delay every join by one
- *   RTT. Opt-in with {@link DtlsServerOptions.helloVerify}.
+ * * HelloVerifyRequest (stateless cookie, RFC 6347 §4.2.1) with
+ *   {@link DtlsServerOptions.helloVerify}; the server may skip it. The
+ *   endpoint turns it on unless the addresses DTLS comes from are proven
+ *   reachable by its own ICE connectivity checks (full ICE): an
+ *   authenticated Binding request alone proves nothing (every joining
+ *   client knows the key), and without the cookie a spoofed ClientHello
+ *   would aim flight 4 (~1 KB, retransmitted) at a victim.
  * * ECDHE (x25519 preferred, secp256r1) with ECDSA P-256 server
  *   certificate; AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305.
  * * extended_master_secret (RFC 7627) is mandatory (browsers always send it).
@@ -163,9 +165,9 @@ export interface DtlsServerOptions {
   /**
    * Stateless cookie exchange (HelloVerifyRequest, RFC 6347 §4.2.1) before
    * any handshake state is allocated: proves the client owns its source
-   * address. Default false — set it only when datagrams can reach
-   * {@link DtlsServer.handleDatagram} from addresses ICE did not authenticate
-   * (RtcEndpoint never does that). Costs the client one extra round trip.
+   * address. Default false here; RtcEndpoint sets it unless its own
+   * connectivity checks proved the address (`helloVerify` option: on with
+   * ICE-lite). Costs the client one extra round trip.
    */
   helloVerify?: boolean;
 }
@@ -412,9 +414,10 @@ export class DtlsServer {
   // ------------------------------------------------------------ input
 
   /**
-   * One UDP datagram from the (ICE-validated) peer. `peerKey` identifies the
+   * One UDP datagram from the peer. `peerKey` identifies its source
    * transport address and is bound into the HelloVerifyRequest cookie (only
-   * used with {@link DtlsServerOptions.helloVerify}).
+   * used with {@link DtlsServerOptions.helloVerify}); {@link DtlsServerOptions.send}
+   * must answer that same address while no handshake runs.
    */
   handleDatagram(buf: Uint8Array, peerKey: string): void {
     let off = 0;

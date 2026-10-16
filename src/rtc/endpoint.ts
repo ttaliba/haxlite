@@ -3,7 +3,9 @@
  * demultiplexed per RFC 7983 (first byte 0–3 STUN, 20–63 DTLS) — STUN
  * requests by the USERNAME's ufrag, STUN responses by transaction id (our
  * connectivity/consent checks and STUN gathering, ice-agent.ts / gather.ts),
- * DTLS by the remote transport address once ICE has authenticated it.
+ * DTLS by the remote transport address once ICE has validated it (full
+ * ICE: our check to it succeeded; ICE-lite: an authenticated request came
+ * from it — see session.ts).
  */
 import dgram, { type Socket } from 'node:dgram';
 import { randomBytes } from 'node:crypto';
@@ -106,6 +108,19 @@ export interface RtcEndpointOptions {
    * AES-256-GCM. A browser without the first suite gets the next one.
    */
   cipherSuites?: readonly (number | string)[];
+  /**
+   * DTLS cookie exchange (HelloVerifyRequest, RFC 6347 §4.2.1): the server
+   * answers a ClientHello with a stateless cookie and only sends its
+   * ~1 KB flight 4 to a source that echoes it, so a spoofed ClientHello can
+   * never make it send that flight to a victim. Costs one round trip per join.
+   *
+   * Default: off with full ICE — DTLS is only accepted from, and flights only
+   * sent to, addresses that answered our own connectivity check (proven
+   * reachable). On with {@link iceLite}: there we send no checks and the
+   * addresses DTLS comes from are only vouched for by Binding requests whose
+   * key (our ICE password) every joining client knows.
+   */
+  helloVerify?: boolean;
 }
 
 export interface RtcEndpointStats {
@@ -119,8 +134,10 @@ export interface RtcEndpointStats {
   stunAuthenticated: number;
   /** STUN dropped: malformed, unknown ufrag, bad USERNAME/MESSAGE-INTEGRITY/FINGERPRINT, role. */
   stunRejected: number;
-  /** DTLS-looking datagrams from addresses no session validated. */
+  /** DTLS-looking datagrams from addresses no session validated (and not held for a check in progress). */
   dtlsUnknownSource: number;
+  /** Full ICE: DTLS datagrams held until our check to their (authenticated, not yet validated) source succeeded. */
+  dtlsHeld: number;
   /** First byte outside the STUN/DTLS ranges. */
   unknownPackets: number;
   handshakesCompleted: number;
@@ -196,6 +213,12 @@ export class RtcEndpoint {
   private readonly byUfrag = new Map<string, RtcSessionImpl>();
   /** remote address → remote port → validated address (DTLS demux). */
   private readonly byAddress = new Map<string, Map<number, ValidatedAddress>>();
+  /**
+   * Full ICE: `address|port` of authenticated Binding requests not validated
+   * yet → session whose triggered check is on its way (DTLS from there is
+   * held for it instead of dropped). Bounded per session; dropped with it.
+   */
+  private readonly holds = new Map<string, RtcSessionImpl>();
   private readonly stunScratch = new StunMessage();
   /** Shared seal buffer for outgoing records (replaced if the kernel ever queues a send that still references it). */
   private sendScratch: Buffer = Buffer.allocUnsafeSlow(2048);
@@ -218,6 +241,7 @@ export class RtcEndpoint {
     stunAuthenticated: 0,
     stunRejected: 0,
     dtlsUnknownSource: 0,
+    dtlsHeld: 0,
     unknownPackets: 0,
     handshakesCompleted: 0,
     handshakesFailed: 0,
@@ -316,6 +340,14 @@ export class RtcEndpoint {
       },
       now,
       ice: this.iceLite ? null : this.ice,
+      helloVerify: opts.helloVerify ?? this.iceLite,
+      holdAddress: (s, address, port) => {
+        const key = `${address}|${port}`;
+        const prev = this.holds.get(key);
+        if (prev === s) return;
+        this.holds.set(key, s); // the latest authenticated session (a rejoin from the same port)
+        s.holdKeys.push(key);
+      },
     };
     this.gatherer.start();
   }
@@ -480,7 +512,10 @@ export class RtcEndpoint {
       const ports = this.byAddress.get(address);
       const v = ports === undefined ? undefined : ports.get(port);
       if (v === undefined || v.sock !== sock) {
-        c.dtlsUnknownSource++;
+        // full ICE: the ClientHello may beat our triggered check to its source: held, not processed
+        const h = this.holds.size === 0 ? undefined : this.holds.get(`${address}|${port}`);
+        if (h !== undefined && h.holdDtls(msg, sock, address, port)) c.dtlsHeld++;
+        else c.dtlsUnknownSource++;
         return;
       }
       v.session.handleDtls(msg, v);
@@ -554,6 +589,8 @@ export class RtcEndpoint {
     if (this.byUfrag.get(s.localUfrag) === s) this.byUfrag.delete(s.localUfrag);
     this.gatherer.forget(s);
     for (const v of s.validated) this.unbindAddress(v);
+    for (const k of s.holdKeys) if (this.holds.get(k) === s) this.holds.delete(k);
+    s.holdKeys.length = 0;
     const d = s.dtlsDrops;
     this.counters.dtlsReplayed += d.replayed;
     this.counters.dtlsBadRecords += d.bad;

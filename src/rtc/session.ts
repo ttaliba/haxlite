@@ -4,6 +4,27 @@
  * server and the data-channel layer on top. Created and fed by
  * {@link RtcEndpoint} (endpoint.ts), which owns the socket(s) and the
  * demultiplexing maps.
+ *
+ * What makes a transport address **validated** (DTLS is routed from it and
+ * may be sent to it):
+ *
+ * * Full ICE: one of OUR connectivity checks to it got an authenticated,
+ *   symmetric success (RFC 8445 §7.2.5.3) — return routability. An
+ *   authenticated Binding request alone proves nothing about its source:
+ *   the key is our ICE password, which every joining client knows from its
+ *   own answer, so a client could spoof a victim's address. Such a request
+ *   is answered and triggers a check (§7.3.1.4); USE-CANDIDATE on it is
+ *   remembered and takes effect once that check succeeds (§7.3.1.5), and
+ *   DTLS that arrives from the address meanwhile is held (a few datagrams)
+ *   instead of dropped, so the triggered check costs no extra round trip.
+ * * ICE-lite (we send no checks): the authenticated request, as before —
+ *   the address is NOT proven, which is why the endpoint turns the DTLS
+ *   cookie exchange (HelloVerifyRequest) on by default there: flight 4 only
+ *   goes to an address that echoed the cookie.
+ *
+ * DTLS handshake flights go to the address of the ClientHello that started
+ * the handshake (always a validated one); application data to the nominated
+ * pair, else the last validated DTLS source.
  */
 import { createSecretKey, type KeyObject } from 'node:crypto';
 import type { UdpIo } from './udp.js';
@@ -14,7 +35,7 @@ import { StunMessage, buildBindingError, buildBindingSuccess, checkFingerprint, 
 import { HAXBALL_CHANNELS, type RemoteAddress, type RtcSession, type RtcSessionState, type SctpAssociationLike, type SctpFactory } from './types.js';
 import type { RtcCertificate } from './cert.js';
 import { IceAgent, type IceAgentOwner, type IceScheduler } from './ice-agent.js';
-import type { GatherWaiter } from './gather.js';
+import { sameIp, type GatherWaiter } from './gather.js';
 
 /** A transport address that passed an authenticated Binding request for a session. */
 export interface ValidatedAddress {
@@ -22,7 +43,7 @@ export interface ValidatedAddress {
   sock: UdpIo;
   address: string;
   port: number;
-  /** `address|port` (the DTLS server's peer key; bound into the HelloVerifyRequest cookie when that exchange is enabled — off by default). */
+  /** `address|port` (the DTLS server's peer key; bound into the HelloVerifyRequest cookie when that exchange is enabled). */
   key: string;
 }
 
@@ -50,10 +71,22 @@ export interface SessionHost {
   now(): number;
   /** Full ICE (connectivity checks, consent checks); null = ICE-lite. */
   readonly ice: IceScheduler | null;
+  /** DTLS cookie exchange (HelloVerifyRequest) before any handshake state. */
+  readonly helloVerify: boolean;
+  /**
+   * Full ICE: DTLS from (address, port) — authenticated by a Binding request,
+   * not validated yet — may be handed to this session ({@link RtcSessionImpl.holdDtls}).
+   */
+  holdAddress(session: RtcSessionImpl, address: string, port: number): void;
 }
 
 const MAX_VALIDATED = 8;
 const MAX_REMOTE_CANDIDATES = 32;
+/** Full ICE: DTLS datagrams held per session while their source awaits our check, and their total size. */
+const MAX_HELD = 4;
+const MAX_HELD_BYTES = 6144;
+/** Full ICE: unvalidated sources whose DTLS may be held, per session. */
+const MAX_HOLD_ADDRESSES = 16;
 
 export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
   /** The answer until DTLS connects (the peer had it then), null afterwards: ~0.5 KB less per live session. */
@@ -89,8 +122,17 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
 
   readonly validated: ValidatedAddress[] = [];
   private nominated: ValidatedAddress | null = null;
-  /** Where DTLS goes: nominated pair, else the last validated source of DTLS/STUN. */
+  /** Where application data goes: nominated pair, else the last validated source of DTLS (or of a successful check). */
   private dest: ValidatedAddress | null = null;
+  /** Where handshake flights go: the validated source of the ClientHello that started the handshake. */
+  private dtlsFrom: ValidatedAddress | null = null;
+  /** Full ICE: the latest USE-CANDIDATE from a source our check has not validated yet (nominated once it succeeds). */
+  private pendingNomination: { sock: UdpIo; address: string; port: number } | null = null;
+  /** Full ICE: DTLS datagrams from sources awaiting our check (null: none). */
+  private held: { sock: UdpIo; address: string; port: number; buf: Buffer }[] | null = null;
+  private heldBytes = 0;
+  /** Full ICE: `address|port` keys registered with {@link SessionHost.holdAddress} (the endpoint drops them on unregister). */
+  readonly holdKeys: string[] = [];
   private readonly host: SessionHost;
   private readonly offer: OfferInfo;
   private readonly dtls: DtlsServer;
@@ -125,9 +167,11 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
       remoteFingerprint: { algorithm: offer.fingerprintAlgorithm, digest: offer.fingerprint },
       mtu: host.mtu,
       ...(host.suites !== undefined ? { suites: host.suites } : null),
+      ...(host.helloVerify ? { helloVerify: true } : null),
       send: (d, len) => {
-        const dest = this.dest;
-        if (dest !== null) this.host.sendTo(dest, d, len);
+        // handshake: only to the (validated) address the handshake came from, never to an unproven one
+        const to = this.state === 'dtls' || this.state === 'open' ? this.dest : this.dtlsFrom;
+        if (to !== null) this.host.sendTo(to, d, len);
       },
       sendBuffer: host.sendBuffer,
       onConnected: () => this.onDtlsConnected(),
@@ -184,12 +228,50 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
     callSafely(this.onGatheringComplete, undefined);
   }
 
-  /** Our check on (sock, address, port) succeeded (full ICE): DTLS may come from / go to there. */
+  /**
+   * Our check on (sock, address, port) succeeded (full ICE): the address is
+   * proven, DTLS may come from / go to there; a USE-CANDIDATE received from it
+   * meanwhile nominates it now, and DTLS held for it is processed.
+   */
   onCheckSucceeded(sock: UdpIo, address: string, port: number): void {
     if (this.state === 'closed') return;
     const v = this.validate(sock, address, port);
-    if (this.nominated === null && this.dest === null) this.dest = v;
+    this.lastConsent = this.host.now(); // a successful check is consent too (RFC 7675 §5.1)
+    const p = this.pendingNomination;
+    if (p !== null && p.port === port && p.sock === sock && sameIp(p.address, address)) {
+      this.pendingNomination = null;
+      this.nominated = v;
+      this.dest = v;
+    } else if (this.nominated === null && this.dest === null) this.dest = v;
     if (this.state === 'new') this.state = 'connecting';
+    const held = this.held;
+    if (held !== null) {
+      for (let i = 0; i < held.length; ) {
+        const h = held[i]!;
+        if (h.port === port && h.sock === sock && sameIp(h.address, address)) {
+          held.splice(i, 1);
+          this.heldBytes -= h.buf.length;
+          this.handleDtls(h.buf, v);
+          if ((this.state as RtcSessionState) === 'closed') return; // the handshake may have failed
+        } else i++;
+      }
+      if (held.length === 0 && this.held === held) this.held = null;
+    }
+  }
+
+  /**
+   * Full ICE: a DTLS datagram from (sock, address, port), whose Binding
+   * request authenticated but which our check has not validated yet. Kept
+   * (a copy, bounded) until the check succeeds — usually the ClientHello,
+   * racing our triggered check. Returns false when not kept.
+   */
+  holdDtls(msg: Buffer, sock: UdpIo, address: string, port: number): boolean {
+    if (this.state === 'closed' || this.agent === null) return false;
+    const held = (this.held ??= []);
+    if (held.length >= MAX_HELD || this.heldBytes + msg.length > MAX_HELD_BYTES) return false;
+    held.push({ sock, address, port, buf: Buffer.from(msg) });
+    this.heldBytes += msg.length;
+    return true;
   }
 
   /** Our consent check was answered (RFC 7675). */
@@ -197,11 +279,12 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
     if (this.state !== 'closed') this.lastConsent = this.host.now();
   }
 
-  // ------------------------------------------------------------ ICE-lite
+  // ------------------------------------------------------------ Binding requests
 
   /**
    * A Binding request whose USERNAME starts with our ufrag (the endpoint
-   * already parsed it into `m`). Validates and answers it.
+   * already parsed it into `m`). Authenticates and answers it; ICE-lite: its
+   * source becomes validated; full ICE: see the file comment.
    * Returns false when it was rejected (not authenticated / malformed).
    */
   handleBinding(m: StunMessage, sock: UdpIo, address: string, port: number): boolean {
@@ -225,6 +308,10 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
       }
       return false;
     }
+    if (this.agent !== null) {
+      this.fullIceRequest(m, sock, address, port);
+      return true;
+    }
     const v = this.validate(sock, address, port);
     this.host.sendTo(v, buildBindingSuccess(m.transactionId(), address, port, this.integrityKey));
     this.lastConsent = this.host.now();
@@ -232,9 +319,32 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
     if (this.nominated !== null) this.dest = this.nominated;
     else if (this.dest === null) this.dest = v;
     if (this.state === 'new') this.state = 'connecting';
-    // full ICE: peer-reflexive candidate + triggered check (ice-agent.ts)
-    if (this.agent !== null) this.agent.onRequest(sock, address, port, m.priority);
     return true;
+  }
+
+  /**
+   * Full ICE, authenticated request: answered wherever it came from (a STUN
+   * response no larger than the request), but its source is only trusted
+   * once our own check to it succeeds (file comment). Consent: our consent
+   * checks, and requests from validated addresses only.
+   */
+  private fullIceRequest(m: StunMessage, sock: UdpIo, address: string, port: number): void {
+    const v = this.findValidated(sock, address, port);
+    this.host.sendTo(v ?? this.tempDest(sock, address, port), buildBindingSuccess(m.transactionId(), address, port, this.integrityKey));
+    if (v !== null) {
+      this.lastConsent = this.host.now();
+      this.host.bindAddress(v); // (re)claim the 5-tuple: proven by our check
+      if (m.useCandidate) {
+        this.pendingNomination = null;
+        this.nominated = v; // nomination; also how NAT rebinding moves the pair (to a proven address)
+        this.dest = v;
+      }
+    } else {
+      if (m.useCandidate) this.pendingNomination = { sock, address, port };
+      if (this.holdKeys.length < MAX_HOLD_ADDRESSES) this.host.holdAddress(this, address, port);
+    }
+    // peer-reflexive candidate + triggered check (ice-agent.ts); none once the pair succeeded
+    (this.agent as IceAgent).onRequest(sock, address, port, m.priority);
   }
 
   /** Marks (sock, address, port) valid for this session and claims its 5-tuple for the DTLS demux. */
@@ -249,6 +359,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
         // its 5-tuple must not keep routing DTLS here (nor keep this session reachable after close)
         if (old !== undefined) {
           this.host.unbindAddress(old);
+          this.dropped(old);
           if (this.dest === old) this.dest = null;
         }
       }
@@ -272,8 +383,15 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
   forgetAddress(v: ValidatedAddress): void {
     const i = this.validated.indexOf(v);
     if (i >= 0) this.validated.splice(i, 1);
+    this.dropped(v);
     if (this.nominated === v) this.nominated = null;
     if (this.dest === v) this.dest = this.nominated ?? this.validated[this.validated.length - 1] ?? null;
+  }
+
+  /** `v` is no longer validated: no handshake flight goes there; full ICE: a new request re-checks it. */
+  private dropped(v: ValidatedAddress): void {
+    if (this.dtlsFrom === v) this.dtlsFrom = null;
+    if (this.agent !== null) this.agent.recheck(v.sock, v.address, v.port);
   }
 
   // ------------------------------------------------------------ DTLS / data
@@ -282,6 +400,8 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
   handleDtls(buf: Buffer, v: ValidatedAddress): void {
     if (this.state === 'closed') return;
     if (this.nominated === null) this.dest = v;
+    // the handshake's address is that of the ClientHello starting it (with the cookie: the one that echoed it)
+    if (this.dtls.state === 'listen' || this.dtlsFrom === null) this.dtlsFrom = v;
     this.dtls.handleDatagram(buf, v.key);
   }
 
@@ -426,6 +546,10 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
     this.validated.length = 0;
     this.nominated = null;
     this.dest = null;
+    this.dtlsFrom = null;
+    this.pendingNomination = null;
+    this.held = null;
+    this.heldBytes = 0;
   }
 }
 

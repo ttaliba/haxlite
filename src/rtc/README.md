@@ -118,14 +118,22 @@ assoc.close()         // no onClose afterwards
   address of that session; DTLS is only accepted from validated addresses. USE-CANDIDATE
   nominates (= `remoteAddress`). NAT rebinding: only through a new authenticated binding.
   Consent: the browser keeps sending bindings (~every 2.5–5 s); none for `idleTimeoutMs` →
-  close.
-* **DTLS 1.2 server** (RFC 6347, `dtls/server.ts`): no HelloVerifyRequest by default — the
+  close. Such an address is **not proven**: every joining client knows our password (it is in
+  its answer) and could spoof a victim's source, hence the DTLS cookie is on by default here.
+* **Full ICE** (default, `ice-agent.ts`): an address is validated only once OUR check to it got
+  an authenticated, symmetric success (RFC 8445 §7.2.5.3); a request triggers that check, and
+  its USE-CANDIDATE nominates when the check succeeds (§7.3.1.5). DTLS arriving meanwhile from
+  the authenticated source is held (≤ 4 datagrams) and processed on success, and a request on
+  an in-progress check retransmits it at once (§7.3.1.4): no extra round trip per join.
+* **DTLS 1.2 server** (RFC 6347, `dtls/server.ts`): with full ICE no HelloVerifyRequest — the
   first ClientHello gets flight 4 (RFC 6347 §4.2.1 allows it; the cookie only proves address
-  ownership, and the endpoint only routes DTLS from addresses validated by authenticated STUN):
-  one client RTT less per join. A retransmitted ClientHello re-sends flight 4 unchanged
-  (rate-limited); an unsolicited cookie is ignored. `DtlsServerOptions.helloVerify: true` keeps
-  the HMAC cookie exchange (bound to the remote address and the ClientHello parameters) for uses
-  outside ICE. Suite preference depends on the runtime (`defaultSuites` in `dtls/crypto.ts`):
+  ownership, which our own connectivity check already proved): one client RTT less per join.
+  Handshake flights only go to the (validated) address of the ClientHello that started the
+  handshake. With ICE-lite the HMAC cookie exchange (bound to the remote address and the
+  ClientHello parameters) is on by default: addresses there are only vouched for by Binding
+  requests. `helloVerify` (RtcEndpointOptions / RtcBackendOptions) overrides either default. A
+  retransmitted ClientHello re-sends flight 4 unchanged (rate-limited); an unsolicited cookie is
+  ignored. Suite preference depends on the runtime (`defaultSuites` in `dtls/crypto.ts`):
   Node prefers `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` — Chromium 141 offers and
   negotiates it — then AES_128_GCM / AES_256_GCM; Bun prefers AES_128_GCM (its native AES-GCM
   is ~3× cheaper than the JS ChaCha20 there), then ChaCha20, AES_256_GCM (all three exercised
