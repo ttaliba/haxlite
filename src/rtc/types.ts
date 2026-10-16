@@ -78,7 +78,11 @@ export interface RemoteAddress {
 
 /** One browser peer (created from its offer by `RtcEndpoint.createSession`). */
 export interface RtcSession {
-  /** The SDP answer (includes our candidates; a=end-of-candidates when {@link gatheringComplete}). */
+  /**
+   * The SDP answer (includes our candidates; a=end-of-candidates when
+   * {@link gatheringComplete}). Read it right after `createSession`: it is
+   * released (`''`) once DTLS connects or the session closes.
+   */
   readonly answerSdp: string;
   /** Our candidate lines, without the `a=` prefix. */
   readonly localCandidates: string[];
