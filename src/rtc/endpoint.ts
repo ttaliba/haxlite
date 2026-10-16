@@ -348,6 +348,13 @@ export class RtcEndpoint {
         this.holds.set(key, s); // the latest authenticated session (a rejoin from the same port)
         s.holdKeys.push(key);
       },
+      unholdAddress: (s, address, port) => {
+        const key = `${address}|${port}`;
+        const i = s.holdKeys.indexOf(key);
+        if (i < 0) return;
+        s.holdKeys.splice(i, 1);
+        if (this.holds.get(key) === s) this.holds.delete(key);
+      },
     };
     this.gatherer.start();
   }

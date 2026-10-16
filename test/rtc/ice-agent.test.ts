@@ -441,6 +441,39 @@ describe('RtcEndpoint full ICE (controlled agent)', () => {
     expect(s.remoteAddress).toEqual({ address: '127.0.0.1', port: spoofed.port });
   });
 
+  it('held DTLS from an address whose check fails is released (slots and hold registration); holds also expire', async () => {
+    const e = await setup();
+    const s = e.createSession(offerSdp());
+    const creds = answerCreds(s.answerSdp);
+    const victim = await client(); // never answers our checks
+    victim.s.send(
+      buildBindingRequest({ txid: randomBytes(12), username: `${creds.ufrag}:${CLIENT_UFRAG}`, key: Buffer.from(creds.pwd), priority: 1845501695 }),
+      e.port,
+      '127.0.0.1',
+    );
+    await sleep(50);
+    victim.s.send(clientHelloDatagram().datagram, e.port, '127.0.0.1');
+    await sleep(50);
+    const impl = s as unknown as { held: unknown[] | null; holdKeys: string[]; holdDtls(m: Buffer, sock: unknown, a: string, p: number): boolean; checkTimers(now: number, h: number, i: number): void };
+    const holds = (e as unknown as { holds: Map<string, unknown> }).holds;
+    expect(e.stats().dtlsHeld).toBe(1);
+    expect(impl.held?.length).toBe(1);
+    expect(impl.holdKeys).toEqual([`127.0.0.1|${victim.port}`]);
+    await sleep(6500); // 0, 200, 600, 1400, 3000 → failed at 6.2 s
+    expect(e.stats().ice.checksFailed).toBe(1);
+    expect(impl.held).toBeNull();
+    expect(impl.holdKeys).toEqual([]);
+    expect(holds.size).toBe(0);
+    // expiry: a datagram held longer than a few seconds is dropped by the sweep, and frees its slot
+    const sock = (e as unknown as { ios: unknown[] }).ios[0];
+    for (let i = 0; i < 4; i++) expect(impl.holdDtls(Buffer.alloc(100, 22), sock, '127.0.0.1', 40000 + i)).toBe(true);
+    expect(impl.holdDtls(Buffer.alloc(100, 22), sock, '127.0.0.1', 40010)).toBe(false); // full
+    impl.checkTimers(Date.now() + 5500, 1e9, 1e9);
+    expect(impl.held).toBeNull();
+    expect(impl.holdDtls(Buffer.alloc(100, 22), sock, '127.0.0.1', 40010)).toBe(true);
+    s.close();
+  }, 15_000);
+
   it('evicting a validated address for capacity: no re-check churn, and never the handshake address', async () => {
     const e = await setup();
     // clients that answer every check of ours
@@ -656,12 +689,16 @@ describe('IceAgent (manual clock)', () => {
       sockets: [{ sock, family: 4, bindAddress: '0.0.0.0' }],
       policy: 'public',
     });
+    const failed: number[] = [];
     const agent = new IceAgent(sched, {
       localUfrag: 'ours',
       remoteUfrag: CLIENT_UFRAG,
       remoteKey: Buffer.from(CLIENT_PWD),
       onCheckSucceeded() {},
       onConsent() {},
+      onCheckFailed(_s, _a, port) {
+        failed.push(port);
+      },
     });
     const run = (ms: number) => {
       for (let i = 0; i < ms; i += 20) {
@@ -669,7 +706,7 @@ describe('IceAgent (manual clock)', () => {
         agent.tick(t);
       }
     };
-    return { sock, sent, sched, agent, run, now: () => t };
+    return { sock, sent, sched, agent, failed, run, now: () => t };
   }
 
   it('full check list: a peer-reflexive address replaces a failed signaled pair, never an in-progress one', () => {
@@ -682,6 +719,7 @@ describe('IceAgent (manual clock)', () => {
       expect(h.agent.describe().some((p) => p.port === 6000)).toBe(false); // nothing replaceable
       h.run(CHECK_TIMEOUT + 200);
       expect(h.agent.describe().every((p) => p.state === 'failed')).toBe(true);
+      expect(h.failed.length).toBe(MAX_PAIRS); // the owner is told of every failure
       h.sent.length = 0;
       h.agent.onRequest(h.sock, '203.0.113.9', 6000, 1845501695);
       const pairs = h.agent.describe();

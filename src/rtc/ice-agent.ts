@@ -227,6 +227,8 @@ export interface IceAgentOwner {
   onCheckSucceeded(sock: UdpIo, address: string, port: number): void;
   /** One of our consent checks on the selected pair was answered (RFC 7675). */
   onConsent(): void;
+  /** Our check on (sock, address, port) failed (timeout, error, non-symmetric, budget): it does not validate the address. */
+  onCheckFailed?(sock: UdpIo, address: string, port: number): void;
 }
 
 const WAITING = 0;
@@ -423,8 +425,7 @@ export class IceAgent {
       if (now < tx.nextAt) continue;
       if (tx.n >= TX_PER_CHECK) {
         this.endTx(p);
-        p.state = FAILED;
-        this.s.stats.checksFailed++;
+        this.fail(p);
         continue;
       }
       if (!this.transmit(p, tx)) continue;
@@ -472,7 +473,7 @@ export class IceAgent {
 
   private startCheck(p: Pair, now: number): boolean {
     if (p.sent >= MAX_TX_PER_PAIR) {
-      p.state = FAILED;
+      this.fail(p);
       return true;
     }
     const buf = buildBindingRequest({
@@ -524,8 +525,7 @@ export class IceAgent {
     if (!checkFingerprint(m) || !checkIntegrity(m, this.owner.remoteKey)) return;
     this.endTx(p);
     if (sock !== p.sock || port !== p.port || !sameIp(address, p.address)) {
-      p.state = FAILED; // non-symmetric (RFC 8445 §7.2.5.2.1)
-      this.s.stats.checksFailed++;
+      this.fail(p); // non-symmetric (RFC 8445 §7.2.5.2.1)
       return;
     }
     if (m.type === StunType.BindingSuccess) {
@@ -544,8 +544,13 @@ export class IceAgent {
       }
       return;
     }
+    this.fail(p);
+  }
+
+  private fail(p: Pair): void {
     p.state = FAILED;
     this.s.stats.checksFailed++;
+    this.owner.onCheckFailed?.(p.sock, p.address, p.port);
   }
 
   /**
