@@ -241,3 +241,92 @@ describe("peerBackend: 'rtc' with a libdatachannel client", () => {
     expect((ep as unknown as { sweepTimer: unknown }).sweepTimer).toBeNull();
   });
 });
+
+describe("peerBackend: 'rtc' frame batching (sendBatchFrames)", () => {
+  const FRAME_MS = 1000 / 60;
+  const gridIndex = () => Math.floor(performance.now() * 0.06 + 1e-6);
+  /** Resolves within the first quarter of a frame of the process-wide 60 Hz grid. */
+  async function frameStart(): Promise<void> {
+    for (;;) {
+      const f = performance.now() * 0.06;
+      if (f - Math.floor(f) < 0.25) return;
+      await new Promise((r) => setTimeout(r, Math.max(1, Math.ceil((Math.floor(f) + 1 - f) * FRAME_MS))));
+    }
+  }
+  const nextIteration = () => new Promise<void>((r) => setImmediate(r));
+
+  async function setup(sendBatchFrames: 0 | 1 | 2) {
+    const h = await startHost({ rtcEndpoint: { ...LOOPBACK, shared: false, sendBatchFrames } });
+    const j = nextJoin(h.t);
+    const c = join(h.roomId);
+    const { peer } = await j;
+    await c.whenOpen();
+    await new Promise((r) => setTimeout(r, 300)); // handshake traffic and SACKs settle
+    return { ...h, c, peer };
+  }
+
+  /** `n` messages on `ru`, one per event-loop iteration inside one frame: datagrams out, start frame, arrival (in frames). */
+  async function burst(s: Awaited<ReturnType<typeof setup>>, n: number) {
+    const ep = s.backend.endpoint!;
+    const have = s.c.received.length;
+    await frameStart();
+    const g0 = gridIndex();
+    const out0 = ep.stats().packetsOut;
+    for (let i = 0; i < n; i++) {
+      expect(s.t.send(s.peer, 1, Uint8Array.of(2, i))).toBe(true);
+      await nextIteration();
+    }
+    await withTimeout(s.c.waitMessages(have + n), 5000, 'burst');
+    const arrivedFrame = performance.now() * 0.06;
+    await new Promise((r) => setTimeout(r, 50));
+    return { datagrams: ep.stats().packetsOut - out0, g0, arrivedFrame, payloads: s.c.received.slice(have).map(([ch, b]) => [ch, b[1]]) };
+  }
+
+  it('is validated at construction (0, 1 or 2)', () => {
+    const base = { token: 't', masterUrl: 'http://127.0.0.1:9/', peerBackend: 'rtc' as const };
+    expect(() => new HostTransport({ ...base, rtcEndpoint: { ...LOOPBACK, sendBatchFrames: 3 as 2 } })).toThrow(/sendBatchFrames/);
+    expect(() => new HostTransport({ ...base, rtcEndpoint: { ...LOOPBACK, sendBatchFrames: 1 } })).not.toThrow();
+  });
+
+  it('off: every iteration sends its own datagram', async () => {
+    const r = await burst(await setup(0), 4);
+    expect(r.datagrams).toBe(4);
+  });
+
+  it('1 frame: ru messages of several iterations leave together on the next grid boundary, in order', async () => {
+    const r = await burst(await setup(1), 4);
+    expect(r.datagrams).toBe(1);
+    expect(r.payloads).toEqual([
+      [1, 0],
+      [1, 1],
+      [1, 2],
+      [1, 3],
+    ]);
+    expect(r.arrivedFrame).toBeGreaterThanOrEqual(r.g0 + 1 - 1e-6); // not before the boundary
+  });
+
+  it('2 frames: held until an even boundary; ro / uu are not held and take the held ru messages along', async () => {
+    const s = await setup(2);
+    const r = await burst(s, 3);
+    expect(r.datagrams).toBe(1);
+    const due = r.g0 % 2 === 0 ? r.g0 + 2 : r.g0 + 1;
+    expect(r.arrivedFrame).toBeGreaterThanOrEqual(due - 1e-6);
+    // a held ru message, then one on uu (heartbeat / pong) or ro: both leave at once, in one datagram
+    for (const ch of [2, 0]) {
+      const ep = s.backend.endpoint!;
+      const have = s.c.received.length;
+      await frameStart();
+      const g = gridIndex();
+      const out0 = ep.stats().packetsOut;
+      s.t.send(s.peer, 1, Uint8Array.of(2, 10 + ch));
+      s.t.send(s.peer, ch, Uint8Array.of(3, 20 + ch));
+      await withTimeout(s.c.waitMessages(have + 2), 5000, `held ru + ${ch}`);
+      expect(performance.now() * 0.06).toBeLessThan(g + 1); // the held one was due at g + 1 or g + 2
+      expect(ep.stats().packetsOut - out0).toBe(1);
+      expect(s.c.received.slice(have).map(([c, b]) => [c, b[1]])).toEqual([
+        [1, 10 + ch],
+        [ch, 20 + ch],
+      ]);
+    }
+  });
+});
