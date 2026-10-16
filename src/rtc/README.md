@@ -38,9 +38,9 @@ const ep = await RtcEndpoint.listen({
   iceLite: false,                 // true: a=ice-lite, no checks, no gathering
   gatherRefreshMs: 60_000,        // srflx result reused for this long
   publicPort: 40000,              // optional: advertised port when a 1:1 NAT maps it (default: bound port)
-  certificate: RtcCertificate.generate(), // optional; default: RtcCertificate.processDefault() (one per process, keygen off-thread)
+  certificate: RtcCertificate.generate(), // optional; default: RtcCertificate.processDefault() (one per process, generated synchronously)
   certificateFile: '/var/lib/haxlite/dtls.pem', // optional: load/persist the identity (RtcCertificate.loadOrCreate)
-  cipherSuites: ['chacha20', 'aes128gcm', 'aes256gcm'], // DTLS server preference (this is the default)
+  cipherSuites: ['chacha20', 'aes128gcm', 'aes256gcm'], // DTLS server preference (default on Node; Bun puts aes128gcm first)
   idleTimeoutMs: 30_000,          // no ICE consent (authenticated binding) for this long → close('timeout')
   handshakeTimeoutMs: 20_000,     // session not open this long after createSession → close('handshake-timeout')
   maxSessions: 10_000,

@@ -125,7 +125,7 @@ export interface RtcBackendOptions {
    * same ephemeral port). false: this room gets its own endpoint and socket.
    */
   shared?: boolean;
-  /** DTLS cipher suites in preference order (default ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM; see RtcEndpointOptions). */
+  /** DTLS cipher suites in preference order (default on Node: ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM; on Bun AES-128-GCM first; see RtcEndpointOptions). */
   cipherSuites?: readonly (number | string)[];
   /** No ICE consent from an open session for this long → closed (default 30 000 ms). */
   idleTimeoutMs?: number;
