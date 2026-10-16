@@ -50,8 +50,8 @@ export interface EdgeTunnelOptions {
   allowWebRtc?: boolean;
   /**
    * Datagram AEAD granted to hosts that ask for ChaCha20-Poly1305
-   * (`AuthFlag.ChaCha`): `'auto'` (default) = this runtime's cheaper one
-   * (Node: ChaCha20-Poly1305, Bun: AES-128-GCM); `'aes-128-gcm'` never
+   * (`AuthFlag.ChaCha`): `'auto'` (default) = ChaCha20-Poly1305 (Node and
+   * Bun); `'aes-128-gcm'` never
    * grants it. Hosts that do not ask always get AES-128-GCM.
    */
   aead?: TunnelAeadOption;

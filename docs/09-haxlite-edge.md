@@ -191,8 +191,9 @@ estado mínimo.
   en el sitio (un datagrama que no autentica queda intacto). Mismo datagrama, nonce, ventana y
   ratchet; al rotar de época se borran el secreto y la clave retirados. El host lo pide con
   `edge.tunnelAead` y el edge lo concede según `tunnel.aead`; con `'auto'` (por defecto en ambos)
-  cada lado quiere el más barato en su runtime: ChaCha20-Poly1305 en Node, AES-128-GCM en Bun. Solo
-  se usa ChaCha si el host lo pide **y** el edge está de acuerdo. Sellar + abrir con buffer
+  cada lado quiere ChaCha20-Poly1305, en Node y en Bun. Solo se usa ChaCha si el host lo pide **y**
+  el edge está de acuerdo; un par anterior al flag (o configurado con `'aes-128-gcm'`) se queda en
+  AES-128-GCM. Sellar + abrir con buffer
   reutilizado (µs, 50 / 150 / 300 B):
 
   | runtime | AES-128-GCM | ChaCha20-Poly1305 (JS) |
@@ -201,7 +202,10 @@ estado mínimo.
   | Bun 1.4 | **2,98 / 3,13 / 3,16** | 3,71 / 6,53 / 10,53 |
 
   Ping/Pong por el túnel real en Node: 31,3 µs (ChaCha) frente a 52,8 µs (AES-GCM) de CPU por ida y
-  vuelta.
+  vuelta. En Bun la micro‑medida favorece AES-128-GCM, pero cada sellado o apertura crea un objeto
+  `Cipher` nativo: esa basura mantiene ocupado al *scavenger* de mimalloc y, de extremo a extremo,
+  ChaCha sale más barata (medido en el DTLS de haxlite-rtc, mismo patrón: ≈ 17 % menos CPU, ver
+  [10 §6.7](10-haxlite-rtc.md)). Por eso `'auto'` es ChaCha20-Poly1305 en los dos runtimes.
 * **SCTP**: `src/rtc/sctp` (el mismo de haxlite-rtc), el host es el iniciador (`connect()`) y el
   edge el lado pasivo (INIT sin estado, cookie HMAC). Streams = canales del túnel (0 `ro`,
   1 `ru`, 2 `uu` con `maxRetransmits: 0`, 3–17 carriles `ro`), mensajes de hasta 1 MiB, paquetes
@@ -247,7 +251,7 @@ Con `HostTransport` directamente: `new HostTransport({ token, edge: { url, key }
 | `key` | — | `"<keyId>:<secret>"` |
 | `dataPlane` | `'udp'` | `'udp'` = túnel v2 (§1.3, sin addons); `'webrtc'` = PeerConnection node-datachannel (carga el addon); `'ws'` = forzar el WebSocket |
 | `roLanes` | `true` | pedir los carriles `ro` (§1.2); `false` = un solo canal `ro` en el túnel |
-| `tunnelAead` | `'auto'` | solo `dataPlane: 'udp'`: AEAD que se pide para el túnel v2 (§1.3). `'auto'` = ChaCha20-Poly1305 en Node, AES-128-GCM en Bun; `'chacha20-poly1305'` lo pide siempre; `'aes-128-gcm'` nunca. El edge decide; uno anterior concede AES-128-GCM |
+| `tunnelAead` | `'auto'` | solo `dataPlane: 'udp'`: AEAD que se pide para el túnel v2 (§1.3). `'auto'` = ChaCha20-Poly1305 (Node y Bun); `'chacha20-poly1305'` lo pide siempre; `'aes-128-gcm'` nunca. El edge decide; uno anterior concede AES-128-GCM |
 | `fallbackWs` | `true` | si el plano UDP no sube en `dataPlaneTimeoutMs` (o el edge no lo concede), todo por el WebSocket (queda en WS hasta reiniciar la sala) |
 | `bindAddress` | — | dirección local para el WS y el socket UDP del túnel |
 | `iceServers` / `portRange` | ninguno / — | solo `dataPlane: 'webrtc'` |
@@ -498,7 +502,7 @@ JSON (`--config` o `HAXLITE_EDGE_CONFIG`) + variables de entorno (ganan): `HAXLI
 | `tunnel.publicHost` / `tunnel.publicPort` | el host de la URL del WS / el puerto ligado | destino que se comunica a los hosts en `AuthOk` |
 | `tunnel.maxPps` / `tunnel.maxForeignPps` | 20 000 / 20 | buckets por `connId` (§4) |
 | `tunnel.idleTimeoutMs` | 30 000 | túnel sin datagramas autenticados |
-| `tunnel.aead` | `'auto'` | AEAD que se concede a los hosts que piden ChaCha20-Poly1305 (§1.3): `'auto'` = el más barato en este runtime (Node: ChaCha20-Poly1305, Bun: AES-128-GCM); `'chacha20-poly1305'` lo concede siempre que se pida; `'aes-128-gcm'` nunca. Quien no lo pide recibe AES-128-GCM |
+| `tunnel.aead` | `'auto'` | AEAD que se concede a los hosts que piden ChaCha20-Poly1305 (§1.3): `'auto'` = ChaCha20-Poly1305 (Node y Bun); `'chacha20-poly1305'` lo concede siempre que se pida; `'aes-128-gcm'` nunca. Quien no lo pide recibe AES-128-GCM |
 | `tunnel.allowWebRtc` | true | conceder el túnel legado a quien lo pida (carga node-datachannel en ese momento) |
 | `limits.maxSessions` | 1000 | túneles simultáneos |
 | `limits.maxSessionsPerKey` / `maxPeersPerKey` | 16 / 256 | cuotas por defecto de cada clave |

@@ -157,7 +157,7 @@ export interface DtlsServerOptions {
   retransmitMs?: number;
   /**
    * Cipher suites in preference order (default {@link defaultSuites}: ChaCha20-Poly1305
-   * first on Node, AES-128-GCM first on Bun).
+   * first, then AES-128-GCM, AES-256-GCM, on Node and Bun).
    */
   suites?: readonly number[];
   /** ChaCha20-Poly1305 implementation (default 'js', allocation-free; 'node' is 'js' on Bun). */

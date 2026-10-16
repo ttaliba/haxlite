@@ -42,7 +42,7 @@ const ep = await RtcEndpoint.listen({
   publicPort: 40000,              // optional: advertised port when a 1:1 NAT maps it (default: bound port)
   certificate: RtcCertificate.generate(), // optional; default: RtcCertificate.processDefault() (one per process, generated synchronously)
   certificateFile: '/var/lib/haxlite/dtls.pem', // optional: load/persist the identity (RtcCertificate.loadOrCreate)
-  cipherSuites: ['chacha20', 'aes128gcm', 'aes256gcm'], // DTLS server preference (default on Node; Bun puts aes128gcm first)
+  cipherSuites: ['chacha20', 'aes128gcm', 'aes256gcm'], // DTLS server preference (the default, Node and Bun)
   idleTimeoutMs: 30_000,          // no ICE consent (authenticated binding) for this long → close('timeout')
   handshakeTimeoutMs: 20_000,     // session not open this long after createSession → close('handshake-timeout')
   maxSessions: 10_000,
@@ -133,11 +133,11 @@ assoc.close()         // no onClose afterwards
   ClientHello parameters) is on by default: addresses there are only vouched for by Binding
   requests. `helloVerify` (RtcEndpointOptions / RtcBackendOptions) overrides either default. A
   retransmitted ClientHello re-sends flight 4 unchanged (rate-limited); an unsolicited cookie is
-  ignored. Suite preference depends on the runtime (`defaultSuites` in `dtls/crypto.ts`):
-  Node prefers `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` — Chromium 141 offers and
-  negotiates it — then AES_128_GCM / AES_256_GCM; Bun prefers AES_128_GCM (its native AES-GCM
-  is ~3× cheaper than the JS ChaCha20 there), then ChaCha20, AES_256_GCM (all three exercised
-  against OpenSSL; `cipherSuites` changes the order). `chacha: 'node'` falls back to the JS AEAD
+  ignored. Suite preference (`defaultSuites` in `dtls/crypto.ts`, same on Node and Bun):
+  `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` — Chromium 141 offers and negotiates it —
+  then AES_128_GCM / AES_256_GCM (all three exercised against OpenSSL; `cipherSuites` changes
+  the order). On Bun, AES-GCM wins a per-record micro-benchmark but costs ~21 % more CPU end to
+  end (a native cipher object per record wakes Bun's mimalloc scavenger; docs/10 §6.7). `chacha: 'node'` falls back to the JS AEAD
   on Bun (no `chacha20-poly1305` in its node:crypto). ChaCha20-Poly1305 records use `dtls/chacha.ts`: a pure-JS,
   constant-time (ARX + 13-bit-limb Poly1305, no secret-dependent branches or tables),
   allocation-free AEAD that encrypts the record in the shared send buffer and decrypts in place

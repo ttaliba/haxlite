@@ -84,19 +84,21 @@ export const SUITES: readonly CipherSuite[] = [
   },
 ];
 
-const isBun = (process.versions as { bun?: string }).bun !== undefined;
-
 /**
- * Default server preference order. Node: ChaCha20-Poly1305 first (the
- * allocation-free JS AEAD beats node:crypto for the small records of a game:
- * docs/10 §6.3), then AES-128-GCM (every browser), then AES-256-GCM.
- * Bun: AES-128-GCM first — Bun's node:crypto AES-GCM is cheap (seal+open of
- * 300 B ≈ 2.9 µs vs ≈ 10.4 µs for the JS ChaCha20-Poly1305), worth its
- * 8-byte explicit nonce per record — then ChaCha20-Poly1305, AES-256-GCM.
- * Either is overridden by an explicit suite list (`suites` / `cipherSuites`).
+ * Default server preference order, the same on Node and Bun:
+ * ChaCha20-Poly1305 first (the allocation-free, in-place JS AEAD: docs/10
+ * §6.3), then AES-128-GCM (every browser), then AES-256-GCM. Overridden by an
+ * explicit suite list (`suites` / `cipherSuites`).
+ *
+ * On Bun a micro-benchmark favours AES-GCM per record (≈ 2.9 µs vs ≈ 10.4 µs
+ * seal+open of 300 B), but end to end it loses: AES-GCM makes a native cipher
+ * object per record, and the churn keeps Bun's mimalloc scavenger busy.
+ * Game N=10, Linux 4 vCPU, Bun 1.4.0: AES first 2.96 % CPU, 5635 B/s UDP per
+ * player; ChaCha first 2.45 %, 5150 B/s (Node 26: 2.42 %, 5140 B/s).
+ * `_bun` is kept for callers and tests; the order no longer depends on it.
  */
-export function defaultSuites(bun = isBun): number[] {
-  return bun ? [0xc02b, 0xcca9, 0xc02c] : [0xcca9, 0xc02b, 0xc02c];
+export function defaultSuites(_bun?: boolean): number[] {
+  return [0xcca9, 0xc02b, 0xc02c];
 }
 
 /** Suite ids or IANA names (`TLS_ECDHE_ECDSA_WITH_…`, or the short OpenSSL-style `chacha20` / `aes128gcm` / `aes256gcm`) → ids. Throws on unknown entries. */
