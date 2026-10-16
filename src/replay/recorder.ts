@@ -38,11 +38,11 @@ import type { RoomEvent, RoomState } from '../room/index.js';
 import { writeEvent, writeRoomState } from '../room/index.js';
 import { REPLAY_HEADER_SIZE, REPLAY_MAGIC, REPLAY_VERSION } from './format.js';
 
-/** Anything exposing the host's current logical frame (e.g. the host engine itself). */
 /** Initial writer capacities (official `Jb` / `yc`); writers that grew past them are dropped at stop. */
 const MARKERS_CAPACITY = 1000;
 const EVENTS_CAPACITY = 16384;
 
+/** Anything exposing the host's current logical frame (e.g. the host engine itself). */
 export interface FrameClock {
   readonly frame: number;
 }
