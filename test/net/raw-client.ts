@@ -31,6 +31,8 @@ export interface RawJoinOptions {
   badSignature?: boolean;
   /** Don't answer the challenge automatically. */
   manualHandshake?: boolean;
+  /** Rewrites the offer SDP sent to the host (e.g. a browser's origin line). */
+  mungeOffer?: (sdp: string) => string;
 }
 
 export class RawClient {
@@ -186,6 +188,7 @@ export class RawClient {
       sdp = local.sdp.split('\r\n')
         .filter((l) => !l.startsWith('a=candidate:') && l !== 'a=end-of-candidates')
         .join('\r\n');
+      if (o.mungeOffer !== undefined) sdp = o.mungeOffer(sdp);
     }
     const w = new Writer(1024);
     w.u8(o.reverse ? 1 : 0);

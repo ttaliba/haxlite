@@ -184,6 +184,11 @@ describe('handshake and identity', () => {
     expect(peer.srflxIps).toEqual(['192.0.2.77']);
     expect(peer.ips).toEqual(['127.0.0.1', '192.0.2.77']);
     await c.whenOpen();
+    // negotiation state released once the answer went out (per-peer memory)
+    expect(peer.localSdp).toBeNull();
+    expect(peer.localCandidates).toEqual([]);
+    expect(peer.mids).toEqual(['0']);
+    expect(c.answerSdp).toContain('a=fingerprint:');
 
     const got: [number, number[]][] = [];
     const three = new Promise<void>((resolve) => {
@@ -212,6 +217,40 @@ describe('handshake and identity', () => {
       [1, [7]],
       [2, [9, 9]],
     ]);
+  });
+
+  it('challenge delay: 10 ms for a libdatachannel offer (o=rtc), none for a browser offer; challengeDelayMs overrides', async () => {
+    const opened = new Map<number, number>();
+    const gaps = new Map<number, number>();
+    const log = (m: string) => {
+      const r = /^peer (\d+): (channel 0 open|challenge sent)$/.exec(m);
+      if (r === null) return;
+      const id = Number(r[1]);
+      if (r[2] === 'channel 0 open') opened.set(id, performance.now());
+      else gaps.set(id, performance.now() - opened.get(id)!);
+    };
+    const nextGap = async (expectedSize: number) => {
+      const t0 = performance.now();
+      while (gaps.size < expectedSize && performance.now() - t0 < 10_000) await new Promise((r) => setTimeout(r, 5));
+      expect(gaps.size).toBe(expectedSize);
+      return [...gaps.values()][expectedSize - 1]!;
+    };
+    const { roomId } = await startHost({ log });
+    // node-haxball / libdatachannel (the raw client's own offer)
+    join(roomId);
+    expect(await nextGap(1)).toBeGreaterThanOrEqual(9);
+    // the same client presenting a Chrome / Firefox origin line: challenge at once
+    // (the libdatachannel client itself may then drop it: only the host side is checked)
+    join(roomId, { mungeOffer: (sdp) => sdp.replace(/^o=rtc /m, 'o=- ') });
+    expect(await nextGap(2)).toBeLessThan(9);
+    join(roomId, { mungeOffer: (sdp) => sdp.replace(/^o=rtc \S+/m, 'o=mozilla...THIS_IS_SDPARTA-99.0') });
+    expect(await nextGap(3)).toBeLessThan(9);
+    // explicit value: every client
+    opened.clear();
+    gaps.clear();
+    const h2 = await startHost({ log, challengeDelayMs: 40 });
+    join(h2.roomId, { mungeOffer: (sdp) => sdp.replace(/^o=rtc /m, 'o=- ') });
+    expect(await nextGap(1)).toBeGreaterThanOrEqual(39);
   });
 
   it('reverse-connection offers (remote ICE delayed) still connect', async () => {

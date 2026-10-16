@@ -416,8 +416,37 @@ describe('RtcEndpoint full ICE (controlled agent)', () => {
     expect(n).toBeGreaterThan(0);
     await sleep(150);
     const s = e.createSession(offerSdp());
-    expect(s.gatheringComplete).toBe(false);
+    // the cached result answers at once; the refresh runs in the background
+    expect(s.gatheringComplete).toBe(true);
+    expect(s.answerSdp).toContain(`127.0.0.1 ${e.port} typ srflx raddr 0.0.0.0 rport 0`);
     await e.whenGathered();
     expect(stun.requests).toBeGreaterThan(n);
+  });
+
+  it('a stale result whose refresh gets no reply: sessions still answer complete with the cached srflx', async () => {
+    const stun = await FakeStunServer.start('127.0.0.1');
+    closers.push(() => stun.close());
+    const e = await setup({ publicAddresses: undefined, iceServers: [stun.url], gatherRefreshMs: 100 });
+    await e.whenGathered();
+    await sleep(150);
+    stun.silent = true;
+    const n = stun.requests;
+    const srflx = `127.0.0.1 ${e.port} typ srflx raddr 0.0.0.0 rport 0`;
+    const s1 = e.createSession(offerSdp()); // starts the refresh
+    const s2 = e.createSession(offerSdp()); // while the refresh runs
+    for (const s of [s1, s2]) {
+      expect(s.gatheringComplete).toBe(true);
+      expect(s.answerSdp).toContain(srflx);
+      expect(s.answerSdp).toContain('a=end-of-candidates');
+    }
+    let late = 0;
+    s1.onLocalCandidate = () => late++;
+    s1.onGatheringComplete = () => late++;
+    await sleep(50);
+    expect(stun.requests).toBeGreaterThan(n); // the refresh did go out
+    await e.whenGathered(); // times out without a reply
+    expect(late).toBe(0); // nothing trickled to sessions that were complete
+    // the lost reply keeps the previous srflx
+    expect(e.createSession(offerSdp()).answerSdp).toContain(srflx);
   });
 });
