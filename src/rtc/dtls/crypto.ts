@@ -13,7 +13,7 @@
  * key again on every call (Node 26: ≈ 47 → 4 µs per HMAC, ≈ 54 → 5.5 µs per
  * AES-GCM record; neutral on Bun).
  */
-import { createCipheriv, createDecipheriv, createHmac, createSecretKey, type KeyObject } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHmac, createSecretKey, getCiphers, type KeyObject } from 'node:crypto';
 import { ChaCha20Poly1305 } from './chacha.js';
 
 // ---------------------------------------------------------------- PRF
@@ -52,9 +52,7 @@ export interface CipherSuite {
 }
 
 /**
- * Supported suites, in our default preference order: ChaCha20-Poly1305 first
- * (allocation-free JS AEAD, faster than node:crypto for the small records of
- * a game: docs/10 §6.3), then AES-128-GCM (every browser), then AES-256-GCM.
+ * Supported suites (the default preference order is {@link defaultSuites}).
  */
 export const SUITES: readonly CipherSuite[] = [
   {
@@ -86,6 +84,21 @@ export const SUITES: readonly CipherSuite[] = [
   },
 ];
 
+const isBun = (process.versions as { bun?: string }).bun !== undefined;
+
+/**
+ * Default server preference order. Node: ChaCha20-Poly1305 first (the
+ * allocation-free JS AEAD beats node:crypto for the small records of a game:
+ * docs/10 §6.3), then AES-128-GCM (every browser), then AES-256-GCM.
+ * Bun: AES-128-GCM first — Bun's node:crypto AES-GCM is cheap (seal+open of
+ * 300 B ≈ 2.9 µs vs ≈ 10.4 µs for the JS ChaCha20-Poly1305), worth its
+ * 8-byte explicit nonce per record — then ChaCha20-Poly1305, AES-256-GCM.
+ * Either is overridden by an explicit suite list (`suites` / `cipherSuites`).
+ */
+export function defaultSuites(bun = isBun): number[] {
+  return bun ? [0xc02b, 0xcca9, 0xc02c] : [0xcca9, 0xc02b, 0xc02c];
+}
+
 /** Suite ids or IANA names (`TLS_ECDHE_ECDSA_WITH_…`, or the short OpenSSL-style `chacha20` / `aes128gcm` / `aes256gcm`) → ids. Throws on unknown entries. */
 export function resolveSuites(list: readonly (number | string)[]): number[] {
   const out: number[] = [];
@@ -111,8 +124,19 @@ export const TAG_LENGTH = 16;
 const EMPTY = new Uint8Array(0);
 export const RECORD_HEADER = 13;
 
-/** How ChaCha20-Poly1305 records are protected: the JS AEAD (default) or node:crypto (diagnostics / A-B). */
+/**
+ * How ChaCha20-Poly1305 records are protected: the JS AEAD (default) or
+ * node:crypto (diagnostics / A-B). 'node' falls back to the JS AEAD where
+ * node:crypto lacks chacha20-poly1305 (Bun).
+ */
 export type ChaChaImpl = 'js' | 'node';
+
+let nativeChaCha: boolean | null = null;
+
+/** node:crypto implements chacha20-poly1305 (Node: yes; Bun 1.x: no). */
+export function hasNativeChaCha(): boolean {
+  return (nativeChaCha ??= getCiphers().includes('chacha20-poly1305'));
+}
 
 /**
  * One direction of record protection for one epoch. `seal`/`open` take the
@@ -133,7 +157,7 @@ export class RecordCipher {
     this.suite = suite;
     this.key = key;
     this.iv = iv;
-    this.js = suite.cipher === 'chacha20-poly1305' && chacha === 'js' ? new ChaCha20Poly1305(key) : null;
+    this.js = suite.cipher === 'chacha20-poly1305' && (chacha === 'js' || !hasNativeChaCha()) ? new ChaCha20Poly1305(key) : null;
     this.keyObject = this.js === null ? createSecretKey(key) : null;
   }
 

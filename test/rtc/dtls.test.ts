@@ -7,7 +7,7 @@
 import { createHash, createHmac } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { RtcCertificate } from '../../src/rtc/cert.js';
-import { RecordCipher, ReplayWindow, SUITES, prf } from '../../src/rtc/dtls/crypto.js';
+import { RecordCipher, ReplayWindow, SUITES, defaultSuites, hasNativeChaCha, prf } from '../../src/rtc/dtls/crypto.js';
 import { DtlsServer } from '../../src/rtc/dtls/server.js';
 import {
   clientHelloDatagram,
@@ -82,6 +82,31 @@ describe('DTLS primitives', () => {
       bad[bad.length - 1] = bad[bad.length - 1]! ^ 1;
       expect(rx.open(23, 0xfefd, 1, 0, 42, bad)).toBeNull();
     }
+  });
+
+  it('record ciphers: the JS and node:crypto ChaCha20-Poly1305 (when present) are interchangeable', () => {
+    const suite = SUITES.find((s) => s.id === 0xcca9)!;
+    const key = Buffer.alloc(32, 7);
+    const iv = Buffer.alloc(12, 3);
+    const js = new RecordCipher(suite, key, iv, 'js');
+    const node = new RecordCipher(suite, key, iv, 'node'); // JS fallback where node:crypto lacks it (Bun)
+    for (const [tx, rx] of [
+      [js, node],
+      [node, js],
+    ] as const) {
+      const pt = Buffer.from('ping 0123456789');
+      const out = Buffer.alloc(pt.length + tx.overhead);
+      tx.seal(23, 0xfefd, 1, 0, 9, pt, out, 0);
+      expect(rx.open(23, 0xfefd, 1, 0, 9, Buffer.from(out))?.toString()).toBe('ping 0123456789');
+    }
+    expect(typeof hasNativeChaCha()).toBe('boolean');
+  });
+
+  it('default suite order: ChaCha20-Poly1305 first on Node, AES-128-GCM first on Bun', () => {
+    expect(defaultSuites(false)).toEqual([0xcca9, 0xc02b, 0xc02c]);
+    expect(defaultSuites(true)).toEqual([0xc02b, 0xcca9, 0xc02c]);
+    expect(defaultSuites()).toEqual(defaultSuites('bun' in process.versions));
+    for (const id of defaultSuites(true)) expect(SUITES.some((s) => s.id === id)).toBe(true);
   });
 
   it('self-signed certificate is valid X.509 (openssl-compatible, verifies itself)', () => {

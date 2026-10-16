@@ -42,7 +42,7 @@ import {
   type KeyObject,
 } from 'node:crypto';
 import type { RtcCertificate } from '../cert.js';
-import { RECORD_HEADER, RecordCipher, ReplayWindow, SUITES, TAG_LENGTH, prf, type ChaChaImpl, type CipherSuite } from './crypto.js';
+import { RECORD_HEADER, RecordCipher, ReplayWindow, SUITES, TAG_LENGTH, defaultSuites, prf, type ChaChaImpl, type CipherSuite } from './crypto.js';
 
 export const ContentType = { ChangeCipherSpec: 20, Alert: 21, Handshake: 22, ApplicationData: 23 } as const;
 
@@ -149,9 +149,12 @@ export interface DtlsServerOptions {
   mtu?: number;
   /** First retransmission timeout of flight 4 (default 1000 ms, doubles up to 8 s). */
   retransmitMs?: number;
-  /** Cipher suites in preference order (default: all of {@link SUITES}, ChaCha20-Poly1305 first). */
+  /**
+   * Cipher suites in preference order (default {@link defaultSuites}: ChaCha20-Poly1305
+   * first on Node, AES-128-GCM first on Bun).
+   */
   suites?: readonly number[];
-  /** ChaCha20-Poly1305 implementation (default 'js', allocation-free). */
+  /** ChaCha20-Poly1305 implementation (default 'js', allocation-free; 'node' is 'js' on Bun). */
   chacha?: ChaChaImpl;
 }
 
@@ -386,7 +389,7 @@ export class DtlsServer {
     this.opts = opts;
     this.mtu = opts.mtu ?? 1200;
     this.retransmitMs = opts.retransmitMs ?? 1000;
-    this.suitePrefs = opts.suites ?? SUITES.map((s) => s.id);
+    this.suitePrefs = opts.suites ?? defaultSuites();
   }
 
   get connected(): boolean {
