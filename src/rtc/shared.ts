@@ -45,6 +45,20 @@ function idOf(o: object): number {
   return id;
 }
 
+/**
+ * ICE servers without credentials: rooms that fetch their own short-lived
+ * TURN credentials (one per room) still share the endpoint; it keeps the
+ * first room's credentials until one calls `setIceServers`.
+ */
+function serversKey(list: RtcEndpointOptions['iceServers']): unknown {
+  if (list === undefined) return null;
+  return list.map((s) => {
+    if (typeof s === 'string') return s.replace(/^(turns?):[^@\s]*@/i, '$1:');
+    if ('urls' in s) return { urls: s.urls };
+    return { hostname: s.hostname, port: s.port, relayType: s.relayType ?? null };
+  });
+}
+
 /** Endpoints are shared only between identical configurations. */
 export function sharedEndpointKey(o: RtcEndpointOptions): string {
   return JSON.stringify([
@@ -53,7 +67,8 @@ export function sharedEndpointKey(o: RtcEndpointOptions): string {
     o.ipv6 === true,
     o.publicAddresses !== undefined ? [...o.publicAddresses] : null,
     o.iceLite === true,
-    o.iceServers ?? null,
+    serversKey(o.iceServers),
+    o.iceTransportPolicy ?? 'all',
     typeof o.candidatePolicy === 'function' ? idOf(o.candidatePolicy) : (o.candidatePolicy ?? null),
     o.gatherRefreshMs ?? null,
     o.publicPort ?? null,

@@ -59,7 +59,7 @@ import { freezeSctpClock, thawSctpClock } from '../rtc/sctp/clock.js';
 import { beginUdpBatch, endUdpBatch } from '../rtc/udp.js';
 import { classifyAddress, type IceCandidatePolicy, type IceServerConfig } from './ice.js';
 import { DEFAULT_ICE_SERVERS } from './constants.js';
-import type { PeerBackend, PeerLink, PeerLinkEvents } from './peer-backend.js';
+import type { PeerBackend, PeerLink, PeerLinkEvents, PeerOfferInfo } from './peer-backend.js';
 
 export interface RtcBackendOptions {
   /**
@@ -99,12 +99,19 @@ export interface RtcBackendOptions {
    */
   iceLite?: boolean;
   /**
-   * STUN servers for server-reflexive candidates. Default: `[]` when
-   * `publicAddresses` is set, else the transport's `iceServers`
-   * (default `stun:stun.l.google.com:19302`, as for `ndc`). TURN entries are
-   * ignored (relay not implemented, see docs/10).
+   * STUN and TURN servers. Default: `[]` when `publicAddresses` is set,
+   * else the transport's `iceServers` (default `stun:stun.l.google.com:19302`,
+   * as for `ndc`). A UDP `turn:` server gives a relay candidate (one
+   * allocation per endpoint, src/rtc/turn.ts); `turns:` and TCP entries are
+   * skipped. See docs/10.
    */
   iceServers?: readonly IceServerConfig[];
+  /**
+   * `'relay'`: announce only the TURN relay candidate and talk to players only
+   * through it (the host's IP never reaches them); needs a `turn:` server.
+   * Default: the transport's `rtc.iceTransportPolicy`, else `'all'`.
+   */
+  iceTransportPolicy?: 'all' | 'relay';
   /**
    * Which interface addresses are announced and which remote address classes
    * may receive our checks (default: the transport's `iceCandidatePolicy`,
@@ -423,7 +430,9 @@ export class RtcPeerBackend implements PeerBackend {
   private readonly opts: RtcBackendOptions;
   /** Explicit (or, for ICE-lite, detected) public addresses; undefined: full ICE gathers. */
   private readonly publicAddresses: string[] | undefined;
-  private readonly iceServers: readonly IceServerConfig[];
+  private iceServers: readonly IceServerConfig[];
+  /** `iceTransportPolicy: 'relay'`. */
+  private readonly relayOnly: boolean;
   private readonly policy: IceCandidatePolicy;
   /** start() generation: a listen that completes after stop() is discarded. */
   private generation = 0;
@@ -446,8 +455,12 @@ export class RtcPeerBackend implements PeerBackend {
    * @param defaults the transport's `iceServers` / `iceCandidatePolicy`
    *   (used when `opts` does not set its own).
    */
-  constructor(opts: RtcBackendOptions = {}, defaults: { iceServers?: readonly IceServerConfig[]; iceCandidatePolicy?: IceCandidatePolicy } = {}) {
+  constructor(
+    opts: RtcBackendOptions = {},
+    defaults: { iceServers?: readonly IceServerConfig[]; iceCandidatePolicy?: IceCandidatePolicy; iceTransportPolicy?: 'all' | 'relay' } = {},
+  ) {
     this.opts = opts;
+    this.relayOnly = (opts.iceTransportPolicy ?? defaults.iceTransportPolicy) === 'relay';
     const bf = opts.sendBatchFrames ?? 0;
     if (bf !== 0 && bf !== 1 && bf !== 2) throw new Error(`peerBackend 'rtc': sendBatchFrames must be 0, 1 or 2 (got ${String(bf)})`);
     this.batchFrames = bf;
@@ -518,6 +531,7 @@ export class RtcPeerBackend implements PeerBackend {
       ...(this.publicAddresses !== undefined ? { publicAddresses: this.publicAddresses } : null),
       ...(o.iceLite === true ? { iceLite: true } : null),
       ...(this.iceServers.length > 0 ? { iceServers: this.iceServers } : null),
+      ...(this.relayOnly ? { iceTransportPolicy: 'relay' as const } : null),
       ...(this.policy !== 'public' ? { candidatePolicy: this.policy } : null),
       ...(o.gatherRefreshMs !== undefined ? { gatherRefreshMs: o.gatherRefreshMs } : null),
       ...(o.address !== undefined ? { address: o.address } : null),
@@ -612,21 +626,42 @@ export class RtcPeerBackend implements PeerBackend {
     return this.closing;
   }
 
-  createPeer(_id: number, offerSdp: string, ev: PeerLinkEvents): PeerLink {
+  createPeer(_id: number, offerSdp: string, ev: PeerLinkEvents, info?: PeerOfferInfo): PeerLink {
     const ep = this.ep;
+    const ip = info?.ip;
     if (ep === null) {
       if (!this.starting) throw new Error("peerBackend 'rtc' is not listening");
       // the socket is still binding (an offer within ms of the room's registration)
-      return new DeferredRtcPeerLink(this, offerSdp, ev, this.deferred);
+      return new DeferredRtcPeerLink(this, offerSdp, ev, this.deferred, ip);
     }
-    return this.attach(ep, offerSdp, ev);
+    return this.attach(ep, offerSdp, ev, ip);
   }
 
-  /** Session for `offerSdp` on `ep`, answer delivered synchronously. Throws RtcSdpError on an unusable offer. */
-  attach(ep: RtcEndpoint, offerSdp: string, ev: PeerLinkEvents): RtcPeerLink {
-    const s = ep.createSession(offerSdp); // throws RtcSdpError on an unusable offer: nothing left behind
+  /**
+   * Replaces the STUN/TURN servers (fresh short-lived TURN credentials): the
+   * endpoint's next Allocate uses them, and so does an endpoint started later.
+   */
+  setIceServers(list: readonly IceServerConfig[]): void {
+    if (this.owned) this.iceServers = list;
+    this.ep?.setIceServers(list);
+  }
+
+  /**
+   * Session for `offerSdp` on `ep`, answer delivered synchronously (relay-only
+   * without an allocation yet: with the first candidate). Throws RtcSdpError
+   * on an unusable offer. `ip`: where the client reached the master from
+   * (a TURN permission for it up front).
+   */
+  attach(ep: RtcEndpoint, offerSdp: string, ev: PeerLinkEvents, ip?: string): RtcPeerLink {
+    // throws RtcSdpError on an unusable offer: nothing left behind
+    const s = ep.createSession(offerSdp, ip !== undefined && ip !== '' ? { remoteIp: ip } : undefined);
     const link = new RtcPeerLink(s, ev, this.links, this.batchFrames);
     this.links.add(link);
+    if (ep.relayOnly && s.localCandidates.length === 0 && !s.gatheringComplete) {
+      // never answer without a candidate: the answer leaves with the relay candidate (or the session fails)
+      link.deferAnswer(s.answerSdp);
+      return link;
+    }
     ev.onLocalDescription(s.answerSdp);
     if (!link.closed) for (const c of s.localCandidates) ev.onLocalCandidate(c, s.mid);
     // srflx candidates of a running STUN round follow through the session callbacks (RtcPeerLink)
@@ -647,7 +682,7 @@ class DeferredRtcPeerLink implements PeerLink {
   private readonly candidates: string[] = [];
   private readonly owner: Set<DeferredRtcPeerLink>;
 
-  constructor(backend: RtcPeerBackend, offerSdp: string, ev: PeerLinkEvents, owner: Set<DeferredRtcPeerLink>) {
+  constructor(backend: RtcPeerBackend, offerSdp: string, ev: PeerLinkEvents, owner: Set<DeferredRtcPeerLink>, ip?: string) {
     this.owner = owner;
     owner.add(this);
     const fail = (err: unknown) => {
@@ -663,7 +698,7 @@ class DeferredRtcPeerLink implements PeerLink {
       const ep = backend.endpoint;
       if (ep === null) return fail(new Error("peerBackend 'rtc' is not listening"));
       try {
-        this.link = backend.attach(ep, offerSdp, ev);
+        this.link = backend.attach(ep, offerSdp, ev, ip);
       } catch (err) {
         return fail(err);
       }
@@ -690,7 +725,7 @@ class DeferredRtcPeerLink implements PeerLink {
 
 /** Close reasons that mean the connection never worked / was lost (→ `'failed'`). */
 function isFailure(reason: string): boolean {
-  return reason === 'timeout' || reason === 'handshake-timeout' || reason.startsWith('dtls-') || reason === 'sctp:timeout' || reason === 'sctp:init-timeout';
+  return reason === 'timeout' || reason === 'handshake-timeout' || reason === 'turn-unavailable' || reason.startsWith('dtls-') || reason === 'sctp:timeout' || reason === 'sctp:init-timeout';
 }
 
 class RtcPeerLink implements PeerLink {
@@ -698,6 +733,8 @@ class RtcPeerLink implements PeerLink {
   private readonly s: RtcSession;
   private readonly owner: Set<RtcPeerLink>;
   closed = false;
+  /** Relay-only: the answer, held until the first candidate (or the end of gathering). */
+  private pendingAnswer: string | null = null;
   /** LINK_IDLE, LINK_HELD (corked, in the batcher) or LINK_BUNDLED (corked, in the bundler). */
   mode = LINK_IDLE;
   /** Grid index the held messages are due at (LINK_HELD). */
@@ -726,8 +763,18 @@ class RtcPeerLink implements PeerLink {
     // the browser closed one channel (dc.close() → stream reset), like node-datachannel's DataChannel `closed`
     s.onChannelClose = (ch) => this.ev?.onChannelClosed(ch);
     // trickle: candidates found by a STUN round still running when the answer was built
-    s.onLocalCandidate = (c) => this.ev?.onLocalCandidate(c, s.mid);
-    s.onGatheringComplete = () => this.ev?.onGatheringComplete();
+    s.onLocalCandidate = (c) => {
+      const e = this.ev;
+      if (e === null) return;
+      this.releaseAnswer(e);
+      e.onLocalCandidate(c, s.mid);
+    };
+    s.onGatheringComplete = () => {
+      const e = this.ev;
+      if (e === null) return;
+      this.releaseAnswer(e);
+      e.onGatheringComplete();
+    };
     s.onClose = (reason) => {
       const e = this.ev;
       this.release();
@@ -736,6 +783,18 @@ class RtcPeerLink implements PeerLink {
       e.onChannelClosed(0);
       e.onConnectionState(isFailure(reason) ? 'failed' : 'closed');
     };
+  }
+
+  /** Holds the answer until the session has a candidate (relay-only waiting for the TURN allocation). */
+  deferAnswer(sdp: string): void {
+    this.pendingAnswer = sdp;
+  }
+
+  private releaseAnswer(e: PeerLinkEvents): void {
+    const sdp = this.pendingAnswer;
+    if (sdp === null) return;
+    this.pendingAnswer = null;
+    e.onLocalDescription(sdp);
   }
 
   addRemoteCandidate(candidate: string): void {

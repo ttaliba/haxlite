@@ -180,19 +180,74 @@ por cada Binding del navegador, una búsqueda en ≤ 16 pares. La ruta DTLS/SCTP
   reintenta. Converge con cualquier agente RFC 8445; un par ICE‑lite (ningún cliente de HaxBall lo
   es) no podría conectar.
 
-**TURN (RFC 8656): no implementado; diseño previsto.** Coste/beneficio: ni el cliente oficial (solo
-`stun.l.google.com`) ni `ndc` con la configuración por defecto usan TURN, así que la paridad con
-node-datachannel no lo necesita; solo ayudaría cuando el host está tras un NAT simétrico **y** el
-jugador también (ningún lado puede aprender un prflx útil del otro). Implementarlo toca la ruta de
-envío (cada datagrama a un par *relay* lleva una cabecera ChannelData de 4 B), por eso quedó fuera de
-esta pasada. Diseño: una asignación (Allocate con credenciales de largo plazo, REALM/NONCE, Refresh
-antes de `LIFETIME`) **por endpoint** desde el mismo socket, que da un candidato `relay` compartido
-por todas las sesiones; por jugador, CreatePermission para la IP de cada candidato remoto y
-ChannelBind para el par elegido (Send/Data indications mientras tanto); en el demux, el rango
-64–79 de RFC 7983 (ChannelData) y las Data indications del servidor TURN se desenvuelven y se vuelven
-a demultiplexar como STUN/DTLS con la dirección del par como origen; `ValidatedAddress` lleva una
-marca `relay` y `sendTo` antepone la cabecera solo en ese caso (sin coste para los pares directos).
-Las entradas `turn:`/`turns:` de `iceServers` se ignoran hoy.
+### 2.2 TURN (RFC 8656, `turn.ts`)
+
+Con una entrada `turn:` (UDP) en `iceServers` el endpoint hace **una asignación** desde su propio
+socket IPv4 y anuncia su dirección relayed como candidato `relay` (`raddr 0.0.0.0 rport 0`) en todas
+las respuestas, sin ningún otro ajuste. Sin `turn:` no cambia nada y no se asigna nada.
+
+* **Allocate** con credenciales de largo plazo: la primera petición va sin autenticar, el 401 trae
+  REALM/NONCE; después USERNAME/REALM/NONCE + MESSAGE‑INTEGRITY con MD5(usuario:realm:clave). 438
+  (nonce caducado) se reintenta; 437 (asignación de un proceso anterior en el mismo puerto) se borra
+  con Refresh de LIFETIME 0 y se repite. Refresh un minuto antes de LIFETIME (a la mitad si es < 2 min).
+  Si el Allocate no contesta se prueba **en el acto** el siguiente servidor de la lista (p. ej. el
+  puerto 53 de Cloudflare tras el 3478); agotada la lista, reintento con espera 5 s → 5 min. Una
+  asignación perdida se rehace en el acto y las sesiones nuevas reciben el candidato nuevo.
+* La primera ronda de recolección espera la asignación como a una respuesta STUN (≤ 3 s, dos
+  idas y vueltas por el 401); su XOR‑MAPPED‑ADDRESS cuenta como srflx.
+* **Permisos**: CreatePermission para la IP de cada candidato remoto que se empareja con el relay,
+  **y para la IP desde la que el jugador llegó al maestro** (`offer.ip`, `createSession(sdp, {remoteIp})`):
+  con CGNAT de pool no emparejado el NAT del jugador puede salir hacia el TURN por otra IP que hacia
+  el STUN de Google, y con candidatos solo mDNS no hay otra; sin permiso el servidor TURN descarta
+  sus checks. Todas las IP de un mismo turno van en **un** CreatePermission. Lo que se manda a una IP
+  cuyo permiso está en vuelo se encola (≤ 4) y sale al instalarse: el primer check no paga un RTO.
+* **Canales**: al primer datagrama DTLS hacia un par (validado) se hace ChannelBind; desde ahí cada
+  datagrama lleva 4 B de ChannelData en vez de ~36 B de Send/Data indication. Permisos (~4 min) y
+  canales (~8 min) se renuevan solo mientras hay tráfico; los números libres se reutilizan tras el
+  enfriamiento del RFC.
+* **ICE**: cada candidato remoto IPv4 de una clase que la política permite tiene además un par sobre
+  el relay (prioridad local de tipo `relay`, se comprueba después de los directos). `TurnRelay`
+  implementa la misma interfaz que el socket (`PacketIo`): pares, direcciones validadas, consentimiento
+  y DTLS funcionan igual; el demux solo mira el puerto del servidor TURN (una comparación por
+  datagrama) y las direcciones validadas por el relay viven en su propio mapa.
+* Solo UDP hacia el servidor TURN y direcciones relayed IPv4: `turns:` y `?transport=tcp` se omiten.
+
+**Solo relay (`iceTransportPolicy: 'relay'`)** — el equivalente a `rtc: { iceTransportPolicy: 'relay' }`
+de node-datachannel (se toma de ahí en `HostTransport`, o `rtcEndpoint.iceTransportPolicy`): solo se
+anuncia el candidato relay (la IP del host nunca aparece en el SDP), checks/consentimiento/DTLS solo
+por el relay y nada que llegue directo de un jugador se contesta (`stats().directDropped`). Necesita
+un `turn:` (si no, `listen` falla). Una sesión sin asignación lista **no** se contesta sin candidatos:
+la respuesta sale con el candidato relay; si no hay asignación posible la sesión se cierra con
+`'turn-unavailable'` (el join falla limpio, `stats().relayUnavailable`).
+
+**Credenciales cortas (Cloudflare).** `iceServers` acepta tal cual la respuesta de
+`generate-ice-servers` (se usan `turn:…:3478?transport=udp` y luego `:53`). Para renovarlas sin
+reiniciar la sala: `room.haxlite.setIceServers(lista)` (o `HostTransport.setIceServers`,
+`RtcEndpoint.setIceServers`). Las nuevas se usan en el siguiente Allocate; si el servidor es el
+mismo, también en los siguientes Refresh/CreatePermission/ChannelBind de la asignación actual (un 401
+con la clave vieja se reintenta con la nueva). Si el servidor rechaza las credenciales de la
+asignación (401/441) se pierde y se rehace con las nuevas. Recomendado: TTL largo (p. ej. 24 h) y
+renovar a la mitad:
+
+```js
+async function cfIce() {
+  const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${KEY_ID}/credentials/generate-ice-servers`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${API_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ttl: 86400 }),
+  });
+  return (await r.json()).iceServers;
+}
+const room = await HBInit({
+  roomName: 'sala', token,
+  haxlite: { peerBackend: 'rtc', iceServers: await cfIce(), rtc: { iceTransportPolicy: 'relay' } },
+});
+setInterval(async () => room.haxlite.setIceServers(await cfIce()), 12 * 3600_000);
+```
+
+Las salas de un mismo proceso con la misma configuración comparten endpoint aunque traigan
+credenciales distintas (la clave de compartición ignora usuario/clave); vale la última
+`setIceServers`.
 
 ## 3. Cómo activarlo: `peerBackend: 'rtc'`
 
@@ -976,9 +1031,10 @@ así una sala inactiva no arranca los 4 hilos del *thread pool* de libuv.
 
 ## 7. Limitaciones
 
-- **Sin TURN** (§2.1): con el host tras un NAT simétrico **y** el jugador también, no hay camino
-  (node-datachannel tampoco lo tiene con la configuración por defecto, sin servidor TURN). Con
-  `iceLite: true` vuelve a hacer falta IP pública o NAT 1:1.
+- **TURN solo por UDP** (§2.2): sin `turn:` configurado, con el host tras un NAT simétrico **y** el
+  jugador también no hay camino (igual que node-datachannel sin TURN). `turns:`/TCP no están
+  soportados; la dirección relayed es siempre IPv4. Con `iceLite: true` no hay TURN y vuelve a hacer
+  falta IP pública o NAT 1:1.
 - **Candidatos mDNS** (`*.local`) del navegador no se resuelven (tampoco en libdatachannel): con un
   jugador que solo ofrece mDNS y no tiene STUN, conecta solo si sus checks nos alcanzan (prflx).
 - Las interfaces se leen al escuchar (un cambio de IP local no se ve hasta reiniciar el endpoint);
@@ -1004,6 +1060,6 @@ todas las condiciones del banco (§5) y tras NAT simulado de puerto restringido,
 (§4.4), y node-datachannel deja de cargarse (sin hilos nativos ni riesgo de SIGABRT/SIGSEGV, §1). En
 contra, por ahora: Firefox/Safari/móviles sin probar (§5.2), IPv6 sin probar en esta VM, NAT
 **reales** (CGNAT de operadoras, routers domésticos con *hairpinning* raro, firewalls que limitan UDP)
-sin probar fuera del simulador, y sin TURN para quien lo configure. Recomendación: cambiarlo tras
+sin probar fuera del simulador (TURN: §2.2). Recomendación: cambiarlo tras
 una prueba de campo con jugadores reales detrás de un NAT doméstico (y Firefox), dejando
 `peerBackend: 'ndc'` como salida.

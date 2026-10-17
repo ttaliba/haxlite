@@ -35,6 +35,13 @@ export interface NatOptions {
   insideAddress?: string;
   /** Outside (WAN-side) address of the external sockets (default {@link insideAddress}). */
   outsideAddress?: string;
+  /**
+   * CGNAT-style address pool (non-"paired" pooling, RFC 4787 §4.1): each new
+   * mapping takes the next address of the pool round-robin instead of
+   * {@link outsideAddress}, so peers can see the inside host from different
+   * public IPs (e.g. one towards the STUN server, another towards a TURN relay).
+   */
+  outsidePool?: readonly string[];
   /** Log every decision. */
   verbose?: boolean;
 }
@@ -78,7 +85,8 @@ function bind(address: string): Promise<Socket> {
 
 export class UdpNat {
   readonly stats: NatStats = { out: 0, in: 0, dropped: 0, mappings: 0 };
-  private readonly o: Required<Omit<NatOptions, 'verbose'>> & { verbose: boolean };
+  private readonly o: Required<Omit<NatOptions, 'verbose' | 'outsidePool'>> & { verbose: boolean; outsidePool: readonly string[] };
+  private poolNext = 0;
   /** Every external port opened so far (tests: what a peer could have learned). */
   readonly externalPorts: number[] = [];
   /** outside address → alias socket. */
@@ -98,6 +106,7 @@ export class UdpNat {
       insideAddress: o.insideAddress ?? '127.0.0.1',
       outsideAddress: o.outsideAddress ?? o.insideAddress ?? '127.0.0.1',
       verbose: o.verbose ?? false,
+      outsidePool: o.outsidePool ?? [],
     };
   }
 
@@ -132,14 +141,16 @@ export class UdpNat {
     const k = mp === 'endpoint-independent' ? key(inside) : `${key(inside)}>${mp === 'address-dependent' ? dest.address : key(dest)}`;
     let p = this.mappings.get(k);
     if (p === undefined) {
-      p = bind(this.o.outsideAddress).then((ext) => {
+      const pool = this.o.outsidePool;
+      const outside = pool.length > 0 ? pool[this.poolNext++ % pool.length]! : this.o.outsideAddress;
+      p = bind(outside).then((ext) => {
         this.sockets.add(ext);
         this.externalPorts.push(ext.address().port);
         const m: Mapping = { inside, ext, extPort: ext.address().port, contacted: new Set() };
         this.stats.mappings++;
         ext.on('message', (msg, rinfo) => this.fromOutside(m, msg, { address: rinfo.address, port: rinfo.port }));
         ext.on('error', () => {});
-        this.log('new mapping', key(inside), '→ ext', m.extPort, 'for', key(dest));
+        this.log('new mapping', key(inside), '→ ext', `${outside}:${m.extPort}`, 'for', key(dest));
         return m;
       });
       this.mappings.set(k, p);

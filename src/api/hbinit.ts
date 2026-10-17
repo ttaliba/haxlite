@@ -461,6 +461,9 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
       const b = transport.backend;
       return b instanceof RtcPeerBackend ? b.stats() : null;
     },
+    setIceServers(list) {
+      transport.setIceServers(list);
+    },
     get rtcPort() {
       const b = transport.backend;
       return b instanceof RtcPeerBackend ? b.port : null;

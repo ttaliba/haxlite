@@ -27,7 +27,7 @@
  * pair, else the last validated DTLS source.
  */
 import { createSecretKey, type KeyObject } from 'node:crypto';
-import type { UdpIo } from './udp.js';
+import type { PacketIo } from './udp.js';
 import { DtlsServer } from './dtls/server.js';
 import type { OfferInfo } from './sdp.js';
 import { parseCandidate, type ParsedCandidate } from './sdp.js';
@@ -40,7 +40,7 @@ import { sameIp, type GatherWaiter } from './gather.js';
 /** A transport address that passed an authenticated Binding request for a session. */
 export interface ValidatedAddress {
   session: RtcSessionImpl;
-  sock: UdpIo;
+  sock: PacketIo;
   address: string;
   port: number;
   /** `address|port` (the DTLS server's peer key; bound into the HelloVerifyRequest cookie when that exchange is enabled). */
@@ -71,6 +71,10 @@ export interface SessionHost {
   now(): number;
   /** Full ICE (connectivity checks, consent checks); null = ICE-lite. */
   readonly ice: IceScheduler | null;
+  /** `iceTransportPolicy: 'relay'`: only relay candidates, no direct path. */
+  readonly relayOnly: boolean;
+  /** A relay-only session closed for want of a TURN allocation. */
+  countRelayUnavailable(): void;
   /** DTLS cookie exchange (HelloVerifyRequest) before any handshake state. */
   readonly helloVerify: boolean;
   /**
@@ -131,9 +135,9 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
   /** Where handshake flights go: the validated source of the ClientHello that started the handshake. */
   private dtlsFrom: ValidatedAddress | null = null;
   /** Full ICE: the latest USE-CANDIDATE from a source our check has not validated yet (nominated once it succeeds). */
-  private pendingNomination: { sock: UdpIo; address: string; port: number } | null = null;
+  private pendingNomination: { sock: PacketIo; address: string; port: number } | null = null;
   /** Full ICE: DTLS datagrams from sources awaiting our check (null: none). */
-  private held: { sock: UdpIo; address: string; port: number; buf: Buffer; at: number }[] | null = null;
+  private held: { sock: PacketIo; address: string; port: number; buf: Buffer; at: number }[] | null = null;
   private heldBytes = 0;
   /** Full ICE: `address|port` keys registered with {@link SessionHost.holdAddress} (the endpoint drops them on unregister). */
   readonly holdKeys: string[] = [];
@@ -223,6 +227,14 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
   /** Gathering round finished (endpoint): trickles the candidates this session did not announce yet. */
   onGathered(lines: readonly string[]): void {
     if (this.state === 'closed' || this.gatheringComplete) return;
+    if (this.host.relayOnly && lines.length === 0) {
+      // relay-only and no TURN allocation: nothing to announce, the peer could never connect
+      this.host.countRelayUnavailable();
+      this.terminate('turn-unavailable');
+      return;
+    }
+    // a relay that became ready during the round: pairs for the candidates already known
+    if (this.agent !== null) this.agent.relaysReady(this.remoteCandidates);
     for (const l of lines) {
       if (this.localCandidates.indexOf(l) >= 0) continue;
       this.localCandidates.push(l);
@@ -237,7 +249,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
    * proven, DTLS may come from / go to there; a USE-CANDIDATE received from it
    * meanwhile nominates it now, and DTLS held for it is processed.
    */
-  onCheckSucceeded(sock: UdpIo, address: string, port: number): void {
+  onCheckSucceeded(sock: PacketIo, address: string, port: number): void {
     if (this.state === 'closed') return;
     const v = this.validate(sock, address, port);
     this.lastConsent = this.host.now(); // a successful check is consent too (RFC 7675 §5.1)
@@ -269,7 +281,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
    * (a copy, bounded) until the check succeeds — usually the ClientHello,
    * racing our triggered check. Returns false when not kept.
    */
-  holdDtls(msg: Buffer, sock: UdpIo, address: string, port: number): boolean {
+  holdDtls(msg: Buffer, sock: PacketIo, address: string, port: number): boolean {
     if (this.state === 'closed' || this.agent === null) return false;
     const now = this.host.now();
     this.dropHeld(null, 0, now - HOLD_TTL_MS);
@@ -284,7 +296,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
    * Drops held datagrams from `sock`/`address`/`port` (sock null: from any
    * source) or received before `before` (ms, endpoint clock).
    */
-  private dropHeld(sock: UdpIo | null, port: number, before: number, address = ''): void {
+  private dropHeld(sock: PacketIo | null, port: number, before: number, address = ''): void {
     const held = this.held;
     if (held === null) return;
     for (let i = 0; i < held.length; ) {
@@ -302,7 +314,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
    * be released by a success — free its slots now (they could keep the real
    * path's ClientHello out), and its hold registration with them.
    */
-  onCheckFailed(sock: UdpIo, address: string, port: number): void {
+  onCheckFailed(sock: PacketIo, address: string, port: number): void {
     if (this.state === 'closed') return;
     this.dropHeld(sock, port, 0, address);
     this.host.unholdAddress(this, address, port);
@@ -321,7 +333,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
    * source becomes validated; full ICE: see the file comment.
    * Returns false when it was rejected (not authenticated / malformed).
    */
-  handleBinding(m: StunMessage, sock: UdpIo, address: string, port: number): boolean {
+  handleBinding(m: StunMessage, sock: PacketIo, address: string, port: number): boolean {
     if (this.state === 'closed') return false;
     // USERNAME = "ourUfrag:theirUfrag" exactly
     const want = this.expectedUsername;
@@ -362,7 +374,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
    * once our own check to it succeeds (file comment). Consent: our consent
    * checks, and requests from validated addresses only.
    */
-  private fullIceRequest(m: StunMessage, sock: UdpIo, address: string, port: number): void {
+  private fullIceRequest(m: StunMessage, sock: PacketIo, address: string, port: number): void {
     const v = this.findValidated(sock, address, port);
     this.host.sendTo(v ?? this.tempDest(sock, address, port), buildBindingSuccess(m.transactionId(), address, port, this.integrityKey));
     if (v !== null) {
@@ -382,7 +394,7 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
   }
 
   /** Marks (sock, address, port) valid for this session and claims its 5-tuple for the DTLS demux. */
-  private validate(sock: UdpIo, address: string, port: number): ValidatedAddress {
+  private validate(sock: PacketIo, address: string, port: number): ValidatedAddress {
     let v = this.findValidated(sock, address, port);
     if (v === null) {
       v = { session: this, sock, address, port, key: `${address}|${port}` };
@@ -406,11 +418,11 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
     return v;
   }
 
-  private tempDest(sock: UdpIo, address: string, port: number): ValidatedAddress {
+  private tempDest(sock: PacketIo, address: string, port: number): ValidatedAddress {
     return { session: this, sock, address, port, key: '' };
   }
 
-  private findValidated(sock: UdpIo, address: string, port: number): ValidatedAddress | null {
+  private findValidated(sock: PacketIo, address: string, port: number): ValidatedAddress | null {
     for (const v of this.validated) if (v.port === port && v.address === address && v.sock === sock) return v;
     return null;
   }

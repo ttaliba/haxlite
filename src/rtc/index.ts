@@ -4,6 +4,7 @@
  * DTLS 1.2 server + SCTP). See src/rtc/README.md.
  */
 export { RtcEndpoint, type RtcEndpointOptions, type RtcEndpointStats } from './endpoint.js';
+export { TurnRelay, turnServers, type TurnServerSpec, type TurnStats, type TurnState } from './turn.js';
 export { RtcCertificate } from './cert.js';
 export { RtcSdpError, parseOffer, type OfferInfo } from './sdp.js';
 export {

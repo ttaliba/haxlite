@@ -123,6 +123,15 @@ function bunHandleOf(sock: Socket): BunDgramHandle | null {
 /** Called with every received datagram (`buf` is the runtime's, owned by the callee). */
 export type DatagramHandler = (msg: Buffer, address: string, port: number) => void;
 
+/**
+ * Where an ICE pair / validated address sends from: a bound socket
+ * ({@link UdpIo}) or a TURN allocation relayed through one (`TurnRelay`,
+ * turn.ts). Same contract as {@link UdpIo.send}. Compared by identity.
+ */
+export interface PacketIo {
+  send(buf: Uint8Array, port: number, address: string): boolean;
+}
+
 /** Ring slot size: one DTLS record of an MTU-sized SCTP packet fits with room to spare. */
 const BATCH_SLOT = 2048;
 /** Datagrams per `sendMany` (a full ring is sent at once and reused). */

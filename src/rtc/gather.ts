@@ -20,13 +20,15 @@
  * `onGatheringComplete`); later sessions get the last result at once, even
  * while a refresh round runs in the background.
  *
- * TURN (`turn:`/`turns:` servers) is not implemented: see docs/10 §7 for the
- * design (one allocation per endpoint, permissions per peer, ChannelData
- * demux on the shared socket); such entries are ignored.
+ * * **relay** candidates: the XOR-RELAYED-ADDRESS of the endpoint's TURN
+ *   allocation (turn.ts, one per endpoint), when a `turn:` server is
+ *   configured; the allocation's XOR-MAPPED-ADDRESS counts as a srflx. A
+ *   round waits for the allocation like for a STUN answer; an allocation
+ *   made or lost between rounds updates the candidates of later sessions.
  */
 import { lookup } from 'node:dns';
 import { randomBytes } from 'node:crypto';
-import type { UdpIo } from './udp.js';
+import type { PacketIo, UdpIo } from './udp.js';
 import { isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { STUN_HEADER, StunAttr, StunType, findAttr, readXorAddress, type StunMessage } from './stun.js';
@@ -127,8 +129,8 @@ export interface StunServerSpec {
 /**
  * ICE server entries as accepted by `HostTransport` (`iceServers`): a URL
  * string (`stun:host:port`, `turn:…`), node-datachannel's object form or the
- * browser `RTCIceServer` form. Only STUN servers are used (TURN: not
- * implemented, ignored).
+ * browser `RTCIceServer` form. STUN servers are used here, UDP TURN
+ * servers by turn.ts (`turnServers`).
  */
 export type IceServerInput =
   | string
@@ -166,7 +168,7 @@ export function candidatePriority(typePreference: number, localPreference: numbe
 export const TYPE_PREF = { host: 126, prflx: 110, srflx: 100, relay: 0 } as const;
 
 export interface LocalCandidate {
-  type: 'host' | 'srflx';
+  type: 'host' | 'srflx' | 'relay';
   address: string;
   port: number;
 }
@@ -225,7 +227,7 @@ export function hasGlobalIpv6(): boolean {
 // ---------------------------------------------------------------- STUN transactions
 
 /** Response to a STUN request we sent (the endpoint routes Binding responses by transaction id). */
-export type TxnHandler = (m: StunMessage, sock: UdpIo, address: string, port: number) => void;
+export type TxnHandler = (m: StunMessage, sock: PacketIo, address: string, port: number) => void;
 
 export interface TxnTable {
   register(txid: string, h: TxnHandler): void;
@@ -296,6 +298,19 @@ export interface GathererOptions {
   timeoutMs?: number;
   /** DNS lookup (tests). */
   lookup?: (host: string) => Promise<{ address: string; family: number }[]>;
+  /** TURN allocations whose relayed address is a candidate (turn.ts `TurnRelay`). */
+  relays?: readonly GatherRelay[];
+  /** Relay candidates only (`iceTransportPolicy: 'relay'`): no host, no srflx, no STUN. */
+  relayOnly?: boolean;
+}
+
+/** What the gatherer needs from a TURN allocation (`TurnRelay`). */
+export interface GatherRelay {
+  readonly ready: boolean;
+  readonly relayed: { address: string; port: number } | null;
+  readonly mapped: { address: string; port: number } | null;
+  /** Makes the allocation if there is none; `done` when made or failed. */
+  allocate(done: (ok: boolean) => void): void;
 }
 
 /** Something waiting for a gathering round (a session created while it ran). */
@@ -316,6 +331,8 @@ function defaultLookup(host: string): Promise<{ address: string; family: number 
 export class Gatherer {
   private readonly host: GathererHost;
   private readonly o: GathererOptions;
+  /** STUN servers (replaceable: {@link setStunServers}). */
+  private stun: readonly StunServerSpec[];
   private readonly hostCands: LocalCandidate[] = [];
   private srflx: LocalCandidate[] = [];
   /** Current candidate lines (host then srflx). */
@@ -334,7 +351,10 @@ export class Gatherer {
   constructor(host: GathererHost, o: GathererOptions) {
     this.host = host;
     this.o = o;
-    if (o.publicAddresses !== undefined && o.publicAddresses.length > 0) {
+    this.stun = o.stunServers;
+    if (o.relayOnly === true) {
+      // our own addresses are never announced
+    } else if (o.publicAddresses !== undefined && o.publicAddresses.length > 0) {
       const port = o.publicPort ?? o.port;
       for (const address of o.publicAddresses) this.hostCands.push({ type: 'host', address, port });
     } else {
@@ -349,7 +369,7 @@ export class Gatherer {
 
   /** Whether STUN servers are configured at all. */
   get enabled(): boolean {
-    return this.o.stunServers.length > 0;
+    return this.stun.length > 0 || (this.o.relays?.length ?? 0) > 0;
   }
 
   get isGathering(): boolean {
@@ -383,6 +403,8 @@ export class Gatherer {
     if (this.enabled && !this.gathering && !this.closed) {
       const refresh = this.o.refreshMs ?? 60_000;
       if (this.lastDone === 0 || this.host.now() - this.lastDone > refresh) this.start();
+      // relay-only without an allocation: the session waits for the (re)allocation instead of getting nothing
+      else if (this.o.relayOnly === true && this.lines.length === 0) this.start();
     }
     return { lines: this.lines.slice(), complete: !this.gathering };
   }
@@ -417,11 +439,40 @@ export class Gatherer {
       this.finishRound(found, mapped);
     };
     const doLookup = this.o.lookup ?? defaultLookup;
-    pending = this.o.stunServers.length;
+    const relays = this.o.relays ?? [];
+    const stun = this.stun;
+    pending = stun.length + relays.length;
     const oneDone = () => {
       if (--pending === 0) finish();
     };
-    for (const server of this.o.stunServers) {
+    const addMapped = (r: { address: string; port: number } | null) => {
+      if (r === null || isIP(r.address) === 0 || r.port <= 0) return;
+      mapped.push(r);
+      if (!found.some((c) => c.address === r.address && c.port === r.port)) found.push({ type: 'srflx', address: r.address, port: r.port });
+    };
+    for (const relay of relays) {
+      // Allocate takes two round trips (401 first): twice a STUN query's budget, then the round goes on
+      // without it (a late allocation still reaches later sessions, see relaysChanged)
+      let over = false;
+      const t = setTimeout(() => {
+        this.timers.delete(t);
+        if (!over) {
+          over = true;
+          oneDone();
+        }
+      }, 2 * (this.o.timeoutMs ?? 1500));
+      t.unref?.();
+      this.timers.add(t);
+      relay.allocate(() => {
+        clearTimeout(t);
+        this.timers.delete(t);
+        if (over) return;
+        over = true;
+        addMapped(relay.mapped);
+        oneDone();
+      });
+    }
+    for (const server of stun) {
       // a hanging resolver (offline host) must not keep the round open: same budget as a query
       let lookupTimer: NodeJS.Timeout | null = null;
       const lookupTimeout = new Promise<{ address: string; family: number }[]>((resolve) => {
@@ -440,10 +491,7 @@ export class Gatherer {
               if (s === undefined) continue;
               pending++;
               this.query(s.sock, a.address, server.port, (r) => {
-                if (r !== null && isIP(r.address) !== 0 && r.port > 0) {
-                  mapped.push(r);
-                  if (!found.some((c) => c.address === r.address && c.port === r.port)) found.push({ type: 'srflx', address: r.address, port: r.port });
-                }
+                addMapped(r);
                 oneDone();
               });
             }
@@ -496,7 +544,7 @@ export class Gatherer {
     if (this.closed) return;
     this.mapped = mapped;
     // a reflexive address equal to a host candidate (public interface, no NAT) is redundant
-    const srflx = found.filter((c) => !this.hostCands.some((h) => sameIp(h.address, c.address) && h.port === c.port));
+    const srflx = this.o.relayOnly === true ? [] : found.filter((c) => !this.hostCands.some((h) => sameIp(h.address, c.address) && h.port === c.port));
     // keep previously found srflx that this round missed (a lost reply): replaced on the next success
     if (srflx.length > 0 || this.srflx.length === 0) this.srflx = srflx;
     this.rebuild();
@@ -506,7 +554,19 @@ export class Gatherer {
   }
 
   private rebuild(): void {
-    this.lines = formatCandidates([...this.hostCands, ...this.srflx]);
+    const relay: LocalCandidate[] = [];
+    for (const r of this.o.relays ?? []) if (r.ready && r.relayed !== null) relay.push({ type: 'relay', address: r.relayed.address, port: r.relayed.port });
+    this.lines = formatCandidates([...this.hostCands, ...this.srflx, ...relay]);
+  }
+
+  /** Replaces the STUN servers (from the next round). */
+  setStunServers(list: readonly StunServerSpec[]): void {
+    this.stun = list;
+  }
+
+  /** A TURN allocation was made or lost outside a round: later sessions get the new candidate set. */
+  relaysChanged(): void {
+    if (!this.closed && !this.gathering) this.rebuild();
   }
 
   close(): void {

@@ -208,7 +208,10 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
    * STUN/TURN servers (default Google STUN, like the official host): libdatachannel
    * URLs (`stun:host:port`, `turn:user:pass@host:port?transport=tcp`, `turns:…`),
    * node-datachannel objects or browser `RTCIceServer`s (`{urls, username, credential}`).
-   * For relay-only operation add `rtc: { iceTransportPolicy: 'relay' }`.
+   * For relay-only operation add `rtc: { iceTransportPolicy: 'relay' }` (also
+   * honoured by `peerBackend: 'rtc'`, whose TURN client is UDP-only:
+   * `turns:` and `?transport=tcp` entries are skipped there). Replace them at
+   * runtime (short-lived TURN credentials) with {@link HostTransport.setIceServers}.
    */
   iceServers?: readonly IceServerConfig[];
   /**
@@ -387,6 +390,17 @@ export class HostTransport {
   private readonly roomInfo: RoomInfo;
   private readonly roomInfoWriter = new Writer(64);
 
+  /**
+   * Replaces the STUN/TURN servers at runtime, e.g. fresh short-lived TURN
+   * credentials (Cloudflare's `generate-ice-servers`). `'rtc'`: the next TURN
+   * Allocate uses them (the current allocation keeps its credentials until
+   * the server refuses them, then it is re-made; see docs/10). `'ndc'`: new
+   * PeerConnections use them. Ignored by an edge backend.
+   */
+  setIceServers(list: readonly IceServerConfig[]): void {
+    this.backend.setIceServers?.(list);
+  }
+
   constructor(opts: HostTransportOptions) {
     this.opts = opts;
     if (opts.backend != null) this.backend = opts.backend;
@@ -395,6 +409,7 @@ export class HostTransport {
       this.backend = new RtcPeerBackend(opts.rtcEndpoint ?? {}, {
         ...(opts.iceServers !== undefined ? { iceServers: opts.iceServers } : null),
         ...(opts.iceCandidatePolicy !== undefined ? { iceCandidatePolicy: opts.iceCandidatePolicy } : null),
+        ...(opts.rtc?.iceTransportPolicy === 'relay' ? { iceTransportPolicy: 'relay' as const } : null),
       });
     }
     else {
@@ -844,7 +859,7 @@ export class HostTransport {
     };
     let link: PeerLink;
     try {
-      link = this.backend.createPeer(peer.id, offer.sdp, events);
+      link = this.backend.createPeer(peer.id, offer.sdp, events, { ip: offer.ip });
     } catch (err) {
       this.reportError(err);
       this.failNegotiation(peer, 'pc create error');

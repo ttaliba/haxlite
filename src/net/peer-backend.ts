@@ -14,6 +14,7 @@
  */
 import type { DataChannel, PeerConnection, RtcConfig } from 'node-datachannel';
 import { CHANNELS } from './constants.js';
+import { toNativeIceServers, type IceServerConfig } from './ice.js';
 import { closeNative, createDataChannel, createPeerConnection } from './webrtc.js';
 
 /** Events of one {@link PeerLink}. Never called after {@link PeerLink.close}. */
@@ -52,6 +53,12 @@ export interface PeerLink {
   close(): void;
 }
 
+/** What the transport knows about an offer besides its SDP. */
+export interface PeerOfferInfo {
+  /** IP the client reached the master from (`offer.ip`). */
+  ip?: string;
+}
+
 export interface PeerBackend {
   /** `'local'` or `'edge'` (diagnostics). */
   readonly kind: string;
@@ -84,7 +91,9 @@ export interface PeerBackend {
    * the three negotiated channels and the answer. Throws if that fails
    * (nothing is left behind then).
    */
-  createPeer(id: number, offerSdp: string, events: PeerLinkEvents): PeerLink;
+  createPeer(id: number, offerSdp: string, events: PeerLinkEvents, info?: PeerOfferInfo): PeerLink;
+  /** Optional: replaces the STUN/TURN servers at runtime (fresh short-lived TURN credentials). */
+  setIceServers?(list: readonly IceServerConfig[]): void;
   /**
    * Optional fan-out: the same bytes to several links on `channel` (each
    * link falls back to channel 0 like {@link PeerLink.send}). Lets the edge
@@ -125,6 +134,11 @@ export class LocalPeerBackend implements PeerBackend {
 
   createPeer(id: number, offerSdp: string, ev: PeerLinkEvents): PeerLink {
     return new LocalPeerLink(`haxlite-${id}`, this.rtc, offerSdp, ev);
+  }
+
+  /** New PeerConnections use `list` (existing ones keep theirs). */
+  setIceServers(list: readonly IceServerConfig[]): void {
+    (this.rtc as { iceServers?: unknown }).iceServers = toNativeIceServers(list);
   }
 }
 

@@ -258,7 +258,7 @@ function hmacWithLength(buf: Uint8Array, end: number, len: number, key: StunKey)
 // ---------------------------------------------------------------- building
 
 /** Encodes `address` (v4 or v6 literal, v4-mapped v6 is reduced to v4) XORed into `out` at `p`; returns bytes written (value only). */
-function writeXorAddress(out: Uint8Array, p: number, address: string, port: number, txid: Uint8Array): number {
+export function writeXorAddress(out: Uint8Array, p: number, address: string, port: number, txid: Uint8Array): number {
   let addr = address;
   if (addr.startsWith('::ffff:') && isIPv4(addr.slice(7))) addr = addr.slice(7);
   const xport = port ^ (MAGIC_COOKIE >>> 16);
@@ -346,7 +346,7 @@ export function findAttr(m: StunMessage, type: number): number {
 }
 
 /** Appends MESSAGE-INTEGRITY (if `key`) and FINGERPRINT to a message whose attributes end at `p`; returns the final size. */
-function finishMessage(out: Uint8Array, p: number, key: StunKey | null): number {
+export function finishMessage(out: Uint8Array, p: number, key: StunKey | null): number {
   if (key !== null) {
     out[p] = 0x00;
     out[p + 1] = 0x08;
@@ -374,7 +374,7 @@ function finishMessage(out: Uint8Array, p: number, key: StunKey | null): number 
   return p + 8;
 }
 
-function writeHeader(out: Uint8Array, type: number, txid: Uint8Array): void {
+export function writeHeader(out: Uint8Array, type: number, txid: Uint8Array): void {
   out[0] = type >>> 8;
   out[1] = type & 0xff;
   out[2] = 0;

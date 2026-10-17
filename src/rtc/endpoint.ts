@@ -6,6 +6,13 @@
  * DTLS by the remote transport address once ICE has validated it (full
  * ICE: our check to it succeeded; ICE-lite: an authenticated request came
  * from it — see session.ts).
+ *
+ * TURN (turn.ts): with a `turn:` server in `iceServers` the endpoint holds
+ * one allocation on its IPv4 socket. Datagrams from the TURN server's
+ * address go to the relay, which unwraps ChannelData / Data indications and
+ * feeds the peer's datagram back into the same demux with the relay as the
+ * receiving "socket" (its validated addresses live in their own map). The
+ * only cost for other datagrams is one port comparison.
  */
 import dgram, { type Socket } from 'node:dgram';
 import { randomBytes } from 'node:crypto';
@@ -21,7 +28,9 @@ import { resolveSuites } from './dtls/crypto.js';
 import type { RtcSession, SctpFactory } from './types.js';
 import { Gatherer, classifyIp, hasGlobalIpv6, stunServers, type AddressClass, type CandidatePolicy, type IceServerInput } from './gather.js';
 import { IceScheduler, type BoundSocket, type IceStats } from './ice-agent.js';
-import { UdpIo, literalLookup } from './udp.js';
+import { UdpIo, literalLookup, type PacketIo } from './udp.js';
+import { TurnRelay, turnServers, type TurnStats } from './turn.js';
+import { sameIp } from './gather.js';
 
 /** A socket bound by {@link RtcEndpoint.listen}, before the endpoint wraps it. */
 interface RawBound {
@@ -67,11 +76,23 @@ export interface RtcEndpointOptions {
    */
   iceLite?: boolean;
   /**
-   * STUN servers for server-reflexive candidates (URL strings like
-   * `stun:stun.l.google.com:19302`, node-datachannel or `RTCIceServer`
-   * objects). Default none. TURN entries are ignored (not implemented).
+   * STUN and TURN servers (URL strings like `stun:stun.l.google.com:19302`
+   * or `turn:user:pass@host:3478`, node-datachannel or `RTCIceServer`
+   * objects). Default none. STUN servers give server-reflexive candidates;
+   * the first reachable UDP TURN server (`turn:…`, `?transport=udp`; `turns:`
+   * and TCP are skipped) gives a relay candidate (turn.ts). Replace them at
+   * runtime with {@link RtcEndpoint.setIceServers} (short-lived credentials).
    */
   iceServers?: readonly IceServerInput[];
+  /**
+   * `'all'` (default): host, server-reflexive and relay candidates.
+   * `'relay'`: only the TURN relay candidate is announced (our IP is never in
+   * the SDP), checks, consent and DTLS only go through the relay, and nothing
+   * that reaches the socket directly from a peer is answered. Needs a `turn:`
+   * server; sessions wait for the allocation, and fail (`'turn-unavailable'`)
+   * when there is none.
+   */
+  iceTransportPolicy?: 'all' | 'relay';
   /**
    * Which interface addresses become host candidates, and which remote
    * address classes may receive our checks (default `'public'`; see
@@ -151,6 +172,12 @@ export interface RtcEndpointStats {
   ice: IceStats;
   /** Our addresses as seen by the STUN servers in the last gathering round (`ip:port`). */
   reflexive: string[];
+  /** Relay-only sessions closed because no TURN allocation could be made. */
+  relayUnavailable: number;
+  /** Datagrams from peers dropped because they did not come through the relay (relay-only). */
+  directDropped: number;
+  /** The TURN allocation (null: no TURN server configured). */
+  turn: TurnStats | null;
 }
 
 const ICE_ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -213,6 +240,14 @@ export class RtcEndpoint {
   private readonly byUfrag = new Map<string, RtcSessionImpl>();
   /** remote address → remote port → validated address (DTLS demux). */
   private readonly byAddress = new Map<string, Map<number, ValidatedAddress>>();
+  /** The TURN allocation (null without a TURN server or with ICE-lite). */
+  private readonly relay: TurnRelay | null;
+  /** DTLS demux of the addresses validated through {@link relay}. */
+  private readonly relayByAddress = new Map<string, Map<number, ValidatedAddress>>();
+  /** The socket {@link relay} allocates from. */
+  private readonly turnIo: PacketIo;
+  /** `iceTransportPolicy: 'relay'`. */
+  readonly relayOnly: boolean;
   /**
    * Full ICE: `address|port` of authenticated Binding requests not validated
    * yet → session whose triggered check is on its way (DTLS from there is
@@ -248,6 +283,8 @@ export class RtcEndpoint {
     dtlsReplayed: 0,
     dtlsBadRecords: 0,
     stunResponses: 0,
+    relayUnavailable: 0,
+    directDropped: 0,
   };
 
   private constructor(opts: RtcEndpointOptions, raw: RawBound[], port: number, certificate: RtcCertificate, dataLayer: SctpFactory) {
@@ -286,14 +323,49 @@ export class RtcEndpoint {
     const ownClasses = new Set<AddressClass>();
     for (const a of opts.publicAddresses ?? []) ownClasses.add(classifyIp(a));
     for (const b of bound) if (b.bindAddress !== '0.0.0.0' && b.bindAddress !== '::') ownClasses.add(classifyIp(b.bindAddress));
-    this.ice = new IceScheduler({ send: rawSend, now, sockets: bound, policy, ownClasses: [...ownClasses] });
+    const turn = this.iceLite ? [] : turnServers(opts.iceServers);
+    this.relayOnly = opts.iceTransportPolicy === 'relay';
+    // one allocation, from the IPv4 socket (relayed addresses are IPv4)
+    const turnSock = bound.find((b) => b.family === 4) ?? bound[0]!;
+    this.relay =
+      turn.length === 0
+        ? null
+        : new TurnRelay(
+            {
+              io: turnSock.sock,
+              family: turnSock.family,
+              now,
+              deliver: (relay, msg, address, port) => this.onRelayPacket(relay, msg, address, port),
+              onChange: (relay) => {
+                if (!relay.ready) this.relayByAddress.clear();
+                this.gatherer.relaysChanged();
+              },
+              countOut: (n) => {
+                counters.packetsOut++;
+                counters.bytesOut += n;
+              },
+            },
+            turn,
+          );
+    this.turnIo = turnSock.sock;
+    this.ice = new IceScheduler({
+      send: rawSend,
+      now,
+      sockets: bound,
+      policy,
+      ownClasses: [...ownClasses],
+      ...(this.relay !== null ? { relays: [this.relay] } : null),
+      ...(this.relayOnly ? { relayOnly: true } : null),
+    });
     this.gatherer = new Gatherer(
       { sockets: bound, send: rawSend, now, register: (k, h) => this.ice.register(k, h), unregister: (k) => this.ice.unregister(k) },
       {
         ...(opts.publicAddresses !== undefined ? { publicAddresses: opts.publicAddresses } : null),
         ...(opts.publicPort !== undefined ? { publicPort: opts.publicPort } : null),
         port,
-        stunServers: this.iceLite ? [] : stunServers(opts.iceServers),
+        stunServers: this.iceLite || this.relayOnly ? [] : stunServers(opts.iceServers),
+        ...(this.relay !== null ? { relays: [this.relay] } : null),
+        ...(this.relayOnly ? { relayOnly: true } : null),
         policy,
         ...(opts.gatherRefreshMs !== undefined ? { refreshMs: opts.gatherRefreshMs } : null),
         // no udp6 socket: STUN servers are only resolved to IPv4 (no AAAA lookups)
@@ -340,6 +412,8 @@ export class RtcEndpoint {
       },
       now,
       ice: this.iceLite ? null : this.ice,
+      relayOnly: this.relayOnly,
+      countRelayUnavailable: () => counters.relayUnavailable++,
       helloVerify: opts.helloVerify ?? this.iceLite,
       holdAddress: (s, address, port) => {
         const key = `${address}|${port}`;
@@ -373,6 +447,12 @@ export class RtcEndpoint {
       }
     } else if (lite) {
       throw new Error('RtcEndpoint: publicAddresses is required with iceLite');
+    }
+    if (opts.iceTransportPolicy === 'relay') {
+      if (lite) throw new Error("RtcEndpoint: iceTransportPolicy 'relay' needs full ICE (not iceLite)");
+      if (turnServers(opts.iceServers).length === 0) throw new Error("RtcEndpoint: iceTransportPolicy 'relay' needs a UDP turn: server in iceServers");
+    } else if (opts.iceTransportPolicy !== undefined && opts.iceTransportPolicy !== 'all') {
+      throw new Error(`RtcEndpoint: iceTransportPolicy must be 'all' or 'relay' (got ${String(opts.iceTransportPolicy)})`);
     }
     // '::' without IPv6 is the IPv4 wildcard; another IPv6 literal is a contradiction
     let address = opts.address;
@@ -480,8 +560,32 @@ export class RtcEndpoint {
     return this.bound.map((b) => ({ family: b.family, address: b.bindAddress }));
   }
 
-  /** Creates the session for a browser offer. Throws RtcSdpError on an unusable offer. */
-  createSession(offerSdp: string): RtcSession {
+  /**
+   * Replaces the STUN/TURN servers at runtime (e.g. fresh short-lived TURN
+   * credentials). TURN: applies to the next Allocate — the current allocation
+   * keeps its credentials until the server refuses them, then it is re-made
+   * with the new ones (new sessions get the new relay candidate). STUN
+   * servers: from the next gathering round. TURN can be changed, not added
+   * or removed (the endpoint is created with or without a relay).
+   */
+  setIceServers(list: readonly IceServerInput[]): void {
+    if (this.closed || this.iceLite) return;
+    this.gatherer.setStunServers(this.relayOnly ? [] : stunServers(list));
+    const turn = turnServers(list);
+    if (this.relay !== null && turn.length > 0) this.relay.setServers(turn);
+  }
+
+  /** The TURN allocation's state (null: no TURN server configured). */
+  get turn(): TurnStats | null {
+    return this.relay?.stats() ?? null;
+  }
+
+  /**
+   * Creates the session for a browser offer. Throws RtcSdpError on an unusable offer.
+   * `remoteIp`: the address the signaling server saw the peer connect from;
+   * with TURN it gets a relay permission up front, next to the offer's candidates.
+   */
+  createSession(offerSdp: string, o?: { remoteIp?: string }): RtcSession {
     if (this.closed) throw new Error('RtcEndpoint closed');
     if (this.byUfrag.size >= this.maxSessions) throw new Error('RtcEndpoint: too many sessions');
     const offer = parseOffer(offerSdp);
@@ -503,6 +607,8 @@ export class RtcEndpoint {
       sessionId: String(BigInt.asUintN(62, randomBytes(8).readBigUInt64BE())),
     });
     const s = new RtcSessionImpl(this.host, offer, ufrag, pwd, answer, g.lines);
+    const ip = o?.remoteIp;
+    if (ip !== undefined && s.agent !== null && this.relay !== null) s.agent.hintRemoteIp(ip.startsWith('::ffff:') ? ip.slice(7) : ip);
     if (!g.complete) {
       s.gatheringComplete = false;
       this.gatherer.wait(s);
@@ -519,13 +625,33 @@ export class RtcEndpoint {
     c.packetsIn++;
     c.bytesIn += msg.length;
     if (msg.length === 0) return;
+    const r = this.relay;
+    if (r !== null && port === r.serverPort && sock === this.turnIo && r.serverAddress !== null) {
+      if ((address === r.serverAddress || sameIp(address, r.serverAddress)) && r.onServerPacket(msg)) return;
+    }
+    if (this.relayOnly) {
+      // nothing from a peer is answered unless it came through the relay
+      c.directDropped++;
+      return;
+    }
+    this.demux(sock, this.byAddress, msg, address, port);
+  }
+
+  /** A peer's datagram unwrapped by the relay (packetsIn/bytesIn counted the outer datagram). */
+  private onRelayPacket(relay: TurnRelay, msg: Buffer, address: string, port: number): void {
+    if (msg.length === 0) return;
+    this.demux(relay, this.relayByAddress, msg, address, port);
+  }
+
+  private demux(sock: PacketIo, byAddress: Map<string, Map<number, ValidatedAddress>>, msg: Buffer, address: string, port: number): void {
+    const c = this.counters;
     const b0 = msg[0]!;
     if (b0 < 4) {
       this.onStun(sock, msg, address, port);
       return;
     }
     if (b0 >= 20 && b0 <= 63) {
-      const ports = this.byAddress.get(address);
+      const ports = byAddress.get(address);
       const v = ports === undefined ? undefined : ports.get(port);
       if (v === undefined || v.sock !== sock) {
         // full ICE: the ClientHello may beat our triggered check to its source: held, not processed
@@ -540,7 +666,7 @@ export class RtcEndpoint {
     c.unknownPackets++;
   }
 
-  private onStun(sock: UdpIo, msg: Buffer, address: string, port: number): void {
+  private onStun(sock: PacketIo, msg: Buffer, address: string, port: number): void {
     const m = this.stunScratch;
     const c = this.counters;
     if (!parseStun(msg, m)) {
@@ -580,11 +706,16 @@ export class RtcEndpoint {
     c.stunAuthenticated++;
   }
 
+  private mapFor(sock: PacketIo): Map<string, Map<number, ValidatedAddress>> {
+    return sock === this.relay ? this.relayByAddress : this.byAddress;
+  }
+
   private bindAddress(v: ValidatedAddress): void {
-    let ports = this.byAddress.get(v.address);
+    const map = this.mapFor(v.sock);
+    let ports = map.get(v.address);
     if (ports === undefined) {
       ports = new Map();
-      this.byAddress.set(v.address, ports);
+      map.set(v.address, ports);
     }
     const prev = ports.get(v.port);
     if (prev === v) return;
@@ -594,10 +725,11 @@ export class RtcEndpoint {
 
   /** Releases v's 5-tuple from the DTLS demux if v still owns it. */
   private unbindAddress(v: ValidatedAddress): void {
-    const ports = this.byAddress.get(v.address);
+    const map = this.mapFor(v.sock);
+    const ports = map.get(v.address);
     if (ports !== undefined && ports.get(v.port) === v) {
       ports.delete(v.port);
-      if (ports.size === 0) this.byAddress.delete(v.address);
+      if (ports.size === 0) map.delete(v.address);
     }
   }
 
@@ -650,6 +782,7 @@ export class RtcEndpoint {
       dtlsBadRecords: bad,
       ice: { ...this.ice.stats },
       reflexive: this.gatherer.mapped.map((a) => (isIP(a.address) === 6 ? `[${a.address}]:${a.port}` : `${a.address}:${a.port}`)),
+      turn: this.relay?.stats() ?? null,
     };
   }
 
@@ -659,6 +792,7 @@ export class RtcEndpoint {
     this.closed = true;
     for (const s of [...this.byUfrag.values()]) s.terminate('endpoint-closed');
     this.gatherer.close();
+    this.relay?.close();
     this.ice.close();
     if (this.sweepTimer !== null) clearInterval(this.sweepTimer);
     this.sweepTimer = null;

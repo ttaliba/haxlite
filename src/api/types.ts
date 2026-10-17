@@ -441,6 +441,12 @@ export interface HaxliteRoomExtensions {
   edgeStats(): EdgeBackendStats | null;
   /** haxlite-rtc endpoint counters (sessions, packets, bytes, handshakes; of the whole shared endpoint), null unless `peerBackend: 'rtc'`. */
   rtcStats(): RtcEndpointStats | null;
+  /**
+   * Replaces the STUN/TURN servers at runtime — e.g. fresh short-lived TURN
+   * credentials (Cloudflare `generate-ice-servers`) before the old ones
+   * expire. See `HostTransport.setIceServers` and docs/10.
+   */
+  setIceServers(list: NonNullable<HaxliteConfig['iceServers']>): void;
   /** UDP port players connect to with `peerBackend: 'rtc'` (null otherwise / until listening). */
   readonly rtcPort: number | null;
   /**

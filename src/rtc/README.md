@@ -35,7 +35,7 @@ const ep = await RtcEndpoint.listen({
   address: '0.0.0.0',             // bind address; default: wildcard of the family of publicAddresses
   ipv6: false,                    // default false: IPv4 only (no udp6, no IPv6 candidates, no AAAA); IPv6 headers cost ≈ +19 % egress
   publicAddresses: ['203.0.113.7'], // optional (full ICE): host candidates instead of the interfaces; required with iceLite
-  iceServers: ['stun:stun.l.google.com:19302'], // srflx gathering (default none; TURN entries ignored)
+  iceServers: ['stun:stun.l.google.com:19302'], // srflx gathering + UDP turn: relay (default none)
   candidatePolicy: 'public',      // interface addresses announced / remote classes checked ('public' | 'private' | 'all' | fn)
   iceLite: false,                 // true: a=ice-lite, no checks, no gathering
   gatherRefreshMs: 60_000,        // older srflx result → refreshed in the background (sessions still get it at once)
