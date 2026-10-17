@@ -578,3 +578,48 @@ describe("haxlite-rtc iceTransportPolicy: 'relay'", () => {
     expect(ep.turn?.state).not.toBe('allocated');
   }, 20_000);
 });
+
+describe('per-allocation peer limit (Cloudflare: ~10 distinct peer addresses per allocation)', () => {
+  const LIMIT = 10;
+
+  async function joinMany(ep: RtcEndpoint, n: number, timeoutMs: number): Promise<boolean[]> {
+    const results: boolean[] = [];
+    for (let i = 0; i < n; i++) {
+      const client = await makeClient({ bindAddress: '127.0.0.1' });
+      const conn = await connect(ep, client, { remoteIp: '127.0.0.1', timeoutMs });
+      results.push(conn.connected && (await conn.pingPong(2)));
+      conn.session.close(); // the player leaves: its address still counts against that allocation
+    }
+    return results;
+  }
+
+  it('control: one allocation for everyone stops relaying after the limit', async () => {
+    const srv = await turnServer({ maxPeerAddresses: LIMIT });
+    const ep = await endpoint({
+      address: '127.0.0.1',
+      candidatePolicy: 'all',
+      iceTransportPolicy: 'relay',
+      iceServers: [srv.urlWithCredentials()],
+      turnPeersPerAllocation: 1000,
+      maxTurnAllocations: 1,
+    });
+    const results = await joinMany(ep, LIMIT + 3, 4000);
+    expect(results.slice(0, LIMIT - 1).every(Boolean)).toBe(true);
+    expect(results.slice(LIMIT + 1).some((ok) => !ok)).toBe(true);
+    expect(srv.counters.droppedPeerLimit).toBeGreaterThan(0);
+  }, 120_000);
+
+  it('40 clients join one relay-only endpoint in a row: sessions are spread over a pool of allocations', async () => {
+    const srv = await turnServer({ maxPeerAddresses: LIMIT });
+    const ep = await endpoint({ address: '127.0.0.1', candidatePolicy: 'all', iceTransportPolicy: 'relay', iceServers: [srv.urlWithCredentials()] });
+    const results = await joinMany(ep, 40, 8000);
+    const failed = results.map((ok, i) => (ok ? -1 : i)).filter((i) => i >= 0);
+    if (process.env.TURN_VERBOSE === '1') console.log('turn', JSON.stringify(ep.turn), 'server', JSON.stringify(srv.counters));
+    expect(failed).toEqual([]);
+    expect(ep.turn!.pool).toBeGreaterThan(1);
+    // exhausted allocations are deleted once their sessions are gone (pool stays small)
+    await until(() => ep.turn!.pool <= 3, 3000);
+    expect(ep.turn!.pool).toBeLessThanOrEqual(3);
+    expect(srv.allocations.size).toBe(ep.turn!.pool);
+  }, 300_000);
+});

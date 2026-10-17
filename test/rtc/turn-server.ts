@@ -217,6 +217,12 @@ export interface TurnServerOptions {
   channelLifetime?: number;
   /** Log every decision. */
   verbose?: boolean;
+  /**
+   * Emulates Cloudflare's per-allocation peer limit: an allocation relays for at most this many
+   * distinct peer transport addresses (ip:port) over its whole life; Send/ChannelData to and data
+   * from any further address are dropped silently and a ChannelBind for one gets 400. 0 = no limit.
+   */
+  maxPeerAddresses?: number;
 }
 
 export interface TurnServerCounters {
@@ -246,6 +252,8 @@ export interface TurnServerCounters {
   droppedSendNoPermission: number;
   /** Allocate requests dropped by {@link TurnServer.dropAllocates}. */
   droppedAllocates: number;
+  /** Datagrams dropped / ChannelBinds refused by {@link TurnServerOptions.maxPeerAddresses}. */
+  droppedPeerLimit: number;
   /** Errors other than 401/438 sent (code → count). */
   errors: Record<number, number>;
 }
@@ -264,6 +272,8 @@ interface Allocation {
   channels: Map<number, { peer: Addr; expires: number }>;
   /** `ip:port` of peer → channel. */
   byPeer: Map<string, number>;
+  /** `ip:port` of every peer it has relayed for (maxPeerAddresses). */
+  peerAddrs: Set<string>;
   /** Transaction id of the Allocate that made it (retransmission → same response). */
   allocTxid: string;
   allocResponse: Buffer;
@@ -290,6 +300,7 @@ export class TurnServer {
     droppedNoPermission: 0,
     droppedSendNoPermission: 0,
     droppedAllocates: 0,
+    droppedPeerLimit: 0,
     errors: {},
   };
   readonly realm: string;
@@ -323,6 +334,7 @@ export class TurnServer {
       permissionLifetime: o.permissionLifetime ?? 300,
       channelLifetime: o.channelLifetime ?? 600,
       verbose: o.verbose ?? false,
+      maxPeerAddresses: o.maxPeerAddresses ?? 0,
     };
     this.realm = this.o.realm;
     sock.on('message', (msg, r) => this.onClient(msg, { address: r.address, port: r.port }));
@@ -532,6 +544,7 @@ export class TurnServer {
       perms: new Map(),
       channels: new Map(),
       byPeer: new Map(),
+      peerAddrs: new Set(),
       allocTxid: m.txid.toString('hex'),
       allocResponse: resp,
     };
@@ -619,6 +632,10 @@ export class TurnServer {
       this.error(m, from, 400, 'Bad Request', hmacKey);
       return;
     }
+    if (!this.peerAllowed(a, peer)) {
+      this.error(m, from, 400, 'Bad Request', hmacKey);
+      return;
+    }
     const now = Date.now();
     a.channels.set(ch, { peer, expires: now + this.o.channelLifetime * 1000 });
     a.byPeer.set(k(peer), ch);
@@ -626,6 +643,20 @@ export class TurnServer {
     if (cur === undefined) this.counters.channels++;
     this.log('channel', k(from), ch.toString(16), '→', k(peer));
     this.send(new Builder(stunType(Method.ChannelBind, 2), m.txid).build(hmacKey), from);
+  }
+
+  /** maxPeerAddresses: whether `peer` is (or can become) one of the allocation's peer addresses. */
+  private peerAllowed(a: Allocation, peer: Addr): boolean {
+    const max = this.o.maxPeerAddresses;
+    if (max <= 0) return true;
+    const key = k(peer);
+    if (a.peerAddrs.has(key)) return true;
+    if (a.peerAddrs.size >= max) {
+      this.counters.droppedPeerLimit++;
+      return false;
+    }
+    a.peerAddrs.add(key);
+    return true;
   }
 
   private hasPerm(a: Allocation, ip: string): boolean {
@@ -644,6 +675,7 @@ export class TurnServer {
       this.counters.droppedSendNoPermission++;
       return;
     }
+    if (!this.peerAllowed(a, peer)) return;
     this.counters.sendIndications++;
     a.relay.send(m.raw.subarray(d[0], d[0] + d[1]), peer.port, peer.address);
   }
@@ -674,6 +706,7 @@ export class TurnServer {
       this.log('drop (no permission)', k(from), '→ relay', k(a.relayed));
       return;
     }
+    if (!this.peerAllowed(a, from)) return;
     const ch = a.byPeer.get(k(from));
     const c = ch === undefined ? undefined : a.channels.get(ch);
     if (ch !== undefined && c !== undefined && c.expires > Date.now()) {

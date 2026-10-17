@@ -34,7 +34,7 @@ import { parseCandidate, type ParsedCandidate } from './sdp.js';
 import { StunMessage, buildBindingError, buildBindingSuccess, checkFingerprint, checkIntegrity } from './stun.js';
 import { HAXBALL_CHANNELS, type RemoteAddress, type RtcSession, type RtcSessionState, type SctpAssociationLike, type SctpFactory } from './types.js';
 import type { RtcCertificate } from './cert.js';
-import { IceAgent, type IceAgentOwner, type IceScheduler } from './ice-agent.js';
+import { IceAgent, type IceAgentOwner, type IceScheduler, type RelayIo } from './ice-agent.js';
 import { sameIp, type GatherWaiter } from './gather.js';
 
 /** A transport address that passed an authenticated Binding request for a session. */
@@ -84,6 +84,13 @@ export interface SessionHost {
   holdAddress(session: RtcSessionImpl, address: string, port: number): void;
   /** Undoes {@link holdAddress} (our check to the address failed). */
   unholdAddress(session: RtcSessionImpl, address: string, port: number): void;
+  /**
+   * TURN: the allocation whose relay candidate new sessions announce (the endpoint spreads sessions
+   * over several allocations); undefined/null: no TURN, every relay is used.
+   */
+  currentRelay?(): RelayIo | null;
+  /** The session announces `relay`'s candidate (load accounting of the allocation pool). */
+  assignRelay?(session: RtcSessionImpl, relay: RelayIo): void;
 }
 
 const MAX_VALIDATED = 8;
@@ -168,7 +175,9 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
     this.mid = offer.mid;
     this.createdAt = host.now();
     this.remoteKey = createSecretKey(Buffer.from(offer.icePwd, 'latin1'));
-    this.agent = host.ice !== null ? new IceAgent(host.ice, this) : null;
+    const relay = host.ice !== null && host.currentRelay !== undefined ? host.currentRelay() : null;
+    this.agent = host.ice !== null ? new IceAgent(host.ice, this, relay !== null ? [relay] : undefined) : null;
+    if (relay !== null) host.assignRelay?.(this, relay);
     for (const c of offer.candidates) this.addRemoteCandidate(c);
     this.dtls = new DtlsServer({
       certificate: host.certificate,
@@ -234,7 +243,14 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
       return;
     }
     // a relay that became ready during the round: pairs for the candidates already known
-    if (this.agent !== null) this.agent.relaysReady(this.remoteCandidates);
+    if (this.agent !== null) {
+      const relay = this.host.currentRelay !== undefined ? this.host.currentRelay() : null;
+      if (relay !== null) {
+        this.agent.adoptRelay(relay);
+        this.host.assignRelay?.(this, relay);
+      }
+      this.agent.relaysReady(this.remoteCandidates);
+    }
     for (const l of lines) {
       if (this.localCandidates.indexOf(l) >= 0) continue;
       this.localCandidates.push(l);

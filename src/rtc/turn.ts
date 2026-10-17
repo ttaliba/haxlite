@@ -283,6 +283,12 @@ export interface TurnStats {
   channelDataOut: number;
   /** Datagrams to peers dropped: no allocation, caps, permission queue full or permission refused. */
   dropped: number;
+  /** Distinct peer transport addresses (ip:port) this allocation has exchanged data with. */
+  peerAddresses: number;
+  /** The server refused a ChannelBind with 400: treated as out of peer addresses. */
+  full: boolean;
+  /** Allocations in the endpoint's pool (1 for a single TurnRelay). */
+  pool: number;
 }
 
 export interface TurnRelayHost {
@@ -299,6 +305,11 @@ export interface TurnRelayHost {
   countOut?(bytes: number): void;
   /** DNS lookup of the TURN server (tests). */
   lookup?: (host: string, family: 4 | 6) => Promise<string[]>;
+  /**
+   * Report the allocation's XOR-MAPPED-ADDRESS as {@link TurnRelay.mapped} (default true). False for an
+   * allocation made from a socket of its own: that address is not the endpoint socket's reflexive one.
+   */
+  reportMapped?: boolean;
 }
 
 interface Permission {
@@ -380,7 +391,8 @@ export class TurnRelay implements PacketIo {
   private readonly channels: (Peer | undefined)[] = [];
   private nextChannel = CHANNEL_MIN;
   /** Released channel numbers and when they were last used. */
-  private readonly freeChannels: { n: number; at: number }[] = [];
+  /** Released channel numbers (still bound at the server until their lifetime ends: inbound ChannelData on them is still the old peer's). */
+  private readonly freeChannels: { n: number; at: number; address: string; port: number }[] = [];
   private permFlush = false;
   private readonly permQueue: string[] = [];
   private waiters: ((ok: boolean) => void)[] = [];
@@ -392,6 +404,14 @@ export class TurnRelay implements PacketIo {
   /** Exact-length views of {@link scratch} (≤ 1536 bytes), so a send builds no view per datagram. */
   private views: (Buffer | undefined)[] = [];
   private readonly msg = new StunMessage();
+  /**
+   * Peer transport addresses (`ip|port`) this allocation has sent to or received from. Some servers
+   * (Cloudflare) only relay for a handful of distinct peer addresses per allocation over its whole
+   * life: the endpoint spreads sessions over several allocations by this count (endpoint.ts).
+   */
+  private readonly seen = new Set<string>();
+  /** A ChannelBind was refused with 400 (the server's per-allocation peer limit): take no new peers. */
+  full = false;
   private readonly counters = {
     allocations: 0,
     allocationFailures: 0,
@@ -466,7 +486,7 @@ export class TurnRelay implements PacketIo {
           return;
         }
         this.relayed = relayed;
-        this.mapped = xorAddressAttr(m, StunAttr.XorMappedAddress);
+        this.mapped = this.host.reportMapped === false ? null : xorAddressAttr(m, StunAttr.XorMappedAddress);
         const lt = lifetimeAttr(m);
         this.lifetimeS = lt > 0 ? lt : 600;
         this.scheduleRefresh();
@@ -555,6 +575,8 @@ export class TurnRelay implements PacketIo {
 
   private reset(): void {
     this.relayed = null;
+    this.seen.clear();
+    this.full = false;
     this.perms.clear();
     this.peers.clear();
     this.peerCount = 0;
@@ -678,8 +700,19 @@ export class TurnRelay implements PacketIo {
     if (b0 >= 0x40 && b0 <= 0x4f) {
       if (msg.length < 4) return true;
       const len = (msg[2]! << 8) | msg[3]!;
-      const peer = this.channels[((b0 << 8) | msg[1]!) - CHANNEL_MIN];
-      if (peer === undefined || 4 + len > msg.length || this.state !== 'allocated') return true;
+      const n = (b0 << 8) | msg[1]!;
+      const peer = this.channels[n - CHANNEL_MIN];
+      if (4 + len > msg.length || this.state !== 'allocated') return true;
+      if (peer === undefined) {
+        // a channel we released that the server still has bound (≤ 10 min): still that peer's
+        const f = this.freeChannels.find((x) => x.n === n);
+        if (f === undefined) return true;
+        const c = this.counters;
+        c.packetsIn++;
+        c.bytesIn += len;
+        this.host.deliver(this, msg.subarray(4, 4 + len), f.address, f.port);
+        return true;
+      }
       peer.used = true;
       const c = this.counters;
       c.packetsIn++;
@@ -704,6 +737,7 @@ export class TurnRelay implements PacketIo {
       const ports = this.peers.get(peer.address);
       const p = ports === undefined ? undefined : ports.get(peer.port);
       if (p !== undefined) p.used = true;
+      else this.see(peer.address, peer.port);
       const c = this.counters;
       c.packetsIn++;
       c.bytesIn += len;
@@ -795,6 +829,7 @@ export class TurnRelay implements PacketIo {
       peer = { address, port, channel: 0, binding: false, boundAt: 0, used: false };
       ports.set(port, peer);
       this.peerCount++;
+      this.see(address, port);
     }
     peer.used = true;
     const c = this.counters;
@@ -900,7 +935,13 @@ export class TurnRelay implements PacketIo {
   private bindChannel(peer: Peer): void {
     if (peer.binding) return;
     const isNew = peer.channel === 0;
-    const n = isNew ? this.takeChannel() : peer.channel;
+    let n = peer.channel;
+    if (isNew) {
+      // the server may still have this peer on a number we released: binding another one would be refused (400)
+      const f = this.freeChannels;
+      const i = f.findIndex((x) => x.port === peer.port && x.address === peer.address);
+      n = i >= 0 ? f.splice(i, 1)[0]!.n : this.takeChannel();
+    }
     if (n === 0) return; // all numbers in use: Send indications
     peer.channel = n;
     peer.binding = isNew; // a rebind keeps using the channel meanwhile
@@ -920,6 +961,8 @@ export class TurnRelay implements PacketIo {
         if (perm !== undefined && perm.installed) perm.at = now; // a ChannelBind refreshes the permission too
         return;
       }
+      // 400 to a bind we expect to be valid: the server's peer limit for this allocation (Cloudflare)
+      if (m !== null && (m.type & 0x0110) === 0x0110 && stunErrorCode(m) === 400) this.full = true;
       if (isNew) this.releaseChannel(peer); // Send indications instead
     });
   }
@@ -930,7 +973,7 @@ export class TurnRelay implements PacketIo {
     peer.channel = 0;
     peer.binding = false;
     this.channels[n - CHANNEL_MIN] = undefined;
-    this.freeChannels.push({ n, at: this.host.now() });
+    this.freeChannels.push({ n, at: this.host.now(), address: peer.address, port: peer.port });
   }
 
   // ------------------------------------------------------------ maintenance
@@ -948,7 +991,14 @@ export class TurnRelay implements PacketIo {
     // channels: rebind used ones, release idle ones
     for (let i = 0; i < this.channels.length; i++) {
       const p = this.channels[i];
-      if (p === undefined || p.binding || now - p.boundAt < CHANNEL_REFRESH_MS) continue;
+      if (p === undefined) continue;
+      // ChannelData never touches the permission: a busy channel keeps its permission in use
+      // (otherwise it is forgotten ~8 min in, with the channel, and inbound ChannelData is dropped)
+      if (p.used) {
+        const perm = this.perms.get(p.address);
+        if (perm !== undefined) perm.used = true;
+      }
+      if (p.binding || now - p.boundAt < CHANNEL_REFRESH_MS) continue;
       if (p.used) {
         p.used = false;
         this.bindChannel(p);
@@ -965,6 +1015,15 @@ export class TurnRelay implements PacketIo {
       } else this.forgetIp(ip);
     }
     for (let i = 0; i < refresh.length; i += PEERS_PER_PERMISSION_REQUEST) this.sendPermissions(refresh.slice(i, i + PEERS_PER_PERMISSION_REQUEST));
+  }
+
+  /** Distinct peer transport addresses used so far (see {@link seen}). */
+  get peerAddresses(): number {
+    return this.seen.size;
+  }
+
+  private see(address: string, port: number): void {
+    if (this.seen.size < MAX_PEERS) this.seen.add(address + '|' + port);
   }
 
   /** Drops the permission for `ip` and its peers (their channels are released). */
@@ -988,6 +1047,9 @@ export class TurnRelay implements PacketIo {
       ...this.counters,
       permissions: this.perms.size,
       channels,
+      peerAddresses: this.seen.size,
+      full: this.full,
+      pool: 1,
     };
   }
 

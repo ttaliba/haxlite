@@ -351,11 +351,26 @@ export class IceAgent {
   private nextConsentAt = 0;
   /** IP the signaling server saw the peer connect from: the relays get a permission for it too. */
   private hintIp: string | null = null;
+  /**
+   * The TURN allocations this session uses (its relay candidates): a subset of the scheduler's
+   * relays when the endpoint spreads sessions over several allocations; null: all of them.
+   */
+  private readonly relays: RelayIo[] | null;
 
-  constructor(scheduler: IceScheduler, owner: IceAgentOwner) {
+  constructor(scheduler: IceScheduler, owner: IceAgentOwner, relays?: readonly RelayIo[]) {
     this.s = scheduler;
     this.owner = owner;
     this.username = `${owner.remoteUfrag}:${owner.localUfrag}`;
+    this.relays = relays !== undefined ? relays.slice() : null;
+  }
+
+  private myRelays(): readonly RelayIo[] | undefined {
+    return this.relays ?? this.s.o.relays;
+  }
+
+  /** Also use `relay` (its candidate reached the peer later, e.g. at the end of a gathering round). */
+  adoptRelay(relay: RelayIo): void {
+    if (this.relays !== null && this.relays.indexOf(relay) < 0) this.relays.push(relay);
   }
 
   /** A remote candidate from the offer or trickled through signaling. */
@@ -384,7 +399,7 @@ export class IceAgent {
 
   /** Pairs on every ready relay for a remote candidate (and the relay's permission for its IP). */
   private addRelayPairs(address: string, port: number, priority: number): boolean {
-    const relays = this.s.o.relays;
+    const relays = this.myRelays();
     if (relays === undefined || !this.s.relayable(address)) return false;
     let added = false;
     for (const r of relays) {
@@ -404,7 +419,7 @@ export class IceAgent {
   hintRemoteIp(address: string): void {
     if (this.closed || !this.s.relayable(address)) return;
     this.hintIp = address;
-    const relays = this.s.o.relays;
+    const relays = this.myRelays();
     if (relays !== undefined) for (const r of relays) if (r.ready) r.permit(address);
   }
 

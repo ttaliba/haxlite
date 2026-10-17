@@ -266,4 +266,65 @@ describe('TurnRelay', () => {
     expect(asked).toEqual(['a', 'b']);
     relay.close();
   }, 10_000);
+
+  it('keeps the permission of a peer whose traffic only flows as ChannelData (no drop after ~8 min)', async () => {
+    const srv = new FakeServer();
+    let clock = 1_000_000;
+    const relay = new TurnRelay(
+      {
+        io: srv.io,
+        family: 4,
+        now: () => clock,
+        deliver: (_r, msg, address, port) => srv.delivered.push({ msg: Buffer.from(msg), address, port }),
+        lookup: async () => [SERVER],
+      },
+      [{ host: 'turn.test', port: 3478, username: 'user', credential: 'pass' }],
+    );
+    srv.relay = relay;
+    expect(await new Promise<boolean>((resolve) => relay.allocate(resolve))).toBe(true);
+    const peer = '203.0.113.7';
+    relay.permit(peer);
+    await tick();
+    relay.send(Buffer.from([22, 254, 253, 0]), 5000, peer); // DTLS: binds a channel
+    await tick();
+    expect(srv.channels).toEqual([{ n: 0x4000, address: peer, port: 5000 }]);
+    const maintain = () => (relay as unknown as { maintain(): void }).maintain();
+    const inbound = () => {
+      const cd = Buffer.alloc(8);
+      writeChannelHeader(cd, 0x4000, 3);
+      cd.set([23, 1, 2], 4);
+      relay.onServerPacket(cd);
+    };
+    // 15 minutes of play: traffic both ways every 15 s, only as ChannelData
+    const before = srv.delivered.length;
+    for (let t = 0; t < 60; t++) {
+      clock += 15_000;
+      relay.send(Buffer.from([23, 254, 253, 1]), 5000, peer);
+      inbound();
+      maintain();
+      await tick();
+    }
+    expect(srv.delivered.length - before).toBe(60); // every inbound datagram reached the endpoint
+    expect(relay.stats().permissions).toBe(1);
+    expect(relay.stats().channels).toBe(1);
+    expect(srv.channels.every((c) => c.n === 0x4000)).toBe(true); // rebinds keep the same number
+
+    // idle long enough to be forgotten (the server keeps the binding a while): its ChannelData is
+    // still delivered, and when it is used again it gets the same number back (a new one: 400)
+    for (let t = 0; t < 40; t++) {
+      clock += 15_000;
+      maintain();
+    }
+    expect(relay.stats().channels).toBe(0);
+    const n0 = srv.delivered.length;
+    inbound();
+    expect(srv.delivered.length).toBe(n0 + 1);
+    expect(srv.delivered[n0]!.address).toBe(peer);
+    relay.send(Buffer.from([22, 254, 253, 0]), 5000, peer);
+    await tick();
+    relay.send(Buffer.from([22, 254, 253, 0]), 5000, peer);
+    await tick();
+    expect(srv.channels.at(-1)).toEqual({ n: 0x4000, address: peer, port: 5000 });
+    relay.close();
+  });
 });

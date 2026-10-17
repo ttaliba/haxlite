@@ -27,9 +27,9 @@ import { DtlsServer } from './dtls/server.js';
 import { resolveSuites } from './dtls/crypto.js';
 import type { RtcSession, SctpFactory } from './types.js';
 import { Gatherer, classifyIp, hasGlobalIpv6, stunServers, type AddressClass, type CandidatePolicy, type IceServerInput } from './gather.js';
-import { IceScheduler, type BoundSocket, type IceStats } from './ice-agent.js';
+import { IceScheduler, type BoundSocket, type IceStats, type RelayIo } from './ice-agent.js';
 import { UdpIo, literalLookup, type PacketIo } from './udp.js';
-import { TurnRelay, turnServers, type TurnStats } from './turn.js';
+import { TurnRelay, turnServers, type TurnStats, type TurnServerSpec } from './turn.js';
 import { sameIp } from './gather.js';
 
 /** A socket bound by {@link RtcEndpoint.listen}, before the endpoint wraps it. */
@@ -93,6 +93,17 @@ export interface RtcEndpointOptions {
    * when there is none.
    */
   iceTransportPolicy?: 'all' | 'relay';
+  /**
+   * TURN: distinct peer transport addresses (ip:port) one allocation is used for before new sessions
+   * go to another allocation (default 8). Some servers relay for only a handful of distinct peer
+   * addresses per allocation over its whole life (Cloudflare: ~10); a client uses one or two. The
+   * endpoint keeps a pool of allocations (the first from its own socket, the others from sockets of
+   * their own), gives each new session the relay candidate of one with room left, keeps a spare one
+   * ready, and deletes exhausted ones once their sessions are gone.
+   */
+  turnPeersPerAllocation?: number;
+  /** TURN: most allocations at once (default 64). */
+  maxTurnAllocations?: number;
   /**
    * Which interface addresses become host candidates, and which remote
    * address classes may receive our checks (default `'public'`; see
@@ -240,10 +251,23 @@ export class RtcEndpoint {
   private readonly byUfrag = new Map<string, RtcSessionImpl>();
   /** remote address → remote port → validated address (DTLS demux). */
   private readonly byAddress = new Map<string, Map<number, ValidatedAddress>>();
-  /** The TURN allocation (null without a TURN server or with ICE-lite). */
+  /** The first TURN allocation, made from the endpoint's IPv4 socket (null without a TURN server or with ICE-lite). */
   private readonly relay: TurnRelay | null;
-  /** DTLS demux of the addresses validated through {@link relay}. */
-  private readonly relayByAddress = new Map<string, Map<number, ValidatedAddress>>();
+  /** Every TURN allocation ({@link relay} first; the others from sockets of their own). Shared with the ICE scheduler. */
+  private readonly pool: TurnRelay[] = [];
+  /** The allocation whose relay candidate new sessions get (one element; the gatherer's relay list). */
+  private readonly current: TurnRelay[] = [];
+  /** Per allocation: DTLS demux of the addresses validated through it, live sessions announcing it, its own socket. */
+  private readonly relayMaps = new Map<TurnRelay, Map<string, Map<number, ValidatedAddress>>>();
+  private readonly relaySessions = new Map<TurnRelay, Set<RtcSessionImpl>>();
+  private readonly relaySockets = new Map<TurnRelay, Socket>();
+  private readonly sessionRelays = new Map<RtcSessionImpl, TurnRelay[]>();
+  private turnSpecs: TurnServerSpec[] = [];
+  private spawning = false;
+  private readonly turnBudget: number;
+  private readonly maxTurn: number;
+  private readonly turnBind: string;
+  private readonly makeRelay: (io: PacketIo, shared: boolean) => TurnRelay;
   /** The socket {@link relay} allocates from. */
   private readonly turnIo: PacketIo;
   /** `iceTransportPolicy: 'relay'`. */
@@ -325,28 +349,35 @@ export class RtcEndpoint {
     for (const b of bound) if (b.bindAddress !== '0.0.0.0' && b.bindAddress !== '::') ownClasses.add(classifyIp(b.bindAddress));
     const turn = this.iceLite ? [] : turnServers(opts.iceServers);
     this.relayOnly = opts.iceTransportPolicy === 'relay';
-    // one allocation, from the IPv4 socket (relayed addresses are IPv4)
+    // the first allocation from the IPv4 socket (relayed addresses are IPv4); more from sockets of their own
     const turnSock = bound.find((b) => b.family === 4) ?? bound[0]!;
-    this.relay =
-      turn.length === 0
-        ? null
-        : new TurnRelay(
-            {
-              io: turnSock.sock,
-              family: turnSock.family,
-              now,
-              deliver: (relay, msg, address, port) => this.onRelayPacket(relay, msg, address, port),
-              onChange: (relay) => {
-                if (!relay.ready) this.relayByAddress.clear();
-                this.gatherer.relaysChanged();
-              },
-              countOut: (n) => {
-                counters.packetsOut++;
-                counters.bytesOut += n;
-              },
-            },
-            turn,
-          );
+    this.turnSpecs = turn;
+    this.turnBudget = Math.max(2, opts.turnPeersPerAllocation ?? 8);
+    this.maxTurn = Math.max(1, opts.maxTurnAllocations ?? 64);
+    this.turnBind = turnSock.family === 4 ? turnSock.bindAddress : '0.0.0.0';
+    this.makeRelay = (io, shared) => {
+      const relay = new TurnRelay(
+        {
+          io,
+          family: 4,
+          now,
+          reportMapped: shared,
+          deliver: (r, msg, address, port) => this.onRelayPacket(r, msg, address, port),
+          onChange: (r) => this.onRelayChange(r),
+          countOut: (n) => {
+            counters.packetsOut++;
+            counters.bytesOut += n;
+          },
+        },
+        this.turnSpecs,
+      );
+      this.pool.push(relay);
+      this.relayMaps.set(relay, new Map());
+      this.relaySessions.set(relay, new Set());
+      return relay;
+    };
+    this.relay = turn.length === 0 ? null : this.makeRelay(turnSock.sock, true);
+    if (this.relay !== null) this.current.push(this.relay);
     this.turnIo = turnSock.sock;
     this.ice = new IceScheduler({
       send: rawSend,
@@ -354,7 +385,7 @@ export class RtcEndpoint {
       sockets: bound,
       policy,
       ownClasses: [...ownClasses],
-      ...(this.relay !== null ? { relays: [this.relay] } : null),
+      ...(this.relay !== null ? { relays: this.pool } : null),
       ...(this.relayOnly ? { relayOnly: true } : null),
     });
     this.gatherer = new Gatherer(
@@ -364,7 +395,7 @@ export class RtcEndpoint {
         ...(opts.publicPort !== undefined ? { publicPort: opts.publicPort } : null),
         port,
         stunServers: this.iceLite || this.relayOnly ? [] : stunServers(opts.iceServers),
-        ...(this.relay !== null ? { relays: [this.relay] } : null),
+        ...(this.relay !== null ? { relays: this.current } : null),
         ...(this.relayOnly ? { relayOnly: true } : null),
         policy,
         ...(opts.gatherRefreshMs !== undefined ? { refreshMs: opts.gatherRefreshMs } : null),
@@ -414,6 +445,12 @@ export class RtcEndpoint {
       ice: this.iceLite ? null : this.ice,
       relayOnly: this.relayOnly,
       countRelayUnavailable: () => counters.relayUnavailable++,
+      ...(this.relay !== null
+        ? {
+            currentRelay: () => this.current[0] ?? null,
+            assignRelay: (s: RtcSessionImpl, r: RelayIo) => this.assignRelay(s, r as TurnRelay),
+          }
+        : null),
       helloVerify: opts.helloVerify ?? this.iceLite,
       holdAddress: (s, address, port) => {
         const key = `${address}|${port}`;
@@ -572,12 +609,40 @@ export class RtcEndpoint {
     if (this.closed || this.iceLite) return;
     this.gatherer.setStunServers(this.relayOnly ? [] : stunServers(list));
     const turn = turnServers(list);
-    if (this.relay !== null && turn.length > 0) this.relay.setServers(turn);
+    if (this.relay !== null && turn.length > 0) {
+      this.turnSpecs = turn;
+      for (const r of this.pool) r.setServers(turn);
+    }
   }
 
   /** The TURN allocation's state (null: no TURN server configured). */
   get turn(): TurnStats | null {
-    return this.relay?.stats() ?? null;
+    return this.turnStats();
+  }
+
+  /** The current allocation's state, counters summed over the pool. */
+  private turnStats(): TurnStats | null {
+    if (this.relay === null) return null;
+    const cur = this.current[0] ?? this.relay;
+    const out = cur.stats();
+    for (const r of this.pool) {
+      if (r === cur) continue;
+      const x = r.stats();
+      out.allocations += x.allocations;
+      out.allocationFailures += x.allocationFailures;
+      out.refreshes += x.refreshes;
+      out.permissions += x.permissions;
+      out.channels += x.channels;
+      out.packetsOut += x.packetsOut;
+      out.bytesOut += x.bytesOut;
+      out.packetsIn += x.packetsIn;
+      out.bytesIn += x.bytesIn;
+      out.sendIndications += x.sendIndications;
+      out.channelDataOut += x.channelDataOut;
+      out.dropped += x.dropped;
+    }
+    out.pool = this.pool.length;
+    return out;
   }
 
   /**
@@ -592,6 +657,7 @@ export class RtcEndpoint {
     let ufrag = randomIceString(8);
     while (this.byUfrag.has(ufrag)) ufrag = randomIceString(8);
     const pwd = randomIceString(24);
+    if (this.relay !== null) this.selectRelay();
     const g = this.gatherer.forSession();
     const answer = buildAnswer({
       offer,
@@ -609,6 +675,7 @@ export class RtcEndpoint {
     const s = new RtcSessionImpl(this.host, offer, ufrag, pwd, answer, g.lines);
     const ip = o?.remoteIp;
     if (ip !== undefined && s.agent !== null && this.relay !== null) s.agent.hintRemoteIp(ip.startsWith('::ffff:') ? ip.slice(7) : ip);
+    if (this.relay !== null) this.ensureSpare();
     if (!g.complete) {
       s.gatheringComplete = false;
       this.gatherer.wait(s);
@@ -640,7 +707,120 @@ export class RtcEndpoint {
   /** A peer's datagram unwrapped by the relay (packetsIn/bytesIn counted the outer datagram). */
   private onRelayPacket(relay: TurnRelay, msg: Buffer, address: string, port: number): void {
     if (msg.length === 0) return;
-    this.demux(relay, this.relayByAddress, msg, address, port);
+    this.demux(relay, this.relayMaps.get(relay) ?? this.byAddress, msg, address, port);
+  }
+
+  /** A datagram on the own socket of a pool allocation: only its TURN server talks to it. */
+  private onRelaySocketPacket(relay: TurnRelay, msg: Buffer, address: string, port: number): void {
+    const c = this.counters;
+    c.packetsIn++;
+    c.bytesIn += msg.length;
+    if (msg.length === 0 || this.closed) return;
+    const sa = relay.serverAddress;
+    if (port === relay.serverPort && sa !== null && (address === sa || sameIp(address, sa)) && relay.onServerPacket(msg)) return;
+    c.directDropped++;
+  }
+
+  // ------------------------------------------------------------ TURN allocation pool
+
+  /** Reserved peer addresses per session that has not connected yet (its srflx and a peer-reflexive one). */
+  private static readonly RESERVE = 2;
+
+  /** Peer addresses an allocation can still take for new sessions. */
+  private relayRoom(r: TurnRelay): number {
+    if (!r.ready || r.full) return 0;
+    let pending = 0;
+    const set = this.relaySessions.get(r);
+    if (set !== undefined) for (const s of set) if (s.state !== 'open') pending++;
+    return this.turnBudget - r.peerAddresses - pending * RtcEndpoint.RESERVE;
+  }
+
+  /** New sessions go to the current allocation while it has room, else to another one with room. */
+  private selectRelay(): void {
+    const cur = this.current[0];
+    if (cur === undefined || this.relayRoom(cur) >= RtcEndpoint.RESERVE) return;
+    let best: TurnRelay | null = null;
+    for (const r of this.pool) if (r !== cur && this.relayRoom(r) >= RtcEndpoint.RESERVE && (best === null || this.relayRoom(r) > this.relayRoom(best))) best = r;
+    if (best === null) return; // none: the current one takes it (overloaded) while a new one is made
+    this.current[0] = best;
+    this.gatherer.relaysChanged();
+  }
+
+  /** Keeps one more allocation with room ready (or being made) when the current one runs low. */
+  private ensureSpare(): void {
+    const cur = this.current[0];
+    if (cur === undefined || this.closed) return;
+    if (cur.ready && this.relayRoom(cur) >= 2 * RtcEndpoint.RESERVE) return;
+    for (const r of this.pool) if (r !== cur && (r.state === 'allocating' || this.relayRoom(r) >= 2 * RtcEndpoint.RESERVE)) return;
+    this.spawnRelay();
+  }
+
+  private spawnRelay(): void {
+    if (this.spawning || this.closed || this.pool.length >= this.maxTurn) return;
+    this.spawning = true;
+    bindSocket('udp4', this.turnBind, 0, 1 << 20).then(
+      (sock) => {
+        this.spawning = false;
+        if (this.closed) {
+          sock.close();
+          return;
+        }
+        let relay: TurnRelay | null = null;
+        const io = new UdpIo(
+          sock,
+          (msg, address, port) => {
+            if (relay !== null) this.onRelaySocketPacket(relay, msg, address, port);
+          },
+          (err) => console.error('[haxlite/rtc] socket error:', err.message),
+        );
+        relay = this.makeRelay(io, false);
+        this.relaySockets.set(relay, sock);
+        relay.allocate();
+      },
+      () => {
+        this.spawning = false;
+      },
+    );
+  }
+
+  private onRelayChange(r: TurnRelay): void {
+    if (!r.ready) this.relayMaps.get(r)?.clear();
+    if (r === this.current[0]) this.gatherer.relaysChanged();
+    else if (r.ready && this.current[0] !== undefined && this.relayRoom(this.current[0]) < RtcEndpoint.RESERVE) {
+      // a new allocation is up and the current one is out of room: new sessions use it
+      this.current[0] = r;
+      this.gatherer.relaysChanged();
+    }
+    if (!r.ready) this.retireIdle();
+  }
+
+  private assignRelay(s: RtcSessionImpl, r: TurnRelay): void {
+    const set = this.relaySessions.get(r);
+    if (set === undefined || set.has(s)) return;
+    set.add(s);
+    let list = this.sessionRelays.get(s);
+    if (list === undefined) {
+      list = [];
+      this.sessionRelays.set(s, list);
+    }
+    list.push(r);
+  }
+
+  /** Deletes allocations (other than the endpoint socket's and the current one) that have no room and no sessions left. */
+  private retireIdle(): void {
+    for (let i = this.pool.length - 1; i >= 0; i--) {
+      const r = this.pool[i]!;
+      if (r === this.relay || r === this.current[0] || r.state === 'allocating') continue;
+      if ((this.relaySessions.get(r)?.size ?? 0) > 0) continue;
+      if (r.ready && this.relayRoom(r) >= RtcEndpoint.RESERVE) continue; // a spare with room: kept
+      this.pool.splice(i, 1);
+      this.relayMaps.delete(r);
+      this.relaySessions.delete(r);
+      r.close();
+      const sock = this.relaySockets.get(r);
+      this.relaySockets.delete(r);
+      sock?.close();
+    }
   }
 
   private demux(sock: PacketIo, byAddress: Map<string, Map<number, ValidatedAddress>>, msg: Buffer, address: string, port: number): void {
@@ -707,7 +887,8 @@ export class RtcEndpoint {
   }
 
   private mapFor(sock: PacketIo): Map<string, Map<number, ValidatedAddress>> {
-    return sock === this.relay ? this.relayByAddress : this.byAddress;
+    if (sock instanceof TurnRelay) return this.relayMaps.get(sock) ?? this.byAddress;
+    return this.byAddress;
   }
 
   private bindAddress(v: ValidatedAddress): void {
@@ -742,6 +923,12 @@ export class RtcEndpoint {
     const d = s.dtlsDrops;
     this.counters.dtlsReplayed += d.replayed;
     this.counters.dtlsBadRecords += d.bad;
+    const relays = this.sessionRelays.get(s);
+    if (relays !== undefined) {
+      this.sessionRelays.delete(s);
+      for (const r of relays) this.relaySessions.get(r)?.delete(s);
+      this.retireIdle();
+    }
   }
 
   // ------------------------------------------------------------ timers
@@ -782,7 +969,7 @@ export class RtcEndpoint {
       dtlsBadRecords: bad,
       ice: { ...this.ice.stats },
       reflexive: this.gatherer.mapped.map((a) => (isIP(a.address) === 6 ? `[${a.address}]:${a.port}` : `${a.address}:${a.port}`)),
-      turn: this.relay?.stats() ?? null,
+      turn: this.turnStats(),
     };
   }
 
@@ -792,7 +979,9 @@ export class RtcEndpoint {
     this.closed = true;
     for (const s of [...this.byUfrag.values()]) s.terminate('endpoint-closed');
     this.gatherer.close();
-    this.relay?.close();
+    for (const r of this.pool) r.close();
+    for (const sock of this.relaySockets.values()) sock.close();
+    this.relaySockets.clear();
     this.ice.close();
     if (this.sweepTimer !== null) clearInterval(this.sweepTimer);
     this.sweepTimer = null;

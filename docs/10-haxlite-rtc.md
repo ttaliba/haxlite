@@ -186,6 +186,20 @@ Con una entrada `turn:` (UDP) en `iceServers` el endpoint hace **una asignación
 socket IPv4 y anuncia su dirección relayed como candidato `relay` (`raddr 0.0.0.0 rport 0`) en todas
 las respuestas, sin ningún otro ajuste. Sin `turn:` no cambia nada y no se asigna nada.
 
+**Pool de asignaciones (0.3.1).** Cloudflare solo relaya para ~10 direcciones de par distintas
+(ip:puerto) por asignación **en toda su vida** (reportado en cloudflare-docs#33972, no documentado):
+la 11.ª no recibe nada, sin error (CreatePermission y Refresh siguen saliendo bien; solo un
+ChannelBind recibe 400). Con una asignación por endpoint, una sala (o un proceso con varias salas,
+que comparten endpoint) dejaba de aceptar jugadores nuevos tras ~10 direcciones, a los pocos minutos
+de tráfico real, mientras los que ya estaban seguían jugando; con haxball.js no pasaba porque cada
+PeerConnection hacía su asignación. Ahora cada sesión recibe el candidato relay de una asignación con
+hueco: presupuesto `turnPeersPerAllocation` (8) direcciones por asignación, 2 reservadas por sesión
+pendiente; una de repuesto se prepara en segundo plano (nadie espera un Allocate); un ChannelBind 400
+marca la asignación como llena; las agotadas siguen sirviendo a sus jugadores y se borran (LIFETIME 0,
+socket cerrado) cuando se quedan sin sesiones; tope `maxTurnAllocations` (64). La primera usa el
+socket del endpoint, las demás un socket UDP propio cada una. Probado contra Cloudflare: 20/20
+entradas seguidas en un endpoint (antes fallaba desde la 8.ª con una asignación ya usada por 3).
+
 * **Allocate** con credenciales de largo plazo: la primera petición va sin autenticar, el 401 trae
   REALM/NONCE; después USERNAME/REALM/NONCE + MESSAGE‑INTEGRITY con MD5(usuario:realm:clave). 438
   (nonce caducado) se reintenta; 437 (asignación de un proceso anterior en el mismo puerto) se borra
