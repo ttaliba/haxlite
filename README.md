@@ -4,7 +4,7 @@
 
 **Un host headless de HaxBall escrito desde cero en TypeScript: más ligero, más rápido y con la misma API `HBInit`.**
 
-[![CI](https://github.com/ttaliba/rev-eng-haxball/actions/workflows/ci.yml/badge.svg)](https://github.com/ttaliba/rev-eng-haxball/actions/workflows/ci.yml)
+[![CI](https://github.com/ttaliba/haxlite/actions/workflows/ci.yml/badge.svg)](https://github.com/ttaliba/haxlite/actions/workflows/ci.yml)
 ![Node](https://img.shields.io/badge/Node.js-%E2%89%A5%2022-3c873a)
 ![Bun](https://img.shields.io/badge/Bun-compatible-f472b6)
 ![Protocolo](https://img.shields.io/badge/HaxBall-protocolo%209-1f6feb)
