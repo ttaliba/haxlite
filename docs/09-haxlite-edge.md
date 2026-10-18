@@ -380,7 +380,7 @@ WantedBy=multi-user.target
 |---|---|
 | TCP 8443 (control) | abierto (autenticado con HMAC); si los hosts tienen IP fija, mejor solo desde ellas. Rate-limit de conexiones nuevas (`ct state new limit rate 20/second`) |
 | UDP 8443 (túnel v2) | **solo de los hosts** si tienen IP fija; si no, abierto: sin un `connId` vigente y un MAC válido el edge no responde nada (§4) |
-| UDP 40000 (jugadores, `webrtc.port`) | el `ROOM_PORTS` de [`ops/haxguard/haxguard.nft`](../ops/haxguard/haxguard.nft): descartar fragmentos, puertos origen < 1024 y reflectores, aceptar STUN con límite por origen. Con `'rtc'` es **un** puerto para todos los jugadores |
+| UDP 40000 (jugadores, `webrtc.port`) | descartar fragmentos, puertos origen < 1024 y reflectores, aceptar STUN con límite por origen. Con `'rtc'` es **un** puerto para todos los jugadores. [`ops/haxguard/haxguard.nft`](../ops/haxguard/haxguard.nft) es la plantilla de esas reglas, pero **no sirve tal cual** para el Edge: (1) su `ROOM_PORTS` por defecto es `20000-20999` y todo UDP fuera de él pasa sin filtrar (hay que cambiarlo al puerto de jugadores del edge); (2) solo deja pasar a las IP de los conjuntos `active4/6` y `pending4/6`, que debe llenar un sidecar privilegiado (haxguard) **que no está en el repo**; con los conjuntos vacíos, tras cambiar `ROOM_PORTS` solo pasa el STUN y se descartan el DTLS/SCTP de los jugadores; (3) está escrita para salas `ndc` con `enableIceUdpMux`. Sin sidecar hay que adaptar una copia que conserve solo las reglas generales (fragmentos, puertos origen < 1024, reflectores, límite de STUN) y no el descarte final |
 | `GET /stats` | ponerle `stats.token` o no exponerlo (bind privado / firewall) |
 
 Con `playerBackend: 'ndc'` el rango es `portRange` (una PeerConnection por puerto salvo
@@ -470,7 +470,9 @@ por diseño; con un /64 IPv6 en el edge se puede seguir aplicando el "canary" de
 
 ## 5. Referencia de configuración del edge
 
-JSON (`--config` o `HAXLITE_EDGE_CONFIG`) + variables de entorno (ganan): `HAXLITE_EDGE_HOST`,
+JSON (`--config` o `HAXLITE_EDGE_CONFIG`) + variables de entorno (ganan sobre el archivo, **salvo las
+claves**: `HAXLITE_EDGE_KEYS` y `HAXLITE_EDGE_KEYS_FILE` se **suman** a `keys` / `keysFile` del JSON,
+no los sustituyen; `--config` gana sobre `HAXLITE_EDGE_CONFIG`): `HAXLITE_EDGE_HOST`,
 `HAXLITE_EDGE_PORT`, `HAXLITE_EDGE_KEYS` (`id:secret,id2:secret2`), `HAXLITE_EDGE_KEYS_FILE`,
 `HAXLITE_EDGE_TLS_CERT`/`HAXLITE_EDGE_TLS_KEY`, `HAXLITE_EDGE_BIND`, `HAXLITE_EDGE_PORT_RANGE`
 (`40000-40999`), `HAXLITE_EDGE_PLAYER_BACKEND` (`rtc`/`ndc`), `HAXLITE_EDGE_PUBLIC_ADDRESSES`
@@ -577,7 +579,7 @@ vuelve por `uu`). Modos: `direct`, `edge[-rtc|-ndc][-udp|-webrtc|-ws]` (por defe
 `rtc`/`udp`, o sea `edge` = la configuración nueva y `edge-ndc-webrtc` = la anterior):
 
 ```sh
-flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings \
+flock /tmp/haxlite-bench.lock node --experimental-strip-types --no-warnings \
   --import ./scripts/ts-resolve.mjs scripts/edge-latency.ts \
   --players 16 --seconds 20 --runs 3 --modes edge-rtc-udp,edge-ndc-webrtc
 ```

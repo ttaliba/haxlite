@@ -99,7 +99,7 @@ IP de origen, **por puerto objetivo** o por protocolo. De aquí:
 **Detección de qué endpoint recibe el ataque** (de más simple a más potente):
 
 - **nftables con sets dinámicos con `counter` por `(daddr, dport)`** — recomendado. Probado:
-  `ipresearch/canary-counters.nft` carga una tabla *solo-conteo* (`policy accept`, sin drops) con hook
+  `ops/haxguard/canary-counters.nft` carga una tabla *solo-conteo* (`policy accept`, sin drops) con hook
   `prerouting`:
   ```
   set canary4 { type ipv4_addr . inet_service; flags dynamic,timeout; timeout 10m; counter; size 65536 }
@@ -266,7 +266,7 @@ en la main para atribuir lo que se filtre desde dentro.
 
 ## Archivos del experimento
 - `ipresearch/canary-exp.mjs` / `canary-exp.out` — asignación de dirección:puerto por PeerConnection.
-- `ipresearch/canary-counters.nft` — tabla nftables solo-conteo por `(daddr,dport)` (hook prerouting).
+- `ops/haxguard/canary-counters.nft` (en el repo; los demás archivos de `ipresearch/` son del experimento y no están en él) — tabla nftables solo-conteo por `(daddr,dport)` (hook prerouting).
 - `ipresearch/attribution-demo.mjs` / `attribution-demo.out` — mapeo endpoint→sesión (tráfico benigno).
 
 ## Fuentes

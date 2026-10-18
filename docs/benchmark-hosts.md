@@ -1,5 +1,7 @@
 # Benchmark: hosts de HaxBall en Node.js
 
+![Comparativa completa: haxlite frente a haxball.js, node-haxball y haxlite + node-datachannel](img/benchmark/0-comparativa-completa.png)
+
 ## Resultado actual (tanda unificada del 13-10-2026, tras la pasada «puntero en todo»)
 
 Misma sesión, las opciones **intercaladas** en cada repetición, 3 repeticiones de 60 s tras 15 s de calentamiento (sala vacía: 3 × 120 s; arranque: 10 repeticiones), haxlite medido con el **paquete minificado** publicado (commit `de3f879`). Mediana [mín–máx]. Máquina: 4 vCPU Xeon a **2,10 GHz** (más lenta que la de las tandas anteriores: los valores absolutos de CPU suben para todos; comparar solo dentro de esta tabla). Datos: `bench/results/unified-*.json` · `sh bench/net/unified.sh` · `node bench/net/report.mjs --unified` · imágenes en `docs/img/benchmark/` (`node bench/charts.mjs docs/img/benchmark bench/results/unified rtc,off,nh`).
@@ -214,18 +216,20 @@ hasta la primera PeerConnection (por eso los 7 hilos en la sala ociosa).
 
 ```sh
 npm ci
-sh bench/net/unified.sh          # ≈ 1 h 45 min; compila haxlite y corre los cuatro escenarios
+sh bench/net/unified.sh          # ≈ 1 h 35 min; compila haxlite y corre los cuatro escenarios con cinco hosts
 node bench/net/report.mjs --unified
 ```
 
-`bench/net/unified.sh` ejecuta, cada uno bajo `flock /tmp/haxlite-bench.lock`:
+`bench/net/unified.sh` ejecuta, cada uno bajo `flock /tmp/haxlite-bench.lock` (hoy con **cinco** hosts: añade
+`haxlite:rtc@bun`, que la tanda del 13-10 de arriba no incluye, y corre `idle` con `--parallel 3`, tres hosts a la vez
+cada uno fijado a su núcleo; la tanda del 13-10 usó cuatro hosts y `idle` en serie):
 
 ```sh
-npm run -s bench:build
-R="node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs bench/net/run.ts"
-I=official,nodehaxball,haxlite:ndc,haxlite:rtc
+node bench/build.mjs
+R="node --no-warnings --import ./bench/ts-resolve.mjs bench/net/run.ts"
+I=official,nodehaxball,haxlite:ndc,haxlite:rtc,haxlite:rtc@bun
 flock /tmp/haxlite-bench.lock $R startup --impl $I --reps 10 --max-foreign 50 --attempts 3 --out bench/results/unified-startup.json
-flock /tmp/haxlite-bench.lock $R idle --impl $I --reps 3 --warmup 15 --window 120 --max-foreign 50 --attempts 3 --out bench/results/unified-idle.json
+flock /tmp/haxlite-bench.lock $R idle --impl $I --reps 3 --warmup 15 --window 120 --parallel 3 --max-foreign 50 --attempts 3 --out bench/results/unified-idle.json
 flock /tmp/haxlite-bench.lock $R game --impl $I --n 4,10,20 --reps 3 --warmup 15 --window 60 --max-foreign 50 --attempts 3 --out bench/results/unified-game.json
 flock /tmp/haxlite-bench.lock $R rooms --impl $I --k 10 --reps 3 --warmup 15 --window 60 --max-foreign 50 --attempts 3 --out bench/results/unified-rooms.json
 ```

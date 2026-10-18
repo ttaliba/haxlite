@@ -199,6 +199,10 @@ marca la asignación como llena; las agotadas siguen sirviendo a sus jugadores y
 socket cerrado) cuando se quedan sin sesiones; tope `maxTurnAllocations` (64). La primera usa el
 socket del endpoint, las demás un socket UDP propio cada una. Probado contra Cloudflare: 20/20
 entradas seguidas en un endpoint (antes fallaba desde la 8.ª con una asignación ya usada por 3).
+`turnPeersPerAllocation` y `maxTurnAllocations` son opciones de `RtcEndpoint.listen`, **no** de
+`RtcBackendOptions`: `HBInit({ haxlite: { rtc } })` y `HostTransport` no las reenvían, así que
+ahí siempre valen 8 y 64; solo se pueden fijar abriendo un `RtcEndpoint` a mano y pasándolo con
+`rtc: { endpoint }`.
 
 * **Allocate** con credenciales de largo plazo: la primera petición va sin autenticar, el 401 trae
   REALM/NONCE; después USERNAME/REALM/NONCE + MESSAGE‑INTEGRITY con MD5(usuario:realm:clave). 438
@@ -284,7 +288,8 @@ new HostTransport({ token, peerBackend: 'rtc', rtcEndpoint: { port: 40000, publi
 |---|---|---|
 | `publicAddresses` | — (ICE completo: interfaces + STUN) | candidatos `host` anunciados tal cual en lugar de las direcciones de las interfaces. Útil con un NAT 1:1 cuyo IP público STUN no ve, o para no depender de STUN (con `publicAddresses` y sin `iceServers` propios no se consulta STUN). Con `iceLite` son las **únicas** direcciones del SDP; por defecto, las IPs públicas de las interfaces, y sin ninguna `HBInit` rechaza / `new HostTransport` lanza |
 | `iceLite` | `false` | modo anterior: `a=ice-lite`, sin recolección ni checks propios (el servidor tiene que ser alcanzable directamente) |
-| `iceServers` | los de `HostTransport.iceServers` (por defecto `stun:stun.l.google.com:19302`, como `ndc`); `[]` si hay `publicAddresses` | servidores STUN para los candidatos srflx (cadenas `stun:host:puerto`, objetos de node-datachannel o `RTCIceServer`). Las entradas TURN se ignoran (§2.1) |
+| `iceServers` | los de `HostTransport.iceServers` (por defecto `stun:stun.l.google.com:19302`, como `ndc`); `[]` si hay `publicAddresses` | servidores STUN para los candidatos srflx y TURN (UDP) para el candidato relay (cadenas `stun:host:puerto` / `turn:…`, objetos de node-datachannel o `RTCIceServer`). `turns:` y `?transport=tcp` se omiten (§2.2). Se pueden renovar en caliente con `room.haxlite.setIceServers(lista)` (§2.2) |
+| `iceTransportPolicy` | la de `HostTransport.rtc.iceTransportPolicy`, si no `'all'` | `'relay'`: solo se anuncia el candidato relay y todo el tráfico va por el TURN (la IP del host no llega al jugador); necesita un `turn:` UDP en `iceServers` y no admite `iceLite` (si no, `listen` falla). Ver §2.2 |
 | `iceCandidatePolicy` | la de `HostTransport.iceCandidatePolicy`, si no `'public'` | qué direcciones de interfaz se anuncian y a qué clases de dirección remota se mandan checks (§2.1). No se aplica a `publicAddresses` |
 | `gatherRefreshMs` | 60 000 | antigüedad a partir de la cual una sesión nueva dispara un refresco STUN en segundo plano (la sesión usa el resultado anterior) |
 | `ipv6` | `false` | usar IPv6: socket `udp6` si hay IPv6 global, candidatos IPv6 (interfaces, `publicAddresses`, srflx) y consultas AAAA. Sin ella se omiten las IPv6 de `publicAddresses` (una lista solo IPv6 es un error), `'::'` es el comodín IPv4 y otra IPv6 literal en `address` es un error (§2.1) |
@@ -345,9 +350,10 @@ Qué cambia y qué no respecto a node-datachannel (`'ndc'`, por defecto):
 
 **Recomendación**: `rtc` funciona ahora en las mismas situaciones que `ndc` (IP pública, NAT 1:1,
 NAT doméstico o de nube con filtrado dependiente de dirección/puerto, NAT simétrico del lado del host,
-doble NAT con hole punching; §4.4) con la mitad de CPU. Lo único que `ndc` puede y `rtc` no es usar un
-servidor TURN configurado a mano (§2.1). El valor por defecto sigue siendo `ndc` (ver la propuesta en
-§7); en servidores con IP pública `publicAddresses` + puerto fijo sigue siendo lo más simple.
+doble NAT con hole punching; §4.4) con la mitad de CPU. TURN (RFC 8656) también funciona en `rtc`
+(§2.2: entradas `turn:` UDP en `iceServers`, `iceTransportPolicy: 'relay'`, `setIceServers` en
+caliente); las limitaciones son solo UDP/IPv4 hacia el TURN y que con `iceLite` no hay TURN (§7). El
+valor por defecto sigue siendo `ndc` (ver la propuesta en §7); en servidores con IP pública `publicAddresses` + puerto fijo sigue siendo lo más simple.
 
 ## 4. Banco de interoperabilidad con navegadores reales (`test/rtc-interop/`)
 
@@ -518,7 +524,7 @@ No hay Firefox ni WebKit instalados en la VM, así que esas columnas están **pe
 probarlos (cualquier navegador, incluso un móvil en la misma red):
 
 ```sh
-node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+node --no-warnings --import ./bench/ts-resolve.mjs \
   test/rtc-interop/manual-server.ts rtc            # o ndc; opcional: <IP ICE> <puerto HTTP>
 # → abre http://<IP>:8080/selftest.html en el navegador a probar y pulsa «Probar»
 ```
@@ -610,7 +616,7 @@ Lectura:
 Reproducir (siempre con el cerrojo compartido de benchmarks de la VM):
 
 ```sh
-flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings \
+flock /tmp/haxlite-bench.lock node --no-warnings \
   --import ./bench/ts-resolve.mjs bench/rtc/run.ts \
   [--backends ndc,rtc] [--peers 1,10,30] [--seconds 30] [--warmup 5] [--input-hz 8] \
   [--per-page 10] [--out bench/results/rtc-backends.json]

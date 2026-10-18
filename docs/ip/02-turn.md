@@ -4,6 +4,8 @@ Fecha de la investigación: 2026-10-10. Topología analizada: **host headless (h
 
 Leyenda: **[DOC]** = documentado por el proveedor. **[CÓDIGO]** = verificado en el código fuente. **[MEDIDO]** = medido desde este contenedor. **[INFERENCIA]** = deducción mía que hay que comprobar en producción.
 
+> **Nota de estado (0.3.x): este informe analiza `peerBackend: 'ndc'` (libdatachannel/libjuice).** Con `peerBackend: 'rtc'` (haxlite-rtc, [docs/10 §2.2](../10-haxlite-rtc.md)) los límites de libjuice de abajo no aplican: el cliente TURN (RFC 8656, `src/rtc/turn.ts`) corre dentro del proceso, acepta varias entradas `turn:` UDP sin límite de 2 ni barajado, y si un Allocate no contesta prueba al instante la siguiente de la lista (p. ej. el puerto 53 de Cloudflare tras el 3478; el bloqueo del 53 es de los navegadores, no del host); con `iceTransportPolicy: 'relay'` no existen pares directos (`ice-agent.ts`) y lo que llegue directo de un jugador no se contesta (`stats().directDropped`), es decir, el bug de la sección 0.1 no existe en ese backend; `room.haxlite.setIceServers(lista)` renueva las credenciales en caliente sin reiniciar la sala; reparte los jugadores entre varias asignaciones (el límite de ~10 pares por asignación de Cloudflare) y pide `CreatePermission` también para la IP con la que el jugador llegó al maestro. Siguen valiendo: solo UDP e IPv4 en el relay, las limitaciones de Cloudflare (BYOIP, rutas, TTL) y el resto del análisis de red. En `ndc`, `setIceServers` también existe, pero solo afecta a las PeerConnections nuevas.
+
 ---
 
 ## 0. Resumen ejecutivo
@@ -16,7 +18,7 @@ Leyenda: **[DOC]** = documentado por el proveedor. **[CÓDIGO]** = verificado en
 2. **Por qué "algunos no pueden entrar"**, de más a menos probable:
    - (a) Por TURN solo pasan los paquetes de IPs para las que el host hizo `CreatePermission`. El host solo conoce las IPs de los candidatos del cliente, y el cliente oficial solo tiene srflx de Google STUN. Si a ese jugador le falla el STUN de Google, o sale a Cloudflare por otra IP pública (CGNAT con pool no emparejado, multi-WAN, VPN/WARP), la conexión muere. Sin TURN, el host lo habría "descubierto" como peer-reflexive. **[DOC+CÓDIGO+INFERENCIA]**
    - (b) Cloudflare **solo asigna relayed addresses IPv4** [DOC]. Los clientes sin candidato IPv4 (iOS en redes IPv6-only/NAT64, o STUN IPv4 fallido) no pueden emparejar.
-   - (c) **Credenciales caducadas**: haxlite fija `iceServers` al construir el transport y la TTL máxima es de 48 h [DOC][CÓDIGO]. Al caducar, las nuevas allocations fallan, así que nadie más entra, y los jugadores conectados se caen poco después.
+   - (c) **Credenciales caducadas**: con `ndc` haxlite fija `iceServers` al construir el transport (hoy se pueden cambiar en caliente con `setIceServers`, ver la nota de estado) y la TTL máxima es de 48 h [DOC][CÓDIGO]. Al caducar, las nuevas allocations fallan, así que nadie más entra, y los jugadores conectados se caen poco después.
    - (d) Cloudflare **rechaza `CreatePermission` hacia rangos BYOIP** de clientes de Cloudflare [DOC]. Un jugador cuyo ISP u hosting anuncie su prefijo vía Cloudflare (Magic Transit/BYOIP) no puede entrar.
    - (e) Bloqueos de IPs de Cloudflare a nivel de país o ISP: España con LaLiga (Movistar, O2, DIGI en días de partido) y el *throttling* de Cloudflare en Rusia.
    - (f) Timeouts del cliente oficial: 4 s, y 10 s en "reverse connection". La relay añade RTT y una ronda de `CreatePermission`.
@@ -127,7 +129,7 @@ Verificado en el código: `src/net/ice.ts`, `src/net/transport.ts`, y libdatacha
    - Los candidatos host del navegador son mDNS `.local` (no resolubles) o privados (Cloudflare los rechaza). En la práctica, **el único candidato útil del jugador es su srflx de Google STUN**.
    - Los pares relay solo se forman con candidatos de la misma familia. Como la relay es IPv4, un jugador sin srflx IPv4 no tiene ningún par relay posible.
 5. Allocation con lifetime de 10 min, refrescada cada 9 min con la **misma** credencial.
-   - En haxlite, `iceServers` es `readonly` y se resuelve una vez en el constructor (`transport.ts:297`). No hay forma de renovar credenciales sin reiniciar el transport.
+   - Cuando se escribió esto, `iceServers` se resolvía una vez en el constructor (`transport.ts`) y no había forma de renovar credenciales sin reiniciar el transport. Hoy existe `HostTransport.setIceServers` / `room.haxlite.setIceServers` (con `ndc` solo las PeerConnections nuevas usan la lista nueva; con `rtc` el siguiente Allocate y los Refresh de la misma asignación).
 6. haxlite envía la answer con el primer candidato permitido (como mucho `answerIceWaitMs` = 500 ms, igual que el oficial) y después hace *trickle* del candidato relay. Bien.
    - El cliente oficial da 4 s para conectar (10 s en "reverse connection", con 2,5 s de retraso al aplicar candidatos). Ver `docs/01-red-y-salas.md`.
 
@@ -170,11 +172,11 @@ Verificación recomendada:
    - Opcionalmente una segunda, `turn:turn.cloudflare.com:443?transport=udp`, como respaldo si el datacenter del host filtra el 3478/udp. libjuice admite como mucho 2.
    - **No incluir** las URLs TCP/TLS (libjuice las ignora), la de puerto 53 ni la de STUN. Un STUN solo sirve para generar candidatos srflx que de todas formas se filtran.
    - Ambas URLs acaban en el mismo PoP y dan dos relay candidates casi idénticos. No hay ganancia de diversidad de ruta.
-2. **Credenciales por conexión.** Hace falta un cambio en haxlite: que `iceServers` acepte una función que se llama en `negotiate()` (async o cacheada).
+2. **Credenciales por conexión.** (Resuelto en parte: ya existe `setIceServers` en caliente; sigue sin existir una función por conexión.) Cuando se redactó hacía falta un cambio en haxlite: que `iceServers` acepte una función que se llama en `negotiate()` (async o cacheada).
    - Generar credenciales con `ttl` de 172800 s (máximo) y renovar la caché cada 1–6 h.
    - Así cada allocation tiene al menos ~42 h de vida y nunca se reutiliza una credencial caducada.
    - Etiquetar con `customIdentifier = <sala>` para ver uso y PoP por sala.
-   - Mientras no exista ese cambio: TTL de 48 h y **reiniciar el transport (o la sala) antes** de que caduque.
+   - Alternativa sin reiniciar: llamar a `setIceServers` con credenciales nuevas antes de que caduquen (docs/10 §2.2 da el ejemplo de renovación a mitad de TTL).
 3. **Forzar IPv4 en el tramo host→TURN** si el catchment IPv6 es peor: `rtc.bindAddress = '<IPv4 del host>'`, o deshabilitar IPv6 en el host o en su namespace.
 4. **Cerrar el bug de relay-only a nivel de sistema** (sección 5.3). Es imprescindible.
 5. **No hay ICE restart con el cliente oficial.** Si Cloudflare reubica una allocation (mantenimiento o cambio de rutas), el jugador cae y tiene que reentrar. Esto es aceptable, pero conviene que la sala tolere reconexiones (por ejemplo, conservar el equipo y el puesto unos segundos).

@@ -659,7 +659,7 @@ en `info.haxliteBuildSha` de cada JSON.
 ```sh
 npm ci
 npm run bench:build                       # compila src/ → node_modules/.cache/haxlite-bench/dist
-R="node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs bench/net/run.ts"
+R="node --no-warnings --import ./bench/ts-resolve.mjs bench/net/run.ts"
 $R startup                                # 10 reps × 3 hosts            → bench/results/startup.json
 $R game                                   # N = 4,10,20 × 3 hosts × 3    → bench/results/game.json
 $R rooms --impl haxlite,official,nodehaxball   # K = 1,5,10 × 4 clientes → bench/results/rooms.json
@@ -1061,7 +1061,7 @@ segundo plano con un solo hilo); no medido como significativo.
 npm run build                                           # tsc + bundle → dist/
 node bench/host-msg.bench.mjs <dist> 20 2000000         # §7.2 (HEAP_PROF=f.heapprofile para atribuir)
 node bench/wakeups.bench.mjs <dist> 10 10 [Infinity]    # §7.1 despertares (K salas, s, maxWakeFrames)
-node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+node --no-warnings --import ./bench/ts-resolve.mjs \
   bench/startup/run.ts 20 antes=<dist-a>/index.js ahora=dist/index.js        # §7.3
 HAXLITE_BENCH_VARIANTS='{"base":{"dist":"…"},"new":{"dist":"…"}}' \
   node … bench/net/run.ts game --impl haxlite:base,haxlite:new --n 4,20 --eld 0 --out bench/results/lite-game.json
@@ -1169,9 +1169,9 @@ Comandos (además de los de §2.5):
 D=node_modules/.cache/haxlite-bench-net            # builds A/B (tsc de una copia de src/)
 flock /tmp/haxlite-bench.lock node bench/net/natives.mjs --n 20 --seconds 15 --dist $D/base/dist [--mux 1]
 HAXLITE_BENCH_VARIANTS='{"base":{"dist":"'$D'/base/dist"},"net":{"dist":"'$D'/final/dist"}}' \
-  flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+  flock /tmp/haxlite-bench.lock node --no-warnings --import ./bench/ts-resolve.mjs \
   bench/net/run.ts game --impl haxlite:base,haxlite:net --n 20 --reps 3 --warmup 10 --window 30
-flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./scripts/ts-resolve.mjs \
+flock /tmp/haxlite-bench.lock node --experimental-strip-types --no-warnings --import ./scripts/ts-resolve.mjs \
   scripts/edge-latency.ts --src $D/final/dist --players 16 --seconds 40 --modes edge --loss 2 [--edge-opts '{"roLanes":false}']
 ```
 
@@ -1212,7 +1212,7 @@ siendo `ndc` porque es el único que funciona sin configuración en cualquier re
 
 ```sh
 npm run bench:build
-flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+flock /tmp/haxlite-bench.lock node --no-warnings --import ./bench/ts-resolve.mjs \
   bench/net/run.ts game --impl haxlite:ndc,haxlite:rtc --n 20 --reps 3 --warmup 15 --window 60 \
   --out bench/results/game-rtc-vs-ndc.json
 ```
@@ -1243,9 +1243,9 @@ en conjunto).
 
 ```sh
 npm run bench:build   # y un build de la referencia en otro dist, vía HAXLITE_BENCH_VARIANTS (dist)
-flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+flock /tmp/haxlite-bench.lock node --no-warnings --import ./bench/ts-resolve.mjs \
   bench/net/run.ts game --impl haxlite:rtc,haxlite:ndc --n 20 --reps 3 --out bench/results/gc-bundling.json
-flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+flock /tmp/haxlite-bench.lock node --no-warnings --import ./bench/ts-resolve.mjs \
   bench/rtc/sctp-host-alloc.ts [--no-bundle] [--const-clock]
 ```
 
@@ -1332,7 +1332,7 @@ npx tsc -p tsconfig.build.json --outDir node_modules/.cache/hx-ab/base --declara
 D=$PWD/node_modules/.cache; N=$D/haxlite-bench/dist
 HAXLITE_BENCH_VARIANTS='{"base":{"dist":"'$D'/hx-ab/base"},"new":{"dist":"'$N'"},
   "cc0":{"dist":"'$N'","sctp":{"congestionControlModule":0}},"sack50":{"dist":"'$N'","sctp":{"delayedSackTime":50}}}' \
-  flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+  flock /tmp/haxlite-bench.lock node --no-warnings --import ./bench/ts-resolve.mjs \
   bench/net/run.ts game --impl haxlite:base,haxlite:new,haxlite:cc0,haxlite:sack50 --n 20 --reps 3 --warmup 10 --window 30
 
 ## Pasada del núcleo (entrada, arranque, heap; `src/net/transport`, build)
@@ -1394,9 +1394,9 @@ Diagnóstico, sin cambio de código:
   (~12 KB/s).
 
 ```sh
-flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+flock /tmp/haxlite-bench.lock node --no-warnings --import ./bench/ts-resolve.mjs \
   bench/startup/run.ts 15 base=<bundle antes>/index.js cur=<bundle después>/index.js
 HAXLITE_BENCH_VARIANTS='{"base":{"dist":"<dist antes>"},"cur":{"dist":"<dist después>"}}' \
-  flock /tmp/haxlite-bench.lock node --experimental-transform-types --no-warnings --import ./bench/ts-resolve.mjs \
+  flock /tmp/haxlite-bench.lock node --no-warnings --import ./bench/ts-resolve.mjs \
   bench/net/run.ts game --impl haxlite:base,haxlite:cur --n 20 --reps 3 --warmup 10 --window 30
 ```
