@@ -856,7 +856,6 @@ export class DtlsServer {
         this.pendingRead = new RecordCipher(suite, Buffer.from(block.subarray(0, k)), Buffer.from(block.subarray(2 * k, 2 * k + iv)), impl);
         this.pendingWrite = new RecordCipher(suite, Buffer.from(block.subarray(k, 2 * k)), Buffer.from(block.subarray(2 * k + iv, 2 * k + 2 * iv)), impl);
         block.fill(0);
-        block.fill(0);
         this.expect = 'cv';
         return;
       }

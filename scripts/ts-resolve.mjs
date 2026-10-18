@@ -1,6 +1,6 @@
 // Resolve hook so `node --experimental-strip-types` can run the repo's TS
 // sources, whose imports use NodeNext-style `.js` specifiers for `.ts` files.
-// Usage: node --experimental-strip-types --import ./scripts/ts-resolve.mjs scripts/net-stress.ts
+// Usage: node --experimental-strip-types --import ./scripts/ts-resolve.mjs scripts/edge.ts
 import { existsSync } from 'node:fs';
 import { register } from 'node:module';
 import { fileURLToPath } from 'node:url';

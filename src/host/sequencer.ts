@@ -278,8 +278,6 @@ export class Sequencer {
   readonly queue: RoomEvent[] = [];
   /** off `Sb`. */
   inputDelayFrames: number;
-  /** Extra frames for the host's own `delay` events (off `Kg`, always 0 in the headless). */
-  handicapFrames = 0;
   /** Frame of the last heartbeat sent (off `df`). */
   lastHeartbeatFrame = 0;
   /** Frame of the last CheckConsistency (off `cf`). */
@@ -700,7 +698,7 @@ export class Sequencer {
     ev.byId = 0;
     ev.clientSeq = 0;
     ev.order = 0;
-    ev.frame = ev.meta.delay ? this.frame + this.inputDelayFrames + this.handicapFrames : this.frame;
+    ev.frame = ev.meta.delay ? this.frame + this.inputDelayFrames : this.frame;
     const variants = this.makeVariants(ev);
     this.submit(ev);
     this.heartbeat();

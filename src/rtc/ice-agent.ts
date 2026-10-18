@@ -175,11 +175,6 @@ export class IceScheduler implements TxnTable {
     this.txns.delete(txid);
   }
 
-  /** Outstanding transactions (tests/diagnostics). */
-  get pendingTransactions(): number {
-    return this.txns.size;
-  }
-
   /** A Binding success/error response: routed to its transaction. False when none matches. */
   onResponse(m: StunMessage, sock: PacketIo, address: string, port: number): boolean {
     const h = this.txns.get(txidKey(m.buf));
@@ -293,7 +288,6 @@ interface Pair {
   sock: PacketIo;
   address: string;
   port: number;
-  remotePriority: number;
   /** Sort key: RFC 8445 §6.1.2.3 pair priority (as a double: only the order matters). */
   prio: number;
   state: number;
@@ -725,7 +719,7 @@ export class IceAgent {
   }
 
   private insert(sock: PacketIo, address: string, port: number, remotePriority: number, localPriority = LOCAL_PRIORITY): Pair {
-    const p: Pair = { sock, address, port, remotePriority, prio: pairPriority(remotePriority, localPriority), state: WAITING, sent: 0, triggered: false, learned: false, parked: false, tx: null };
+    const p: Pair = { sock, address, port, prio: pairPriority(remotePriority, localPriority), state: WAITING, sent: 0, triggered: false, learned: false, parked: false, tx: null };
     let i = 0;
     while (i < this.pairs.length && this.pairs[i]!.prio >= p.prio) i++;
     this.pairs.splice(i, 0, p);

@@ -2358,7 +2358,6 @@ export class SctpAssociation {
     const diff = (newCum - this.rCum) >>> 0;
     if (this.rBits !== null) {
       const bits = this.rBits;
-      const hf = this.hFlags!;
       const mask = this.rxMask;
       if (diff >= this.rxCap) {
         // Every TSN of the receive window is <= newCum.

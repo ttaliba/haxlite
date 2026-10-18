@@ -151,7 +151,7 @@ export interface RoomObject {
   kickPlayer(playerId: number, reason?: string | null, ban?: boolean): void;
   /** Removes the ban created when `playerId` was banned. Synchronous. */
   clearBan(playerId: number): void;
-  /** Clears the whole ban list (including haxlite IP/range/auth bans). Synchronous. */
+  /** Clears the kick-ban list, like the official one; haxlite IP/range/auth bans stay (use `haxlite.bans.clear()`). Synchronous. */
   clearBans(): void;
   /** No effect while a game is running. */
   setScoreLimit(limit: number): void;
@@ -311,8 +311,9 @@ export interface HaxliteConfig {
   peerBackend?: 'ndc' | 'rtc';
   /**
    * `peerBackend: 'rtc'` settings: `{ port: 40000, publicAddresses: ['203.0.113.7'] }`.
-   * `publicAddresses` defaults to the machine's public interface addresses;
-   * without one (NAT / cloud 1:1 NAT) it must be given, or HBInit rejects.
+   * `publicAddresses` is optional with the default full ICE (works behind NAT);
+   * with `iceLite: true` it defaults to the machine's public interface addresses
+   * and must be given on NAT / cloud 1:1 NAT, or HBInit rejects.
    * Rooms of one process with the same settings share one endpoint / UDP
    * socket (`shared: false` for a socket per room); `certificateFile` keeps
    * the DTLS identity on disk; `cipherSuites` sets the DTLS preference

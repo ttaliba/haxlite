@@ -243,7 +243,6 @@ export class RtcEndpoint {
   readonly port: number;
   private readonly sockets: Socket[];
   private readonly ios: UdpIo[];
-  private readonly opts: RtcEndpointOptions;
   private readonly bound: BoundSocket[];
   private readonly gatherer: Gatherer;
   private readonly ice: IceScheduler;
@@ -312,7 +311,6 @@ export class RtcEndpoint {
   };
 
   private constructor(opts: RtcEndpointOptions, raw: RawBound[], port: number, certificate: RtcCertificate, dataLayer: SctpFactory) {
-    this.opts = opts;
     this.sockets = raw.map((b) => b.sock);
     const onError = (err: Error) => {
       // ICMP errors etc.: never fatal for a shared UDP socket
