@@ -8,7 +8,7 @@
  * ONLY place allowed to touch its internals (minified names). How they were
  * found is documented next to each use and in docs/06 §6.
  *
- * NEVER import this from src/. Product code must stay clean-room.
+ * NEVER import this from src/. Product code must not depend on it.
  */
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';

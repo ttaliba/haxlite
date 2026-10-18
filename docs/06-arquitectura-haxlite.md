@@ -1,9 +1,8 @@
 # 06 — Arquitectura de haxlite
 
-> haxlite es una reimplementación *clean-room*, ligera y en TypeScript de un **host** de HaxBall
-> (sala *headless*) para Node.js ≥ 22 y Bun (§4.6). Debe interoperar bit a bit con los clientes oficiales del
-> navegador (protocolo 9) y ofrecer una API compatible con `HBInit` (la del headless oficial, como
-> `mertushka/haxball.js`). Este documento fija los límites entre módulos, las reglas de código
+> haxlite es un **host** de HaxBall (sala *headless*) ligero y en TypeScript, escrito
+> para Node.js ≥ 22 y Bun (§4.6). Debe interoperar bit a bit con los clientes oficiales del
+> navegador (protocolo 9) y ofrecer una API compatible con `HBInit` (la del headless oficial). Este documento fija los límites entre módulos, las reglas de código
 > que todos seguimos y cómo usar los oráculos de prueba.
 >
 > Documentos de referencia: [01 red](01-red-y-salas.md), [02 protocolo](02-protocolo-binario.md),
@@ -162,7 +161,7 @@ node-datachannel: un consumidor TypeScript con `skipLibCheck: false` y sin el pa
 4. Las extensiones de node-haxball (eventos 24–26, campos extra en `SendChatIndicator`) **nunca**
    se envían.
 
-### 4.4 Clean-room
+### 4.4 Procedencia del código
 
 1. Prohibido copiar código minificado (de `hl.js`, `api.js`, `game.pretty.js`) al producto. Se
    reimplementa con nombres legibles. Se permite transcribir **constantes numéricas, fórmulas y

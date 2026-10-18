@@ -1,5 +1,5 @@
 /**
- * Growable binary writer (clean-room equivalent of the official StreamWriter).
+ * Growable binary writer (equivalent of the official StreamWriter).
  *
  * - Big-endian by default; explicit `*LE` methods exist for the few
  *   little-endian fields (RoomInfo). There is no endianness *mode*: each call

@@ -1,5 +1,5 @@
 /**
- * `.hbs` (JSON5) stadium parser, clean-room equivalent of the official
+ * `.hbs` (JSON5) stadium parser, equivalent of the official
  * `w.kh` (headless f066733d) and its helpers (`tg` traits, `Ua` collision
  * flags, `Tc` colours, `qh` vertex, `ph` segment, `lh` goal, `ef` disc,
  * `nh` plane, `mh` joint, `oh` player physics).

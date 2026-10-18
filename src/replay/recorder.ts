@@ -1,7 +1,7 @@
 /**
  * Replay recorder: produces the official `.hbr2` (version 3) byte layout.
  *
- * Clean-room equivalent of the official headless recorder (off `cb`, built by
+ * Equivalent of the official headless recorder (off `cb`, built by
  * `startRecording()`, finished by `stopRecording()`). Behaviour reproduced:
  *
  *  - at start, the whole RoomState is serialized into the event stream buffer

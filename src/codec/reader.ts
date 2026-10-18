@@ -1,5 +1,5 @@
 /**
- * Binary reader (clean-room equivalent of the official StreamReader).
+ * Binary reader (equivalent of the official StreamReader).
  *
  * Big-endian by default with explicit `*LE` variants. Reads past the end throw
  * (the DataView RangeError for fixed-size reads, CodecError otherwise), as the

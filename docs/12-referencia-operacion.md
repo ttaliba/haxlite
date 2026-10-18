@@ -1,4 +1,4 @@
-# 12 — Referencia de operación: todo lo configurable fuera del código de la sala
+# 12 - Referencia de operación: todo lo configurable fuera del código de la sala
 
 > Esta página reúne, en un solo lugar, lo que se configura **alrededor** de una sala haxlite y no
 > dentro de ella: el gateway **haxlite Edge** (CLI, archivo de configuración, variables de entorno,
@@ -8,7 +8,7 @@
 > producción.
 >
 > La API de la sala (`HBInit`, `room.haxlite`, opciones `haxlite.*`) está en
-> [11 — Referencia de la API](11-referencia-api.md). Aquí solo se enlaza.
+> [11 - Referencia de la API](11-referencia-api.md). Aquí solo se enlaza.
 >
 > **Convención.** Cada valor por defecto de las tablas se **leyó en el código** (ruta indicada en
 > cada sección), no en los otros documentos. Lo que no se pudo confirmar en esta revisión lleva
@@ -67,7 +67,7 @@
 | `vitest` | `^5.0.3` | `devDependencies` | `npm test` |
 | `playwright-core` | `1.56.1` (fija) | `devDependencies` | Solo para las pruebas con navegador real. **No descarga navegadores** (ver `HAXLITE_CHROMIUM`, §4). La 1.56.1 corresponde a Chromium 141 (`chromium-1194`) |
 | `haxball.js`, `node-haxball`, `pako` | `5.1.0`, `2.3.1`, `^2.2.0` | `devDependencies` | Oráculos de prueba y referencias de los benchmarks |
-| Linux, `taskset`, `flock`, `nft` | — | `bench/net/run.ts`, `scripts/edge-latency.ts` | Solo para benchmarks publicables (`/proc`, fijar núcleos, cerrojo, pérdida simulada). Los benchmarks corren en Windows, pero la CPU por proceso allí no es fiable (docs/07) |
+| Linux, `taskset`, `flock`, `nft` | - | `bench/net/run.ts`, `scripts/edge-latency.ts` | Solo para benchmarks publicables (`/proc`, fijar núcleos, cerrojo, pérdida simulada). Los benchmarks corren en Windows, pero la CPU por proceso allí no es fiable (docs/07) |
 | Chromium instalado | build `chromium-1194` | `test/rtc-interop/harness/browser.ts` | Solo `npm run test:interop` y `bench/rtc` |
 
 **Instalación desde el repositorio**
@@ -94,7 +94,7 @@ Todos salen de `package.json` → `scripts`. Los argumentos extra se pasan tras 
 | `build` | `node scripts/build.mjs` | `tsc -p tsconfig.build.json` a un directorio temporal, empaqueta con rolldown (entradas `index` y `edge/cli`, un *chunk* compartido, minificado, ASCII), copia los `.d.ts` y deja el resultado en `dist/` | Flags de `scripts/build.mjs`: `--out <dir>` (por defecto `dist`), `--no-minify`. Borra el destino antes de compilar. Lo necesita `bin/haxlite-edge.js` (`import '../dist/edge/cli.js'`) |
 | `typecheck` | `tsc -p tsconfig.json --noEmit && tsc -p tsconfig.build.json --noEmit` | Comprueba tipos de `src/`, `test/` y `vitest.config.ts`, y luego solo `src/` con `erasableSyntaxOnly` | `tsconfig.build.json` prohíbe `enum`, `namespace` y propiedades de parámetro en `src/`, para poder ejecutarlo sin compilar con `--experimental-strip-types` |
 | `test` | `vitest run` | Dos proyectos: `ndc` (todo `test/**/*.test.ts` y `src/**/*.test.ts`) y `rtc` (las suites host/API/transporte repetidas con `peerBackend: 'rtc'`) | Pool `forks`, tiempo límite de 60 s por prueba (`vitest.config.ts`). Las pruebas con Chromium se omiten solas si no hay navegador |
-| `test:watch` | `vitest` | Igual, en modo observación | — |
+| `test:watch` | `vitest` | Igual, en modo observación | - |
 | `test:interop` | `vitest run -c test/rtc-interop/vitest.config.ts` | Banco de interoperabilidad con Chromium real (`test/rtc-interop/**/*.interop.ts`) | Lento (minutos); `fileParallelism: false`; tiempo límite 60 s. Variables en §4 (`HAXLITE_CHROMIUM`, `RTC_INTEROP_*`, `HAXBALL_CLIENT_DIR`) |
 | `edge` | `node --experimental-strip-types --no-warnings --import ./scripts/ts-resolve.mjs scripts/edge.ts` | Ejecuta el Edge **desde las fuentes TypeScript**, sin compilar | `npm run edge -- --config edge.json`, `npm run edge -- genkey alice` |
 | `bench:build` | `node bench/build.mjs` | Compila haxlite para los hosts del benchmark (`node_modules/.cache/haxlite-bench/{dist,bundle}`), saltándose el trabajo si nada cambió | `--force` o `HAXLITE_BENCH_REBUILD=1` fuerzan la recompilación |
@@ -110,7 +110,7 @@ No existe un script `lint` ni `format` en `package.json` (verificado).
 
 Fuentes: `bin/haxlite-edge.js`, `src/edge/cli.ts`, `src/edge/config.ts`, `src/edge/server.ts`,
 `src/edge/tunnel-udp.ts`, `src/edge/players.ts`, `src/net/edge-protocol.ts`. Diseño y modelo de
-seguridad: [09 — haxlite Edge](09-haxlite-edge.md).
+seguridad: [09 - haxlite Edge](09-haxlite-edge.md).
 
 ### 3.1 CLI `haxlite-edge`
 
@@ -174,13 +174,13 @@ El archivo se lee con `JSON.parse`: **JSON estricto, sin comentarios ni comas fi
 
 | Variable | Tipo | Defecto | Equivale a | Qué hace / notas |
 |---|---|---|---|---|
-| `HAXLITE_EDGE_CONFIG` | ruta | — | `--config` | Archivo JSON. `--config` tiene prioridad |
+| `HAXLITE_EDGE_CONFIG` | ruta | - | `--config` | Archivo JSON. `--config` tiene prioridad |
 | `HAXLITE_EDGE_HOST` | cadena (IP/host) | `0.0.0.0` | `listen.host` | Dirección de escucha del control TCP. También es la base de la dirección del socket UDP del túnel (§3.5). Se usa `??`: una cadena vacía **cuenta como fijada** |
 | `HAXLITE_EDGE_PORT` | entero 0–65535 | `8443` | `listen.port` | Puerto TCP del control (WebSocket + `/stats`). `0` = efímero. Valor inválido → error `bad port` |
-| `HAXLITE_EDGE_KEYS` | lista `id:secreto,id2:secreto2` | — | `keys[]` | Se separa por comas y saltos de línea; `#` comenta una línea. Un secreto que contenga `,` no se puede dar por aquí. Se **suma** a las demás claves |
-| `HAXLITE_EDGE_KEYS_FILE` | ruta | — | `keysFile` | Archivo de claves (§3.7). Se **suma** |
-| `HAXLITE_EDGE_TLS_CERT` | ruta PEM | — | `tls.certFile` | Cadena completa del certificado. Requiere `HAXLITE_EDGE_TLS_KEY` |
-| `HAXLITE_EDGE_TLS_KEY` | ruta PEM | — | `tls.keyFile` | Clave privada |
+| `HAXLITE_EDGE_KEYS` | lista `id:secreto,id2:secreto2` | - | `keys[]` | Se separa por comas y saltos de línea; `#` comenta una línea. Un secreto que contenga `,` no se puede dar por aquí. Se **suma** a las demás claves |
+| `HAXLITE_EDGE_KEYS_FILE` | ruta | - | `keysFile` | Archivo de claves (§3.7). Se **suma** |
+| `HAXLITE_EDGE_TLS_CERT` | ruta PEM | - | `tls.certFile` | Cadena completa del certificado. Requiere `HAXLITE_EDGE_TLS_KEY` |
+| `HAXLITE_EDGE_TLS_KEY` | ruta PEM | - | `tls.keyFile` | Clave privada |
 | `HAXLITE_EDGE_BIND` | IP | todas | `webrtc.bindAddress` | Dirección local de los jugadores; el socket UDP del túnel la hereda si no se fija `tunnel.bindAddress` |
 | `HAXLITE_EDGE_PORT_RANGE` | `a-b` (p. ej. `40000-40999`) | efímeros | `webrtc.portRange` | Formato estricto `^\d+-\d+$`, `0 < a <= b < 65536`, o error. Con `rtc` **solo se usa el primer puerto** (`a`) como puerto único de jugadores; con `ndc` es el rango de las PeerConnections |
 | `HAXLITE_EDGE_PLAYER_BACKEND` | `rtc` / `ndc` | `rtc` | `playerBackend` | Cualquier otro valor → error |
@@ -215,14 +215,14 @@ Esqueleto completo (`EdgeConfigFile` en `config.ts`):
 | `listen.port` | entero | `8443` | Puerto TCP del control; `0` = efímero | Env: `HAXLITE_EDGE_PORT` |
 | `listen.path` | cadena | `/tunnel` | Ruta del WebSocket de los hosts (`EDGE_DEFAULT_PATH`) | Solo archivo. Otra ruta → la conexión se destruye sin respuesta |
 | `tls` | objeto o `null` | `null` (sin TLS, `ws://`) | `{certFile, keyFile}`: PEM → `wss://` | Env: `HAXLITE_EDGE_TLS_*`. SIGHUP recarga (§3.6) |
-| `keys[]` | lista | — | Claves de API (§3.7) | Con `keys`+`keysFile`+env vacíos el Edge **no arranca** (`no API keys configured`) |
-| `keysFile` | ruta | — | Más claves: array JSON o `id:secreto` por línea | Env: `HAXLITE_EDGE_KEYS_FILE` |
+| `keys[]` | lista | - | Claves de API (§3.7) | Con `keys`+`keysFile`+env vacíos el Edge **no arranca** (`no API keys configured`) |
+| `keysFile` | ruta | - | Más claves: array JSON o `id:secreto` por línea | Env: `HAXLITE_EDGE_KEYS_FILE` |
 | `playerBackend` | `"rtc"` / `"ndc"` | `"rtc"` | Cómo se atiende WebRTC de los jugadores | `rtc` = haxlite-rtc (TypeScript puro, 1 puerto UDP, ICE-lite). `ndc` = node-datachannel (addon nativo, carga perezosa) |
 | `stats.path` | cadena o `null` | `/stats` | Ruta HTTP(S) de las estadísticas; `null` desactiva el endpoint | Solo archivo |
 | `stats.token` | cadena o `null` | `null` | Token *bearer*; sin él, `/stats` es público en ese puerto | Env: `HAXLITE_EDGE_STATS_TOKEN` |
 | `stats.logIntervalMs` | ms | `60000` | Periodo del resumen en el log; `0` = apagado | Env: `HAXLITE_EDGE_LOG_INTERVAL_MS` |
 
-#### `webrtc` (jugadores) — `EdgeWebRtcOptions`
+#### `webrtc` (jugadores) - `EdgeWebRtcOptions`
 
 | Clave | Tipo | Defecto | Aplica a | Qué hace / notas |
 |---|---|---|---|---|
@@ -237,9 +237,9 @@ Esqueleto completo (`EdgeConfigFile` en `config.ts`):
 | `iceServers` | lista | `stun:stun.l.google.com:19302` | ndc, túnel `webrtc` | STUN/TURN de las PeerConnections propias del Edge |
 | `iceCandidatePolicy` | `public` / `private` / `all` / función | `public` | rtc, ndc | Qué direcciones propias se anuncian (con `rtc` también filtra las detectadas). `all` solo para pruebas en loopback |
 | `remoteCandidatePolicy` | `public` / `private` / `all` | `public` | rtc, ndc, túnel `webrtc` | Qué candidatos remotos se aceptan: filtra el SDP de la *offer* del jugador y los candidatos que el host reenvía. Con `ndc` además limita a qué direcciones se envían comprobaciones; con `rtc` (ICE-lite) el Edge nunca inicia comprobaciones, así que solo actúa el filtro |
-| `rtc` | objeto | — | ndc | Extras de node-datachannel (`mtu`, `maxMessageSize`…) para las PeerConnections de jugadores |
+| `rtc` | objeto | - | ndc | Extras de node-datachannel (`mtu`, `maxMessageSize`…) para las PeerConnections de jugadores |
 
-#### `tunnel` (host ↔ Edge, túnel v2) — `EdgeTunnelOptions`
+#### `tunnel` (host ↔ Edge, túnel v2) - `EdgeTunnelOptions`
 
 | Clave | Tipo | Defecto | Qué hace | Notas |
 |---|---|---|---|---|
@@ -257,7 +257,7 @@ Esqueleto completo (`EdgeConfigFile` en `config.ts`):
 Los sockets UDP del túnel piden búferes de 4 MiB de recepción y de envío (`setRecvBufferSize` /
 `setSendBufferSize`); el kernel puede recortarlos (`net.core.rmem_max` / `wmem_max`).
 
-#### `limits` — `EdgeLimitsOptions`
+#### `limits` - `EdgeLimitsOptions`
 
 | Clave | Tipo | Defecto | Qué limita |
 |---|---|---|---|
@@ -321,7 +321,7 @@ solo permita UDP hacia la IP del Edge garantiza que el host nunca le hable direc
 * Para rotar una clave hay que editar el archivo y **reiniciar** el Edge (no hay recarga de claves;
   SIGHUP solo recarga TLS). Al reiniciar se pierden los jugadores conectados, los hosts reconectan
   solos.
-* La clave del host se pasa en la opción `haxlite.edge` de la sala: ver [11 — Referencia de la API](11-referencia-api.md).
+* La clave del host se pasa en la opción `haxlite.edge` de la sala: ver [11 - Referencia de la API](11-referencia-api.md).
 
 ### 3.8 Códigos de cierre del WebSocket
 
@@ -349,7 +349,7 @@ solo permita UDP hacia la IP del Edge garantiza que el host nunca le hable direc
 
   Campos (`EdgeStats`): `uptimeSec`, `playerBackend`, `sessions`, `peers`, `authFailures`,
   `keys[]` (`id`, `label`, `sessions`, `peers`, `bytesIn/Out`, `messagesIn/Out`, `ppsIn/Out`
-  —desde la consulta anterior—, `floods`), `webrtc` (objetos nativos; `null` si node-datachannel
+  -desde la consulta anterior-, `floods`), `webrtc` (objetos nativos; `null` si node-datachannel
   nunca se cargó), `rtc` (contadores del endpoint de jugadores; `null` con `ndc`), `tunnel` (puerto,
   túneles, datagramas, `unknownConn`, `rateLimited`, `rejected`, `migrations`; `null` si está
   apagado), `dataPlanes` (`udp`/`webrtc`/`ws`), `memoryRssMb`.
@@ -367,7 +367,7 @@ solo permita UDP hacia la IP del Edge garantiza que el host nunca le hable direc
 `edge.generateEdgeKey(id)`. `EdgeServerOptions` admite además `server` (un servidor HTTP(S)
 existente; entonces `host`/`port`/`tls` se ignoran) y `log`. Métodos: `stats()`, `url(host?)`,
 `reloadTls()`, `close({ shutdownWebRtc })`; propiedades `tunnelPort`, `playerPort`, `address`.
-La API completa está en [11 — Referencia de la API](11-referencia-api.md).
+La API completa está en [11 - Referencia de la API](11-referencia-api.md).
 
 ---
 
@@ -381,7 +381,7 @@ el Edge (§3.3) y el cliente HTTP del maestro (proxies en Bun).
 
 | Variable | Defecto | Dónde | Efecto |
 |---|---|---|---|
-| `HAXLITE_EDGE_*` (12 variables) | — | `src/edge/config.ts` | Configuración del Edge: ver §3.3 |
+| `HAXLITE_EDGE_*` (12 variables) | - | `src/edge/config.ts` | Configuración del Edge: ver §3.3 |
 | `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `http_proxy`, `https_proxy`, `all_proxy` | sin definir | `src/net/master-http.ts` (`useFetch`) | **Solo en Bun:** si alguna está definida (o se pasa `agent`), el cliente del maestro **no** usa el `fetch` nativo de Bun y cae a `node:http(s)`. haxlite **no aplica** el proxy por sí mismo: para salir por un proxy hay que pasar un `agent` (`https-proxy-agent`, `socks-proxy-agent`…; opción `haxlite.agent`, ver [11](11-referencia-api.md)). `NO_PROXY` no se lee |
 
 El paquete no lee ninguna otra variable: ni `HAXLITE_*` genéricas, ni `NODE_ENV`, ni `DEBUG`
@@ -391,19 +391,19 @@ El paquete no lee ninguna otra variable: ni `HAXLITE_*` genéricas, ni `NODE_ENV
 
 | Variable | Defecto | Dónde | Efecto |
 |---|---|---|---|
-| `HAXBALL_TOKEN` | — (obligatoria) | `examples/basic-room.mjs`, `moderation.mjs`, `among-us-vision.mjs`, `scripts/hidden-bigmap-room.mjs` | *Headless token* de <https://www.haxball.com/headlesstoken> (caduca a los pocos minutos) |
-| `HX_TOKEN` | — (obligatoria) | `examples/live-room.mjs` | Igual, **otro nombre** (ver apéndice A) |
+| `HAXBALL_TOKEN` | - (obligatoria) | `examples/basic-room.mjs`, `moderation.mjs`, `among-us-vision.mjs`, `scripts/hidden-bigmap-room.mjs` | *Headless token* de <https://www.haxball.com/headlesstoken> (caduca a los pocos minutos) |
+| `HX_TOKEN` | - (obligatoria) | `examples/live-room.mjs` | Igual, **otro nombre** (ver apéndice A) |
 | `HAXLITE_OPTIONS` | `{}` | los mismos ejemplos | JSON que se pasa como opción `haxlite` de `HBInit` (p. ej. `{"masterUrl":"…","iceServers":[]}`) |
 | `HX_BACKEND` | `ndc` | `live-room.mjs` | `rtc` o `ndc` (`peerBackend`) |
 | `HX_RTC_PORT` | `40000` | `live-room.mjs` | Puerto UDP con `rtc` |
 | `HX_PUBLIC_IP` | autodetectada | `live-room.mjs` | IPs públicas a anunciar con `rtc`, separadas por comas |
-| `HX_EDGE_URL`, `HX_EDGE_KEY` | — | `live-room.mjs` | Aloja la sala a través de un Edge |
+| `HX_EDGE_URL`, `HX_EDGE_KEY` | - | `live-room.mjs` | Aloja la sala a través de un Edge |
 | `MODERATION_FILE` | `./moderation.json` | `moderation.mjs` | Archivo de bans persistentes |
 | `ADMIN_AUTHS` | vacío | `moderation.mjs` | `auth` de los administradores, separados por comas |
 | `QUARANTINE_MS` | `120000` | `moderation.mjs` | Tiempo sin poder escribir de un `auth` nunca visto |
 | `CONTROL` | sin definir | `scripts/hidden-bigmap-room.mjs` | `1` = sala de control (sin ocultar jugadores) |
 | `HAXBALL_CLIENT_DIR`, `OUT`, `PREFIX`, `FILES`, `EXAMPLE`, `VIEW_MODE`, `FRAME`, `POS`, `ONLY`, `PROPS`, `SPECTATE`, `WAIT`, `NAMES`, `KILL`, `KEYS`, `SETTLE`, `CHECKSUM` | ver el encabezado del script | `scripts/among-us-screenshots.ts` | Parámetros de las capturas con el cliente oficial (§5) |
-| `EDGE_BENCH_SRC`, `EDGE_BENCH_WEBRTC`, `EDGE_BENCH_EDGE_OPTS` | — | `scripts/edge-latency.ts` | **Internas:** el orquestador las fija desde `--src`, `--edge-webrtc`, `--edge-opts` para sus procesos hijos. No las definas a mano |
+| `EDGE_BENCH_SRC`, `EDGE_BENCH_WEBRTC`, `EDGE_BENCH_EDGE_OPTS` | - | `scripts/edge-latency.ts` | **Internas:** el orquestador las fija desde `--src`, `--edge-webrtc`, `--edge-opts` para sus procesos hijos. No las definas a mano |
 
 ### 4.3 Pruebas (`test/`)
 
@@ -427,7 +427,7 @@ El paquete no lee ninguna otra variable: ni `HAXLITE_*` genéricas, ni `NODE_ENV
 | `NET_DEBUG`, `EDGE_DEBUG` | sin definir | Log de depuración de `test/net/transport.test.ts` y de `test/edge/harness.ts` |
 | `TURN_VERBOSE` | sin definir | `1` (o cualquier valor en `turn-server.test.ts`) activa el log del servidor TURN de prueba |
 | `PARITY_DUMP` | sin definir | Ruta donde `test/api/parity.test.ts` vuelca las trazas oficial/propia |
-| `NN_KEY`, `NN_PLAYER_BACKEND` | — | **Internas** de `test/edge/edge-no-native.test.ts` |
+| `NN_KEY`, `NN_PLAYER_BACKEND` | - | **Internas** de `test/edge/edge-no-native.test.ts` |
 
 ### 4.4 Benchmarks (`bench/`)
 
@@ -437,19 +437,19 @@ El paquete no lee ninguna otra variable: ni `HAXLITE_*` genéricas, ni `NODE_ENV
 | `HAXLITE_BENCH_REBUILD` | sin definir | `1` fuerza `bench/build.mjs` a recompilar |
 | `HAXLITE_BENCH_VARIANTS` | `{}` | JSON `{"<nombre>": {dist?, bundle?, transport?, sctp?, logger?}}` que añade variantes `haxlite:<nombre>` para comparar builds A/B (§6.3) |
 | `HAXLITE_HOST_OPTS` | `{}` | JSON con opciones extra de `HostRoom` (p. ej. `{"heartbeatFrames":9}`). Solo diagnóstico, nunca en las tablas publicadas |
-| `HAXLITE_BENCH_IMPAIR` | — | **Interna** de `join-impaired`: el orquestador la fija |
-| `HOST_CPU_PROFILE` | — | Archivo `.cpuprofile` del perfil V8 del hilo JS durante la ventana de medición |
-| `HOST_ALLOC_PROFILE` | — | Archivo `.heapprofile` de asignaciones (incluye basura) |
-| `HOST_HEAP_SNAPSHOT` | — | Archivo `.heapsnapshot` al final de la ventana |
-| `HEAP_PROF` | — | `bench/host-msg.bench.mjs`: archivo de perfil de asignaciones |
+| `HAXLITE_BENCH_IMPAIR` | - | **Interna** de `join-impaired`: el orquestador la fija |
+| `HOST_CPU_PROFILE` | - | Archivo `.cpuprofile` del perfil V8 del hilo JS durante la ventana de medición |
+| `HOST_ALLOC_PROFILE` | - | Archivo `.heapprofile` de asignaciones (incluye basura) |
+| `HOST_HEAP_SNAPSHOT` | - | Archivo `.heapsnapshot` al final de la ventana |
+| `HEAP_PROF` | - | `bench/host-msg.bench.mjs`: archivo de perfil de asignaciones |
 | `CHROME_PATH` | Chromium de Playwright; si no, Chrome/Edge local | `bench/charts.mjs`: navegador para capturar los PNG |
 
 ### 4.5 Variables de runtime que no lee el código pero que importan
 
 | Variable | Valor | Efecto | Origen de la recomendación |
 |---|---|---|---|
-| `MIMALLOC_SCAVENGER` | `0` | **Solo Bun.** Elimina el hilo `mi-scavenger`: −7–12 % de CPU y la mitad de despertares, ≈ +1 MB de RSS | Medición del 16-10-2026 en la VM de pruebas Linux (4 vCPU). **No está en `docs/`**; ver apéndice A. Valídala con un *soak* largo antes de aplicarla |
-| `MALLOC_ARENA_MAX` | `2` | −5 MB de RSS con node-datachannel (arenas de glibc de los hilos nativos) | docs/07 §7.5. Con `peerBackend: 'rtc'` no hay hilos nativos: efecto no medido (no verificado) |
+| `MIMALLOC_SCAVENGER` | `0` | **Solo Bun.** Elimina el hilo `mi-scavenger`: -7–12 % de CPU y la mitad de despertares, ≈ +1 MB de RSS | Medición del 16-10-2026 en la VM de pruebas Linux (4 vCPU). **No está en `docs/`**; ver apéndice A. Valídala con un *soak* largo antes de aplicarla |
+| `MALLOC_ARENA_MAX` | `2` | -5 MB de RSS con node-datachannel (arenas de glibc de los hilos nativos) | docs/07 §7.5. Con `peerBackend: 'rtc'` no hay hilos nativos: efecto no medido (no verificado) |
 
 ---
 
@@ -476,7 +476,7 @@ host y Edge; el Edge en `127.0.0.2`, el túnel del host en `127.0.0.3`).
 | `--runs` | entero | `1` | Repeticiones (intercaladas entre modos) |
 | `--modes` | lista | `direct,edge,edge-ws` | `direct`, o `edge[-<jugadores>][-<plano>]` con jugadores `rtc` (defecto) o `ndc` y plano `udp` (defecto), `webrtc` o `ws`. `edge` = `edge-rtc-udp`; `edge-ndc-webrtc` = la configuración anterior |
 | `--src` | ruta | `src/` | Carga host y Edge desde un build compilado (A/B) |
-| `--loss` | % | — | Descarta ese % del UDP 127.0.0.2↔127.0.0.3 en ambos sentidos con una regla nftables (`numgen random`). **Linux y root**; la tabla se elimina al salir |
+| `--loss` | % | - | Descarta ese % del UDP 127.0.0.2↔127.0.0.3 en ambos sentidos con una regla nftables (`numgen random`). **Linux y root**; la tabla se elimina al salir |
 | `--edge-webrtc` | JSON | `{}` | Opciones extra de `webrtc` del `EdgeServer` |
 | `--edge-opts` | JSON | `{}` | Opciones extra de `haxlite.edge` del host (p. ej. `{"roLanes":false}`) |
 
@@ -566,7 +566,7 @@ Con `--quick` la salida va a `bench/results/dev/` (ignorado por git: `bench/resu
 | `--parallel` | entero | `1` | igual | K configuraciones a la vez. **Solo `idle`, `soak`, `join-impaired`**; en otros escenarios el arnés lo rechaza. Implica `--pin` |
 | `--pin` | (sin valor) | apagado | igual | Linux con `taskset`: cada host a su núcleo (`taskset -c`), el resto del arnés a los demás. Sin `taskset` o con < 2 CPU avisa y no fija |
 | `--host-node-args` | cadena | vacío | igual | Argumentos extra de Node **solo** para el proceso host (diagnóstico: `"--cpu-prof --cpu-prof-dir=DIR"`) |
-| `--quick` | (sin valor) | apagado | — | Perfil de **desarrollo, NO publicable** (`info.publishable: false`). Un flag explícito manda sobre el perfil |
+| `--quick` | (sin valor) | apagado | - | Perfil de **desarrollo, NO publicable** (`info.publishable: false`). Un flag explícito manda sobre el perfil |
 
 Lag del event loop (`game`, `rooms`, `fleet`, `soak`):
 
@@ -651,7 +651,7 @@ cambian entre sesiones y máquinas: compara solo dentro de una misma tanda).
 `R` en los ejemplos: `R="node --no-warnings --import ./bench/ts-resolve.mjs bench/net/run.ts"`
 y `L="flock /tmp/haxlite-bench.lock"`.
 
-#### `docs/benchmark-hosts.md` — tabla «Resultado actual» (tanda unificada del 13-10-2026)
+#### `docs/benchmark-hosts.md` - tabla «Resultado actual» (tanda unificada del 13-10-2026)
 
 Filas por escenario y comando equivalente (4 hosts: `I=official,nodehaxball,haxlite:ndc,haxlite:rtc`):
 
@@ -669,11 +669,11 @@ tres columnas de `benchmark-hosts.md` son esos mismos datos sin la columna `haxl
 Para acercarte al método del 13-10: añade `--warmup-mode fixed --eld-mode inline` (no verificado
 que reproduzca exactamente las cifras de entonces).
 
-#### `docs/benchmark-hosts.md` — «Resultado rápido anterior» (11-10-2026)
+#### `docs/benchmark-hosts.md` - «Resultado rápido anterior» (11-10-2026)
 
 `sh bench/net/quick.sh` (ventanas de 30 s; sala vacía 60 s) → `bench/results/quick-*.json`.
 
-#### `docs/benchmark-hosts.md` y `docs/07` — «Comparativa unificada anterior», reparto por hilo, versiones de WebRTC
+#### `docs/benchmark-hosts.md` y `docs/07` - «Comparativa unificada anterior», reparto por hilo, versiones de WebRTC
 
 * Misma tanda que `unified-*.json` de 11-10-2026 (ya sobrescrita en el repositorio): los comandos son los
   de arriba con el arnés de entonces. El **reparto por hilo** (`hilo JS`, `RTC worker`, `juice poll`,
@@ -683,7 +683,7 @@ que reproduzca exactamente las cifras de entonces).
   `info.versions` de cada JSON las guarda (`haxball.js`, `node-haxball`, `node-datachannel`,
   `@webrtc-node/webrtc`).
 
-#### `docs/07` — escenarios de producción y Bun
+#### `docs/07` - escenarios de producción y Bun
 
 | Tabla | Comando |
 |---|---|
@@ -706,7 +706,7 @@ Desarrollo rápido, no publicable: `npm run bench:game -- --quick --impl haxlite
 | §7.2 camino de mensajes | `node bench/host-msg.bench.mjs <dist> 20 2000000` (`HEAP_PROF=f.heapprofile` para atribuir) |
 | §7.3 arranque | `node --import ./bench/ts-resolve.mjs bench/startup/run.ts 20 antes=<dist-a>/index.js ahora=dist/index.js` |
 | §7.5 flags de Node | `$R game --impl haxlite:new --n 20 --reps 2 --eld 0 --host-node-args "--v8-pool-size=1"` |
-| «Pasada de ligereza — red» | `bench/net/natives.mjs --n 20 --seconds 15 --dist <dist> [--mux 1]` y `scripts/edge-latency.ts` (§5) |
+| «Pasada de ligereza - red» | `bench/net/natives.mjs --n 20 --seconds 15 --dist <dist> [--mux 1]` y `scripts/edge-latency.ts` (§5) |
 | docs/10 §6 (rtc vs ndc con Chromium) | `bench/rtc/run.ts` (§6.6) |
 | docs/10 §6.3 (asignaciones del host) | `bench/rtc/sctp-host-alloc.ts` (§6.6) |
 
@@ -721,7 +721,7 @@ docs/09 (no verificado).
 
 ### 6.6 Otros bancos
 
-**`bench/startup/run.ts`** — arranque en frío de `HBInit` (proceso nuevo → `import` del paquete →
+**`bench/startup/run.ts`** - arranque en frío de `HBInit` (proceso nuevo → `import` del paquete →
 sala → enlace, contra el FakeMaster, sin red). Posicional, sin flags con nombre:
 
 ```sh
@@ -735,7 +735,7 @@ Las entradas se intercalan. Imprime un JSON con la **mediana** por etiqueta de `
 `hbinitToLinkMs`, `processToLinkMs`, `cpuMs`, `rssMB`, `heapMB`, `cjsModules`. Los argumentos tras
 `--` se pasan a `node` en cada hijo (p. ej. `--max-semi-space-size=1`).
 
-**`bench/rtc/run.ts`** — haxlite-rtc frente a node-datachannel con Chromium real (docs/10 §6).
+**`bench/rtc/run.ts`** - haxlite-rtc frente a node-datachannel con Chromium real (docs/10 §6).
 Requiere Linux (`/proc`), Chromium (`HAXLITE_CHROMIUM`) y rolldown.
 
 | Flag | Tipo | Defecto | Qué hace |
@@ -754,7 +754,7 @@ flock /tmp/haxlite-bench.lock node --no-warnings --import ./bench/ts-resolve.mjs
   --backends ndc,rtc --peers 1,10,30 --seconds 30 --warmup 5 --out bench/results/rtc-backends.json
 ```
 
-**`bench/rtc/sctp-host-alloc.ts`** — asignaciones del camino de datos (SCTP + `RtcPeerLink`) sin red.
+**`bench/rtc/sctp-host-alloc.ts`** - asignaciones del camino de datos (SCTP + `RtcPeerLink`) sin red.
 Flags: `--peers` (20), `--seconds` (120), `--no-bundle`, `--const-clock`, `--depth` (3),
 `--show-other`, `--warmup-frames` (20000). Los valores por defecto se leyeron de la documentación
 del encabezado; el archivo tiene 320 líneas y no se contrastó cada uno (no verificado).
@@ -814,7 +814,7 @@ configuraciones para copiar y adaptar (verificado: ningún archivo de `src/` ni 
 
 ## 8. Integración continua (`.github/workflows`)
 
-### `ci.yml` — «CI»
+### `ci.yml` - «CI»
 
 * **Disparadores:** `push` a `main`, `pull_request` y `workflow_dispatch`. Permisos `contents: read`.
   `concurrency` por flujo y rama con cancelación de ejecuciones anteriores.
@@ -828,7 +828,7 @@ configuraciones para copiar y adaptar (verificado: ningún archivo de `src/` ni 
   binario es ejecutable; ejecuta `npx vitest run --project ndc test/rtc/chromium-dtls.test.ts test/rtc/sctp/chromium.test.ts` y luego
   `npm run test:interop`. No usa `HAXBALL_CLIENT_DIR`: las pruebas contra el cliente oficial se omiten.
 
-### `publish.yml` — «Publish»
+### `publish.yml` - «Publish»
 
 * **Disparadores:** `push` de una etiqueta `v*` y `workflow_dispatch`. Permisos `contents: read`,
   `packages: write`.
@@ -959,7 +959,7 @@ lo que se deduce del código y de docs/10:
   variables `HTTP(S)_PROXY` **no** se aplican solas (§4.1).
 * **Token:** cada sala necesita un *headless token* vigente al arrancar (caduca a los pocos
   minutos); una sala reiniciada necesita uno nuevo.
-* Opciones concretas (`peerBackend`, `rtc.*`, `edge`, `iceServers`…): [11 — Referencia de la API](11-referencia-api.md)
+* Opciones concretas (`peerBackend`, `rtc.*`, `edge`, `iceServers`…): [11 - Referencia de la API](11-referencia-api.md)
   y [10 §3](10-haxlite-rtc.md).
 * Hospedar **detrás de un Edge** en vez de exponer la IP: la sala usa `haxlite.edge: { url, key }`
   y no abre puertos de jugadores (§3).
@@ -984,8 +984,8 @@ lo que se deduce del código y de docs/10:
 
 | Ajuste | Aplica a | Efecto medido | Estado |
 |---|---|---|---|
-| `MIMALLOC_SCAVENGER=0` (variable de entorno) | Bun | −7–12 % CPU, mitad de despertares, ≈ +1 MB RSS | Medido el 16-10-2026 en la VM de pruebas; **no documentado en `docs/`**; validar con *soak* largo (§4.5) |
-| `MALLOC_ARENA_MAX=2 node --v8-pool-size=1 --max-semi-space-size=1` | Node + node-datachannel | −7 MB de RSS (−8 %) sin coste de CPU medible | docs/07 §7.5 (medido con `ndc`) |
+| `MIMALLOC_SCAVENGER=0` (variable de entorno) | Bun | -7–12 % CPU, mitad de despertares, ≈ +1 MB RSS | Medido el 16-10-2026 en la VM de pruebas; **no documentado en `docs/`**; validar con *soak* largo (§4.5) |
+| `MALLOC_ARENA_MAX=2 node --v8-pool-size=1 --max-semi-space-size=1` | Node + node-datachannel | -7 MB de RSS (-8 %) sin coste de CPU medible | docs/07 §7.5 (medido con `ndc`) |
 | `cipherSuites` DTLS por defecto `['chacha20','aes128gcm','aes256gcm']` | rtc | ChaCha20-Poly1305 en JS gana de extremo a extremo también en Bun (≈ 17 % menos CPU) | docs/10 §6.7. No hay que tocarlo |
 | `tunnel.aead` / `edge.tunnelAead` `auto` | Edge y host | ChaCha20-Poly1305 en los dos runtimes | docs/09 §1.3 |
 | Límites del sistema | todos | `LimitNOFILE` (systemd) / `ulimit -n`; búferes UDP (`net.core.rmem_max`, `wmem_max`) si el kernel recorta los 4 MiB que pide el socket del túnel | Recomendación general (no verificado en producción) |
@@ -1031,7 +1031,7 @@ desajuste y **qué dice el código**. No se modificó ningún otro archivo.
 **B. Banderas de Node obsoletas en otros documentos y scripts**
 
 4. `--experimental-transform-types` aparece aún en: `docs/benchmark-hosts.md` («Comandos exactos»),
-   `docs/07-benchmarks.md` (§2.5, «Pasada de ligereza — red» y «Comandos»), `docs/10-haxlite-rtc.md`
+   `docs/07-benchmarks.md` (§2.5, «Pasada de ligereza - red» y «Comandos»), `docs/10-haxlite-rtc.md`
    (§5.2 y §6), `scripts/among-us-screenshots.ts`, `scripts/vision-mask-cost.ts` y
    `test/rtc-interop/manual-server.ts`. En Node 26 hay que usar `--import ./bench/ts-resolve.mjs`
    (transpila con oxc) sin esa bandera.

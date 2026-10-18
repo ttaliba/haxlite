@@ -1,7 +1,7 @@
 /**
  * Physics world step and world helpers.
  *
- * Clean-room transcription of the official World step `Oa.Da(dt)` and the
+ * Transcription of the official World step `Oa.Da(dt)` and the
  * collision routines it calls (headless f066733d): disc-disc `Ba.Cg`,
  * disc-plane (inline), disc-segment `Ba.Dg`, disc-vertex (inline), joint
  * `Ha.Da`. Every floating-point expression keeps the official operand order

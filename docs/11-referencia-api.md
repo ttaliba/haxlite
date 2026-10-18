@@ -1,4 +1,4 @@
-# 11 — Referencia de la API de haxlite
+# 11 - Referencia de la API de haxlite
 
 Referencia completa de lo que ofrece **haxlite** (paquete `haxlite` 0.3.1, Node.js ≥ 22 o Bun) a quien lo usa como librería: `HBInit(config)`, el objeto `room`, las extensiones `config.haxlite` / `room.haxlite` y los módulos de uso avanzado.
 
@@ -136,7 +136,7 @@ haxlite puede terminar las conexiones WebRTC de los jugadores de tres maneras. P
 | Nombre | Tipo | Por defecto | Notas |
 |---|---|---|---|
 | `iceServers` (`config.haxlite.`) | `readonly IceServerConfig[]` | `['stun:stun.l.google.com:19302']` (como el host oficial) | Cada entrada puede ser: una cadena (`'stun:host:3478'`, `'turn:usuario:clave@host:3478'`, `'turn:u:c@host:3478?transport=tcp'`, `'turns:…'`), un objeto de node-datachannel (`{ hostname, port, username, password, relayType }`) o un `RTCIceServer` del navegador (`{ urls, username, credential }`). Con `ndc` valen todas; con `rtc` solo **UDP** `turn:` (se omiten `turns:` y `?transport=tcp`). Con `edge` se ignora (el edge tiene los suyos) |
-| `room.haxlite.setIceServers(lista)` **[ext.]** | método | — | Sustituye los servidores en caliente (p. ej. credenciales TURN de corta vida de Cloudflare). `rtc`: el siguiente `Allocate` usa las nuevas; `ndc`: las PeerConnections nuevas. Ignorado por un backend edge. Ver [docs/10 §2.2](10-haxlite-rtc.md) |
+| `room.haxlite.setIceServers(lista)` **[ext.]** | método | - | Sustituye los servidores en caliente (p. ej. credenciales TURN de corta vida de Cloudflare). `rtc`: el siguiente `Allocate` usa las nuevas; `ndc`: las PeerConnections nuevas. Ignorado por un backend edge. Ver [docs/10 §2.2](10-haxlite-rtc.md) |
 
 Con `peerBackend: 'rtc'`, `iceServers` es solo el **valor por defecto** de `rtc.iceServers`. **Ojo:** si das `rtc.publicAddresses` y no das `rtc.iceServers`, la lista efectiva es `[]` aunque pongas `haxlite.iceServers` (código en `RtcPeerBackend`); pon el TURN dentro de `rtc.iceServers` en ese caso.
 
@@ -181,8 +181,8 @@ Los jugadores se conectan al edge, nunca a esta máquina. Se ignoran `iceServers
 
 | Opción | Tipo | Por defecto | Qué hace |
 |---|---|---|---|
-| `url` | `string` | — (obligatorio) | Endpoint de control, p. ej. `wss://edge.ejemplo.com:8443/tunnel` (`ws://` solo pruebas/LAN) |
-| `key` | `string` | — (obligatorio) | Clave del operador del edge: `"<keyId>:<secreto>"` |
+| `url` | `string` | - (obligatorio) | Endpoint de control, p. ej. `wss://edge.ejemplo.com:8443/tunnel` (`ws://` solo pruebas/LAN) |
+| `key` | `string` | - (obligatorio) | Clave del operador del edge: `"<keyId>:<secreto>"` |
 | `dataPlane` | `'udp' \| 'webrtc' \| 'ws'` | `'udp'` | `'udp'` = túnel v2 (SCTP sobre UDP cifrado, TypeScript puro); `'webrtc'` = PeerConnection legada (carga el addon); `'ws'` = directamente por WebSocket |
 | `fallbackWs` | `boolean` | `true` | Si el plano UDP no sube en `dataPlaneTimeoutMs` (o el edge no lo concede), todo el tráfico va por el WebSocket (HOL blocking, algo más de latencia) |
 | `roLanes` | `boolean` | `true` | Pide carriles `ro` independientes para que una pérdida en host↔edge no frene a todos |
@@ -235,35 +235,35 @@ Con edge: `room.haxlite.edgeStats()` devuelve `{ state, dataPlane, roLanes, sess
 | `checksumIntervalFrames` | `number` | `600` | Periodo de *CheckConsistency* | Lectura/escritura; 1–1 048 576 |
 | `maxWakeFrames` | `number` | `4` | Cota de despertar con partida en curso | Lectura/escritura; 1–600 o `Infinity` |
 | `roomLink` | `string \| null` (solo lectura) | `null` hasta que el maestro lo asigna | Enlace actual de la sala | Es el último recibido: **no se recalcula** al llamar a `setPassword()` (usa `room.haxlite.transport.roomLink` para el enlace con `&p=1` actualizado). Se vuelve a recibir tras reconexiones de la señalización |
-| `frame` | `number` (solo lectura) | — | Frame actual del reloj del host | |
+| `frame` | `number` (solo lectura) | - | Frame actual del reloj del host | |
 | `stopped` | `boolean` (solo lectura) | `false` | `true` tras `stop()`/`close()` | |
 | `bans` | `HaxliteBans` | lista de la sala (o la de `config.haxlite.bans`) | Operaciones sobre los bans | Ver tabla de abajo |
 | `onBeforeOperation` | `((ev: RoomEvent, byPlayerId: number, requestedFrame: number) => boolean \| void) \| null` | `null` | Ve cada evento de cliente, después de asignarle frame y del filtro de chat, y antes de aplicarlo y difundirlo | Devolver `false` lo descarta; se pueden modificar campos del evento (no `frame`/`order`/`byId`); si **lanza**, se expulsa al emisor («Bad actor»). Se llama también por cada input: mantenlo barato |
 | `onJoinRequest` | `JoinRequestHandler \| null` | el de `config.haxlite` o `null` | Gancho previo a WebRTC | Ver [§2.3](#23-admisión-y-moderación) |
 | `onRecaptcha` | `((sitekey: string) => void) \| null` | `null` | El maestro pide captcha **tras** el arranque (p. ej. al reconectar con un token caducado) | Responde con `useRecaptchaToken()`. Sin manejador se notifica `InvalidRoomTokenError` por `onError` |
-| `useRecaptchaToken(respuesta)` | método | — | Reintenta el registro en el maestro con la respuesta al captcha | No hace nada si la sala está parada |
+| `useRecaptchaToken(respuesta)` | método | - | Reintenta el registro en el maestro con la respuesta al captcha | No hace nada si la sala está parada |
 | `onError` | `((err: unknown) => void) \| null` | `null` (→ `console.error('[haxlite]', err)`) | Errores de callbacks de sala, del transporte y de visuales privados rechazados | Si el propio manejador lanza, se ignora |
-| `getPlayerConnection(playerId)` | `PlayerConnectionInfo \| null` | — | Datos de conexión de un jugador | `null` para el host, ids desconocidos o jugadores ya cerrados |
-| `setMaxPlayers(n)` | método | — | Cambia la capacidad en caliente (no es posible en el oficial) | Mismo *cast* y recorte 2..30 que `maxPlayers`. Actualiza el cartel de la lista pública |
-| `setDiscPropertiesFor(viewerId, discIndex, props, opts?)` | método | — | Cambia un disco **solo** para un jugador | Ver [§2.6](#26-visuales-privados-y-jugadores-ocultos) |
-| `clearDiscOverrides(viewerId)` | método | — | Restaura los valores de la sala en los discos modificados para ese jugador | |
-| `getDiscPropertiesFor(viewerId, discIndex)` | `DiscPropertiesObject \| null` | — | El disco tal como lo ve ese jugador | |
-| `hasPrivateView(viewerId)` | `boolean` | — | `true` mientras el jugador tiene un mundo privado | |
+| `getPlayerConnection(playerId)` | `PlayerConnectionInfo \| null` | - | Datos de conexión de un jugador | `null` para el host, ids desconocidos o jugadores ya cerrados |
+| `setMaxPlayers(n)` | método | - | Cambia la capacidad en caliente (no es posible en el oficial) | Mismo *cast* y recorte 2..30 que `maxPlayers`. Actualiza el cartel de la lista pública |
+| `setDiscPropertiesFor(viewerId, discIndex, props, opts?)` | método | - | Cambia un disco **solo** para un jugador | Ver [§2.6](#26-visuales-privados-y-jugadores-ocultos) |
+| `clearDiscOverrides(viewerId)` | método | - | Restaura los valores de la sala en los discos modificados para ese jugador | |
+| `getDiscPropertiesFor(viewerId, discIndex)` | `DiscPropertiesObject \| null` | - | El disco tal como lo ve ese jugador | |
+| `hasPrivateView(viewerId)` | `boolean` | - | `true` mientras el jugador tiene un mundo privado | |
 | `onPrivateViewEnd` | `((viewerId: number) => void) \| null` | `null` | La vista privada terminó porque su mundo volvió a ser idéntico al de la sala | No se llama si el jugador sale |
-| `hidePlayerFor(viewerId, playerId)` | método | — | Oculta a `playerId` solo para `viewerId` | Ver [§2.6](#26-visuales-privados-y-jugadores-ocultos) |
-| `showPlayerFor(viewerId, playerId)` | método | — | Deshace `hidePlayerFor` | |
-| `setPlayerHiddenFor(viewerId, playerId, oculto)` | método | — | `oculto ? hidePlayerFor : showPlayerFor` | |
-| `isPlayerHiddenFor(viewerId, playerId)` | `boolean` | — | `true` si está oculto (tras ejecutarse la llamada diferida) | |
-| `getHiddenPlayersFor(viewerId)` | `number[]` | — | Ids ocultos para ese jugador | |
-| `edgeStats()` | `EdgeBackendStats \| null` | — | Estadísticas del túnel de edge | `null` sin `haxlite.edge` |
-| `rtcStats()` | `RtcEndpointStats \| null` | — | Contadores del endpoint haxlite-rtc | `null` salvo con `peerBackend: 'rtc'` o hasta que escucha. Del endpoint **compartido**: `sessions`, `open`, `packetsIn/Out`, `bytesIn/Out`, `stunAuthenticated`, `stunRejected`, `dtlsUnknownSource`, `dtlsHeld`, `unknownPackets`, `handshakesCompleted/Failed`, `dtlsReplayed`, `dtlsBadRecords`, `stunResponses`, `ice`, `reflexive`, `relayUnavailable`, `directDropped`, `turn` |
-| `setIceServers(lista)` | método | — | Cambia los servidores STUN/TURN en caliente | Ver [§2.4](#iceservers) |
+| `hidePlayerFor(viewerId, playerId)` | método | - | Oculta a `playerId` solo para `viewerId` | Ver [§2.6](#26-visuales-privados-y-jugadores-ocultos) |
+| `showPlayerFor(viewerId, playerId)` | método | - | Deshace `hidePlayerFor` | |
+| `setPlayerHiddenFor(viewerId, playerId, oculto)` | método | - | `oculto ? hidePlayerFor : showPlayerFor` | |
+| `isPlayerHiddenFor(viewerId, playerId)` | `boolean` | - | `true` si está oculto (tras ejecutarse la llamada diferida) | |
+| `getHiddenPlayersFor(viewerId)` | `number[]` | - | Ids ocultos para ese jugador | |
+| `edgeStats()` | `EdgeBackendStats \| null` | - | Estadísticas del túnel de edge | `null` sin `haxlite.edge` |
+| `rtcStats()` | `RtcEndpointStats \| null` | - | Contadores del endpoint haxlite-rtc | `null` salvo con `peerBackend: 'rtc'` o hasta que escucha. Del endpoint **compartido**: `sessions`, `open`, `packetsIn/Out`, `bytesIn/Out`, `stunAuthenticated`, `stunRejected`, `dtlsUnknownSource`, `dtlsHeld`, `unknownPackets`, `handshakesCompleted/Failed`, `dtlsReplayed`, `dtlsBadRecords`, `stunResponses`, `ice`, `reflexive`, `relayUnavailable`, `directDropped`, `turn` |
+| `setIceServers(lista)` | método | - | Cambia los servidores STUN/TURN en caliente | Ver [§2.4](#iceservers) |
 | `rtcPort` | `number \| null` (solo lectura) | `null` | Puerto UDP al que se conectan los jugadores | Solo con `peerBackend: 'rtc'` y ya escuchando |
 | `onBackendState` | `((state: 'ready' \| 'down', err: Error \| null) => void) \| null` | `null` | Disponibilidad del backend (túnel del edge) | Los backends locales siempre están `ready` |
-| `stop()` | `Promise<void>` | — | Detiene la sala: temporizadores, señalización y todos los peers | Idempotente. Espera a que se libere el socket UDP de `rtc` y, con la última sala del proceso, a `shutdownWebRtc()` |
-| `close()` | `Promise<void>` | — | Alias de `stop()` | |
-| `host` | `HostRoom` (solo lectura) | — | El motor, para usos avanzados | [§5](#5-uso-avanzado-lo-que-exporta-haxlite) |
-| `transport` | `HostTransport` (solo lectura) | — | El transporte, para usos avanzados | [§5](#5-uso-avanzado-lo-que-exporta-haxlite) |
+| `stop()` | `Promise<void>` | - | Detiene la sala: temporizadores, señalización y todos los peers | Idempotente. Espera a que se libere el socket UDP de `rtc` y, con la última sala del proceso, a `shutdownWebRtc()` |
+| `close()` | `Promise<void>` | - | Alias de `stop()` | |
+| `host` | `HostRoom` (solo lectura) | - | El motor, para usos avanzados | [§5](#5-uso-avanzado-lo-que-exporta-haxlite) |
+| `transport` | `HostTransport` (solo lectura) | - | El transporte, para usos avanzados | [§5](#5-uso-avanzado-lo-que-exporta-haxlite) |
 
 `room.stopRecordingAsync()` **[ext.]** vive en `room`, no en `room.haxlite` ([§3](#3-métodos-de-room-y-callbacks-on)).
 
@@ -493,7 +493,7 @@ Constantes congeladas, accesibles como `room.CollisionFlags` / `room.InputFlags`
 | `wall` | 32 | | | |
 | `kick` | 64 | | | |
 | `score` | 128 | | | |
-| `c0` / `c1` / `c2` / `c3` | 268435456 / 536870912 / 1073741824 / −2147483648 | | | |
+| `c0` / `c1` / `c2` / `c3` | 268435456 / 536870912 / 1073741824 / -2147483648 | | | |
 | `all` | 63 | | | |
 
 ### Otros tipos de la API
@@ -670,7 +670,7 @@ Van a `room.haxlite.onError(err)`: excepciones en tus callbacks, errores del tra
 | `4102` | `Banned` | «You are banned from this room.»: IP del maestro o *srflx* baneada, o `onJoinRequest` devolvió `false` |
 | `4103` | `Version` | Versión del protocolo incompatible (la sala exige 9) |
 | `4104` | `TooManyPending` | Demasiadas negociaciones pendientes (≥ 16), **o** `joinRateLimit` excedido (código por defecto), **o** el backend no está listo / el túnel del edge está caído, **o** `onJoinRequest` falló (lanzó o rechazó la promesa) |
-| *n* | — | El que devuelva `onJoinRequest` (`n` o `{ reject: n }`) o `joinRateLimit.code` |
+| *n* | - | El que devuelva `onJoinRequest` (`n` o `{ reject: n }`) o `joinRateLimit.code` |
 
 Códigos del servidor maestro (`net.MasterCloseCode`): `4001` sala cerrada (el host **no** reconecta) y `4004` el maestro exige un captcha al cliente. La señalización reconecta sola con retardo de 10–60 s tras cualquier otra caída (`transport: { reconnect: false }` lo evita).
 
@@ -683,5 +683,5 @@ Códigos del túnel host↔edge (`net.EdgeCloseCode`): `4400` protocolo, `4401` 
 | `allowNullAuth: false` y verificación fallida | «Identity verification failed» | `PeerCloseReason` `'auth'` |
 | `auth` baneado (`bans.addAuth`) | «You are banned from this room.» | `'banned'` |
 | Exceso de mensajes (`floodCapacity`), mensaje de texto o malformado, evento no permitido, excepción en `onPlayerChat`/`onBeforeOperation` | «Bad actor» | `'flood'`/`'protocol'`; se emite `onPlayerLeave` y `onPlayerKicked` |
-| Sin mensajes durante `peerIdleTimeoutMs` (10 s) | — (conexión cerrada) | `'timeout'` |
+| Sin mensajes durante `peerIdleTimeoutMs` (10 s) | - (conexión cerrada) | `'timeout'` |
 | `kickPlayer(id, reason, ban)` | el `reason` indicado | Con `ban`, el cliente ve el baneo |

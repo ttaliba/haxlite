@@ -1,7 +1,7 @@
 /**
  * Stadium geometry helpers: segment curvature and derived segment geometry.
  *
- * Clean-room transcription of the official formulas (headless f066733d):
+ * Transcription of the official formulas (headless f066733d):
  *   applySegmentCurve   = off `E.bb(deg)`
  *   computeSegmentGeometry = off `E.Pb()`
  *   prepareStadium      = off `w.Pb()` (Pb on every segment)

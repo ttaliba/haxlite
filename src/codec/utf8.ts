@@ -1,5 +1,5 @@
 /**
- * HaxBall's hand-rolled "UTF-8" (clean-room reimplementation).
+ * HaxBall's hand-rolled "UTF-8".
  *
  * Quirk that MUST be preserved for byte-exact interop (docs/02 §1.4):
  *  - The encoder walks the string by UTF-16 *code unit* (`charCodeAt`), so a

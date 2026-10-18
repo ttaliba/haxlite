@@ -1,6 +1,6 @@
 # Benchmark: hosts de HaxBall en Node.js
 
-![Comparativa completa: haxlite frente a haxball.js, node-haxball y haxlite + node-datachannel](img/benchmark/0-comparativa-completa.png)
+![Comparativa completa: haxlite frente a haxball.js y node-haxball](img/benchmark/0-comparativa-completa.png)
 
 ## Resultado actual (tanda unificada del 13-10-2026, tras la pasada «puntero en todo»)
 

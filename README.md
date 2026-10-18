@@ -12,13 +12,11 @@
 
 </div>
 
-haxlite habla el protocolo 9 bit a bit con los clientes oficiales del navegador y expone la misma API que la página headless oficial (y que [`haxball.js`](https://github.com/mertushka/haxball.js)), **sin navegador y sin ejecutar el script oficial**. Es una reimplementación *clean-room*: física, netcode, reglas, replays y red salen de entender el protocolo, no de copiar código.
+haxlite habla el protocolo 9 bit a bit con los clientes oficiales del navegador y expone la misma API `HBInit` que la página headless oficial, **sin navegador y sin ejecutar el script oficial**. Está escrito en TypeScript y se basa en el trabajo de la comunidad (ver la [aclaración](#aclaración) al final).
 
 <p align="center">
-  <img src="docs/img/benchmark/0-comparativa-completa.png" alt="Comparativa completa de benchmarks: haxlite frente a haxball.js, node-haxball y haxlite con node-datachannel" width="900">
+  <img src="docs/img/benchmark/0-comparativa-completa.png" alt="Comparativa completa de benchmarks: haxlite frente a haxball.js y node-haxball" width="900">
 </p>
-
-> Misma máquina, misma sesión, clientes reales en procesos aparte y mediana de 3 repeticiones intercaladas (4 vCPU Xeon 2,10 GHz, Node 22). Detalle y método: [benchmarks](#benchmarks).
 
 ## Contenido
 
@@ -35,12 +33,13 @@ haxlite habla el protocolo 9 bit a bit con los clientes oficiales del navegador 
 - [Desarrollo](#desarrollo)
 - [HaxBall en una página](#haxball-en-una-página)
 - [Aviso y licencia](#aviso-y-licencia)
+- [Aclaración](#aclaración)
 
 ## Por qué haxlite
 
 | | |
 |---|---|
-| **Menos CPU y memoria** | Con 20 jugadores usa un 58 % menos de CPU que el host oficial y 27 % menos de RAM. Con 10 salas en un proceso, un 67 % menos de CPU. |
+| **Menos CPU y memoria** | Con 20 jugadores usa un 58 % menos de CPU que haxball.js y 27 % menos de RAM. Con 10 salas en un proceso, un 67 % menos de CPU. |
 | **Sala vacía = 0 % CPU** | Un solo temporizador por proceso en una rejilla de 60 Hz compartida por todas las salas; sin partida, no se despierta. |
 | **Entra el doble de rápido** | La entrada a la sala pasa de ≈ 2,06 s a ≈ 1,06 s. |
 | **WebRTC propio, sin addons nativos** | `peerBackend: 'rtc'`: ICE completo con STUN y TURN, DTLS 1.2 y SCTP en TypeScript puro, un único puerto UDP para todas las salas. Funciona detrás de NAT. |
@@ -113,11 +112,11 @@ Todos los métodos (`sendChat`, `sendAnnouncement`, `kickPlayer`, `setPlayerAdmi
 
 Mismo modelo de ejecución: los métodos que cambian el estado se aplican en un *microtask*, en orden de llamada (`setPlayerAdmin(id, true); getPlayer(id).admin` sigue siendo `false` en esa línea). Los errores de validación (`.hbs` inválido, `Stadium doesn't exist`, *casts*) se lanzan de forma síncrona.
 
-`test/api/parity.test.ts` ejecuta **el mismo script y el mismo escenario** contra el `HBInit` oficial real (el `headless-min.js` de haxball.js, conectado a un maestro falso) y contra haxlite.
+`test/api/parity.test.ts` ejecuta **el mismo script y el mismo escenario** contra el `HBInit` oficial real (conectado a un maestro falso) y contra haxlite.
 
 ### Diferencias deliberadas
 
-| | Oficial / haxball.js | haxlite |
+| | Oficial | haxlite |
 |---|---|---|
 | `HBInit` | síncrono | `await HBInit(config)`: resuelve cuando el maestro asigna el enlace; un `onRoomLink` asignado después lo recibe igual |
 | Token caducado | captcha en la página / `InvalidRoomTokenError` sin capturar | promesa rechazada con `InvalidRoomTokenError`, o flujo `haxlite.onRecaptcha` |
@@ -130,7 +129,7 @@ Mismo modelo de ejecución: los métodos que cambian el estado se aplican en un 
 
 ## Extensiones propias
 
-Todas son opcionales; sin ellas el comportamiento es el oficial. Se pasan en `config.haxlite` y se usan desde `room.haxlite`. **Referencia completa con tipos y valores por defecto: [docs/11 — Referencia de la API](docs/11-referencia-api.md).**
+Todas son opcionales; sin ellas el comportamiento es el oficial. Se pasan en `config.haxlite` y se usan desde `room.haxlite`. **Referencia completa con tipos y valores por defecto: [docs/11 - Referencia de la API](docs/11-referencia-api.md).**
 
 ```js
 const room = await HBInit({
@@ -169,10 +168,10 @@ room.haxlite.onBeforeOperation = (event, byPlayerId, frame) => true; // false de
 | Modo | Cuándo usarlo | Notas |
 |---|---|---|
 | `peerBackend: 'ndc'` (por defecto) | desarrollo, compatibilidad máxima | `node-datachannel` (libdatachannel nativo) |
-| `peerBackend: 'rtc'` | **producción** | WebRTC propio en TypeScript, un puerto UDP, sin hilos nativos, ≈ −35 % de CPU con 20 jugadores. ICE completo con STUN y TURN (RFC 8656): funciona detrás de NAT. [docs/10](docs/10-haxlite-rtc.md) |
+| `peerBackend: 'rtc'` | **producción** | WebRTC propio en TypeScript, un puerto UDP, sin hilos nativos, ≈ -35 % de CPU con 20 jugadores. ICE completo con STUN y TURN (RFC 8656): funciona detrás de NAT. [docs/10](docs/10-haxlite-rtc.md) |
 | `edge: { url, key }` | ocultar la IP del host | los jugadores se conectan a un [haxlite Edge](docs/09-haxlite-edge.md) remoto; la IP del host no llega a ningún jugador |
 
-`rtc.sendBatchFrames: 1 | 2` agrupa las difusiones de eventos de cliente: de −23 % a −44 % de bytes por jugador a cambio de n × 8,3 ms de media en las entradas ajenas (por defecto 0). Para esconder la IP del host con Cloudflare TURN y firewall, ver [docs/08](docs/08-ocultar-ip.md) y [docs/ip](docs/ip/01-exposicion-ip.md).
+`rtc.sendBatchFrames: 1 | 2` agrupa las difusiones de eventos de cliente: de -23 % a -44 % de bytes por jugador a cambio de n × 8,3 ms de media en las entradas ajenas (por defecto 0). Para esconder la IP del host con Cloudflare TURN y firewall, ver [docs/08](docs/08-ocultar-ip.md) y [docs/ip](docs/ip/01-exposicion-ip.md).
 
 ## Ajustes de netcode
 
@@ -186,9 +185,9 @@ Los clientes oficiales se adaptan a estos ajustes sin cambios, porque el host le
 
 ## Benchmarks
 
-Tanda unificada del 13-10-2026: haxball.js (host oficial), node-haxball y haxlite (con su WebRTC propio y con node-datachannel), en la misma sesión y con las opciones **intercaladas** en cada repetición. haxlite se mide con el **paquete minificado** publicado. Mediana [mín–máx] de 3 repeticiones de 60 s tras 15 s de calentamiento.
+Tanda del 13-10-2026 (4 vCPU Xeon 2,10 GHz, Node 22): haxball.js, node-haxball y haxlite. haxlite se mide con el **paquete minificado** publicado. Los valores son la mediana de la tanda.
 
-| métrica | haxball.js (oficial) | node-haxball | **haxlite** |
+| métrica | haxball.js | node-haxball | **haxlite** |
 |---|---:|---:|---:|
 | **20 jugadores** · CPU % | 16,88 | 18,35 | **7,12** |
 | RSS MB · heap MB | 91,4 · 12,5 | 92,5 · 16,1 | **67,0 · 10,6** |
@@ -241,7 +240,7 @@ Resultados completos, método y todas las tandas: [docs/benchmark-hosts.md](docs
 | `src/replay` | grabación y reproducción `.hbr2` |
 | `bench/`, `scripts/`, `ops/` | benchmarks, utilidades y firewall `haxguard` |
 
-Más detalle: [docs/06 — Arquitectura](docs/06-arquitectura-haxlite.md) y el contrato del motor en [`src/host/README.md`](src/host/README.md).
+Más detalle: [docs/06 - Arquitectura](docs/06-arquitectura-haxlite.md) y el contrato del motor en [`src/host/README.md`](src/host/README.md).
 
 ## Documentación
 
@@ -249,25 +248,25 @@ Más detalle: [docs/06 — Arquitectura](docs/06-arquitectura-haxlite.md) y el c
 
 | Documento | Contenido |
 |---|---|
-| [11 — Referencia de la API](docs/11-referencia-api.md) | **todos** los parámetros de `HBInit`, `config.haxlite` / `room.haxlite`, métodos, callbacks, tipos y errores |
-| [12 — Referencia de operación](docs/12-referencia-operacion.md) | Edge (CLI, variables de entorno, JSON), scripts de npm, arnés de benchmarks, firewall `haxguard`, CI y despliegue en producción |
-| [09 — haxlite Edge](docs/09-haxlite-edge.md) | gateway que oculta la IP del host: arquitectura, despliegue, seguridad |
-| [10 — haxlite-rtc](docs/10-haxlite-rtc.md) | WebRTC propio: ICE, DTLS, SCTP, TURN, interoperabilidad y benchmarks |
-| [08 — Ocultar y proteger la IP](docs/08-ocultar-ip.md) | por qué se ve la IP, Cloudflare TURN, anti-DDoS, `haxguard` (más en [`docs/ip/`](docs/ip/01-exposicion-ip.md)) |
-| [06 — Arquitectura](docs/06-arquitectura-haxlite.md) | módulos, reglas de código y oráculos de prueba |
-| [07 — Benchmarks](docs/07-benchmarks.md) · [resultado actual](docs/benchmark-hosts.md) | CPU, memoria, GC y lag frente a haxball.js y node-haxball |
+| [11 - Referencia de la API](docs/11-referencia-api.md) | **todos** los parámetros de `HBInit`, `config.haxlite` / `room.haxlite`, métodos, callbacks, tipos y errores |
+| [12 - Referencia de operación](docs/12-referencia-operacion.md) | Edge (CLI, variables de entorno, JSON), scripts de npm, arnés de benchmarks, firewall `haxguard`, CI y despliegue en producción |
+| [09 - haxlite Edge](docs/09-haxlite-edge.md) | gateway que oculta la IP del host: arquitectura, despliegue, seguridad |
+| [10 - haxlite-rtc](docs/10-haxlite-rtc.md) | WebRTC propio: ICE, DTLS, SCTP, TURN, interoperabilidad y benchmarks |
+| [08 - Ocultar y proteger la IP](docs/08-ocultar-ip.md) | por qué se ve la IP, Cloudflare TURN, anti-DDoS, `haxguard` (más en [`docs/ip/`](docs/ip/01-exposicion-ip.md)) |
+| [06 - Arquitectura](docs/06-arquitectura-haxlite.md) | módulos, reglas de código y oráculos de prueba |
+| [07 - Benchmarks](docs/07-benchmarks.md) · [resultado actual](docs/benchmark-hosts.md) | CPU, memoria, GC y lag frente a haxball.js y node-haxball |
 
 ### Cómo funciona HaxBall por dentro
 
-Investigación hecha leyendo [`mertushka/haxball.js`](https://github.com/mertushka/haxball.js) (commit `e5231b0`, envuelve el script oficial `headless-min.js`, hash `f066733d`) y [`wxyz-abcd/node-haxball`](https://github.com/wxyz-abcd/node-haxball) (commit `4d4b88f`, reimplementación completa). Todo sale de leer código; no se capturó tráfico ni se crearon salas. Lo no confirmado está marcado «(no verificado)».
+Investigación hecha leyendo el código de librerías públicas (fuentes y versiones exactas en la [aclaración](#aclaración) y en los propios documentos). Todo sale de leer código; no se capturó tráfico ni se crearon salas. Lo no confirmado está marcado «(no verificado)».
 
 | Documento | Contenido |
 |---|---|
-| [01 — Red y salas](docs/01-red-y-salas.md) | servidor maestro, lista de salas, señalización WebSocket, WebRTC, auth y versiones |
-| [02 — Protocolo binario](docs/02-protocolo-binario.md) | streams, framing, eventos 0–26, snapshot inicial, estadios en binario y `.hbr2` |
-| [03 — Física y estadios](docs/03-fisica-y-estadios.md) | bucle de juego, colisiones, jugador y chute, reglas, formato `.hbs` |
-| [04 — Netcode](docs/04-netcode-y-sincronizacion.md) | lockstep, asignación de frames, predicción, ping, checksums |
-| [05 — Librerías y APIs](docs/05-librerias-y-apis.md) | arquitectura de haxball.js y node-haxball, API HBInit, glosario |
+| [01 - Red y salas](docs/01-red-y-salas.md) | servidor maestro, lista de salas, señalización WebSocket, WebRTC, auth y versiones |
+| [02 - Protocolo binario](docs/02-protocolo-binario.md) | streams, framing, eventos 0–26, snapshot inicial, estadios en binario y `.hbr2` |
+| [03 - Física y estadios](docs/03-fisica-y-estadios.md) | bucle de juego, colisiones, jugador y chute, reglas, formato `.hbs` |
+| [04 - Netcode](docs/04-netcode-y-sincronizacion.md) | lockstep, asignación de frames, predicción, ping, checksums |
+| [05 - Librerías y APIs](docs/05-librerias-y-apis.md) | librerías públicas de referencia, API HBInit, glosario |
 
 ## Desarrollo
 
@@ -284,7 +283,7 @@ npm run edge           # haxlite Edge desde el código fuente
 Notas:
 
 - Algunos tests dependen de Linux (permisos `0600`, `openssl`, NAT simulado, el addon nativo). En Windows fallan por entorno; el CI de Linux (Node 22, 24 y 26) es la referencia.
-- Los tests comparan haxlite con los **oráculos** reales: el headless oficial, node-haxball y Chromium (ver [docs/06 §6](docs/06-arquitectura-haxlite.md)).
+- Los tests comparan haxlite con **oráculos** externos: el headless oficial, un cliente independiente y Chromium (ver [docs/06 §6](docs/06-arquitectura-haxlite.md)).
 - Lista completa de scripts y parámetros del arnés: [docs/12](docs/12-referencia-operacion.md).
 
 ## HaxBall en una página
@@ -316,9 +315,9 @@ Notas:
 
 **Discrepancias y pendientes de la investigación**
 
-- El host oficial usa un retardo de input de **2** frames (`Sb=2`) y node-haxball usa **4** (`ZW=4`); no se sabe por qué (doc 04).
-- En `index.d.ts` de node-haxball, `GameState.timeElapsed` figura en milisegundos, pero el código lo usa en **segundos**. Además, `curveF` no es un ángulo (docs 03 y 05).
-- Los ids de eventos 0–23 de node-haxball coinciden 1:1 con el orden de registro del script oficial; los 24–26 son extensiones propias de node-haxball (doc 02).
+- El host oficial usa un retardo de input de **2** frames (`Sb=2`) y otra implementación pública usa **4** (`ZW=4`); no se sabe por qué (doc 04).
+- En los tipos de esa implementación pública, `GameState.timeElapsed` figura en milisegundos, pero el código lo usa en **segundos**. Además, `curveF` no es un ángulo (docs 03 y 05).
+- Los ids de eventos 0–23 de esa implementación coinciden 1:1 con el orden de registro del script oficial; los 24–26 son extensiones propias suyas (doc 02).
 - No se analizó en profundidad el cliente de navegador oficial (`game-min.js`).
 - Los nombres minificados cambian en cada build del script oficial; las referencias de los documentos corresponden al hash `f066733d`.
 
@@ -326,6 +325,15 @@ Notas:
 
 ## Aviso y licencia
 
-Documentación y código con fines educativos y de interoperabilidad. El script oficial del host es «© Mario Carbajal – All rights reserved». node-haxball incluye funciones que permiten abusar del juego (jugadores falsos, speedhack…); el [doc 05](docs/05-librerias-y-apis.md) comenta los riesgos.
+Documentación y código con fines educativos y de interoperabilidad. HaxBall y su script oficial del host son «© Mario Carbajal – All rights reserved»; este proyecto no está afiliado a HaxBall.
 
 MIT, ver [LICENSE](LICENSE).
+
+## Aclaración
+
+haxlite se basa en el trabajo de la comunidad, en especial en dos proyectos de código abierto con licencia MIT:
+
+- [`haxball.js`](https://github.com/mertushka/haxball.js) (© mertushka), que ejecuta el script oficial del host headless en Node.js. Las declaraciones de tipos de la API `HBInit` (`src/api/types.ts`) están adaptadas de las suyas.
+- [`node-haxball`](https://github.com/wxyz-abcd/node-haxball) (© wxyz-abcd), una implementación completa del cliente y del host.
+
+Los usamos para entender el protocolo y la estructura del host, y como referencia en las pruebas y en los benchmarks, donde figuran solo como dependencias de desarrollo. La investigación de los documentos 01 a 05 parte de `haxball.js` (commit `e5231b0`, script oficial con hash `f066733d`) y `node-haxball` (commit `4d4b88f`).
