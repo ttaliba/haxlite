@@ -552,7 +552,7 @@ No hay negociación de versión ni compatibilidad hacia atrás: es igualdad estr
 
 ## 7. Fuentes
 
-Rutas relativas a `$SRC = /tmp/claude-0/-home-user-rev-eng-haxball/20d9142d-8a57-56a7-abf4-587dc63c89b2/scratchpad/src`.
+Rutas relativas a `$SRC`, el directorio con los fuentes descargados.
 Los JS minificados son una sola línea: usar `grep -o '.\{200\}PATRÓN.\{300\}'`.
 
 **Headless oficial** — `$SRC/haxball.js/src/generated/headless.ts` (línea 31):

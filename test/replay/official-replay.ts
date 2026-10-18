@@ -148,8 +148,7 @@ export class OfficialRecordingRoom {
 
 // ----------------------------------------------------------------- client
 
-const DEFAULT_CLIENT_JS =
-  '/tmp/claude-0/-home-user-rev-eng-haxball/20d9142d-8a57-56a7-abf4-587dc63c89b2/scratchpad/web/game-min.js';
+const DEFAULT_CLIENT_JS = 'game-min.js';
 
 export const CLIENT_JS_PATH = process.env.HAXBALL_CLIENT_JS ?? DEFAULT_CLIENT_JS;
 export const clientAvailable = existsSync(CLIENT_JS_PATH);

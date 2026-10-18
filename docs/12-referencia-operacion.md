@@ -12,9 +12,7 @@
 >
 > **Convención.** Cada valor por defecto de las tablas se **leyó en el código** (ruta indicada en
 > cada sección), no en los otros documentos. Lo que no se pudo confirmar en esta revisión lleva
-> «(no verificado)». Los desajustes entre el código y los documentos existentes están en el
-> [apéndice A](#apéndice-a-inconsistencias-detectadas-entre-documentos-y-código). Revisión hecha sobre
-> la versión `0.3.1` de `package.json`.
+> «(no verificado)». Revisión hecha sobre la versión `1.0.0` de `package.json`.
 
 ## Índice
 
@@ -49,7 +47,6 @@
    - [9.3 TURN, relay-only y firewall del host](#93-turn-relay-only-y-firewall-del-host)
    - [9.4 Ajuste de runtime](#94-ajuste-de-runtime)
    - [9.5 Publicación del paquete](#95-publicación-del-paquete)
-10. [Apéndice A: inconsistencias detectadas entre documentos y código](#apéndice-a-inconsistencias-detectadas-entre-documentos-y-código)
 
 ---
 
@@ -392,7 +389,7 @@ El paquete no lee ninguna otra variable: ni `HAXLITE_*` genéricas, ni `NODE_ENV
 | Variable | Defecto | Dónde | Efecto |
 |---|---|---|---|
 | `HAXBALL_TOKEN` | - (obligatoria) | `examples/basic-room.mjs`, `moderation.mjs`, `among-us-vision.mjs`, `scripts/hidden-bigmap-room.mjs` | *Headless token* de <https://www.haxball.com/headlesstoken> (caduca a los pocos minutos) |
-| `HX_TOKEN` | - (obligatoria) | `examples/live-room.mjs` | Igual, **otro nombre** (ver apéndice A) |
+| `HX_TOKEN` | - (obligatoria) | `examples/live-room.mjs` | Igual, **otro nombre** |
 | `HAXLITE_OPTIONS` | `{}` | los mismos ejemplos | JSON que se pasa como opción `haxlite` de `HBInit` (p. ej. `{"masterUrl":"…","iceServers":[]}`) |
 | `HX_BACKEND` | `ndc` | `live-room.mjs` | `rtc` o `ndc` (`peerBackend`) |
 | `HX_RTC_PORT` | `40000` | `live-room.mjs` | Puerto UDP con `rtc` |
@@ -414,7 +411,7 @@ El paquete no lee ninguna otra variable: ni `HAXLITE_*` genéricas, ni `NODE_ENV
 | `HAXLITE_CHROMIUM` | `/opt/pw-browsers/chromium-1194/chrome-linux/chrome` | Ejecutable de Chromium para `test/rtc-interop`, `test/rtc/chromium-dtls.test.ts`, `test/rtc/sctp/chromium.test.ts` y `bench/rtc`. Sin él las pruebas se omiten |
 | `HAXBALL_CLIENT_DIR` | vacío | Directorio con el cliente web oficial sin modificar (`game.html`, `game-min.js`, `res.dat`, `vendor/*.js`). Sin él `official-client*.interop.ts` se omiten (docs/10 §4.3) |
 | `HAXLITE_TURN_ICE` | vacío | Archivo JSON con la respuesta de `generate-ice-servers` de Cloudflare para `official-client-turn.interop.ts` (necesita red) |
-| `HAXBALL_CLIENT_JS` | ruta fija del entorno de desarrollo del autor (`/tmp/claude-0/…/game-min.js`) | `game-min.js` del cliente oficial para `test/replay`. La ruta por defecto es específica de esa máquina: fíjala o la prueba se omite |
+| `HAXBALL_CLIENT_JS` | `game-min.js` (relativa al directorio de trabajo) | `game-min.js` del cliente oficial para `test/replay`. Si el archivo no existe, esas pruebas se omiten |
 | `HAXLITE_REPLAY_FRAMES` | `12000` | Longitud del escenario de `test/replay/replay.test.ts` |
 | `HAXLITE_DIFF_TICKS` | `5000` | Ticks por corrida de `test/room/diff.test.ts` |
 | `HAXLITE_DIFF_VERBOSE` | sin definir | Imprime estadísticas por corrida |
@@ -448,7 +445,7 @@ El paquete no lee ninguna otra variable: ni `HAXLITE_*` genéricas, ni `NODE_ENV
 
 | Variable | Valor | Efecto | Origen de la recomendación |
 |---|---|---|---|
-| `MIMALLOC_SCAVENGER` | `0` | **Solo Bun.** Elimina el hilo `mi-scavenger`: -7–12 % de CPU y la mitad de despertares, ≈ +1 MB de RSS | Medición del 16-10-2026 en la VM de pruebas Linux (4 vCPU). **No está en `docs/`**; ver apéndice A. Valídala con un *soak* largo antes de aplicarla |
+| `MIMALLOC_SCAVENGER` | `0` | **Solo Bun.** Elimina el hilo `mi-scavenger`: -7–12 % de CPU y la mitad de despertares, ≈ +1 MB de RSS | Medición del 16-10-2026 (Linux, 4 vCPU). Valídala con un *soak* largo antes de aplicarla |
 | `MALLOC_ARENA_MAX` | `2` | -5 MB de RSS con node-datachannel (arenas de glibc de los hilos nativos) | docs/07 §7.5. Con `peerBackend: 'rtc'` no hay hilos nativos: efecto no medido (no verificado) |
 
 ---
@@ -489,7 +486,7 @@ sudo node --experimental-strip-types --no-warnings --import ./scripts/ts-resolve
   scripts/edge-latency.ts --players 17 --seconds 40 --runs 2 --modes edge --loss 2
 ```
 
-(docs/09 §7 muestra `--experimental-transform-types`; esa bandera la eliminó Node 26: ver apéndice A.)
+(docs/09 §7 muestra `--experimental-transform-types`; esa bandera la eliminó Node 26.)
 
 **Ejemplos** (`examples/`): `basic-room.mjs`, `moderation.mjs`, `live-room.mjs`,
 `among-us-vision.mjs`; sus variables están en §4.2. `test/api/examples.test.ts` los ejecuta contra
@@ -984,7 +981,7 @@ lo que se deduce del código y de docs/10:
 
 | Ajuste | Aplica a | Efecto medido | Estado |
 |---|---|---|---|
-| `MIMALLOC_SCAVENGER=0` (variable de entorno) | Bun | -7–12 % CPU, mitad de despertares, ≈ +1 MB RSS | Medido el 16-10-2026 en la VM de pruebas; **no documentado en `docs/`**; validar con *soak* largo (§4.5) |
+| `MIMALLOC_SCAVENGER=0` (variable de entorno) | Bun | -7–12 % CPU, mitad de despertares, ≈ +1 MB RSS | Medido el 16-10-2026 (Linux, 4 vCPU); validar con *soak* largo (§4.5) |
 | `MALLOC_ARENA_MAX=2 node --v8-pool-size=1 --max-semi-space-size=1` | Node + node-datachannel | -7 MB de RSS (-8 %) sin coste de CPU medible | docs/07 §7.5 (medido con `ndc`) |
 | `cipherSuites` DTLS por defecto `['chacha20','aes128gcm','aes256gcm']` | rtc | ChaCha20-Poly1305 en JS gana de extremo a extremo también en Bun (≈ 17 % menos CPU) | docs/10 §6.7. No hay que tocarlo |
 | `tunnel.aead` / `edge.tunnelAead` `auto` | Edge y host | ChaCha20-Poly1305 en los dos runtimes | docs/09 §1.3 |
@@ -1009,86 +1006,3 @@ alias para seguir usando `require('haxlite')`:
 y un `~/.npmrc` con `@<propietario>:registry=https://npm.pkg.github.com` y un *token* clásico con
 `read:packages` (`//npm.pkg.github.com/:_authToken=…`). Recuerda que `^0.1.0` **no** admite `0.2.x`
 ni `0.3.x` (en versiones `0.y.z`, el `^` fija el `y`): para subir de minor hay que cambiar el alias.
-
----
-
-## Apéndice A: inconsistencias detectadas entre documentos y código
-
-Revisión del 18-10-2026 sobre el árbol de trabajo (`0.3.1`). Cada punto indica **dónde** está el
-desajuste y **qué dice el código**. No se modificó ningún otro archivo.
-
-**A. Edge y configuración**
-
-1. `docs/09-haxlite-edge.md` §5 afirma que las variables de entorno «ganan» sobre el archivo.
-   En `src/edge/config.ts` `HAXLITE_EDGE_KEYS` y `HAXLITE_EDGE_KEYS_FILE` se **suman** a las
-   claves del archivo (y un `id` repetido es un error); solo el resto sobrescribe.
-2. `docs/09` §5 y `src/edge/cli.ts` no avisan de que `--config` exige un valor separado (`--config=x`
-   se ignora) ni de que el archivo es JSON estricto aunque `json5` sea dependencia.
-3. `docs/09` §7 (comando de `edge-latency`) usa `--experimental-transform-types`, bandera que Node 26
-   eliminó (así lo dicen `tsconfig.build.json` y `docs/07` §«Comandos exactos»); el encabezado de
-   `scripts/edge-latency.ts` usa `--experimental-strip-types`.
-
-**B. Banderas de Node obsoletas en otros documentos y scripts**
-
-4. `--experimental-transform-types` aparece aún en: `docs/benchmark-hosts.md` («Comandos exactos»),
-   `docs/07-benchmarks.md` (§2.5, «Pasada de ligereza - red» y «Comandos»), `docs/10-haxlite-rtc.md`
-   (§5.2 y §6), `scripts/among-us-screenshots.ts`, `scripts/vision-mask-cost.ts` y
-   `test/rtc-interop/manual-server.ts`. En Node 26 hay que usar `--import ./bench/ts-resolve.mjs`
-   (transpila con oxc) sin esa bandera.
-
-**C. Benchmarks**
-
-5. `docs/benchmark-hosts.md` («Comandos exactos») describe `unified.sh` como 4 hosts, ≈ 1 h 45 y
-   sin `--parallel 3`; el guion actual (`bench/net/unified.sh`) usa **5** hosts (con
-   `haxlite:rtc@bun`), `--parallel 3` en `idle` y declara ≈ 1 h 35. `docs/07` §«Comparativa
-   unificada» abre hablando de «las cuatro opciones» pero sus «Comandos exactos» ya mencionan
-   `+ haxlite:rtc@bun`.
-6. `docs/10` §6 dice `--out bench/results/rtc-backends.json`; los archivos del repositorio se llaman
-   `rtc-backends-1.json` y `rtc-backends-2.json`.
-
-**D. haxguard / ops**
-
-7. `docs/ip/04-atribucion-y-gating.md` (§1.4 y «Archivos del experimento») cita
-   `ipresearch/canary-counters.nft`, `canary-exp.mjs`, `attribution-demo.mjs`; el repositorio no
-   tiene carpeta `ipresearch/` y el archivo real es `ops/haxguard/canary-counters.nft`, con tabla
-   `ipresearch_test`.
-8. `docs/09` §3.1 recomienda `ops/haxguard/haxguard.nft` para el puerto de jugadores del Edge, pero
-    el archivo asume un *sidecar* que mantenga `active4/6` y `pending4/6`; ese sidecar no existe en
-    el repositorio, así que tal cual **descarta el tráfico DTLS/SCTP de cualquier jugador** (solo
-    pasa el STUN). Además su `ROOM_PORTS` por defecto es `20000-20999`, no el 40000 de docs/09.
-    Su comentario de cabecera habla de `enableIceUdpMux` (1 puerto por sala), que no es el modelo
-    del Edge con `rtc` (1 puerto para todos los jugadores).
-9. `ops/haxguard/relay-only.nft` y `docs/08`/`docs/ip/02` §5.3 asumen `portRange` de node-datachannel;
-    con `peerBackend: 'rtc'` el puerto es `rtc.port` y la política relay se aplica dentro del proceso
-    (`directDropped`), por lo que el rango del archivo debe adaptarse (o no es necesario).
-
-**E. haxlite-rtc y TURN**
-
-10. `docs/10` §3 (tabla de opciones, fila `iceServers`) dice «Las entradas TURN se ignoran (§2.1)» y la
-    «Recomendación» del mismo apartado afirma que «lo único que `ndc` puede y `rtc` no es usar un
-    servidor TURN». Contradice §2.2 y §7 del mismo documento y `src/rtc/turn.ts`/`endpoint.ts`
-    (TURN implementado desde 0.3.0).
-11. La tabla de opciones de `docs/10` §3 no lista `iceTransportPolicy`, `turnPeersPerAllocation`
-    (defecto 8) ni `maxTurnAllocations` (defecto 64), que existen en `src/rtc/endpoint.ts`.
-12. `docs/ip/02-turn.md` §4 (una sola URL, «no incluir la de puerto 53», credenciales por función en
-    `negotiate()`) y `docs/08` describen las limitaciones de libjuice/`ndc`; con `rtc` hay lista de
-    servidores con *failover* al puerto 53, `setIceServers()` y relay-only dentro del proceso
-    (docs/10 §2.2). Los documentos de `docs/ip/` no lo indican.
-
-**F. Variables de entorno y ajuste**
-
-13. `MIMALLOC_SCAVENGER=0` (recomendación medida para Bun) no aparece en ningún documento del
-    repositorio; `docs/07` §7.5 recomienda en cambio `MALLOC_ARENA_MAX=2 node --v8-pool-size=1 …`,
-    medido solo con node-datachannel.
-14. Los ejemplos usan dos nombres para el token: `HAXBALL_TOKEN` (`basic-room`, `moderation`,
-    `among-us-vision`) y `HX_TOKEN` (`live-room`). El README solo cita `HAXBALL_TOKEN`.
-15. `test/replay/official-replay.ts` usa por defecto una ruta absoluta de la máquina del autor
-    (`/tmp/claude-0/…/game-min.js`) para `HAXBALL_CLIENT_JS`; `src/replay/README.md` solo dice
-    «o la copia de scratch».
-
-**G. Otros**
-
-16. `README.md` indica que el valor por defecto de `peerBackend` es `ndc`, y así es en el código
-    (`src/net/transport.ts`); `docs/10` §3 propone cambiarlo a `rtc` (propuesta explícita, no
-    aplicada). La producción (docs/07) ya usa `rtc`: quien despliegue desde cero debe fijar
-    `peerBackend: 'rtc'`.
