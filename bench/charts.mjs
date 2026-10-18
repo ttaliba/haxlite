@@ -19,11 +19,11 @@ const C = { surface: '#fcfcfb', ink: '#0b0b0b', ink2: '#52514e', ink3: '#7d7c77'
 const LIB_DEFS = [
   { key: 'rtc', name: 'haxlite + WebRTC propio', color: '#2a78d6' },
   { key: 'ndc', name: 'haxlite + node-datachannel', color: '#eb6834' },
-  { key: 'off', name: 'haxball.js (oficial)', color: '#1baf7a' },
+  { key: 'off', name: 'haxball.js', color: '#1baf7a' },
   { key: 'nh', name: 'node-haxball', color: '#eda100' },
   { key: 'rtcbun', name: 'haxlite + WebRTC propio (Bun)', color: '#7a4fd0' },
 ];
-let LIBS = LIB_DEFS.filter((l) => (process.argv[4] === undefined ? l.key !== 'rtcbun' : process.argv[4].split(',').includes(l.key)));
+const LIBS = LIB_DEFS.filter((l) => (process.argv[4] === undefined ? l.key !== 'rtcbun' : process.argv[4].split(',').includes(l.key)));
 const HAS_NDC = LIBS.some((l) => l.key === 'ndc');
 const fmt = (v, d) => v.toLocaleString('es-AR', { minimumFractionDigits: d, maximumFractionDigits: d });
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
@@ -104,7 +104,7 @@ function hpanel({ title, sub, values, decimals, unit = '', width = 530, best = '
 }
 
 function card({ id, title, sub, body, note, cls = '', src }) {
-  return `<section class="card${cls}" id="${id}"><header><h1>${esc(title)}</h1><p>${sub}</p></header>${legend()}${body}${note ? `<footer>${note}</footer>` : ''}<div class="src">${src ?? `Benchmark haxlite · ${RUN_DATE} · misma máquina y sesión (4 vCPU, Node 22) · mediana de 3 repeticiones intercaladas · clientes reales en procesos aparte · paquete minificado`}</div></section>`;
+  return `<section class="card${cls}" id="${id}"><header><h1>${esc(title)}</h1><p>${sub}</p></header>${legend()}${body}${note ? `<footer>${note}</footer>` : ''}<div class="src">${src ?? `Benchmark haxlite · ${RUN_DATE} · 4 vCPU, Node 22`}</div></section>`;
 }
 
 
@@ -139,7 +139,7 @@ cards.push(card({
     { label: 'Una sala con 20 jugadores', values: cg },
     { label: '10 salas × 4 jugadores (un proceso)', values: cr },
   ]),
-  note: `Con 20 jugadores, haxlite con WebRTC propio usa <b>${pct(cg.rtc, cg.off)} % menos CPU</b> que el host oficial (haxball.js) y <b>${pct(cg.rtc, cg.nh)} % menos</b> que node-haxball. Con 10 salas, <b>${pct(cr.rtc, cr.off)} % menos</b> que el oficial.`,
+  note: `Con 20 jugadores, haxlite con WebRTC propio usa <b>${pct(cg.rtc, cg.off)} % menos CPU</b> que haxball.js y <b>${pct(cg.rtc, cg.nh)} % menos</b> que node-haxball. Con 10 salas, <b>${pct(cr.rtc, cr.off)} % menos</b> que haxball.js.`,
 }));
 
 cards.push(card({
@@ -206,17 +206,13 @@ cards.push(card({
 
 // ---- summary card: every key metric + headline gains of haxlite (rtc) over the official host ----
 {
-  // the summary always shows every library (rtcbun only when requested), whatever the 3rd-argument filter says
-  const libsFilter = LIBS;
-  LIBS = LIB_DEFS.filter((l) => l.key !== 'rtcbun' || libsFilter.some((x) => x.key === 'rtcbun'));
   const ghz = /@\s*([\d.]+)\s*GHz/.exec(RUN_INFO.cpu ?? '')?.[1];
   const machine = `${RUN_INFO.nproc} vCPU Xeon${ghz ? ' ' + fmt(+ghz, 2) + ' GHz' : ''}, Node ${String(RUN_INFO.node).replace(/^v(\d+).*/, '$1')}`;
-  const reps = RUN_INFO.params?.REPS ?? 3;
   const sep = (t) => `<h2 class="sec">${t}</h2>`;
   const ratio1 = (r) => fmt(Math.round(r * 10) / 10, 1).replace(/,0$/, '');
-  const mi = (n) => (n < 0 ? '+' : '−') + Math.abs(n) + ' %';
+  const mi = (n) => (n < 0 ? '+' : '-') + Math.abs(n) + ' %';
   // headline tiles, all computed from the results: haxlite (rtc) vs official (haxball.js)
-  const tile = (big, label, a, b, f) => `<div class="tile"><div class="big">${big}</div><div class="tl">${label}</div><div class="td">${f(a)} frente a ${f(b)} del oficial</div></div>`;
+  const tile = (big, label, a, b, f) => `<div class="tile"><div class="big">${big}</div><div class="tl">${label}</div><div class="td">${f(a)} frente a ${f(b)} de haxball.js</div></div>`;
   const less = (label, v, d, u) => tile(mi(pct(v.rtc, v.off)), label, v.rtc, v.off, (x) => fmt(x, d) + u);
   const fast = (label, labelFallback, v, d, u) => {
     const r = v.off / v.rtc;
@@ -234,7 +230,7 @@ cards.push(card({
     less('de tiempo de arranque hasta el link', st, 0, ' ms'),
   ];
   const P = (o) => hpanel({ width: 312, rowH: 24, gap: 8, mark: true, ...o });
-  const body = `<div class="heads">${heads.join('')}</div><div class="subcap">Titulares: haxlite con WebRTC propio frente al host oficial (haxball.js), en las mismas condiciones.</div>
+  const body = `<div class="heads">${heads.join('')}</div><div class="subcap">Titulares: haxlite con WebRTC propio frente a haxball.js.</div>
 ${sep('Una sala con 20 jugadores')}<div class="grid four">${[
     P({ title: 'CPU del host', sub: '% de un núcleo', values: game('cpuPct'), decimals: 1, unit: ' %' }),
     P({ title: 'Memoria RAM (RSS)', sub: 'MB', values: game('rssMeanMB'), decimals: 1, unit: ' MB' }),
@@ -263,9 +259,8 @@ ${sep('Sala vacía y arranque')}<div class="grid four">${[
     title: 'haxlite frente a las demás librerías: comparativa completa',
     sub: 'Todas las métricas del benchmark en una sola imagen · <b>menos es mejor</b> en todas',
     body,
-    src: `Benchmark haxlite · ${RUN_DATE} · misma máquina y sesión (${machine}) · mediana de ${reps} repeticiones intercaladas · clientes reales en procesos aparte · paquete minificado`,
+    src: `Benchmark haxlite · ${RUN_DATE} · ${machine}`,
   }));
-  LIBS = libsFilter;
 }
 
 const stack = [
