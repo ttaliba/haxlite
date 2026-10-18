@@ -52,12 +52,16 @@ haxlite habla el protocolo 9 bit a bit con los clientes oficiales del navegador 
 ## Instalación
 
 ```sh
-npm install haxlite                  # cuando esté publicado
-npm install haxlite --omit=optional  # sin node-datachannel: solo peerBackend 'rtc' o edge con 'rtc'
+npm install https://github.com/ttaliba/haxlite/releases/download/v1.0.0/haxlite-1.0.0.tgz
+
+# sin node-datachannel: solo peerBackend 'rtc' o edge con 'rtc'
+npm install https://github.com/ttaliba/haxlite/releases/download/v1.0.0/haxlite-1.0.0.tgz --omit=optional
 
 # o, desde este repositorio:
 npm install && npm run build         # genera dist/ con los .d.ts
 ```
+
+El paquete se instala con el nombre `haxlite`. Todavía no está en npmjs.com; el archivo `.tgz` de cada versión se adjunta en [Releases](https://github.com/ttaliba/haxlite/releases).
 
 `node-datachannel` es una `optionalDependency`. Solo hace falta con `peerBackend: 'ndc'` (el valor por defecto), con los jugadores `'ndc'` del edge o con su túnel WebRTC legado. Si falta y se necesita, la negociación falla con «node-datachannel no está instalado: instálalo o usa peerBackend: 'rtc'». Un proyecto TypeScript con `skipLibCheck: false` puede ver TS2307 sin él, porque algunos `.d.ts` importan sus tipos.
 
