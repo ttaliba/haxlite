@@ -1,5 +1,5 @@
 // Generates benchmark chart cards (HTML/SVG) and screenshots each one as a PNG.
-// Usage: node bench/charts.mjs docs/img/benchmark [bench/results/quick] [rtc,off,nh]
+// Usage: node bench/charts.mjs docs/img/benchmark [bench/results/quick] [rtc,off,nh]   (also writes 0-comparativa-completa.png: every metric + headline gains; it always shows all libraries)
 // The third argument picks the libraries shown (keys of LIBS; default: all four; `rtcbun`
 // = haxlite:rtc@bun, when the results have it). Browser: $CHROME_PATH, else the Playwright
 // Chromium of /opt/pw-browsers, else a local Chrome/Edge (Windows/macOS/Linux). Without a
@@ -16,13 +16,14 @@ const OUT = process.argv[2];
 mkdirSync(OUT, { recursive: true });
 
 const C = { surface: '#fcfcfb', ink: '#0b0b0b', ink2: '#52514e', ink3: '#7d7c77', grid: '#e9e8e4', axis: '#c9c8c2' };
-const LIBS = [
+const LIB_DEFS = [
   { key: 'rtc', name: 'haxlite + WebRTC propio', color: '#2a78d6' },
   { key: 'ndc', name: 'haxlite + node-datachannel', color: '#eb6834' },
   { key: 'off', name: 'haxball.js (oficial)', color: '#1baf7a' },
   { key: 'nh', name: 'node-haxball', color: '#eda100' },
   { key: 'rtcbun', name: 'haxlite + WebRTC propio (Bun)', color: '#7a4fd0' },
-].filter((l) => (process.argv[4] === undefined ? l.key !== 'rtcbun' : process.argv[4].split(',').includes(l.key)));
+];
+let LIBS = LIB_DEFS.filter((l) => (process.argv[4] === undefined ? l.key !== 'rtcbun' : process.argv[4].split(',').includes(l.key)));
 const HAS_NDC = LIBS.some((l) => l.key === 'ndc');
 const fmt = (v, d) => v.toLocaleString('es-AR', { minimumFractionDigits: d, maximumFractionDigits: d });
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
@@ -83,8 +84,9 @@ function grouped({ groups, unit, decimals, max }) {
 }
 
 // one horizontal-bar small multiple
-function hpanel({ title, sub, values, decimals, unit = '', width = 530, best = 'min' }) {
-  const rowH = 34, gap = 10, labW = 0, T = 8, W = width, R = 70;
+// rowH/gap shrink the bars; mark draws a dot before the best value(s) (ties at the printed precision)
+function hpanel({ title, sub, values, decimals, unit = '', width = 530, best = 'min', rowH = 34, gap = 10, mark = false }) {
+  const labW = 0, T = 8, W = width, R = mark ? 84 : 70;
   const H = T + LIBS.length * (rowH + gap);
   const max = Math.max(...LIBS.map((l) => values[l.key]));
   const pw = W - labW - R;
@@ -94,13 +96,15 @@ function hpanel({ title, sub, values, decimals, unit = '', width = 530, best = '
   LIBS.forEach((l, i) => {
     const v = values[l.key], y = T + i * (rowH + gap), w = Math.max(3, (v / max) * pw);
     s += `<path d="${hbar(labW, y, w, rowH)}" fill="${l.color}"/>`;
-    s += `<text x="${labW + w + 10}" y="${y + rowH / 2 + 6}" class="val${v === bestV ? ' best' : ''}">${fmt(v, decimals)}${unit}</text>`;
+    const isBest = mark ? v.toFixed(decimals) === bestV.toFixed(decimals) : v === bestV;
+    if (mark && isBest) s += `<circle cx="${labW + w + 15}" cy="${y + rowH / 2}" r="4" fill="${C.ink}"/>`;
+    s += `<text x="${labW + w + (mark && isBest ? 26 : 10)}" y="${y + rowH / 2 + (mark ? 5 : 6)}" class="val${isBest ? ' best' : ''}">${fmt(v, decimals)}${unit}</text>`;
   });
   return s + '</svg></div>';
 }
 
-function card({ id, title, sub, body, note }) {
-  return `<section class="card" id="${id}"><header><h1>${esc(title)}</h1><p>${sub}</p></header>${legend()}${body}${note ? `<footer>${note}</footer>` : ''}<div class="src">Benchmark haxlite · ${RUN_DATE} · misma máquina y sesión (4 vCPU, Node 22) · mediana de 3 repeticiones intercaladas · clientes reales en procesos aparte · paquete minificado</div></section>`;
+function card({ id, title, sub, body, note, cls = '', src }) {
+  return `<section class="card${cls}" id="${id}"><header><h1>${esc(title)}</h1><p>${sub}</p></header>${legend()}${body}${note ? `<footer>${note}</footer>` : ''}<div class="src">${src ?? `Benchmark haxlite · ${RUN_DATE} · misma máquina y sesión (4 vCPU, Node 22) · mediana de 3 repeticiones intercaladas · clientes reales en procesos aparte · paquete minificado`}</div></section>`;
 }
 
 
@@ -115,8 +119,9 @@ function load(name) {
   for (const c of j.configs) out[IMPL[c.spec.runtime === 'bun' ? `${c.spec.impl}@bun` : c.spec.impl]] = c.summary;
   return (metric, scale = 1) => Object.fromEntries(Object.entries(out).map(([k, s]) => [k, s[metric].median * scale]));
 }
+const RUN_INFO = JSON.parse(readFileSync(`${RES}-game.json`, 'utf8')).info;
 const RUN_DATE = (() => {
-  const d = new Date(JSON.parse(readFileSync(`${RES}-game.json`, 'utf8')).info.date);
+  const d = new Date(RUN_INFO.date);
   return `${String(d.getUTCDate()).padStart(2, '0')}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${d.getUTCFullYear()}`;
 })();
 const game = load('game'), rooms = load('rooms'), idle = load('idle'), startup = load('startup');
@@ -199,6 +204,70 @@ cards.push(card({
   })(),
 }));
 
+// ---- summary card: every key metric + headline gains of haxlite (rtc) over the official host ----
+{
+  // the summary always shows every library (rtcbun only when requested), whatever the 3rd-argument filter says
+  const libsFilter = LIBS;
+  LIBS = LIB_DEFS.filter((l) => l.key !== 'rtcbun' || libsFilter.some((x) => x.key === 'rtcbun'));
+  const ghz = /@\s*([\d.]+)\s*GHz/.exec(RUN_INFO.cpu ?? '')?.[1];
+  const machine = `${RUN_INFO.nproc} vCPU Xeon${ghz ? ' ' + fmt(+ghz, 2) + ' GHz' : ''}, Node ${String(RUN_INFO.node).replace(/^v(\d+).*/, '$1')}`;
+  const reps = RUN_INFO.params?.REPS ?? 3;
+  const sep = (t) => `<h2 class="sec">${t}</h2>`;
+  const ratio1 = (r) => fmt(Math.round(r * 10) / 10, 1).replace(/,0$/, '');
+  const mi = (n) => (n < 0 ? '+' : '−') + Math.abs(n) + ' %';
+  // headline tiles, all computed from the results: haxlite (rtc) vs official (haxball.js)
+  const tile = (big, label, a, b, f) => `<div class="tile"><div class="big">${big}</div><div class="tl">${label}</div><div class="td">${f(a)} frente a ${f(b)} del oficial</div></div>`;
+  const less = (label, v, d, u) => tile(mi(pct(v.rtc, v.off)), label, v.rtc, v.off, (x) => fmt(x, d) + u);
+  const fast = (label, labelFallback, v, d, u) => {
+    const r = v.off / v.rtc;
+    return r >= 1.5 ? tile(`${ratio1(r)}×`, label, v.rtc, v.off, (x) => fmt(x, d) + u) : less(labelFallback, v, d, u);
+  };
+  const st = startup('processStartToLinkMs');
+  const heads = [
+    less('de CPU con 20 jugadores', game('cpuPct'), 1, ' %'),
+    less('de CPU con 10 salas', rooms('cpuPct'), 1, ' %'),
+    less('de RAM con 20 jugadores', game('rssMeanMB'), 0, ' MB'),
+    fast('más rápido al entrar a la sala', 'de tiempo para entrar a la sala', game('joinP50Ms', 1 / 1000), 2, ' s'),
+    fast('menos despertares por segundo', 'de despertares por segundo', game('wakeupsPerS'), 0, ''),
+    less('de tiempo en GC', game('gcMsPerMin'), 0, ' ms/min'),
+    less('de hilos del proceso', game('threadCount'), 0, ''),
+    less('de tiempo de arranque hasta el link', st, 0, ' ms'),
+  ];
+  const P = (o) => hpanel({ width: 312, rowH: 24, gap: 8, mark: true, ...o });
+  const body = `<div class="heads">${heads.join('')}</div><div class="subcap">Titulares: haxlite con WebRTC propio frente al host oficial (haxball.js), en las mismas condiciones.</div>
+${sep('Una sala con 20 jugadores')}<div class="grid four">${[
+    P({ title: 'CPU del host', sub: '% de un núcleo', values: game('cpuPct'), decimals: 1, unit: ' %' }),
+    P({ title: 'Memoria RAM (RSS)', sub: 'MB', values: game('rssMeanMB'), decimals: 1, unit: ' MB' }),
+    P({ title: 'Tiempo para entrar', sub: 'mediana, segundos', values: game('joinP50Ms', 1 / 1000), decimals: 2, unit: ' s' }),
+    P({ title: 'Hilos del proceso', sub: 'incluye los de Node.js', values: game('threadCount'), decimals: 0 }),
+    P({ title: 'Despertares por segundo', sub: 'veces que el proceso se despierta', values: game('wakeupsPerS'), decimals: 0 }),
+    P({ title: 'Tiempo en GC', sub: 'ms por minuto', values: game('gcMsPerMin'), decimals: 1, unit: ' ms' }),
+    P({ title: 'Memoria JS (heap)', sub: 'MB', values: game('heapUsedMeanMB'), decimals: 1, unit: ' MB' }),
+    P({ title: 'Lag del event loop p99', sub: 'ms (un frame = 16,7 ms)', values: game('eldP99'), decimals: 2, unit: ' ms' }),
+  ].join('')}</div>
+${sep('10 salas en un mismo proceso (4 jugadores c/u)')}<div class="grid four">${[
+    P({ title: 'CPU del host', sub: '% de un núcleo', values: rooms('cpuPct'), decimals: 1, unit: ' %' }),
+    P({ title: 'Memoria RAM (RSS)', sub: 'MB', values: rooms('rssMeanMB'), decimals: 0, unit: ' MB' }),
+    P({ title: 'Tiempo en GC', sub: 'ms por minuto', values: rooms('gcMsPerMin'), decimals: 0, unit: ' ms' }),
+    P({ title: 'Sockets y archivos (fds)', sub: 'descriptores abiertos', values: rooms('fdCount'), decimals: 0 }),
+  ].join('')}</div>
+${sep('Sala vacía y arranque')}<div class="grid four">${[
+    P({ title: 'CPU con la sala vacía', sub: '% de un núcleo', values: idle('cpuPct'), decimals: 2, unit: ' %' }),
+    P({ title: 'Despertares/s, sala vacía', sub: 'haxlite: ~0,3 = solo el medidor', values: idle('wakeupsPerS'), decimals: 1 }),
+    P({ title: 'Arranque hasta el link', sub: 'ms desde que inicia el proceso', values: startup('processStartToLinkMs'), decimals: 0, unit: ' ms' }),
+    '<div class="how"><b>Cómo leerlo</b><br>Barra más corta = mejor. <i class="dot"></i> marca el mejor valor de cada métrica. Cada métrica tiene su propia escala.</div>',
+  ].join('')}</div>`;
+  cards.unshift(card({
+    id: 'all',
+    cls: ' wide all',
+    title: 'haxlite frente a las demás librerías: comparativa completa',
+    sub: 'Todas las métricas del benchmark en una sola imagen · <b>menos es mejor</b> en todas',
+    body,
+    src: `Benchmark haxlite · ${RUN_DATE} · misma máquina y sesión (${machine}) · mediana de ${reps} repeticiones intercaladas · clientes reales en procesos aparte · paquete minificado`,
+  }));
+  LIBS = libsFilter;
+}
+
 const stack = [
   ['off', 'haxball.js 5.1.0', '@webrtc-node/webrtc 0.2.1', 'libdatachannel (master, ~0.24.5) · libjuice 1.7.2 · OpenSSL 1.1.1w · usrsctp', '18 hilos con jugadores · 1 socket UDP por jugador', 'Cualquier red, también detrás de NAT'],
   ['nh', 'node-haxball 2.3.1', 'node-datachannel 0.25.0 (copia propia)', 'libdatachannel 0.22.2 · libjuice 1.5.7 · OpenSSL 1.1.1w · usrsctp', '15 hilos · 1 socket UDP por jugador', 'Cualquier red'],
@@ -230,6 +299,16 @@ footer{margin-top:20px;padding:14px 16px;background:#f0efec;border-radius:8px;fo
 table{width:100%;border-collapse:collapse;margin-top:22px;font-size:15px;line-height:1.4}
 th{text-align:left;font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:${C.ink3};padding:0 14px 10px;border-bottom:1px solid ${C.axis}}
 td{padding:14px;border-bottom:1px solid ${C.grid};vertical-align:top;color:${C.ink2}} td:first-child{color:${C.ink};white-space:nowrap}
+.heads{display:grid;grid-template-columns:repeat(4,1fr);gap:14px 16px;margin-bottom:8px}
+.tile{background:#f0efec;border-radius:10px;padding:14px 16px 12px;border-left:5px solid ${LIB_DEFS[0].color}}
+.big{font:700 38px/1.05 'Inter Display',Inter,sans-serif;letter-spacing:-.02em}
+.tl{font-size:16px;font-weight:600;margin-top:4px;line-height:1.25}.td{font-size:13px;color:${C.ink3};margin-top:4px}
+.subcap{font-size:13px;color:${C.ink3};margin:2px 0 4px}
+.sec{font:700 22px/1.2 'Inter Display',Inter,sans-serif;margin:22px 0 12px;padding-top:14px;border-top:1px solid ${C.grid}}
+.grid.four{grid-template-columns:repeat(4,312px);gap:18px 24px}.all .ptitle{font-size:16px}.all .psub{font-size:13px;margin-bottom:6px}
+.all .val{font-size:13px}
+.how{align-self:center;font-size:14px;line-height:1.5;color:${C.ink2};background:#f0efec;border-radius:8px;padding:12px 14px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:${C.ink}}
 .sw{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:8px;vertical-align:-1px}
 </style></head><body>${cards.join('\n')}</body></html>`;
 writeFileSync(`${OUT}/charts.html`, html);
@@ -250,8 +329,14 @@ if (!browserPath) {
 const browser = await chromium.launch({ executablePath: browserPath });
 const page = await browser.newPage({ viewport: { width: 1500, height: 1000 }, deviceScaleFactor: 2 });
 await page.setContent(html);
+// optional: INTER_FONT=<variable Inter .woff2> renders with Inter when it is not installed
+if (process.env.INTER_FONT && existsSync(process.env.INTER_FONT)) {
+  const b64 = readFileSync(process.env.INTER_FONT).toString('base64');
+  const face = (n) => `@font-face{font-family:'${n}';font-weight:100 900;src:url(data:font/woff2;base64,${b64}) format('woff2')}`;
+  await page.addStyleTag({ content: face('Inter') + face('Inter Display') });
+}
 await page.evaluate(() => document.fonts.ready);
-const names = { cpu: '1-cpu', p20: '2-sala-20-jugadores', gc: '3-gc-y-lag', rooms: '4-diez-salas', idle: '5-sala-vacia-y-arranque', stack: '6-webrtc-por-libreria' };
+const names = { all: '0-comparativa-completa', cpu: '1-cpu', p20: '2-sala-20-jugadores', gc: '3-gc-y-lag', rooms: '4-diez-salas', idle: '5-sala-vacia-y-arranque', stack: '6-webrtc-por-libreria' };
 for (const [id, name] of Object.entries(names)) await page.locator(`#${id}`).screenshot({ path: `${OUT}/${name}.png` });
 await browser.close();
 console.log('ok');
