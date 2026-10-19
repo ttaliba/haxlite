@@ -1,5 +1,5 @@
 // Room for the "far off-screen" screenshots of hidden players
-// (scripts/among-us-screenshots.ts with EXAMPLE=scripts/hidden-bigmap-room.mjs):
+// (scripts/hidden-players-screenshots.ts, which runs this room by default):
 // a map much larger than any view, so every other player is off-screen and the
 // official client would draw an edge arrow for each one. Every player is
 // hidden from "A" (room.haxlite.hidePlayerFor) unless CONTROL=1.

@@ -434,7 +434,7 @@ Probado con clientes node-haxball reales (`test/api/private-view.test.ts`):
 - `clearDiscOverrides`, `stopGame` y la salida del jugador cierran la vista;
 - control negativo: el mismo cambio enviado como mensaje 6 marca al jugador como desincronizado ante toda la sala en la ronda siguiente.
 
-`examples/among-us-vision.mjs` lo usa para una niebla por habitación y un marcador de tarea, junto con `hidePlayerFor` (jugadores de otras zonas y fantasmas, ver "Jugadores ocultos por espectador"), y también se prueba.
+Sirve para máscaras de visión y marcadores por jugador; se combina con `hidePlayerFor` (ver "Jugadores ocultos por espectador").
 
 **Orden de dibujo del cliente oficial** (`game-min.js` `0349dd60`, método de render de la vista de juego; el `defaultRenderer` de node-haxball sigue el mismo orden):
 
@@ -463,7 +463,7 @@ Límites:
 - cada actualización manda además un no-op de 20 bytes a cada otro cliente. Las actualizaciones de varios jugadores en la misma tanda comparten ranura (`HostRoom.batchPrivate`; la fachada `HBInit` agrupa las llamadas consecutivas);
 - los espectadores y la grabación `.hbr2` ven el mundo de la sala.
 
-**Flechas de borde del cliente oficial** (`game-min.js` `0349dd60`, `wr`/`Jk`/`Kk`; verificado con el cliente real en Chromium, `scripts/among-us-screenshots.ts`, capturas en `docs/img/among-us/`):
+**Flechas de borde del cliente oficial** (`game-min.js` `0349dd60`, `wr`/`Jk`/`Kk`; verificado con el cliente real en Chromium, `scripts/hidden-players-screenshots.ts`, capturas en `docs/img/hidden-players/`):
 
 - `wr` llama a `Jk` para el disco 0 (balón, en su color de disco) y para **cada jugador con disco** (`null != e.I`): rojos y azules, compañeros o rivales, y también el propio. Los espectadores no tienen disco, así que no tienen flecha.
 - `Jk(pos, color, ancho, alto)` recorta la posición del disco al rectángulo de la vista reducido 25 unidades por lado (`±(ancho/2 − 25)`, `±(alto/2 − 25)` alrededor de la cámara). Si el centro del disco queda a **más de 30 unidades** de ese punto (`900 < dx² + dy²`), dibuja allí un triángulo de 15 × 14 que apunta al disco, con sombra `rgba(0,0,0,0.5)`. Es decir: solo hay flecha si el centro está más de ~5 unidades fuera de la pantalla.
@@ -479,13 +479,13 @@ Límites:
 
 **Cómo evitar que delaten posiciones** (comprobado en el cliente real):
 
-1. **Que el mapa quepa en la pantalla** (sirve): `width`/`height` del estadio iguales a la mitad del mapa y centros de disco dentro de la vista. La cámara queda centrada, nadie está fuera de cámara y no se dibuja ninguna flecha. Con el ejemplo (centros en ±245 × ±115, hace falta una vista de 480 × 230) no hay flechas en Dynamic, Restricted ni en Full 1x–2x con un área de 1000 × 700 (`01`–`03`, `06`).
-2. **Niebla como semiplano** (refuerzo): un disco de radio 10000 cuyo borde pasa por la puerta tapa todo lo que hay más allá, también fuera del mapa. Si el jugador acerca la cámara y el mapa ya no cabe, la flecha hacia la sala con niebla cae en el borde de la pantalla y queda **debajo** de la niebla mientras ese borde esté pasada la puerta (`07`). Con la cámara contra la pared del fondo, eso se cumple si el ancho visible es ≥ `width + puerta + 25` (325 unidades en el ejemplo): Full 2,5x a partir de ~815 px de ancho.
+1. **Que el mapa quepa en la pantalla** (sirve): `width`/`height` del estadio iguales a la mitad del mapa y centros de disco dentro de la vista. La cámara queda centrada, nadie está fuera de cámara y no se dibuja ninguna flecha. Solo hace falta una vista algo mayor que el rango de los centros de disco (±(`width` − radio) por lado).
+2. **Niebla como semiplano** (refuerzo): un disco de radio 10000 cuyo borde pasa por la puerta tapa todo lo que hay más allá, también fuera del mapa. Si el jugador acerca la cámara y el mapa ya no cabe, la flecha hacia la sala con niebla cae en el borde de la pantalla y queda **debajo** de la niebla mientras ese borde esté pasada la puerta. Con la cámara contra la pared del fondo, eso se cumple si el ancho visible es ≥ `width + puerta + 25`.
 3. **Espectadores** (sirve, pero solo para quien ya no juega): un jugador "muerto" movido a espectadores no tiene disco ni flecha.
 4. **Propiedades del disco del jugador** (no sirve): son globales y la flecha no mira radio ni color.
-5. **Ocultar al jugador para ese espectador** (sirve siempre, con cualquier zoom): `room.haxlite.hidePlayerFor(V, P)`. Es lo que usa ahora el ejemplo. Se explica abajo.
+5. **Ocultar al jugador para ese espectador** (sirve siempre, con cualquier zoom): `room.haxlite.hidePlayerFor(V, P)`. Es la opción recomendada. Se explica abajo.
 
-Límite de los puntos 1 y 2: la sala no conoce ni controla el zoom del cliente. Con zoom fuerte en una ventana estrecha (Full 2,5x a 800 px, `08`) el borde de la pantalla cae en el pasillo y las flechas de los jugadores asoman. `04` muestra el problema original: mapa más grande que la vista y niebla circular. Con el punto 5 la misma vista ya no tiene flechas (`09`).
+Límite de los puntos 1 y 2: la sala no conoce ni controla el zoom del cliente. Con zoom fuerte en una ventana estrecha (Full 2,5x a 800 px) el borde de la pantalla puede caer fuera de la zona tapada y las flechas de los jugadores asoman. Con el punto 5 la misma vista ya no tiene flechas (`03`).
 
 #### Jugadores ocultos por espectador (`hidePlayerFor` / `showPlayerFor`)
 
@@ -545,28 +545,24 @@ Medido con `scripts/nan-probe.js`: NaN leída del f32, 200 000 ticks de `x + v` 
   - el cambio de equipo se vuelve a ocultar;
   - `showPlayerFor` hace converger la vista;
   - `stopGame` y la salida de V la limpian.
-- `test/api/examples.test.ts`: el ejemplo con niebla, jugadores ocultos por zona y fantasmas que atraviesan paredes.
-- Cliente oficial real en Chromium (`scripts/among-us-screenshots.ts` con `CHECKSUM=30`): con el jugador oculto moviéndose y chutando, 23 y 28 rondas sin ningún `SetPlayerSync` ni aviso "desynchronized". Capturas:
+- Cliente oficial real en Chromium (`scripts/hidden-players-screenshots.ts` con `CHECKSUM=30`): con el jugador oculto moviéndose y chutando, 23 y 28 rondas sin ningún `SetPlayerSync` ni aviso "desynchronized". Capturas:
 
 | Captura | Qué muestra |
 |---|---|
-| `09-oculto-zoom2.5x-ventana-estrecha-sin-flechas.png` | el caso de `08` (Full 2,5x a 800 px): ya no hay flechas |
-| `10-…-vivo-A-no-ve-fantasmas.png`, `12-…-vivo-C-…` | los vivos no ven a los fantasmas B y D aunque están a su lado: ni disco, ni nombre, ni avatar, ni flecha |
-| `11-…-fantasma-B-ve-a-todos.png`, `13-…-fantasma-D-…` | los fantasmas se ven entre sí (avatar 👻) y ven a los vivos |
-| `14-mapa-grande-sin-ocultar-flechas.png` (control) / `15-mapa-grande-ocultos-sin-flechas.png` | mapa de 3000 × 1400: sin ocultar hay flechas roja y azul; ocultos solo queda la del balón |
-| `16-mapa-grande-zoom2.5x-ocultos-A.png` / `17-…-B-ve-a-A.png` | zoom 2,5x: A no ve a nadie; B, en el mismo partido, ve las flechas de A y C |
+| `01-sin-ocultar-flechas.png` (control) / `02-ocultos-sin-flechas.png` | mapa de 3000 × 1400: sin ocultar hay flechas roja y azul; ocultos solo queda la del balón |
+| `03-zoom2.5x-ocultos-A.png` / `04-zoom2.5x-B-ve-a-A.png` | zoom 2,5x: A no ve a nadie; B, en el mismo partido, ve las flechas de A y C |
 
 **Garantías y límites (honestos):**
 
 - **Cliente oficial y física oficial:** comprobado en Chromium. Firefox, Safari y ARM se apoyan en el análisis de NaN de arriba y en la sonda con SpiderMonkey y JSC; el cliente oficial no se ha ejecutado en ellos.
 - **No es seguridad.** El estado de la sala sigue llegando a todos: V recibe los `SendInput` de P y conoce sus posiciones hasta que se oculta. Un cliente modificado puede reconstruir dónde está P (simulando la sala, o simplemente sin aplicar el NaN). Esto oculta a P del cliente oficial; no impide hacer trampa.
-- **Retraso:** ocultar y mostrar llegan ≈ 1 RTT + *heartbeat* después. Un saque tras gol reaparece a P en el mundo de V hasta que llega el nuevo ocultado. Ese evento sale en el mismo frame del host, pero el cliente de V puede haber extrapolado ya algún frame por delante: unas decenas de ms con P visible en su punto de saque. Un cambio de equipo hecho por el host se vuelve a ocultar en el mismo frame. Un juego nuevo termina las parejas: el script vuelve a ocultar en cuanto lo sabe (el ejemplo, en el primer `onGameTick`, un tick después).
-- **Si P interactúa con algo compartido** (empuja a otro, chuta el balón), V ve el efecto un tick tarde (la reconciliación) y además todos reciben un evento de 36 B por disco y tick mientras dure. Lo que no es un disco no se puede corregir. Si P mueve el balón en el saque, el reloj de V arranca un tick tarde. Si lo mete en la portería, V puede no ver el gol. Por eso el ejemplo hace que los ocultos no toquen nada: vivos `c1` (no chocan entre sí), fantasmas `c0` (solo los bordes los paran) y balón no chutable.
+- **Retraso:** ocultar y mostrar llegan ≈ 1 RTT + *heartbeat* después. Un saque tras gol reaparece a P en el mundo de V hasta que llega el nuevo ocultado. Ese evento sale en el mismo frame del host, pero el cliente de V puede haber extrapolado ya algún frame por delante: unas decenas de ms con P visible en su punto de saque. Un cambio de equipo hecho por el host se vuelve a ocultar en el mismo frame. Un juego nuevo termina las parejas: el script vuelve a ocultar en cuanto lo sabe (en el primer `onGameTick`, un tick después).
+- **Si P interactúa con algo compartido** (empuja a otro, chuta el balón), V ve el efecto un tick tarde (la reconciliación) y además todos reciben un evento de 36 B por disco y tick mientras dure. Lo que no es un disco no se puede corregir. Si P mueve el balón en el saque, el reloj de V arranca un tick tarde. Si lo mete en la portería, V puede no ver el gol. Por eso conviene que los ocultos no toquen nada compartido: por ejemplo, un `cGroup` propio que no choque con otros jugadores ni con el balón, y un balón no chutable.
 - **Sigue en la lista de jugadores:** P aparece en su equipo en la lista de V. Solo deja de dibujarse en el campo.
 - **Clientes node-haxball como espectadores:** funcionan, gracias a que se quita el bit de chute. Otros clientes de terceros con otra física ante NaN podrían desincronizarse si P interactúa con algo.
 - **Coste:** una vista privada por espectador con jugadores ocultos (≈ 1 µs/tick cada una). Ocultar o mostrar cuesta 32 B para V y un no-op de 20 B para cada uno de los demás.
 
-**Lo que no necesita ninguna divergencia** (camino recomendado para las interacciones de tarea):
+**Lo que no necesita ninguna divergencia** (camino recomendado para las interacciones por jugador):
 
 - el host lee posiciones (`getPlayerDiscProperties`, `onGameTick`) y decide;
 - `sendAnnouncement`/`sendChat` con `targetId` (mensaje 6: no tocan el estado);

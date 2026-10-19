@@ -12,7 +12,7 @@
  *  - `context.routeWebSocket` bridges `wss://p2p.haxball.com/client?…` to the
  *    FakeMaster's client signaling WebSocket (close codes preserved).
  *
- * Used by `official-client.interop.ts` and `scripts/among-us-screenshots.ts`.
+ * Used by `official-client.interop.ts` and `scripts/hidden-players-screenshots.ts`.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';

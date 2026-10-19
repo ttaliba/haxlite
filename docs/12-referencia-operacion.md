@@ -388,7 +388,7 @@ El paquete no lee ninguna otra variable: ni `HAXLITE_*` genéricas, ni `NODE_ENV
 
 | Variable | Defecto | Dónde | Efecto |
 |---|---|---|---|
-| `HAXBALL_TOKEN` | - (obligatoria) | `examples/basic-room.mjs`, `moderation.mjs`, `among-us-vision.mjs`, `scripts/hidden-bigmap-room.mjs` | *Headless token* de <https://www.haxball.com/headlesstoken> (caduca a los pocos minutos) |
+| `HAXBALL_TOKEN` | - (obligatoria) | `examples/basic-room.mjs`, `moderation.mjs`, `scripts/hidden-bigmap-room.mjs` | *Headless token* de <https://www.haxball.com/headlesstoken> (caduca a los pocos minutos) |
 | `HX_TOKEN` | - (obligatoria) | `examples/live-room.mjs` | Igual, **otro nombre** |
 | `HAXLITE_OPTIONS` | `{}` | los mismos ejemplos | JSON que se pasa como opción `haxlite` de `HBInit` (p. ej. `{"masterUrl":"…","iceServers":[]}`) |
 | `HX_BACKEND` | `ndc` | `live-room.mjs` | `rtc` o `ndc` (`peerBackend`) |
@@ -399,7 +399,7 @@ El paquete no lee ninguna otra variable: ni `HAXLITE_*` genéricas, ni `NODE_ENV
 | `ADMIN_AUTHS` | vacío | `moderation.mjs` | `auth` de los administradores, separados por comas |
 | `QUARANTINE_MS` | `120000` | `moderation.mjs` | Tiempo sin poder escribir de un `auth` nunca visto |
 | `CONTROL` | sin definir | `scripts/hidden-bigmap-room.mjs` | `1` = sala de control (sin ocultar jugadores) |
-| `HAXBALL_CLIENT_DIR`, `OUT`, `PREFIX`, `FILES`, `EXAMPLE`, `VIEW_MODE`, `FRAME`, `POS`, `ONLY`, `PROPS`, `SPECTATE`, `WAIT`, `NAMES`, `KILL`, `KEYS`, `SETTLE`, `CHECKSUM` | ver el encabezado del script | `scripts/among-us-screenshots.ts` | Parámetros de las capturas con el cliente oficial (§5) |
+| `HAXBALL_CLIENT_DIR`, `OUT`, `PREFIX`, `FILES`, `EXAMPLE`, `VIEW_MODE`, `FRAME`, `POS`, `ONLY`, `PROPS`, `SPECTATE`, `WAIT`, `NAMES`, `KEYS`, `SETTLE`, `CHECKSUM` | ver el encabezado del script | `scripts/hidden-players-screenshots.ts` | Parámetros de las capturas con el cliente oficial (§5) |
 | `EDGE_BENCH_SRC`, `EDGE_BENCH_WEBRTC`, `EDGE_BENCH_EDGE_OPTS` | - | `scripts/edge-latency.ts` | **Internas:** el orquestador las fija desde `--src`, `--edge-webrtc`, `--edge-opts` para sus procesos hijos. No las definas a mano |
 
 ### 4.3 Pruebas (`test/`)
@@ -458,7 +458,7 @@ El paquete no lee ninguna otra variable: ni `HAXLITE_*` genéricas, ni `NODE_ENV
 | `scripts/ts-resolve.mjs` | Gancho de resolución: permite que `node --experimental-strip-types` ejecute las fuentes de `src/` (imports `.js` que nombran `.ts`) | `--import ./scripts/ts-resolve.mjs` |
 | `scripts/edge.ts` | Punto de entrada del Edge desde fuentes (`npm run edge`) | `npm run edge -- --config edge.json` |
 | `scripts/edge-latency.ts` | Mide el sobrecoste del Edge en loopback: RTT por canal (`ro`/`uu`) y CPU del host y del Edge por jugador | Ver abajo |
-| `scripts/among-us-screenshots.ts` | Capturas de `examples/among-us-vision.mjs` con el **cliente oficial** real en Chromium, sin red | `HAXBALL_CLIENT_DIR=… node --import ./scripts/ts-resolve.mjs scripts/among-us-screenshots.ts` (variables en §4.2) |
+| `scripts/hidden-players-screenshots.ts` | Capturas de una sala con jugadores ocultos (por defecto `scripts/hidden-bigmap-room.mjs`) con el **cliente oficial** real en Chromium, sin red | `HAXBALL_CLIENT_DIR=… node --import ./scripts/ts-resolve.mjs scripts/hidden-players-screenshots.ts` (variables en §4.2) |
 | `scripts/hidden-bigmap-room.mjs` | Sala de un mapa enorme para las capturas de jugadores ocultos | La usa el script anterior con `EXAMPLE=scripts/hidden-bigmap-room.mjs` |
 | `scripts/vision-mask-cost.ts` | Coste en bytes y desfase de una «máscara de visión» por jugador (docs/04 §7.4) | `node --import ./scripts/ts-resolve.mjs scripts/vision-mask-cost.ts` |
 | `scripts/nan-probe.js` | Patrones de bits de NaN en distintos motores JS (jugadores ocultos, docs/04 §7.4) | `node scripts/nan-probe.js` (también en shells de SpiderMonkey/JSC) |
@@ -488,8 +488,8 @@ sudo node --experimental-strip-types --no-warnings --import ./scripts/ts-resolve
 
 (docs/09 §7 muestra `--experimental-transform-types`; esa bandera la eliminó Node 26.)
 
-**Ejemplos** (`examples/`): `basic-room.mjs`, `moderation.mjs`, `live-room.mjs`,
-`among-us-vision.mjs`; sus variables están en §4.2. `test/api/examples.test.ts` los ejecuta contra
+**Ejemplos** (`examples/`): `basic-room.mjs`, `moderation.mjs`, `live-room.mjs`;
+sus variables están en §4.2. `test/api/examples.test.ts` los ejecuta contra
 el FakeMaster.
 
 ---

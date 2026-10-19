@@ -395,7 +395,7 @@ export interface HaxliteRoomExtensions {
 
   /**
    * Private visuals: changes disc `discIndex` ONLY for player `viewerId`
-   * (e.g. a fog / vision mask, a task marker). Deferred like the official
+   * (e.g. a vision mask, a marker). Deferred like the official
    * setters. Must be a "visual-only" stadium disc: not disc 0, not a player
    * disc, in no joint, cGroup 0 in every world (nothing can touch, kick or
    * score with it), so the viewer's game plays exactly like everyone

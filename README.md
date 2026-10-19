@@ -105,7 +105,6 @@ const room = await HBInit({
 |---|---|
 | [`examples/basic-room.mjs`](examples/basic-room.mjs) | admin al primer jugador, equipos automáticos, comandos `!bb`, `!afk`, `!swap`, `!rr` |
 | [`examples/moderation.mjs`](examples/moderation.mjs) | bans persistentes en JSON, re-ban al volver con otra IP, cuarentena de chat para `auth` nuevos, mute, bans por rango CIDR, rechazo de jugadores sin `auth` |
-| [`examples/among-us-vision.mjs`](examples/among-us-vision.mjs) | niebla por habitación, marcador de tarea, jugadores de otras zonas ocultos y fantasmas invisibles para los vivos, todo solo para cada jugador |
 | [`examples/live-room.mjs`](examples/live-room.mjs) | sala real de prueba manual, configurada con variables `HX_*` (ver la cabecera del archivo) |
 
 Los tres primeros se ejecutan en los tests (`test/api/examples.test.ts`).
@@ -162,8 +161,8 @@ room.haxlite.onBeforeOperation = (event, byPlayerId, frame) => true; // false de
 | `peerBackend`, `rtc`, `edge` | cómo se conectan los jugadores ([ver abajo](#cómo-se-conectan-los-jugadores)) |
 | `stop()` / `close()` | cierra temporizadores, señalización y conexiones; Node termina solo |
 | `stopRecordingAsync()` | como `stopRecording()` pero el deflate corre fuera del bucle (≈ 3 ms en vez de ≈ 280 ms con una hora de grabación) |
-| `setDiscPropertiesFor`, `clearDiscOverrides`… | **visuales privados**: cambia un disco solo en el mundo de un jugador sin desincronizar a nadie (niebla, marcadores) |
-| `hidePlayerFor`, `showPlayerFor`, `setPlayerHiddenFor`… | **jugadores ocultos**: el jugador desaparece solo para ese espectador (fantasmas, visión por zonas). No es seguridad: un cliente modificado sigue pudiendo saber dónde está |
+| `setDiscPropertiesFor`, `clearDiscOverrides`… | **visuales privados**: cambia un disco solo en el mundo de un jugador sin desincronizar a nadie (máscaras de visión, marcadores) |
+| `hidePlayerFor`, `showPlayerFor`, `setPlayerHiddenFor`… | **jugadores ocultos**: el jugador desaparece solo para ese espectador (visión por zonas, espectadores que no deben ver a ciertos jugadores). No es seguridad: un cliente modificado sigue pudiendo saber dónde está |
 | `getPlayerConnection(id)` | `auth`, `conn`, IP, IPs *srflx*, ping |
 | `setMaxPlayers`, `roomLink`, `frame`, `onError`, `host`, `transport` | utilidades y acceso al motor |
 

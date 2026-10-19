@@ -294,9 +294,9 @@ Con edge: `room.haxlite.edgeStats()` devuelve `{ state, dataPlane, roLanes, sess
 
 ### 2.6 Visuales privados y jugadores ocultos
 
-Ambos mecanismos hacen que un solo jugador vea un mundo distinto sin desincronizar a nadie: el host simula ese mundo privado y le manda su propio hash de *CheckConsistency*. Explicación completa en [docs/04 §7.4](04-netcode-y-sincronizacion.md); ejemplo real en [`examples/among-us-vision.mjs`](../examples/among-us-vision.mjs). Todas las llamadas son diferidas (se aplican en un *microtask*) y los errores van a `onError`.
+Ambos mecanismos hacen que un solo jugador vea un mundo distinto sin desincronizar a nadie: el host simula ese mundo privado y le manda su propio hash de *CheckConsistency*. Explicación completa en [docs/04 §7.4](04-netcode-y-sincronizacion.md). Todas las llamadas son diferidas (se aplican en un *microtask*) y los errores van a `onError`.
 
-* **`setDiscPropertiesFor(viewerId, discIndex, props, { force })`**: cambia el disco `discIndex` solo para `viewerId` (niebla, marcador de tarea…). El disco debe ser «solo visual»: de estadio, no el 0, no un disco de jugador, sin *joints* y con `cGroup` 0 en todos los mundos. Si no, se rechaza por `onError`, salvo `force: true` (entonces ese jugador puede ver otra partida de verdad). `props` es un `DiscPropertiesUpdate`. Llamadas consecutivas sin otra acción en medio comparten un lote. El efecto se descarta al parar/empezar el juego, cambiar de estadio, un saque inicial que reinicia el disco, `clearDiscOverrides` o al salir el jugador.
+* **`setDiscPropertiesFor(viewerId, discIndex, props, { force })`**: cambia el disco `discIndex` solo para `viewerId` (máscaras de visión, marcadores…). El disco debe ser «solo visual»: de estadio, no el 0, no un disco de jugador, sin *joints* y con `cGroup` 0 en todos los mundos. Si no, se rechaza por `onError`, salvo `force: true` (entonces ese jugador puede ver otra partida de verdad). `props` es un `DiscPropertiesUpdate`. Llamadas consecutivas sin otra acción en medio comparten un lote. El efecto se descarta al parar/empezar el juego, cambiar de estadio, un saque inicial que reinicia el disco, `clearDiscOverrides` o al salir el jugador.
 * **`hidePlayerFor(viewerId, playerId)`**: `playerId` desaparece por completo para `viewerId` (sin disco, nombre, avatar ni flecha de borde en el cliente oficial) y sigue jugando normal para los demás. En el mundo del espectador su disco pasa a posición NaN y `cGroup` 0. Se vuelve a ocultar tras cada reaparición. Termina con el juego o cuando sale cualquiera de los dos. **No es una frontera de seguridad**: el estado de la sala sigue llegando a todos los clientes.
 
 ### 2.7 Ejemplos
@@ -364,7 +364,7 @@ room.haxlite.onBeforeOperation = (ev, byPlayerId, requestedFrame) => {
 Un jugador oculto para otro y un disco visual privado:
 
 ```js
-room.haxlite.hidePlayerFor(viewerId, ghostId);                       // viewer ya no ve a ghost
+room.haxlite.hidePlayerFor(viewerId, playerId);                      // viewer ya no ve a ese jugador
 room.haxlite.setDiscPropertiesFor(viewerId, 5, { color: 0xff0000 }); // disco 5: solo visual
 room.haxlite.onPrivateViewEnd = (id) => console.log('vista privada terminada', id);
 ```
