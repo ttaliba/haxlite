@@ -778,7 +778,9 @@ export class Sequencer {
    * frame, `fg` validation (chat filter), {@link onBeforeOperation}, then
    * apply/queue and broadcast to every client (author included) on `ru`.
    * Throws {@link ProtocolViolation} (or a codec error) when the client must
-   * be dropped.
+   * be dropped. A SetStadium that decodes but can't be re-encoded within the
+   * wire limits ({@link SetStadiumEvent.wireError}) is dropped and reported
+   * through {@link onError}; its sender stays.
    */
   clientMessage(client: SequencerClient, r: Reader, now: number): RoomEvent | null {
     const requested = r.u32();
@@ -810,6 +812,14 @@ export class Sequencer {
     if (discLimitViolation(this.rs, ev, this.queue, this.maxPlayers()) !== null) return null;
     const hook = this.onBeforeOperation;
     if (hook !== null && hook(ev, client.playerId, requested) === false) return null;
+    if (type === EventType.SetStadium) {
+      // valid payload that our deflate can't fit back in the u16: dropped, the sender stays
+      const err = (ev as SetStadiumEvent).wireError();
+      if (err !== null) {
+        this.reportError(new Error(`SetStadium from player ${client.playerId} dropped: ${err}`));
+        return null;
+      }
+    }
     const variants = this.makeVariants(ev);
     this.submit(ev);
     this.sendSequenced(ev, variants);

@@ -250,6 +250,12 @@ const OUR_STREAMS = 65535;
 const MAX_TX_RECORDS = 1 << 20;
 /** RE-CONFIG request parameters processed per packet (one chunk carries at most 2). */
 const MAX_RECONF_REQS = 2;
+/**
+ * FORWARD-TSN stream-entry work per packet, in pending-map reads per receive
+ * window slot. Each entry costs at most its stream's pending count and those
+ * add up to at most one window, so only repeated entries can reach this.
+ */
+const FWD_WORK_PER_SLOT = 4;
 const EMPTY = new Uint8Array(0);
 
 // ---------------------------------------------------------------------------
@@ -414,6 +420,12 @@ export class SctpAssociation {
   private lastFwdAt = -1e12;
   private orphanScan = false;
   private cumAtInput = 0;
+  /** FORWARD-TSN entry work spent in the current packet (see FWD_WORK_PER_SLOT). */
+  private fwdWork = 0;
+  /** Scratch for FORWARD-TSN: distances of pending SSNs from the stream cursor. */
+  private fwdDist: Uint16Array | null = null;
+  /** The oversized-message check of a full receive buffer ran in this packet. */
+  private bigChecked = false;
   /** processAck inputs (see there). */
   private ackCum = 0;
   private ackRwnd = 0;
@@ -1387,6 +1399,8 @@ export class SctpAssociation {
     }
     this.pktHadData = false;
     this.reconfReqs = 0;
+    this.fwdWork = 0;
+    this.bigChecked = false;
     let off = c0;
     while (off + 4 <= len && !this.dead) {
       const type = p[off];
@@ -1857,7 +1871,15 @@ export class SctpAssociation {
     // Receive buffer full. The next in-order TSN gets one message of headroom
     // so it can always fill the gap that held data waits on; a peer that
     // keeps sending fragments of a message that never ends hits this too.
-    if (this.heldBytes + dLen > (d > 1 ? this.rxBufferSize : this.rxBufferSize + this.maxRecvMessage)) return;
+    if (this.heldBytes + dLen > (d > 1 ? this.rxBufferSize : this.rxBufferSize + this.maxRecvMessage)) {
+      // An in-order continuation of a message already past maxRecvMessage can
+      // never be delivered: fail now instead of stalling on the full buffer.
+      if (d === 1 && !(fl & F_B) && !this.bigChecked) {
+        this.bigChecked = true;
+        if (this.partialBytes((tsn - 1) >>> 0, sid, fl & F_U, ssn) + dLen > this.maxRecvMessage) this.fail('message-too-large');
+      }
+      return;
+    }
     hf[s] = H_HELD | fl;
     this.hTsn![s] = tsn;
     this.hSid![s] = sid;
@@ -1875,6 +1897,23 @@ export class SctpAssociation {
     if ((fl & F_B || this.matches(pt & mask, pt, sid, u, ssn)) && (fl & F_E || this.matches(nt & mask, nt, sid, u, ssn))) {
       this.tryAssemble(tsn);
     }
+  }
+
+  /**
+   * Bytes of the unfinished message whose fragments end at `tsn` (held,
+   * contiguous, no E); stops once past maxRecvMessage.
+   */
+  private partialBytes(tsn: number, sid: number, u: number, ssn: number): number {
+    const mask = this.rxMask;
+    const hf = this.hFlags!;
+    let total = 0;
+    for (let t = tsn, n = 0; n < this.rxCap; t = (t - 1) >>> 0, n++) {
+      const s = t & mask;
+      if (!this.matches(s, t, sid, u, ssn) || hf[s] & F_E) break;
+      total += this.hData[s]!.length;
+      if (hf[s] & F_B || total > this.maxRecvMessage) break;
+    }
+    return total;
   }
 
   private addDup(tsn: number): void {
@@ -2414,19 +2453,48 @@ export class SctpAssociation {
       const m = this.rPending[sid];
       if (m !== undefined && m !== null && m.size > 0) {
         // Deliver complete messages up to `ssn` in order, then skip the rest.
-        // Pending SSNs all lie ahead of `next`, so walking next..ssn meets them
-        // in order and stops once none is left (at most a half-range per chunk).
-        for (let k = next; m.size > 0; k = (k + 1) & 0xffff) {
-          const b = m.get(k);
-          if (b !== undefined) {
-            m.delete(k);
-            this.deliverPending(b, sid);
+        // Pending SSNs all lie ahead of `next`: walk next..ssn when that is
+        // shorter than the map, else pick the map's SSNs in range once.
+        const dist = (ssn - next) & 0xffff;
+        const cost = dist < m.size ? dist + 1 : m.size;
+        // A sender lists each stream once; past the budget the rest of the
+        // packet's entries are ignored (only repeated entries get here).
+        if (this.fwdWork + cost > FWD_WORK_PER_SLOT * this.rxCap) break;
+        this.fwdWork += cost;
+        if (dist < m.size) {
+          for (let k = next; m.size > 0; k = (k + 1) & 0xffff) {
+            const b = m.get(k);
+            if (b !== undefined) {
+              m.delete(k);
+              this.deliverPending(b, sid);
+            }
+            if (k === ssn) break;
           }
-          if (k === ssn) break;
+        } else {
+          this.deliverPendingUpTo(m, sid, next, dist);
         }
       }
       this.rNextSsn[sid] = ssn + 1;
       this.drainPending(sid);
+    }
+  }
+
+  /** Delivers, in SSN order, the pending messages of `sid` within `dist` of `next`. */
+  private deliverPendingUpTo(m: Map<number, number>, sid: number, next: number, dist: number): void {
+    let sc = this.fwdDist;
+    if (sc === null || sc.length < m.size) sc = this.fwdDist = new Uint16Array(Math.max(m.size, this.rxCap));
+    let n = 0;
+    for (const k of m.keys()) {
+      const d = (k - next) & 0xffff;
+      if (d <= dist) sc[n++] = d;
+    }
+    if (n === 0) return;
+    if (n > 1) sc.subarray(0, n).sort();
+    for (let i = 0; i < n && !this.dead; i++) {
+      const k = (next + sc[i]) & 0xffff;
+      const b = m.get(k)!;
+      m.delete(k);
+      this.deliverPending(b, sid);
     }
   }
 

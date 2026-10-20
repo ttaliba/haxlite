@@ -383,6 +383,12 @@ export interface HaxliteRoomExtensions {
   readonly frame: number;
   /** True after stop()/close(). */
   readonly stopped: boolean;
+  /**
+   * True once the current (or last) recording froze at its cap
+   * (`host.recorder.maxBytes` / `maxEvents`): the replay ends at the frame it
+   * froze at. Reported once per recording through {@link onError}.
+   */
+  readonly recordingTruncated: boolean;
   readonly bans: HaxliteBans;
 
   /**

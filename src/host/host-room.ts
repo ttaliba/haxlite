@@ -506,9 +506,28 @@ export class HostRoom {
     this.flushErrorRuns(Infinity);
   }
 
-  /** `.hbr2` recorder (one per room, reused; created on first use): see {@link startRecording}. */
+  /**
+   * `.hbr2` recorder (one per room, reused; created on first use): see
+   * {@link startRecording}. When a recording freezes at the recorder's cap
+   * the room reports it once through {@link onError}.
+   */
   get recorder(): ReplayRecorder {
-    return (this.rec ??= new ReplayRecorder());
+    let rec = this.rec;
+    if (rec === null) {
+      rec = this.rec = new ReplayRecorder();
+      rec.onTruncated = (frame) =>
+        this.reportError(
+          new Error(
+            `replay recording truncated at frame ${frame} (recorder.maxBytes ${rec!.maxBytes} / maxEvents ${rec!.maxEvents} reached); the replay ends there`,
+          ),
+        );
+    }
+    return rec;
+  }
+
+  /** True once the current/last recording froze at the recorder's cap (see {@link recorder}). */
+  get recordingTruncated(): boolean {
+    return this.rec !== null && this.rec.truncated;
   }
 
   get isRunning(): boolean {
@@ -1586,6 +1605,10 @@ export class HostRoom {
       if (peer.state !== 'joined' || !this.running) return;
       this.catchUp();
       const id = this.allocPlayerId();
+      if (id < 0) {
+        this.transport.close(peer, 'host');
+        throw new Error('no free player id');
+      }
       const c = new HostConnection(id, peer, info.auth, info.conn);
       peer.playerId = id;
       peer.userData = c;
@@ -1604,19 +1627,35 @@ export class HostRoom {
    * Player id for a new connection: official `wh++`, but ids travel as u16
    * (event header byId, snapshot), so after 0xFFFF the count restarts at 1
    * and skips ids still in use: connected, in the room, holding a ban
-   * (clearBan(id)) or the author of a queued event. Id 0 is the host.
+   * (clearBan(id)) or the author of a queued event. Id 0 is the host. When
+   * bans hold every other id, the id of the oldest ban is reused: the ban
+   * stays in force, only clearBan(oldId) no longer finds it. -1 when no id
+   * is free at all.
    */
   private allocPlayerId(): number {
-    for (let tries = 0; tries < 0xffff; tries++) {
-      const id = this.nextPlayerId;
-      this.nextPlayerId = id >= 0xffff ? 1 : id + 1;
-      if (this.connections.has(id) || getPlayer(this.state, id) !== null || this.bansByPlayer.has(id)) continue;
-      const queue = this.sequencer.queue;
-      let queued = false;
-      for (let i = 0; i < queue.length && !queued; i++) queued = queue[i]!.byId === id;
-      if (!queued) return id;
+    // banned ids are never connected, so this many taken ids leave none free
+    if (this.bansByPlayer.size + this.connections.size < 0xffff) {
+      for (let tries = 0; tries < 0xffff; tries++) {
+        const id = this.nextPlayerId;
+        this.nextPlayerId = id >= 0xffff ? 1 : id + 1;
+        if (this.bansByPlayer.has(id) || !this.idFree(id)) continue;
+        return id;
+      }
     }
-    throw new Error('no free player id');
+    for (const id of this.bansByPlayer.keys()) {
+      if (!this.idFree(id)) continue;
+      this.bansByPlayer.delete(id);
+      return id;
+    }
+    return -1;
+  }
+
+  /** `id` is neither connected, in the room nor the author of a queued event. */
+  private idFree(id: number): boolean {
+    if (this.connections.has(id) || getPlayer(this.state, id) !== null) return false;
+    const queue = this.sequencer.queue;
+    for (let i = 0; i < queue.length; i++) if (queue[i]!.byId === id) return false;
+    return true;
   }
 
   private connectionOf(peer: Peer): HostConnection | null {

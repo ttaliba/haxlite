@@ -107,10 +107,14 @@ export function readReplay(bytes: Uint8Array, opts: ReplayReadOptions = {}): Rep
   const { version, totalFrames } = readReplayHeader(bytes);
   const maxEvents = eventLimit(opts.maxEvents);
 
+  const maxBody = inflateLimit(opts.maxBodyBytes);
   let body: Uint8Array;
   try {
-    body = inflateRaw(bytes.subarray(REPLAY_HEADER_SIZE), inflateLimit(opts.maxBodyBytes));
+    body = inflateRaw(bytes.subarray(REPLAY_HEADER_SIZE), maxBody);
   } catch (err) {
+    if (maxBody !== undefined && err instanceof CodecError && err.message === 'Inflate size exceeds limit') {
+      fail(`replay body larger than maxBodyBytes (${maxBody})`, err);
+    }
     fail('corrupt replay body', err);
   }
   const r = new Reader(body);
@@ -135,7 +139,7 @@ export function readReplay(bytes: Uint8Array, opts: ReplayReadOptions = {}): Rep
   let frame = 0;
   try {
     while (r.remaining > 0) {
-      if (events.length >= maxEvents) throw new ReplayFormatError('too many events');
+      if (events.length >= maxEvents) throw new ReplayFormatError(`too many events (more than maxEvents = ${maxEvents})`);
       frame += r.varUint();
       const byId = r.u16();
       const ev = readEvent(r);

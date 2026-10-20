@@ -106,26 +106,39 @@ export const NetDefaults = {
   /** Max inflated signaling payload (`new Uint8Array(51200)` bounded inflater). */
   signalingInflateLimit: 51_200,
   /**
-   * haxlite: max connections from one public address that have not joined yet
-   * (negotiating, awaiting `onJoinRequest`, challenged or verifying). Half of
-   * {@link maxPendingNegotiations}: one address can never take every
-   * negotiation slot, while a LAN or carrier NAT still gets several
-   * simultaneous joins. Joined players are never counted.
+   * haxlite: max connections from one public address (IPv6: one /64) that
+   * have not joined yet (negotiating, awaiting `onJoinRequest`, challenged or
+   * verifying). Three quarters of {@link maxPendingNegotiations}: one address
+   * never takes every negotiation slot, while 10 players behind one NAT can
+   * still join at once (a reverse retry replaces its abandoned direct
+   * attempt, see {@link directAttemptMs}). Joined players are never counted.
    */
-  maxUnjoinedPerIp: 8,
+  maxUnjoinedPerIp: 12,
   /**
-   * haxlite: when the room is full, a connection that has been waiting this
-   * long for its handshake gives its seat to a new one (an official client
-   * answers the challenge within one round trip).
+   * Official client: a direct (non-reverse) attempt that has not connected
+   * after 4 s is given up and retried once with the reverse flag (node-haxball
+   * `Ii(4e3)`). A reverse offer from an address replaces the oldest direct
+   * negotiation of that address still without channel 0 after this long.
    */
-  staleChallengeMs: 3_000,
+  directAttemptMs: 4_000,
   /**
-   * haxlite: per-address penalty for connections closed as abusive (flood,
-   * protocol violation, no handshake): each takes a token (`capacity`, one
-   * back every `msPerToken`); once none is left, offers from that address
-   * are refused with 4104 for `blockMs`.
+   * haxlite: when the room is full, a connection that has not answered the
+   * challenge this long after it was sent gives its seat to a new connection
+   * once that one opens channel 0 (an official client answers within one
+   * round trip; the margin covers slow, lossy mobile links).
    */
-  abusePenalty: { capacity: 3, msPerToken: 20_000, blockMs: 30_000 },
+  staleChallengeMs: 5_000,
+  /**
+   * haxlite: per-address penalty for abuse a connection commits itself
+   * (flood, protocol violation, no handshake; closes decided by the room are
+   * not counted): each takes a token (`capacity`, one back every
+   * `msPerToken`); once none is left, for `blockMs` the address only gets one
+   * new connection every `admitEveryMs`, the rest are refused with 4104.
+   * 20 tokens, one back every 3 s: 10 players behind one NAT can each time
+   * out twice a minute without effect, and keeping an address limited takes
+   * at least one abusive close every 3 s.
+   */
+  abusePenalty: { capacity: 20, msPerToken: 3_000, blockMs: 30_000, admitEveryMs: 3_000 },
 } as const;
 
 /**

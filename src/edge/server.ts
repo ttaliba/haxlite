@@ -48,7 +48,7 @@ import {
 } from '../net/ice.js';
 import { formatIp, parseIp } from '../net/ip.js';
 import type { PeerLink, PeerLinkEvents } from '../net/peer-backend.js';
-import { TokenBucket } from '../net/rate-limit.js';
+import { TokenBucket, assertBucketParams } from '../net/rate-limit.js';
 import type { NdcRtcConfig, WebRtcStats } from '../net/webrtc.js';
 import type { NdcTunnelPlane } from '../net/edge-ndc.js';
 import type { RtcEndpointStats } from '../rtc/index.js';
@@ -163,25 +163,46 @@ export interface EdgeLimitsOptions {
   /**
    * Concurrent tunnel sockets still in the `Hello` → `Auth` phase (counted
    * apart from {@link maxSessions}, so anonymous sockets never take a host's
-   * slot). When full, the oldest one is closed (4408) to make room: a real
-   * host authenticates within a round trip. Default 256 (0 = unlimited).
+   * slot). When full, a socket that has waited 5 s or more without
+   * authenticating is closed (4408) to make room; if every one is younger,
+   * the new upgrade gets HTTP 503 instead (a host mid-handshake is never
+   * pushed out). Default 1024 (0 = unlimited).
    */
   maxPreAuthSessions?: number;
   /**
    * Unauthenticated tunnel sockets per source address (IPv6: per /64);
    * further upgrades get HTTP 429. Hosts leave this state as soon as they
-   * authenticate, so many rooms behind one address are not affected.
-   * Behind a reverse proxy every host shares the proxy's address: raise it
-   * or set 0 (unlimited). Default 32.
+   * authenticate, so many rooms behind one address are only limited while
+   * they all reconnect at once. Public sources only, unless
+   * {@link perIpLimitsApplyToPrivate}. Default 256 (0 = unlimited).
    */
   maxPreAuthPerIp?: number;
   /**
    * New tunnel upgrades per source address (IPv6: per /64), token bucket:
    * burst {@link ipConnectCapacity}, one more per {@link ipConnectMsPerToken};
-   * over it → HTTP 429. Default 64 burst, 1 per 100 ms (0 capacity = off).
+   * over it → HTTP 429. Public sources only, unless
+   * {@link perIpLimitsApplyToPrivate}. Default 256 burst, 1 per 20 ms
+   * (0 capacity = off).
    */
   ipConnectCapacity?: number;
   ipConnectMsPerToken?: number;
+  /**
+   * Apply {@link maxPreAuthPerIp} and {@link ipConnectCapacity} to loopback,
+   * private (RFC 1918, 100.64/10, fc00::/7) and link-local sources too.
+   * Default false: behind a reverse proxy (or a LAN NAT) every host and every
+   * attacker shares one such address, and limiting it would let one client
+   * lock every host out. Set it when the edge is reached directly.
+   */
+  perIpLimitsApplyToPrivate?: boolean;
+  /**
+   * Behind a reverse proxy: when the connection comes from a non-public
+   * address, key the per-address limits on the last `X-Forwarded-For` entry
+   * (the address the proxy appended; entries before it are client-supplied).
+   * The proxy must append it (nginx `$proxy_add_x_forwarded_for`). Default
+   * false: the header is ignored. Only enable it when nothing but the proxy
+   * can reach the edge from a private address.
+   */
+  trustForwardedFor?: boolean;
   /** Default per-key session quota. Default 16. */
   maxSessionsPerKey?: number;
   /** Default per-key player quota. Default 256. */
@@ -233,7 +254,7 @@ export interface EdgeServerOptions {
   /**
    * `GET <path>` returns {@link EdgeStats} as JSON (`null` disables). Default
    * `/stats`. Without {@link statsToken} only edge-wide aggregates are served
-   * (`keys` empty; `webrtc`, `rtc` and `tunnel` null).
+   * (`keys` empty; `webrtc`, `rtc` and `tunnel` null; `redacted: true`).
    */
   statsPath?: string | null;
   /** Bearer token for the full stats (per-key ids, labels and traffic). Default none: aggregates only. */
@@ -276,14 +297,22 @@ export interface EdgeStats {
   /** Sessions per data plane. */
   dataPlanes: { udp: number; webrtc: number; ws: number };
   memoryRssMb: number;
+  /**
+   * `true` in the stats endpoint's anonymous view (no {@link EdgeServerOptions.statsToken}):
+   * `keys` is empty and `webrtc`, `rtc` and `tunnel` are null because they were
+   * withheld, not because there is nothing to report. Absent otherwise.
+   */
+  redacted?: true;
 }
 
 const DEFAULTS = {
   maxSessions: 1000,
-  maxPreAuthSessions: 256,
-  maxPreAuthPerIp: 32,
-  ipConnectCapacity: 64,
-  ipConnectMsPerToken: 100,
+  maxPreAuthSessions: 1024,
+  maxPreAuthPerIp: 256,
+  ipConnectCapacity: 256,
+  ipConnectMsPerToken: 20,
+  perIpLimitsApplyToPrivate: false,
+  trustForwardedFor: false,
   maxSessionsPerKey: 16,
   maxPeersPerKey: 256,
   maxPeersPerSession: 40,
@@ -358,6 +387,59 @@ function sourceKey(remote: string): string {
   return `${formatIp(b)}/64`;
 }
 
+/** Loopback, private and link-local sources (a reverse proxy, a LAN NAT): exempt from per-address limits by default. */
+function sharedSource(remote: string): boolean {
+  const cls = classifyAddress(remote);
+  return cls === 'loopback' || cls === 'private' || cls === 'linklocal';
+}
+
+/** Last `X-Forwarded-For` entry (the one the nearest proxy appended), canonical; null if absent or not an IP. */
+function forwardedClient(header: string | string[] | undefined): string | null {
+  if (header === undefined) return null;
+  const h = typeof header === 'string' ? header : header[header.length - 1];
+  if (h === undefined) return null;
+  const b = parseIp(h.slice(h.lastIndexOf(',') + 1));
+  return b === null ? null : formatIp(b);
+}
+
+/** Validates the numeric limits where the edge is built (a bad one would otherwise throw in the upgrade handler). */
+function checkLimits(l: Required<EdgeLimitsOptions>): void {
+  const counts = [
+    'maxSessions',
+    'maxPreAuthSessions',
+    'maxPreAuthPerIp',
+    'ipConnectCapacity',
+    'maxSessionsPerKey',
+    'maxPeersPerKey',
+    'maxPeersPerSession',
+    'maxPendingPerSession',
+  ] as const;
+  for (const name of counts) {
+    const v = l[name];
+    if (typeof v !== 'number' || !(v >= 0)) throw new RangeError(`limits.${name} must be a number >= 0, got ${String(v)}`);
+  }
+  const buckets: [string, number, number][] = [
+    ['peerOpen', l.peerOpenCapacity, l.peerOpenMsPerToken],
+    ['flood', l.floodCapacity, l.floodMsPerToken],
+  ];
+  if (l.ipConnectCapacity > 0) buckets.push(['ipConnect', l.ipConnectCapacity, l.ipConnectMsPerToken]);
+  for (const [name, capacity, ms] of buckets) {
+    if (typeof capacity !== 'number' || typeof ms !== 'number') {
+      throw new RangeError(`limits.${name}Capacity / ${name}MsPerToken must be numbers`);
+    }
+    try {
+      assertBucketParams(capacity, ms);
+    } catch (err) {
+      throw new RangeError(`limits.${name}Capacity / ${name}MsPerToken: ${(err as Error).message}`);
+    }
+  }
+}
+
+/** A refused upgrade is torn down after this long even if the peer never reads the response. */
+const REFUSE_LINGER_MS = 2000;
+/** A full pre-auth pool only closes sockets that have waited this long without authenticating. */
+const PREAUTH_EVICT_AGE_MS = 5000;
+
 /** Remote-supplied text for a log line: control and line-separator characters escaped. */
 function printable(s: string): string {
   return s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, (c) => {
@@ -369,12 +451,17 @@ function printable(s: string): string {
 }
 
 function refuseUpgrade(socket: Duplex, status: string): void {
+  // the HTTP server removed its own error listener before 'upgrade': a reset here would be uncaught
+  socket.on('error', () => socket.destroy());
   if (!socket.writable) {
     socket.destroy();
     return;
   }
+  const linger = setTimeout(() => socket.destroy(), REFUSE_LINGER_MS);
+  linger.unref();
+  socket.once('close', () => clearTimeout(linger));
   socket.once('finish', () => socket.destroy());
-  socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+  socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n`);
 }
 
 export class EdgeServer {
@@ -436,6 +523,9 @@ export class EdgeServer {
     limits.authTimeoutMs = timerMs('authTimeoutMs', limits.authTimeoutMs);
     limits.dataPlaneTimeoutMs = timerMs('dataPlaneTimeoutMs', limits.dataPlaneTimeoutMs);
     limits.keepAliveMs = timerMs('keepAliveMs', limits.keepAliveMs);
+    checkLimits(limits);
+    limits.perIpLimitsApplyToPrivate = limits.perIpLimitsApplyToPrivate === true;
+    limits.trustForwardedFor = limits.trustForwardedFor === true;
     this.limits = limits;
     this.statsLogMs = timerMs('statsLogIntervalMs', opts.statsLogIntervalMs ?? 0);
     const w = opts.webrtc ?? {};
@@ -660,6 +750,7 @@ export class EdgeServer {
       tunnel: null,
       dataPlanes: this.dataPlaneCounts(),
       memoryRssMb: Math.round(process.memoryUsage().rss / 1048576),
+      redacted: true,
     };
   }
 
@@ -705,6 +796,15 @@ export class EdgeServer {
   };
 
   private readonly onUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer): void => {
+    try {
+      this.upgrade(req, socket, head);
+    } catch (err) {
+      this.log(`upgrade failed: ${(err as Error).message}`);
+      socket.destroy();
+    }
+  };
+
+  private upgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
     const path = (req.url ?? '/').split('?')[0];
     if (this.closed || path !== (this.opts.path ?? EDGE_DEFAULT_PATH)) {
       socket.destroy();
@@ -712,22 +812,36 @@ export class EdgeServer {
     }
     // per-source limits before the WebSocket handshake (cheap to refuse)
     const lim = this.limits;
-    const remote = req.socket.remoteAddress ?? '?';
-    const key = sourceKey(remote);
-    if (this.sources.size >= this.prunePoint) {
-      this.pruneSources();
-      this.prunePoint = Math.max(1024, this.sources.size * 2);
+    let remote = req.socket.remoteAddress ?? '?';
+    if (lim.trustForwardedFor && sharedSource(remote)) remote = forwardedClient(req.headers['x-forwarded-for']) ?? remote;
+    // shared (proxy / NAT) sources are not limited per address unless asked
+    const key = lim.perIpLimitsApplyToPrivate || !sharedSource(remote) ? sourceKey(remote) : null;
+    let src: SourceState | null = null;
+    if (key !== null) {
+      if (this.sources.size >= this.prunePoint) {
+        this.pruneSources();
+        this.prunePoint = Math.max(1024, this.sources.size * 2);
+      }
+      src = this.sources.get(key) ?? null;
+      if (src === null) {
+        src = { preAuth: 0, bucket: lim.ipConnectCapacity > 0 ? new TokenBucket(lim.ipConnectCapacity, lim.ipConnectMsPerToken) : null };
+        this.sources.set(key, src);
+      }
+      if ((src.bucket !== null && !src.bucket.take()) || (lim.maxPreAuthPerIp > 0 && src.preAuth >= lim.maxPreAuthPerIp)) {
+        refuseUpgrade(socket, '429 Too Many Requests');
+        return;
+      }
     }
-    let src = this.sources.get(key);
-    if (src === undefined) {
-      src = { preAuth: 0, bucket: lim.ipConnectCapacity > 0 ? new TokenBucket(lim.ipConnectCapacity, lim.ipConnectMsPerToken) : null };
-      this.sources.set(key, src);
-    }
-    if ((src.bucket !== null && !src.bucket.take()) || (lim.maxPreAuthPerIp > 0 && src.preAuth >= lim.maxPreAuthPerIp)) {
-      refuseUpgrade(socket, '429 Too Many Requests');
+    // anonymous sockets compete only among themselves; one that has waited long makes room,
+    // a host mid-handshake is never pushed out (the newcomer retries instead)
+    if (this.preAuthFull() && this.evictable() === null) {
+      refuseUpgrade(socket, '503 Service Unavailable');
       return;
     }
     this.wss.handleUpgrade(req, socket, head, (ws) => {
+      // until a session owns it: a broken frame from the peer must not be an uncaught 'error'
+      const onError = (): void => ws.terminate();
+      ws.on('error', onError);
       if (this.closed) {
         ws.terminate();
         return;
@@ -737,19 +851,27 @@ export class EdgeServer {
         setTimeout(() => ws.terminate(), 2000).unref();
         return;
       }
-      // anonymous sockets compete only among themselves: the oldest makes room
-      if (lim.maxPreAuthSessions > 0 && this.preAuth.size >= lim.maxPreAuthSessions) {
-        const oldest = this.preAuth.values().next().value;
-        if (oldest !== undefined) oldest.close(EdgeCloseCode.Timeout, 'auth timeout');
-      }
+      if (this.preAuthFull()) this.evictable()?.close(EdgeCloseCode.Timeout, 'auth timeout');
+      ws.off('error', onError);
       const s = new EdgeSession(this, ws, this.nextSessionId++, remote, key);
       this.sessions.add(s);
       this.preAuth.add(s);
-      src.preAuth++;
+      if (src !== null) src.preAuth++;
       // keep-alive pings only while there is a tunnel to keep alive
       if (this.keepAliveTimer === null) this.keepAliveTimer = setInterval(() => this.keepAlive(), lim.keepAliveMs);
     });
-  };
+  }
+
+  private preAuthFull(): boolean {
+    const max = this.limits.maxPreAuthSessions;
+    return max > 0 && this.preAuth.size >= max;
+  }
+
+  /** The oldest unauthenticated session if it has waited long enough to be closed for a newcomer. */
+  private evictable(): EdgeSession | null {
+    const oldest = this.preAuth.values().next().value;
+    return oldest !== undefined && performance.now() - oldest.createdAt >= PREAUTH_EVICT_AGE_MS ? oldest : null;
+  }
 
   private keepAlive(): void {
     for (const s of this.sessions) s.keepAlive();
@@ -796,7 +918,7 @@ export class EdgeServer {
 
   /** @internal `s` authenticated (or closed): it no longer counts against its source's pre-auth limit. */
   leavePreAuth(s: EdgeSession): void {
-    if (!this.preAuth.delete(s)) return;
+    if (!this.preAuth.delete(s) || s.source === null) return;
     const src = this.sources.get(s.source);
     if (src !== undefined) src.preAuth--;
   }
@@ -858,8 +980,9 @@ class EdgeSession {
   private readonly edge: EdgeServer;
   private readonly ws: WebSocket;
   private readonly remote: string;
-  /** @internal Limit key of {@link remote}. */
-  readonly source: string;
+  /** @internal Limit key of {@link remote} (null: not limited per address). */
+  readonly source: string | null;
+  readonly createdAt = performance.now();
   private readonly nonce = randomBytes(EDGE_NONCE_LENGTH);
   private key: KeyState | null = null;
   /** `Auth` accepted, `AuthOk` waiting for node-datachannel to load. */
@@ -880,7 +1003,7 @@ class EdgeSession {
   private readonly w = new Writer(1024);
   private scratch = Buffer.allocUnsafe(4096);
 
-  constructor(edge: EdgeServer, ws: WebSocket, id: number, remote: string, source: string) {
+  constructor(edge: EdgeServer, ws: WebSocket, id: number, remote: string, source: string | null) {
     this.edge = edge;
     this.ws = ws;
     this.id = id;

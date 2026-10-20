@@ -76,7 +76,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 describe('EdgeServer control listener limits', () => {
   it('anonymous sockets from one address cannot take the slots of authenticated hosts', async () => {
-    const edge = await edgeWith({ limits: { maxSessions: 20 } });
+    // loopback stands in for a public address here
+    const edge = await edgeWith({ limits: { maxSessions: 20, maxPreAuthPerIp: 32, perIpLimitsApplyToPrivate: true } });
     const url = edge.url();
     let opened = 0;
     for (let i = 0; i < 60; i++) {
@@ -90,7 +91,7 @@ describe('EdgeServer control listener limits', () => {
   });
 
   it('new upgrades per address are rate limited', async () => {
-    const edge = await edgeWith({ limits: { ipConnectCapacity: 5, ipConnectMsPerToken: 60_000 } });
+    const edge = await edgeWith({ limits: { ipConnectCapacity: 5, ipConnectMsPerToken: 60_000, perIpLimitsApplyToPrivate: true } });
     let opened = 0;
     for (let i = 0; i < 10; i++) {
       const c = connect(edge.url(), '127.0.0.4');
@@ -103,18 +104,21 @@ describe('EdgeServer control listener limits', () => {
     expect(await connect(edge.url(), '127.0.0.5').hello).not.toBeNull();
   });
 
-  it('a full pre-auth pool evicts its oldest socket, not the newcomer', async () => {
+  it('a full pre-auth pool of fresh sockets refuses the newcomer, then admits it once a slot frees', async () => {
     const edge = await edgeWith({ limits: { maxPreAuthSessions: 4 } });
     const idle: Conn[] = [];
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 4; i++) {
       const c = connect(edge.url(), `127.0.1.${i + 1}`);
       expect(await c.hello).not.toBeNull();
       idle.push(c);
     }
-    expect(await idle[0]!.closed).toBe(EdgeCloseCode.Timeout);
-    expect(await idle[1]!.closed).toBe(EdgeCloseCode.Timeout);
+    expect(await connect(edge.url(), '127.0.1.5').hello).toBeNull();
+    expect(await connect(edge.url(), '127.0.1.6').hello).toBeNull();
     await sleep(50);
     expect(edge.stats().sessions).toBe(4);
+    for (const c of idle) expect(c.ws.readyState).toBe(WebSocket.OPEN);
+    // one authenticates (leaves the pool): a new host gets in
+    expect(await authenticate(idle[0]!, key)).toBe('ok');
     expect(await authenticate(connect(edge.url(), '127.0.1.10'), key)).toBe('ok');
   });
 

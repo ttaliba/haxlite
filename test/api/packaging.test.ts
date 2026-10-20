@@ -1,8 +1,9 @@
 /**
  * Package contents, checked on the BUILT package (scripts/build.mjs) the way a
  * consumer gets it:
- *  - declarations keep their JSDoc only in src/api and the root entry points;
- *    the other modules ship comment-free (same types, a third of the bytes);
+ *  - declarations keep their JSDoc in src/api, the root entry points and the
+ *    operator modules (dts-jsdoc.test.ts); the internals (rtc, sim, codec,
+ *    room, the wire protocols) ship comment-free (same types, a third of the bytes);
  *  - json5's parser is bundled into dist (json5 is a devDependency), loaded
  *    lazily like before, and its MIT notice travels with it.
  */
@@ -33,22 +34,24 @@ function walk(dir: string): string[] {
 const hasComment = (text: string) => /\/\*|^\s*\/\//m.test(text);
 
 describe('declarations', () => {
-  it('keep their JSDoc in api/ and the root files, ship comment-free elsewhere', () => {
+  it('keep their JSDoc in api/ and the root files, ship the internals comment-free', () => {
     const read = (rel: string) => readFileSync(path.join(DIST, rel), 'utf8');
     // what HBInit users read in their editor
     expect(read('api/hbinit.d.ts')).toContain('Creates a headless room (official `HBInit`, Promise-returning).');
     expect(read('api/types.d.ts')).toContain('/** `HBInit(config)`: every field is optional (official defaults in brackets). */');
     expect(read('index.d.ts')).toContain('haxlite public entry point.');
     expect(read('protocol.d.ts')).toMatch(/\/\*\*/);
-    // the advanced modules: the declarations are there, the comments are not
-    const bare = walk(DIST)
+    // the advanced modules: the declarations are there, the comments of the internals are not
+    const advanced = walk(DIST)
       .filter((f) => f.endsWith('.d.ts'))
       .map((f) => path.relative(DIST, f))
       .filter((rel) => rel.includes(path.sep) && !rel.startsWith(`api${path.sep}`));
-    expect(bare.length).toBeGreaterThan(60);
-    expect(bare).toContain(path.join('net', 'transport.d.ts'));
+    expect(advanced.length).toBeGreaterThan(60);
+    expect(advanced).toContain(path.join('net', 'transport.d.ts'));
     expect(read('net/transport.d.ts')).toContain('export declare class HostTransport');
-    expect(bare.filter((rel) => hasComment(read(rel)))).toEqual([]);
+    const internals = advanced.filter((rel) => /^(rtc|sim|codec|room)[\\/]/.test(rel) || /^(host[\\/]sequencer|net[\\/]edge-(protocol|udp|ndc)|net[\\/]peer-backend)\.d\.ts$/.test(rel));
+    expect(internals.length).toBeGreaterThan(40);
+    expect(internals.filter((rel) => hasComment(read(rel)))).toEqual([]);
   });
 
   it('still describe the whole public API (consumer type-check, skipLibCheck off)', () => {

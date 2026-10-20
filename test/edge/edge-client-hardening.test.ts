@@ -1,7 +1,7 @@
 /**
  * Host side of the Edge tunnel against hostile or broken control endpoints
  * (fake edges on loopback, src/net/edge-client.ts):
- *  - `ws://` is only accepted for loopback unless `allowInsecure`;
+ *  - `ws://` to a public host is only accepted with `allowInsecure` (the rest of the policy: edge-url-policy.test.ts);
  *  - a tunnel that reaches Ready and drops at once is retried with backoff;
  *  - the WebSocket data plane has a bounded send queue (hard limit tears the
  *    tunnel down, unreliable frames are shed first) and the edge must answer
@@ -131,14 +131,12 @@ const sessionWs = (b: EdgePeerBackend): WebSocket => (b as Any).session.ws as We
 describe('edge url policy', () => {
   const make = (url: string, extra: Partial<EdgeOptions> = {}) => new EdgePeerBackend({ url, key: KEY, ...extra });
 
-  it('ws:// is only accepted for a loopback host', () => {
+  it('ws:// to a public host is refused, loopback is accepted', () => {
     for (const url of ['ws://127.0.0.1:8443/tunnel', 'ws://127.0.0.2:1/t', 'ws://localhost/t', 'ws://[::1]:9/t', 'ws://[::ffff:127.0.0.1]/t', 'WS://LOCALHOST/t']) {
       expect(() => make(url), url).not.toThrow();
     }
     for (const url of [
       'ws://203.0.113.9:8443/tunnel',
-      'ws://192.168.1.10/t',
-      'ws://10.0.0.1/t',
       'ws://0.0.0.0/t',
       'ws://edge.example.com/t',
       'ws://127.0.0.1.example.com/t',

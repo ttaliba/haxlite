@@ -61,11 +61,14 @@ export type EdgeDataPlane = 'udp' | 'webrtc' | 'ws';
 
 export interface EdgeOptions {
   /**
-   * Control endpoint, e.g. `wss://edge.example.com:8443/tunnel`. `ws://` is
-   * only accepted for a loopback host (tests, same-machine edge) unless
-   * {@link allowInsecure} is set: without TLS anybody on the path can read and
-   * rewrite the control channel and, on the WebSocket data plane, every player
-   * message.
+   * Control endpoint, e.g. `wss://edge.example.com:8443/tunnel`. `ws://` has
+   * no TLS: anybody on the path can read the control channel and, on the
+   * WebSocket data plane, every player message. It is accepted for loopback
+   * and private-network hosts (RFC 1918, 100.64.0.0/10, link-local, fc00::/7,
+   * IPv4-mapped private addresses, single-label names and `.local`,
+   * `.internal`, `.lan` and `.home.arpa` names; the private ones log a
+   * warning). For any other host it is refused unless {@link allowInsecure} is
+   * set.
    */
   url: string;
   /** API key issued by the edge operator: `"<keyId>:<secret>"`. */
@@ -75,14 +78,15 @@ export interface EdgeOptions {
    * be established within `dataPlaneTimeoutMs` (or the edge does not grant
    * it), carry all player traffic over the WebSocket instead (TCP:
    * head-of-line blocking, slightly more latency). Default true, except for a
-   * non-loopback `ws://` url ({@link allowInsecure}), where it is false: the
-   * fallback carries player traffic in clear and could otherwise be forced by
-   * whoever sits on the path.
+   * public `ws://` url accepted through {@link allowInsecure}, where it is
+   * false: the fallback carries player traffic in clear and could otherwise be
+   * forced by whoever sits on the path.
    */
   fallbackWs?: boolean;
   /**
-   * Accept a `ws://` url whose host is not loopback (no TLS: the edge is not
-   * authenticated on the control channel, see {@link url}). Default false.
+   * Accept a `ws://` url whose host is neither loopback nor on a private
+   * network (no TLS: the control channel is readable on the path, see
+   * {@link url}; the key still authenticates the edge). Default false.
    */
   allowInsecure?: boolean;
   /**
@@ -256,7 +260,7 @@ export class EdgePeerBackend implements PeerBackend {
   private sessions = 0;
   /** When the current/last session became ready (`performance.now()`). */
   private readyAt = 0;
-  /** Non-loopback `ws://` url accepted through {@link EdgeOptions.allowInsecure}. */
+  /** Public `ws://` url accepted through {@link EdgeOptions.allowInsecure}. */
   private insecure = false;
   /** @internal */ readonly counters = { bytesOut: 0, bytesIn: 0, messagesOut: 0, messagesIn: 0 };
 
@@ -268,12 +272,20 @@ export class EdgePeerBackend implements PeerBackend {
     this.mode = opts.dataPlane ?? 'udp';
     this.backoff = opts.reconnectMinMs ?? 250;
     if (!/^wss?:\/\//i.test(opts.url)) throw new Error('edge url must start with ws:// or wss://');
-    if (/^ws:\/\//i.test(opts.url) && !isLoopbackHost(urlHost(opts.url))) {
-      if (opts.allowInsecure !== true) throw new Error('ws:// edge url is only accepted for loopback: use wss:// (or allowInsecure: true)');
-      this.insecure = true;
-      this.log('WARNING: ws:// edge url without TLS: the edge is not authenticated and the control channel is open to the path');
+    const scope = /^ws:\/\//i.test(opts.url) ? hostScope(urlHost(opts.url)) : null;
+    if (scope === 'private' || scope === 'public') {
+      if (scope === 'public') {
+        if (opts.allowInsecure !== true) {
+          throw new Error(
+            `ws:// edge url points to a public host (${urlHost(opts.url)}) without TLS: use wss://, or set allowInsecure: true in the edge options to accept plaintext ` +
+              '(the WebSocket fallback then defaults to off: add fallbackWs: true to enable it). ws:// needs no option for loopback and private-network hosts',
+          );
+        }
+        this.insecure = true;
+      }
+      this.log(`WARNING: ws:// edge url without TLS${scope === 'private' ? ' (private network)' : ''}: the control channel is readable by anyone on the path`);
       if (secret.length < 22) this.log('WARNING: short edge key secret: a captured Auth lets an eavesdropper guess it offline');
-    } else if (opts.wsOptions?.rejectUnauthorized === false && /^wss:\/\//i.test(opts.url)) {
+    } else if (scope === null && opts.wsOptions?.rejectUnauthorized === false) {
       this.log('WARNING: TLS certificate verification is off: the edge is not authenticated');
     }
   }
@@ -281,6 +293,11 @@ export class EdgePeerBackend implements PeerBackend {
   /** @internal effective {@link EdgeOptions.fallbackWs} (its default depends on the url). */
   get fallbackWs(): boolean {
     return this.opts.fallbackWs ?? !this.insecure;
+  }
+
+  /** @internal appended to "fallbackWs is off" errors when the default (public `ws://` url) turned it off. */
+  get fallbackWsHint(): string {
+    return this.opts.fallbackWs === undefined && this.insecure ? ' (off by default for a public ws:// url: set fallbackWs: true to allow it)' : '';
   }
 
   get ready(): boolean {
@@ -472,13 +489,58 @@ function urlHost(url: string): string {
   return h.startsWith('[') && h.endsWith(']') ? h.slice(1, -1) : h;
 }
 
-/** `localhost`, 127.0.0.0/8, `::1` and IPv4-mapped 127.x (as normalised by `URL`). */
-function isLoopbackHost(host: string): boolean {
+type HostScope = 'loopback' | 'private' | 'public';
+
+/** Scope of an IPv4 address given its first two octets. */
+function v4Scope(a: number, b: number): HostScope {
+  if (a === 127) return 'loopback';
+  if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127)) return 'private';
+  return 'public';
+}
+
+/** The eight 16-bit groups of a valid IPv6 literal (compressed, lowercase, optional dotted IPv4 tail). */
+function v6Groups(literal: string): number[] {
+  let text = literal;
+  const tail = text.lastIndexOf('.') >= 0 ? text.lastIndexOf(':') : -1;
+  if (tail >= 0) {
+    const o = text.slice(tail + 1).split('.').map(Number);
+    text = `${text.slice(0, tail + 1)}${((o[0]! << 8) | o[1]!).toString(16)}:${((o[2]! << 8) | o[3]!).toString(16)}`;
+  }
+  const gap = text.indexOf('::');
+  const part = (s: string): number[] => (s === '' ? [] : s.split(':').map((g) => parseInt(g, 16)));
+  if (gap < 0) return part(text);
+  const head = part(text.slice(0, gap));
+  const rest = part(text.slice(gap + 2));
+  return [...head, ...new Array<number>(8 - head.length - rest.length).fill(0), ...rest];
+}
+
+/**
+ * Where a host name or literal (as normalised by `URL`) sits for the `ws://`
+ * policy: `localhost` and 127.0.0.0/8, `::1` and mapped 127.x are loopback;
+ * RFC 1918, 100.64.0.0/10, 169.254.0.0/16, fc00::/7, fe80::/10, mapped
+ * private IPv4, single-label names and `.local`/`.internal`/`.lan`/`.home.arpa`
+ * names are private; the rest is public.
+ */
+function hostScope(host: string): HostScope {
   const h = host.toLowerCase();
-  if (h === 'localhost' || h === 'localhost.') return true;
   const family = isIP(h);
-  if (family === 4) return h.startsWith('127.');
-  return family === 6 && (h === '::1' || /^::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}$/.test(h) || h.startsWith('::ffff:127.'));
+  if (family === 4) {
+    const [a, b] = h.split('.').map(Number);
+    return v4Scope(a!, b!);
+  }
+  if (family === 6) {
+    const g = v6Groups(h);
+    if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0) {
+      if (g[5] === 0xffff) return v4Scope(g[6]! >> 8, g[6]! & 0xff);
+      if (g[5] === 0 && g[6] === 0 && g[7] === 1) return 'loopback';
+    }
+    if ((g[0]! & 0xfe00) === 0xfc00 || (g[0]! & 0xffc0) === 0xfe80) return 'private';
+    return 'public';
+  }
+  const name = h.endsWith('.') ? h.slice(0, -1) : h;
+  if (name === 'localhost') return 'loopback';
+  if (!name.includes('.') || /\.(?:local|internal|lan|home\.arpa)$/.test(name)) return 'private';
+  return 'public';
 }
 
 /** Text from the edge made safe for logs and error messages: printable ASCII, bounded. */
@@ -827,7 +889,7 @@ class TunnelSession {
       // protocol-1 edge: no UDP tunnel
       if (this.mode === 'udp') {
         if (!this.backend.fallbackWs) {
-          this.fail(new EdgeError('edge speaks protocol 1 (no UDP tunnel) and fallbackWs is off', 'version', true));
+          this.fail(new EdgeError(`edge speaks protocol 1 (no UDP tunnel) and fallbackWs is off${this.backend.fallbackWsHint}`, 'version', true));
           return;
         }
         this.backend.log('edge speaks protocol 1: no UDP tunnel, using the WebSocket data plane');
@@ -880,7 +942,7 @@ class TunnelSession {
     // the edge put this session's data on the WebSocket
     if (this.requested !== 0) {
       if (!this.backend.fallbackWs) {
-        this.fail(new EdgeError('the edge did not grant a UDP data plane and fallbackWs is off', 'tunnel'));
+        this.fail(new EdgeError(`the edge did not grant a UDP data plane and fallbackWs is off${this.backend.fallbackWsHint}`, 'tunnel'));
         return;
       }
       this.backend.log('edge granted no UDP data plane: using the WebSocket');

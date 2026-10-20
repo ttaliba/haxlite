@@ -170,16 +170,16 @@ describe('checks before the offer payload is inflated', () => {
 });
 
 describe('unjoined connections per address', () => {
-  it('8 at a time from one public address by default; others and loopback are not affected', () => {
+  it('12 at a time from one public address by default; others and loopback are not affected', () => {
     const { t, rejects, feed } = host({ onJoinRequest: () => new Promise<boolean>(() => {}) });
-    for (let i = 0; i < 9; i++) feed(offerFrame(i + 1, '198.51.100.9'));
-    expect(t.pendingCount).toBe(8);
-    expect(rejects.map((r) => [r.peerId, r.code, r.why])).toEqual([[9, 4104, 'too many unjoined connections from this address']]);
+    for (let i = 0; i < 13; i++) feed(offerFrame(i + 1, '198.51.100.9'));
+    expect(t.pendingCount).toBe(12);
+    expect(rejects.map((r) => [r.peerId, r.code, r.why])).toEqual([[13, 4104, 'too many unjoined connections from this address']]);
     feed(offerFrame(20, '::ffff:198.51.100.9')); // same address, another spelling
     expect(rejects.at(-1)?.peerId).toBe(20);
     feed(offerFrame(21, '198.51.100.10'));
-    for (let i = 0; i < 6; i++) feed(offerFrame(30 + i, '127.0.0.1'));
-    expect(t.pendingCount).toBe(15);
+    for (let i = 0; i < 3; i++) feed(offerFrame(30 + i, '127.0.0.1'));
+    expect(t.pendingCount).toBe(16);
     expect(rejects.length).toBe(2);
   });
 
@@ -221,14 +221,15 @@ describe('seats held without a handshake', () => {
     expect(t.connectionCount).toBe(3);
     feed(offerFrame(4, '198.51.100.4'));
     expect(rejects.map((r) => r.code)).toEqual([4100]); // nobody is stale yet
-    await tick(3_100);
+    await tick(5_100);
     links[0]!.ev.onMessage(0, Uint8Array.of(1)); // the joined player stays active
     feed(offerFrame(5, '198.51.100.5'));
     expect(rejects.length).toBe(1);
+    expect(links[1]!.closed).toBe(false); // given up only once the new connection works
+    open(links[3]!);
     expect(links[1]!.closed).toBe(true); // the older silent one
     expect(links[2]!.closed).toBe(false);
     expect(links[0]!.closed).toBe(false);
-    open(links[3]!);
     expect(t.connectionCount).toBe(3);
     handshake(links[3]!);
     await settle();
@@ -371,8 +372,8 @@ describe('join hook decisions', () => {
     expect(throwing).toMatchObject({ code: 4104, created: 0 });
   });
 
-  it('values outside JoinDecision fail closed with 4104 and are reported; valid ones keep their meaning', async () => {
-    for (const bad of [NaN, -1, 1.5, 70_000, { reject: undefined }, { reject: 'x' }, 'false', {}, { accept: false }]) {
+  it('malformed rejections fail closed with 4104 and are reported; valid ones keep their meaning', async () => {
+    for (const bad of [NaN, -1, 1.5, 70_000, { reject: undefined }, { reject: 'x' }, { reject: -1 }, { reject: 70_000 }]) {
       const r = await decide(() => bad);
       expect(r, String(bad)).toMatchObject({ code: 4104, created: 0 });
       expect(r.errors.length).toBe(1);

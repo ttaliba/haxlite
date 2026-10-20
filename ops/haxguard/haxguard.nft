@@ -6,8 +6,11 @@
 #
 # Alcance: solo se filtra el UDP dirigido a ROOM_PORTS. TCP, ICMP, ARP/ND y el UDP a otros puertos
 # pasan por `policy accept` (SSH, WebSocket al master y vecinos L2 siguen funcionando). Excepciones:
-# deny4/6 descarta cualquier protocolo de esa IP, y los fragmentos IPv6 se descartan sea cual sea su
-# protocolo (un fragmento no inicial no permite saber si es UDP).
+# deny4/6 descarta cualquier protocolo de esa IP; los fragmentos UDP IPv4 se descartan sea cual sea el
+# puerto (un fragmento no inicial no lleva cabecera UDP y WebRTC nunca fragmenta, pero un DNS/EDNS, IKE
+# o syslog grande al mismo host dejaría de llegar: si hay tales cargas, quitar la primera regla de la
+# cadena ingress); y los fragmentos IPv6 se descartan sea cual sea su protocolo (un fragmento no
+# inicial no permite saber si es UDP).
 #
 # Contrato con el sidecar (privilegiado; no existe en el repositorio). Escribe en los sets de abajo
 # con `nft` o netlink y debe tratar como error (y alertar) que un `add` falle por set lleno (size):
@@ -27,10 +30,14 @@
 
 define WAN = "eth0"
 define ROOM_PORTS = 20000-20999
-# Máscara del cubo de limitación del STUN de desconocidos. Agrupar por prefijo (/24 v4, /64 v6) evita
-# que orígenes aleatorios llenen el set: 255.255.255.255 y ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff dan un cubo por IP.
-define STUN_V4_MASK = 255.255.255.0
-define STUN_V6_MASK = ffff:ffff:ffff:ffff::
+# Máscara del cubo de limitación del STUN de desconocidos. Por defecto un cubo por IP origen (5/s, ráfaga
+# 10): varios jugadores tras el mismo CGNAT o prefijo que aún no están en pending no se quitan la ráfaga
+# entre sí. Si el set se llena (flood con orígenes suplantados) el límite por origen deja de aplicarse y
+# solo actúa el global de 2000/s, con cualquier máscara. Para agrupar por prefijo y que un atacante con un
+# /24 propio no multiplique su cuota, usar 255.255.255.0 y ffff:ffff:ffff:ffff:: (a costa de que los
+# vecinos de prefijo compartan la ráfaga).
+define STUN_V4_MASK = 255.255.255.255
+define STUN_V6_MASK = ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
 
 table netdev haxguard
 delete table netdev haxguard
@@ -51,8 +58,9 @@ table netdev haxguard {
 	# llegan por una red privada (LAN, VPN): sus IP caerían entonces en el carril de STUN de desconocidos.
 	set bogons4 { type ipv4_addr; flags interval; elements = { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } }
 	set bogons6 { type ipv6_addr; flags interval; elements = { ::/128, ::1/128, ::ffff:0:0/96, fc00::/7, fe80::/10, ff00::/8 } }
-	# medidores dinámicos por origen (prefijo) para STUN de IPs desconocidas. Timeout corto: con
-	# orígenes suplantados el set se llena a size/timeout entradas por segundo (65536/10 s).
+	# medidores dinámicos por origen (STUN_V4_MASK/STUN_V6_MASK) para STUN de IPs desconocidas. Timeout
+	# corto: con orígenes suplantados el set se llena a size/timeout entradas por segundo (65536/10 s);
+	# los desconocidos legítimos son un puñado por segundo, así que no hace falta más tamaño.
 	set stunrate4 { type ipv4_addr; flags dynamic, timeout; timeout 10s; size 65536; }
 	set stunrate6 { type ipv6_addr; flags dynamic, timeout; timeout 10s; size 65536; }
 	# tope por jugador unido (un jugador malicioso inundando desde su IP real)
@@ -81,8 +89,9 @@ table netdev haxguard {
 	chain ingress {
 		type filter hook ingress device $WAN priority -500; policy accept;
 
-		# 1) fragmentos UDP (WebRTC nunca fragmenta: DTLS/SCTP < MTU) y todo lo que no sea UDP a los
-		#    puertos de sala (TCP, ICMP, ARP/ND y UDP a otros puertos) pasa sin filtrar
+		# 1) fragmentos UDP IPv4 de cualquier puerto (WebRTC nunca fragmenta: DTLS/SCTP < MTU) y fragmentos
+		#    IPv6; todo lo que no sea UDP a los puertos de sala (TCP, ICMP, ARP/ND y UDP a otros puertos)
+		#    pasa sin filtrar
 		ip frag-off & 0x3fff != 0 meta l4proto udp counter name c_frag drop
 		ip6 nexthdr ipv6-frag counter name c_frag drop
 		udp dport != $ROOM_PORTS accept

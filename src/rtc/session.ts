@@ -148,6 +148,8 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
   private heldBytes = 0;
   /** Full ICE: `address|port` keys registered with {@link SessionHost.holdAddress} (the endpoint drops them on unregister). */
   readonly holdKeys: string[] = [];
+  /** Consecutive datagrams of this session whose processing threw (the endpoint closes it past a limit). */
+  packetErrors = 0;
   private readonly host: SessionHost;
   private readonly offer: OfferInfo;
   private readonly dtls: DtlsServer;
@@ -609,8 +611,17 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
         reportError(err);
       }
     }
-    this.dtls.close();
-    if (this.agent !== null) this.agent.close();
+    // a throw below must not keep the session registered (it would hold a maxSessions slot for good)
+    try {
+      this.dtls.close();
+    } catch (err) {
+      reportError(err);
+    }
+    try {
+      if (this.agent !== null) this.agent.close();
+    } catch (err) {
+      reportError(err);
+    }
     this.state = 'closed';
     this.answer = null;
     this.host.unregister(this);

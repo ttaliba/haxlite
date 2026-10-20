@@ -29,22 +29,24 @@ export const REPLAY_MAGIC = 0x48425232;
 export const REPLAY_HEADER_SIZE = 12;
 
 /**
- * Default cap on the inflated body {@link readReplay} accepts (32 MiB: a match
- * logs about 8 MB per hour, so this is several hours). Raise it per call for
- * longer trusted files.
+ * Default cap on the inflated body {@link readReplay} accepts (32 MiB: twice
+ * the default recording cap, {@link REPLAY_RECORD_MAX_BYTES}). Raise it per
+ * call for longer trusted files.
  */
 export const REPLAY_MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 /**
  * Default cap on the events {@link readReplay} decodes (2^21, about two hours
- * of play). Events are decoded eagerly into objects, so this bounds the heap
- * (~100 B per event) independently of the body cap.
+ * of a regular match: most events are 8-byte inputs). Events are decoded
+ * eagerly into objects (60 to 80 B each), so this bounds the heap
+ * independently of the body cap. A recording made with the default caps
+ * ({@link ReplayRecorder.maxEvents}) never holds more.
  */
 export const REPLAY_MAX_EVENTS = 2097152;
 
 /**
  * Default cap on the event log of a recording ({@link ReplayRecorder}), in
- * bytes: 16 MiB, i.e. about two hours of a regular match.
+ * bytes: 16 MiB, i.e. about two hours of a regular match (8 MB per hour).
  */
 export const REPLAY_RECORD_MAX_BYTES = 16 * 1024 * 1024;
 

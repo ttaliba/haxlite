@@ -974,6 +974,10 @@ export class DtlsServer {
     const epoch = this.writeEpoch;
     const hi = this.writeSeqHi[epoch]!;
     const lo = this.writeSeqLo[epoch]!;
+    if (hi === 0xffff && lo === 0xffffffff) {
+      this.sequenceExhausted();
+      return false;
+    }
     this.nextWriteSeq(epoch);
     const n = c.seal(ContentType.ApplicationData, DTLS_1_2, epoch, hi, lo, data, rec, RECORD_HEADER);
     writeRecordHeader(rec, ContentType.ApplicationData, DTLS_1_2, epoch, hi, lo, n);
@@ -984,19 +988,36 @@ export class DtlsServer {
   /** Largest application-data record {@link send} produces (header + max plaintext + AEAD overhead). */
   static readonly MAX_RECORD = RECORD_HEADER + MAX_PLAINTEXT + 8 + TAG_LENGTH;
 
+  /**
+   * 48-bit sequence space; never wraps (RFC 6347 §4.1: a wrapped number reuses
+   * the AEAD nonce). The last number (2^48 - 1) is never sent: callers check
+   * for it and close instead.
+   */
   private nextWriteSeq(epoch: number): void {
     let lo = this.writeSeqLo[epoch]! + 1;
     if (lo > 0xffffffff) {
       lo = 0;
-      this.writeSeqHi[epoch] = (this.writeSeqHi[epoch]! + 1) & 0xffff; // 48-bit sequence space
+      this.writeSeqHi[epoch] = this.writeSeqHi[epoch]! + 1;
     }
     this.writeSeqLo[epoch] = lo;
+  }
+
+  /**
+   * Write sequence space of the epoch used up: no record (not even an alert)
+   * may be sealed any more. Closes at once; `onClose` runs from a microtask
+   * because {@link send} is called from inside the caller's output path.
+   */
+  private sequenceExhausted(): void {
+    if (this.state === 'closed') return;
+    this.release();
+    queueMicrotask(() => this.opts.onClose('dtls-error:sequence-exhausted'));
   }
 
   /** A complete record (header + protected fragment) at the current write epoch. */
   private sealRecord(type: number, payload: Uint8Array, epoch = this.writeEpoch): Buffer {
     const hi = this.writeSeqHi[epoch]!;
     const lo = this.writeSeqLo[epoch]!;
+    if (hi === 0xffff && lo === 0xffffffff) throw new Error('sequence-exhausted');
     this.nextWriteSeq(epoch);
     if (epoch === 0) {
       const rec = Buffer.allocUnsafe(RECORD_HEADER + payload.length);

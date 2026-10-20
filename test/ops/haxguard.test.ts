@@ -78,7 +78,7 @@ describe('ops/haxguard nft files', () => {
     for (const rule of rules) expect(rule).not.toMatch(/^counter name \w+ drop$/);
   });
 
-  it('haxguard.nft caps the pending lane and keys the unknown-STUN meter by prefix', () => {
+  it('haxguard.nft caps the pending lane and keys the unknown-STUN meter by a configurable source mask', () => {
     const src = read('haxguard.nft');
     expect(chainRules(src, 'pending_rate').join('\n')).toMatch(/limit rate over \d+\/second/);
     expect(chainRules(src, 'ingress').join('\n')).toMatch(/@pending4 jump pending_rate/);

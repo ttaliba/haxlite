@@ -310,6 +310,11 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
   const useRecaptchaToken = (response: string): void => {
     if (!stopped) transport.useRecaptchaToken(response);
   };
+  /** The start-up onRecaptcha threw or rejected: fails the init, or goes to onError once the room is up. */
+  const recaptchaFailed = (err: unknown): void => {
+    if (initialized) reportError(err);
+    else finishInit(err == null ? new Error(`onRecaptcha failed: ${String(err)}`) : err);
+  };
 
   host.onError = reportError;
   transport.onError = (err) => {
@@ -328,9 +333,9 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
       }
       try {
         const r = h(sitekey, useRecaptchaToken) as unknown;
-        if (isThenable(r)) r.then(undefined, finishInit);
+        if (isThenable(r)) r.then(undefined, recaptchaFailed);
       } catch (err) {
-        finishInit(err);
+        recaptchaFailed(err);
       }
       return;
     }
@@ -482,6 +487,9 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     },
     get stopped() {
       return stopped;
+    },
+    get recordingTruncated() {
+      return host.recordingTruncated;
     },
     bans: banOps,
     get onBeforeOperation() {

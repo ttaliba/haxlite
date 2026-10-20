@@ -476,8 +476,6 @@ export const STADIUM_PACKED_LIMIT = 0xffff;
  * takes ~76 KB plus its name; a 64 KB deflate bomb inflates to ~67 MB.
  */
 export const STADIUM_INFLATE_LIMIT = 262144;
-/** Below this raw size the deflated stadium always fits the u16 (deflate adds < 0.1 %). */
-const STADIUM_RAW_ALWAYS_FITS = 65000;
 
 /**
  * 11 — off `V`. Payload: u16 n + deflateRaw(stadium). Admin-only filter,
@@ -543,14 +541,15 @@ export class SetStadiumEvent extends RoomEvent {
     w.u16(packed.length);
     w.bytes(packed);
   }
+  /**
+   * Re-encoding for the broadcast can need more than the u16 when the sender's
+   * deflate packed tighter than ours: the payload is valid, so it decodes
+   * fine and {@link wireError} reports it (a host drops such an event).
+   */
   read(r: Reader): void {
     const raw = inflateRaw(r.bytes(r.u16()), STADIUM_INFLATE_LIMIT);
     this.stadium = readStadium(new Reader(raw));
     this.packed = this.packedFor = null;
-    // re-encoded for the broadcast; below this size deflate always fits the u16
-    if (raw.length > STADIUM_RAW_ALWAYS_FITS && this.pack().length > STADIUM_PACKED_LIMIT) {
-      throw new CodecError('Stadium too large');
-    }
   }
   apply(rs: RoomState): void {
     if (!isHostOrAdmin(rs, this.byId)) return;

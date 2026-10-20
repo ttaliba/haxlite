@@ -36,16 +36,18 @@
  * deflate, so bodies past 64 KiB use a fast level there (about 3% larger
  * files, a 10 to 100 times shorter stall); smaller ones keep level 6.
  *
- * The event log is capped ({@link ReplayRecorder.maxBytes}): events can come
- * from any connected player, valid or not, and are all recorded. Past the cap
- * the recording freezes where it is instead of growing without bound.
+ * The event log is capped ({@link ReplayRecorder.maxBytes},
+ * {@link ReplayRecorder.maxEvents}): events can come from any connected
+ * player, valid or not, and are all recorded. Past the cap the recording
+ * freezes where it is instead of growing without bound. With the default caps
+ * the file always reads back with the default {@link readReplay} limits.
  */
 import { Writer, deflateRaw } from '../codec/index.js';
 import { deflateRawAsync } from '../codec/compress.js';
 import type { TeamId } from '../protocol.js';
 import type { RoomEvent, RoomState } from '../room/index.js';
 import { writeEvent, writeRoomState } from '../room/index.js';
-import { REPLAY_HEADER_SIZE, REPLAY_MAGIC, REPLAY_RECORD_MAX_BYTES, REPLAY_VERSION } from './format.js';
+import { REPLAY_HEADER_SIZE, REPLAY_MAGIC, REPLAY_MAX_EVENTS, REPLAY_RECORD_MAX_BYTES, REPLAY_VERSION } from './format.js';
 
 /** Initial writer capacities (official `Jb` / `yc`); writers that grew past them are dropped at stop. */
 const MARKERS_CAPACITY = 1000;
@@ -64,6 +66,8 @@ const FAST_LEVEL = typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined' 
 export interface ReplayRecorderOptions {
   /** Initial value of {@link ReplayRecorder.maxBytes}. */
   maxBytes?: number;
+  /** Initial value of {@link ReplayRecorder.maxEvents}. */
+  maxEvents?: number;
 }
 
 /** Anything exposing the host's current logical frame (e.g. the host engine itself). */
@@ -91,6 +95,7 @@ export class ReplayRecorder {
   private capFrame = 0;
   private frozen = false;
   private limit: number;
+  private eventLimit: number;
   private startFrame = 0;
   private lastEventFrame = 0;
   private lastMarkerFrame = 0;
@@ -112,7 +117,8 @@ export class ReplayRecorder {
   /** Format version written in the header (official recorder is built with 3). */
   readonly version: number;
   /**
-   * Called once when the recording freezes at the {@link maxBytes} cap, with
+   * Called once when the recording freezes at the {@link maxBytes} or
+   * {@link maxEvents} cap, with
    * the frame it froze at (the replay ends there). It runs from inside
    * {@link onEvent}, after the recording is already frozen.
    */
@@ -121,7 +127,9 @@ export class ReplayRecorder {
   constructor(version: number = REPLAY_VERSION, opts: ReplayRecorderOptions = {}) {
     this.version = version;
     this.limit = REPLAY_RECORD_MAX_BYTES;
+    this.eventLimit = REPLAY_MAX_EVENTS;
     if (opts.maxBytes !== undefined) this.maxBytes = opts.maxBytes;
+    if (opts.maxEvents !== undefined) this.maxEvents = opts.maxEvents;
   }
 
   /**
@@ -140,7 +148,22 @@ export class ReplayRecorder {
     this.limit = bytes >= 0 ? bytes : REPLAY_RECORD_MAX_BYTES;
   }
 
-  /** True once the current/last recording froze at the {@link maxBytes} cap (it keeps recording nothing until stopped). */
+  /**
+   * Cap on the number of events of a recording (`Infinity` = none); past it
+   * the recording freezes like at {@link maxBytes}. Default
+   * {@link REPLAY_MAX_EVENTS}, the default event limit of {@link readReplay}:
+   * events without payload take 4 bytes, so the byte cap alone would let a
+   * recording hold more events than a default read accepts. Takes effect on
+   * the next event; invalid values give the default.
+   */
+  get maxEvents(): number {
+    return this.eventLimit;
+  }
+  set maxEvents(events: number) {
+    this.eventLimit = events >= 0 ? events : REPLAY_MAX_EVENTS;
+  }
+
+  /** True once the current/last recording froze at the {@link maxBytes} / {@link maxEvents} cap (it keeps recording nothing until stopped). */
   get truncated(): boolean {
     return this.frozen;
   }
@@ -218,7 +241,7 @@ export class ReplayRecorder {
     if (!this.open) return;
     const w = this.events!;
     const start = w.pos;
-    if (start >= this.limit) {
+    if (start >= this.limit || this.eventCount >= this.eventLimit) {
       this.freeze(frame);
       return;
     }

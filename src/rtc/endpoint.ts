@@ -240,6 +240,8 @@ function randomIceString(n: number): string {
 
 /** Internal errors (a datagram or a timer whose processing threw) are logged at most this often. */
 const ERROR_LOG_INTERVAL_MS = 10_000;
+/** A session whose datagrams throw this many times in a row is closed ('error'): its state is suspect. */
+const SESSION_PACKET_ERRORS = 5;
 
 /** Largest datagram whose exact-length scratch view is cached (≥ the 1200-byte SCTP MTU + DTLS overhead). */
 const VIEW_CACHE_MAX = 1536;
@@ -925,10 +927,29 @@ export class RtcEndpoint {
         else c.dtlsUnknownSource++;
         return;
       }
-      v.session.handleDtls(msg, v);
+      const s = v.session;
+      try {
+        s.handleDtls(msg, v);
+      } catch (err) {
+        this.sessionPacketError(s, err);
+        return;
+      }
+      s.packetErrors = 0;
       return;
     }
     c.unknownPackets++;
+  }
+
+  /** A datagram of `s` threw: counted and logged like any other; a session that keeps throwing is closed. */
+  private sessionPacketError(s: RtcSessionImpl, err: unknown): void {
+    this.counters.packetErrors++;
+    this.internalError('datagram', err);
+    if (++s.packetErrors < SESSION_PACKET_ERRORS) return;
+    try {
+      s.terminate('error');
+    } catch (e) {
+      this.internalError('session teardown', e);
+    }
   }
 
   private onStun(sock: PacketIo, msg: Buffer, address: string, port: number): void {
@@ -964,10 +985,22 @@ export class RtcEndpoint {
     }
     const ufrag = msg.toString('latin1', m.usernameOffset, m.usernameOffset + colon);
     const s = this.byUfrag.get(ufrag);
-    if (s === undefined || !s.handleBinding(m, sock, address, port)) {
+    if (s === undefined) {
       c.stunRejected++;
       return;
     }
+    let ok: boolean;
+    try {
+      ok = s.handleBinding(m, sock, address, port);
+    } catch (err) {
+      this.sessionPacketError(s, err);
+      return;
+    }
+    if (!ok) {
+      c.stunRejected++;
+      return;
+    }
+    s.packetErrors = 0;
     c.stunAuthenticated++;
   }
 

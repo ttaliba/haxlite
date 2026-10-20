@@ -13,10 +13,18 @@
 //  - IPv4 sobre Ethernet, con hasta 2 etiquetas 802.1Q/802.1ad. NO hay active6/pending6/deny6: el UDP IPv6 a ROOM_PORT no
 //    se filtra; se cuenta en S_V6 y pasa (XDP_DROP con -DHG_DROP_V6, que corta también a los jugadores IPv6). Las cabeceras de
 //    extensión IPv6 no se recorren. Usar con rtc.ipv6:false o combinar con haxguard.nft, que sí filtra IPv6.
+//  - Solo se filtra el UDP a ROOM_PORT; el resto pasa. Excepciones, que se descartan antes de mirar el puerto igual que en
+//    haxguard.nft: los fragmentos UDP IPv4 de cualquier puerto (un fragmento no inicial no lleva cabecera UDP; WebRTC no
+//    fragmenta, pero DNS/EDNS, IKE o syslog grandes al mismo host dejarían de llegar), la cabecera IPv4 de menos de 20 B y
+//    el UDP truncado (paquetes malformados que el kernel descartaría igual). Las opciones IP (ihl > 5) solo se
+//    descartan hacia ROOM_PORT; hacia otros puertos el paquete pasa.
 //  - Sin amp_sports ni stun_servers4 (las respuestas de un STUN propio entran por el carril de STUN de desconocidos).
-//  - El carril de STUN de desconocidos limita por IP (no por /24) y no hay set "lleno" que falle en abierto: stunrate4 es LRU.
+//  - El carril de STUN de desconocidos limita por IP origen, igual que haxguard.nft con sus máscaras por defecto, y no hay
+//    set "lleno" que falle en abierto: stunrate4 es LRU.
 //  - Los topes son cubos de fichas con una carrera benigna entre CPUs (cada cola de un driver nativo puede gastar la misma
-//    ficha): el tope real puede salir algo más laxo que en nft. `over` de cada cubo cuenta los descartes por IP para el sidecar.
+//    ficha o recargar el mismo intervalo): el tope real puede salir más laxo que en nft, hasta como mucho el número de
+//    colas que corren a la vez. Un reloj que va hacia atrás entre CPUs (now < last_ns) cuenta como 0 s transcurridos y no
+//    recarga el cubo. `over` de cada cubo cuenta los descartes por IP para el sidecar.
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
@@ -85,7 +93,10 @@ static __always_inline int bogon4(__u32 a) {
 
 // Cubo de fichas: pps de recarga y ráfaga. Devuelve 0 (y cuenta en b->over) si no queda ficha.
 static __always_inline int allow(struct bucket *b, __u64 now, __u32 pps, __u32 burst) {
-	__u64 d = now - b->last_ns;
+	// Otra CPU puede haber guardado un last_ns posterior a este now (se lee antes de que ella escriba): sin la
+	// guarda la resta da la vuelta, parece que pasó mucho tiempo y el cubo se llena entero. last_ns solo avanza
+	// (refill > 0 implica now > last_ns).
+	__u64 d = now > b->last_ns ? now - b->last_ns : 0;
 	if (d > 10000000000ull) d = 10000000000ull;                 // evita desbordar y basta para llenar el cubo
 	__u64 refill = d * pps / 1000000000ull;
 	if (refill) { __u64 t = b->tokens + refill; b->tokens = t > burst ? burst : t; b->last_ns = now; }
@@ -136,12 +147,14 @@ int haxguard(struct xdp_md *ctx) {
 	if (proto != __constant_htons(ETH_P_IP)) return XDP_PASS;
 	struct iphdr *ip = l3;
 	if ((void *)(ip + 1) > end || ip->protocol != IPPROTO_UDP) return XDP_PASS;
-	if (ip->frag_off & __constant_htons(0x3fff)) return count(S_FRAG, XDP_DROP);   // sin fragmentos UDP
-	if (ip->ihl != 5) return XDP_DROP;                                               // opciones IP: nunca en WebRTC
-	struct udphdr *udp = (void *)(ip + 1);
-	if ((void *)(udp + 1) > end) return XDP_DROP;
+	if (ip->frag_off & __constant_htons(0x3fff)) return count(S_FRAG, XDP_DROP);   // sin fragmentos UDP, de cualquier puerto
+	__u32 ihl = ip->ihl * 4;
+	if (ihl < sizeof(*ip)) return XDP_DROP;                                          // cabecera IPv4 inválida
+	struct udphdr *udp = (void *)ip + ihl;
+	if ((void *)(udp + 1) > end) return XDP_DROP;                                    // UDP truncado
 	__u16 dport = __builtin_bswap16(udp->dest), sport = __builtin_bswap16(udp->source);
 	if (dport < ROOM_PORT_MIN || dport > ROOM_PORT_MAX) return XDP_PASS;
+	if (ihl != sizeof(*ip)) return XDP_DROP;                                         // opciones IP: nunca en WebRTC
 	struct lpm4 lpm = { 32, ip->saddr };
 	if (bpf_map_lookup_elem(&deny4, &lpm)) return count(S_DENY, XDP_DROP);
 	if (sport < 1024) return count(S_LOWPORT, XDP_DROP);                             // DNS/NTP/CLDAP/SSDP... reflexión
