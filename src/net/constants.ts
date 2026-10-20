@@ -105,7 +105,35 @@ export const NetDefaults = {
   floodMsPerToken: 16,
   /** Max inflated signaling payload (`new Uint8Array(51200)` bounded inflater). */
   signalingInflateLimit: 51_200,
+  /**
+   * haxlite: max connections from one public address that have not joined yet
+   * (negotiating, awaiting `onJoinRequest`, challenged or verifying). Half of
+   * {@link maxPendingNegotiations}: one address can never take every
+   * negotiation slot, while a LAN or carrier NAT still gets several
+   * simultaneous joins. Joined players are never counted.
+   */
+  maxUnjoinedPerIp: 8,
+  /**
+   * haxlite: when the room is full, a connection that has been waiting this
+   * long for its handshake gives its seat to a new one (an official client
+   * answers the challenge within one round trip).
+   */
+  staleChallengeMs: 3_000,
+  /**
+   * haxlite: per-address penalty for connections closed as abusive (flood,
+   * protocol violation, no handshake): each takes a token (`capacity`, one
+   * back every `msPerToken`); once none is left, offers from that address
+   * are refused with 4104 for `blockMs`.
+   */
+  abusePenalty: { capacity: 3, msPerToken: 20_000, blockMs: 30_000 },
 } as const;
+
+/**
+ * haxlite: remote ICE candidates taken from an offer and accepted by trickle
+ * per negotiation (a browser sends a handful; the edge has the same cap,
+ * `EdgeLimits.maxRemoteCandidates`). Offer candidates past it are ignored.
+ */
+export const MAX_REMOTE_CANDIDATES = 32;
 
 /** Join info limits checked by the official host (`D.yh`), in UTF-16 code units. */
 export const JoinLimits = {

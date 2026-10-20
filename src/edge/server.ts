@@ -46,6 +46,7 @@ import {
   type IceCandidatePolicy,
   type IceServerConfig,
 } from '../net/ice.js';
+import { formatIp, parseIp } from '../net/ip.js';
 import type { PeerLink, PeerLinkEvents } from '../net/peer-backend.js';
 import { TokenBucket } from '../net/rate-limit.js';
 import type { NdcRtcConfig, WebRtcStats } from '../net/webrtc.js';
@@ -157,8 +158,30 @@ export interface EdgeWebRtcOptions {
 }
 
 export interface EdgeLimitsOptions {
-  /** Concurrent tunnel sessions on this edge. Default 1000. */
+  /** Concurrent authenticated tunnel sessions on this edge. Default 1000. */
   maxSessions?: number;
+  /**
+   * Concurrent tunnel sockets still in the `Hello` → `Auth` phase (counted
+   * apart from {@link maxSessions}, so anonymous sockets never take a host's
+   * slot). When full, the oldest one is closed (4408) to make room: a real
+   * host authenticates within a round trip. Default 256 (0 = unlimited).
+   */
+  maxPreAuthSessions?: number;
+  /**
+   * Unauthenticated tunnel sockets per source address (IPv6: per /64);
+   * further upgrades get HTTP 429. Hosts leave this state as soon as they
+   * authenticate, so many rooms behind one address are not affected.
+   * Behind a reverse proxy every host shares the proxy's address: raise it
+   * or set 0 (unlimited). Default 32.
+   */
+  maxPreAuthPerIp?: number;
+  /**
+   * New tunnel upgrades per source address (IPv6: per /64), token bucket:
+   * burst {@link ipConnectCapacity}, one more per {@link ipConnectMsPerToken};
+   * over it → HTTP 429. Default 64 burst, 1 per 100 ms (0 capacity = off).
+   */
+  ipConnectCapacity?: number;
+  ipConnectMsPerToken?: number;
   /** Default per-key session quota. Default 16. */
   maxSessionsPerKey?: number;
   /** Default per-key player quota. Default 256. */
@@ -207,11 +230,15 @@ export interface EdgeServerOptions {
   keys: readonly EdgeKeyConfig[];
   webrtc?: EdgeWebRtcOptions;
   limits?: EdgeLimitsOptions;
-  /** `GET <path>` returns {@link EdgeStats} as JSON (`null` disables). Default `/stats`. */
+  /**
+   * `GET <path>` returns {@link EdgeStats} as JSON (`null` disables). Default
+   * `/stats`. Without {@link statsToken} only edge-wide aggregates are served
+   * (`keys` empty; `webrtc`, `rtc` and `tunnel` null).
+   */
   statsPath?: string | null;
-  /** Bearer token required by the stats endpoint (default none: bind it to a private address or firewall it). */
+  /** Bearer token for the full stats (per-key ids, labels and traffic). Default none: aggregates only. */
   statsToken?: string | null;
-  /** Log a one-line summary every N ms (0 = off). */
+  /** Log a one-line summary every N ms (0 = off; at most 2147483647). */
   statsLogIntervalMs?: number;
   log?: (msg: string) => void;
 }
@@ -253,6 +280,10 @@ export interface EdgeStats {
 
 const DEFAULTS = {
   maxSessions: 1000,
+  maxPreAuthSessions: 256,
+  maxPreAuthPerIp: 32,
+  ipConnectCapacity: 64,
+  ipConnectMsPerToken: 100,
   maxSessionsPerKey: 16,
   maxPeersPerKey: 256,
   maxPeersPerSession: 40,
@@ -301,6 +332,51 @@ function remoteCandidateOk(policy: 'public' | 'private' | 'all', line: string): 
   return remoteAllowed(policy, p.address);
 }
 
+/** Largest delay `setTimeout`/`setInterval` honour; a larger one fires after 1 ms. */
+const MAX_TIMER_MS = 0x7fffffff;
+
+function timerMs(name: string, ms: number): number {
+  const n = Number(ms);
+  if (Number.isNaN(n)) throw new RangeError(`${name} must be a number of milliseconds`);
+  return n > MAX_TIMER_MS ? MAX_TIMER_MS : n;
+}
+
+/** Per-source state of the control listener. */
+interface SourceState {
+  /** Unauthenticated sessions from this source. */
+  preAuth: number;
+  /** New upgrades (null when `ipConnectCapacity` is 0). */
+  readonly bucket: TokenBucket | null;
+}
+
+/** Limit key of a remote address: the IP (IPv4-mapped → IPv4), or its /64 for IPv6. */
+function sourceKey(remote: string): string {
+  const b = parseIp(remote);
+  if (b === null) return remote;
+  if (b.length === 4) return formatIp(b);
+  b.fill(0, 8);
+  return `${formatIp(b)}/64`;
+}
+
+/** Remote-supplied text for a log line: control and line-separator characters escaped. */
+function printable(s: string): string {
+  return s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, (c) => {
+    const n = c.charCodeAt(0);
+    if (n === 10) return '\\n';
+    if (n === 13) return '\\r';
+    return n < 0x100 ? `\\x${n.toString(16).padStart(2, '0')}` : `\\u${n.toString(16)}`;
+  });
+}
+
+function refuseUpgrade(socket: Duplex, status: string): void {
+  if (!socket.writable) {
+    socket.destroy();
+    return;
+  }
+  socket.once('finish', () => socket.destroy());
+  socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+}
+
 export class EdgeServer {
   readonly opts: EdgeServerOptions;
   private readonly server: HttpServer | HttpsServer;
@@ -308,6 +384,11 @@ export class EdgeServer {
   private readonly wss: WebSocketServer;
   private readonly keys = new Map<string, KeyState>();
   /** @internal */ readonly sessions = new Set<EdgeSession>();
+  /** Sessions not authenticated yet, oldest first. */
+  private readonly preAuth = new Set<EdgeSession>();
+  private readonly sources = new Map<string, SourceState>();
+  /** `sources` size that triggers a prune from the upgrade path (doubles while it stays busy). */
+  private prunePoint = 1024;
   /** @internal */ readonly limits: Required<EdgeLimitsOptions>;
   /** @internal */ readonly playerRtc: NdcRtcConfig;
   /** @internal */ readonly tunnelRtc: RtcConfig;
@@ -323,6 +404,7 @@ export class EdgeServer {
   private authFailures = 0;
   private nextSessionId = 1;
   private keepAliveTimer: NodeJS.Timeout | null = null;
+  private readonly statsLogMs: number;
   private statsTimer: NodeJS.Timeout | null = null;
   private closed = false;
   /** Dummy secret: unknown key ids still cost one HMAC (no timing oracle on ids). */
@@ -349,7 +431,13 @@ export class EdgeServer {
         lastAt: performance.now(),
       });
     }
-    this.limits = { ...DEFAULTS, allowWsDataPlane: true, ...stripUndefined(opts.limits ?? {}) };
+    const limits = { ...DEFAULTS, allowWsDataPlane: true, ...stripUndefined(opts.limits ?? {}) };
+    limits.channelOpenTimeoutMs = timerMs('channelOpenTimeoutMs', limits.channelOpenTimeoutMs);
+    limits.authTimeoutMs = timerMs('authTimeoutMs', limits.authTimeoutMs);
+    limits.dataPlaneTimeoutMs = timerMs('dataPlaneTimeoutMs', limits.dataPlaneTimeoutMs);
+    limits.keepAliveMs = timerMs('keepAliveMs', limits.keepAliveMs);
+    this.limits = limits;
+    this.statsLogMs = timerMs('statsLogIntervalMs', opts.statsLogIntervalMs ?? 0);
     const w = opts.webrtc ?? {};
     const range = w.portRange;
     const base: RtcConfig = {
@@ -384,7 +472,13 @@ export class EdgeServer {
   /** Creates and starts listening. */
   static async start(opts: EdgeServerOptions): Promise<EdgeServer> {
     const s = new EdgeServer(opts);
-    await s.listen();
+    try {
+      await s.listen();
+    } catch (err) {
+      // nobody else holds `s`: release the listener / handlers it attached
+      await s.close();
+      throw err;
+    }
     return s;
   }
 
@@ -395,6 +489,7 @@ export class EdgeServer {
   async listen(): Promise<void> {
     const w = this.opts.webrtc ?? {};
     const t = this.opts.tunnel ?? {};
+    let bound = false;
     try {
       if (this.players === null) {
         if (this.playerBackend === 'rtc') {
@@ -405,8 +500,8 @@ export class EdgeServer {
             publicAddresses,
             ...(w.ipv6 === true ? { ipv6: true } : null),
             ...(w.publicPort !== undefined ? { publicPort: w.publicPort } : null),
-            handshakeTimeoutMs: this.limits.channelOpenTimeoutMs + 1000,
-            ...(w.consentTimeoutMs !== undefined ? { idleTimeoutMs: w.consentTimeoutMs } : null),
+            handshakeTimeoutMs: Math.min(this.limits.channelOpenTimeoutMs + 1000, MAX_TIMER_MS),
+            ...(w.consentTimeoutMs !== undefined ? { idleTimeoutMs: timerMs('consentTimeoutMs', w.consentTimeoutMs) } : null),
           });
           this.log(`players: haxlite-rtc on UDP ${(this.players as RtcPlayers).port}, announcing ${publicAddresses.join(', ')}`);
         } else {
@@ -422,6 +517,7 @@ export class EdgeServer {
             resolve();
           });
         });
+        bound = true;
       }
       if (this.udp === null && t.udp !== false) {
         const host = this.opts.host ?? '0.0.0.0';
@@ -433,9 +529,13 @@ export class EdgeServer {
     } catch (err) {
       await this.players?.close();
       this.players = null;
+      if (bound) {
+        this.server.closeAllConnections?.();
+        await new Promise<void>((resolve) => this.server.close(() => resolve()));
+      }
       throw err;
     }
-    const every = this.opts.statsLogIntervalMs ?? 0;
+    const every = this.statsLogMs;
     if (every > 0 && this.statsTimer === null) this.statsTimer = setInterval(() => this.logStats(), every);
   }
 
@@ -508,8 +608,6 @@ export class EdgeServer {
   stats(): EdgeStats {
     const now = performance.now();
     let peers = 0;
-    const dataPlanes = { udp: 0, webrtc: 0, ws: 0 };
-    for (const s of this.sessions) if (s.dataPlane !== null) dataPlanes[s.dataPlane]++;
     const keys: EdgeKeyStats[] = [];
     for (const k of this.keys.values()) {
       peers += k.peers;
@@ -541,9 +639,34 @@ export class EdgeServer {
       webrtc: ndcModule !== null ? ndcModule.webRtcStats() : null,
       rtc: this.players instanceof RtcPlayers ? this.players.stats() : null,
       tunnel: this.udp?.stats() ?? null,
-      dataPlanes,
+      dataPlanes: this.dataPlaneCounts(),
       memoryRssMb: Math.round(process.memoryUsage().rss / 1048576),
     };
+  }
+
+  /** Edge-wide aggregates only (the stats endpoint without a token); leaves the pps windows alone. */
+  private publicStats(): EdgeStats {
+    let peers = 0;
+    for (const k of this.keys.values()) peers += k.peers;
+    return {
+      uptimeSec: Math.round((performance.now() - this.startedAt) / 1000),
+      playerBackend: this.playerBackend,
+      sessions: this.sessions.size,
+      peers,
+      authFailures: this.authFailures,
+      keys: [],
+      webrtc: null,
+      rtc: null,
+      tunnel: null,
+      dataPlanes: this.dataPlaneCounts(),
+      memoryRssMb: Math.round(process.memoryUsage().rss / 1048576),
+    };
+  }
+
+  private dataPlaneCounts(): EdgeStats['dataPlanes'] {
+    const dataPlanes = { udp: 0, webrtc: 0, ws: 0 };
+    for (const s of this.sessions) if (s.dataPlane !== null) dataPlanes[s.dataPlane]++;
+    return dataPlanes;
   }
 
   private logStats(): void {
@@ -574,7 +697,8 @@ export class EdgeServer {
         }
       }
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-      res.end(JSON.stringify(this.stats()));
+      // no token configured: nothing that names or profiles a tenant
+      res.end(JSON.stringify(token !== null ? this.stats() : this.publicStats()));
       return;
     }
     res.writeHead(404).end();
@@ -586,21 +710,58 @@ export class EdgeServer {
       socket.destroy();
       return;
     }
+    // per-source limits before the WebSocket handshake (cheap to refuse)
+    const lim = this.limits;
+    const remote = req.socket.remoteAddress ?? '?';
+    const key = sourceKey(remote);
+    if (this.sources.size >= this.prunePoint) {
+      this.pruneSources();
+      this.prunePoint = Math.max(1024, this.sources.size * 2);
+    }
+    let src = this.sources.get(key);
+    if (src === undefined) {
+      src = { preAuth: 0, bucket: lim.ipConnectCapacity > 0 ? new TokenBucket(lim.ipConnectCapacity, lim.ipConnectMsPerToken) : null };
+      this.sources.set(key, src);
+    }
+    if ((src.bucket !== null && !src.bucket.take()) || (lim.maxPreAuthPerIp > 0 && src.preAuth >= lim.maxPreAuthPerIp)) {
+      refuseUpgrade(socket, '429 Too Many Requests');
+      return;
+    }
     this.wss.handleUpgrade(req, socket, head, (ws) => {
-      if (this.sessions.size >= this.limits.maxSessions) {
-        ws.close(EdgeCloseCode.Quota, 'edge full');
+      if (this.closed) {
+        ws.terminate();
         return;
       }
-      const remote = req.socket.remoteAddress ?? '?';
-      const s = new EdgeSession(this, ws, this.nextSessionId++, remote);
+      if (this.sessions.size - this.preAuth.size >= lim.maxSessions) {
+        ws.close(EdgeCloseCode.Quota, 'edge full');
+        setTimeout(() => ws.terminate(), 2000).unref();
+        return;
+      }
+      // anonymous sockets compete only among themselves: the oldest makes room
+      if (lim.maxPreAuthSessions > 0 && this.preAuth.size >= lim.maxPreAuthSessions) {
+        const oldest = this.preAuth.values().next().value;
+        if (oldest !== undefined) oldest.close(EdgeCloseCode.Timeout, 'auth timeout');
+      }
+      const s = new EdgeSession(this, ws, this.nextSessionId++, remote, key);
       this.sessions.add(s);
+      this.preAuth.add(s);
+      src.preAuth++;
       // keep-alive pings only while there is a tunnel to keep alive
-      if (this.keepAliveTimer === null) this.keepAliveTimer = setInterval(() => this.keepAlive(), this.limits.keepAliveMs);
+      if (this.keepAliveTimer === null) this.keepAliveTimer = setInterval(() => this.keepAlive(), lim.keepAliveMs);
     });
   };
 
   private keepAlive(): void {
     for (const s of this.sessions) s.keepAlive();
+    this.pruneSources();
+  }
+
+  /** Forgets sources with no unauthenticated session and a full bucket. */
+  private pruneSources(): void {
+    const now = performance.now();
+    for (const [key, src] of this.sources) {
+      if (src.preAuth === 0 && (src.bucket === null || src.bucket.isFull(now))) this.sources.delete(key);
+    }
   }
 
   // ------------------------------------------------------------------ auth / quotas
@@ -628,11 +789,25 @@ export class EdgeServer {
     return k.cfg.maxPeers ?? this.limits.maxPeersPerKey;
   }
 
+  /** @internal True while authenticated sessions are below `maxSessions` (`s` itself is still pre-auth). */
+  hasRoom(): boolean {
+    return this.sessions.size - this.preAuth.size < this.limits.maxSessions;
+  }
+
+  /** @internal `s` authenticated (or closed): it no longer counts against its source's pre-auth limit. */
+  leavePreAuth(s: EdgeSession): void {
+    if (!this.preAuth.delete(s)) return;
+    const src = this.sources.get(s.source);
+    if (src !== undefined) src.preAuth--;
+  }
+
   /** @internal */ removeSession(s: EdgeSession): void {
+    this.leavePreAuth(s);
     this.sessions.delete(s);
     if (this.sessions.size === 0 && this.keepAliveTimer !== null) {
       clearInterval(this.keepAliveTimer);
       this.keepAliveTimer = null;
+      this.pruneSources();
     }
   }
 }
@@ -683,6 +858,8 @@ class EdgeSession {
   private readonly edge: EdgeServer;
   private readonly ws: WebSocket;
   private readonly remote: string;
+  /** @internal Limit key of {@link remote}. */
+  readonly source: string;
   private readonly nonce = randomBytes(EDGE_NONCE_LENGTH);
   private key: KeyState | null = null;
   /** `Auth` accepted, `AuthOk` waiting for node-datachannel to load. */
@@ -703,11 +880,12 @@ class EdgeSession {
   private readonly w = new Writer(1024);
   private scratch = Buffer.allocUnsafe(4096);
 
-  constructor(edge: EdgeServer, ws: WebSocket, id: number, remote: string) {
+  constructor(edge: EdgeServer, ws: WebSocket, id: number, remote: string, source: string) {
     this.edge = edge;
     this.ws = ws;
     this.id = id;
     this.remote = remote;
+    this.source = source;
     ws.binaryType = 'nodebuffer';
     ws.on('message', (data: RawData, isBinary: boolean) => {
       this.alive = true;
@@ -921,12 +1099,16 @@ class EdgeSession {
       version === EDGE_LEGACY_VERSION ? edgeAuthMac(secret, nonce) : edgeAuthMacV2(secret, nonce, flags, hostPub),
     );
     if (k === null) {
-      this.edge.log(`session ${this.id} from ${this.remote}: authentication failed (key "${keyId.slice(0, 32)}")`);
+      this.edge.log(`session ${this.id} from ${this.remote}: authentication failed (key "${printable(keyId.slice(0, 32))}")`);
       this.close(EdgeCloseCode.AuthFailed, 'authentication failed');
       return;
     }
     if (k.sessions >= this.edge.sessionQuota(k)) {
       this.close(EdgeCloseCode.Quota, 'too many sessions for this key');
+      return;
+    }
+    if (!this.edge.hasRoom()) {
+      this.close(EdgeCloseCode.Quota, 'edge full');
       return;
     }
     // data plane: the UDP tunnel, else the legacy PeerConnection, else this WebSocket
@@ -940,6 +1122,7 @@ class EdgeSession {
     }
     this.key = k;
     k.sessions++;
+    this.edge.leavePreAuth(this);
     if (plane === 'webrtc' && ndcModule === null) {
       // the legacy tunnel needs node-datachannel: load it now (only hosts asking for it pay for it)
       this.authing = true;
@@ -1154,7 +1337,7 @@ class EdgeSession {
       if (peer.closed) link.close();
       else peer.link = link;
     } catch (err) {
-      this.edge.log(`session ${this.id}: peer slot ${slot}: bad offer: ${(err as Error).message}`);
+      this.edge.log(`session ${this.id}: peer slot ${slot}: bad offer: ${printable((err as Error).message)}`);
       this.closePeer(slot, EdgePeerClose.Failed);
     }
   }

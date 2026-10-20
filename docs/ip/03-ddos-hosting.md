@@ -104,10 +104,10 @@
 |---|---|---|
 | Amplificación (sport 53/123/389/1900/11211…) | descarta barato **si el enlace no está lleno** (`udp sport < 1024`, set `amp_sports`) | **Sí**, trivial: ACL por puerto origen (OVH ENF, cloud firewall) y scrubbing |
 | Fragment flood | `ip frag-off` drop (WebRTC no fragmenta) | ENF `fragments` / scrubbing |
-| UDP flood "bypass" a la IP:puerto de la sala | **Sí**: sólo pasan `active`/`pending`/STUN limitado | difícil para scrubbers genéricos; lo ideal es una allowlist upstream (Magic Transit PFP, SG de AWS) |
-| STUN flood | límite por origen (5/s) y global (2000/s); opcional: comprobar ufrag en XDP | perfil STUN (Path), rate-limit |
+| UDP flood "bypass" a la IP:puerto de la sala | **Sí**: sólo pasan `active`/`pending`/STUN limitado; `pending` solo vale si el sidecar mete IPs validadas (la oferta la escribe el cliente) | difícil para scrubbers genéricos; lo ideal es una allowlist upstream (Magic Transit PFP, SG de AWS) |
+| STUN flood | nft: límite por prefijo de origen (5/s; /24 v4, /64 v6) y global (2000/s); XDP: por IP de origen y global (2000/s); opcional: comprobar ufrag en XDP | perfil STUN (Path), rate-limit |
 | SYN/ACK flood | descartar SYN salvo SSH de administración; syncookies | scrubbing estándar (lo hacen todos) |
-| Jugador malicioso (ya en allowlist) | tope de 1000 pps por IP, kick y set `deny` | — |
+| Jugador malicioso (ya en allowlist) | tope de 1000 pps por IP (nft y XDP), kick y set `deny` | — |
 | Volumétrico > capacidad del enlace / carpet bombing del /24 | **No** | **Sí**, y es lo único que funciona |
 
 ---

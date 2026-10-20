@@ -1,10 +1,17 @@
 # Fuerza relay-only real en haxlite (bug libjuice: checks directos desde la IP real).
 # Uso: haxlite con portRange [40000, 40999] y rtc.iceTransportPolicy = "relay".
 # Mantener los sets turn4/turn6 al día con los A/AAAA de tu servidor TURN.
+# Validar: nft -c -f relay-only.nft     Cargar: nft -f relay-only.nft  (comprobar el rc: la carga es
+# atómica y, si falla, la tabla no se crea y la IP real sigue saliendo). Comprobar después con
+# `nft list table inet haxhost`. Quitar: nft delete table inet haxhost
+# Los sets llevan `flags interval`: sin él nft rechaza los prefijos (a.b.c.d/24).
+# Las dos primeras líneas hacen la carga idempotente sin depender de `destroy`: recargar no duplica reglas.
 
+table inet haxhost
+delete table inet haxhost
 table inet haxhost {
-  set turn4 { type ipv4_addr; elements = { 141.101.90.1, 162.159.207.0/24 } }   # o la IP de tu relay
-  set turn6 { type ipv6_addr; elements = { 2a06:98c1:3200::1, 2606:4700:48::1 } }
+  set turn4 { type ipv4_addr; flags interval; elements = { 141.101.90.1, 162.159.207.0/24 } }   # o la IP de tu relay
+  set turn6 { type ipv6_addr; flags interval; elements = { 2a06:98c1:3200::1, 2606:4700:48::1 } }
   chain out {
     type filter hook output priority 0; policy accept;
     udp sport 40000-40999 ip  daddr @turn4 accept

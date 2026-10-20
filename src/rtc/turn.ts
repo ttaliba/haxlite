@@ -356,6 +356,15 @@ function defaultLookup(host: string, family: 4 | 6): Promise<string[]> {
   });
 }
 
+/** An internal error in a timer or promise callback: logged, never propagated (it would end the process). */
+function reportError(what: string, err: unknown): void {
+  try {
+    console.error(`[haxlite/rtc] error in ${what}:`, err);
+  } catch {
+    /* never propagate */
+  }
+}
+
 function txKey(buf: Uint8Array): string {
   return Buffer.from(buf.buffer, buf.byteOffset + 8, 12).toString('latin1');
 }
@@ -458,10 +467,31 @@ export class TurnRelay implements PacketIo {
     }
     this.state = 'allocating';
     const spec = (this.current = this.server);
-    (this.host.lookup ?? defaultLookup)(spec.host, this.host.family).then(
-      (addrs) => this.onResolved(addrs),
-      () => this.onResolved([]),
+    let lookup: Promise<string[]>;
+    try {
+      lookup = (this.host.lookup ?? defaultLookup)(spec.host, this.host.family);
+    } catch {
+      lookup = Promise.resolve([]);
+    }
+    lookup.then(
+      (addrs) => this.resolved(addrs),
+      () => this.resolved([]),
     );
+  }
+
+  /** {@link onResolved} from the lookup's promise: a throw there would be an unhandled rejection (fatal). */
+  private resolved(addrs: string[]): void {
+    try {
+      this.onResolved(addrs);
+    } catch (err) {
+      reportError('TURN allocation', err);
+      if (this.state !== 'allocating') return;
+      try {
+        this.allocationFailed();
+      } catch (e) {
+        reportError('TURN allocation', e);
+      }
+    }
   }
 
   private onResolved(addrs: string[]): void {
@@ -980,7 +1010,13 @@ export class TurnRelay implements PacketIo {
 
   private armMaintenance(): void {
     if (this.maintenance !== null) return;
-    const t = setInterval(() => this.maintain(), MAINTENANCE_MS);
+    const t = setInterval(() => {
+      try {
+        this.maintain();
+      } catch (err) {
+        reportError('TURN maintenance', err);
+      }
+    }, MAINTENANCE_MS);
     t.unref?.();
     this.maintenance = t;
   }

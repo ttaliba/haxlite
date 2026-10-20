@@ -147,6 +147,13 @@ export class IpRange {
     return new IpRange(base, prefix);
   }
 
+  /** Highest address of the range (`base` with every host bit set). */
+  last(): Uint8Array {
+    const out = this.base.slice();
+    for (let i = 0; i < out.length; i++) out[i]! |= 0xff >> Math.max(0, Math.min(8, this.prefix - i * 8));
+    return out;
+  }
+
   /** Whether `addr` (bytes from {@link parseIp}) is inside the range. */
   contains(addr: Uint8Array): boolean {
     if (addr.length !== this.base.length) return false;

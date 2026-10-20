@@ -15,13 +15,19 @@
  * on the existing 40 s keep-alive interval, so a dead link is detected in
  * 40–80 s instead of whenever the kernel gives up on the TCP connection.
  *
+ * The master is untrusted input: a frame over {@link MAX_MESSAGE_BYTES}, an
+ * oversized renewed token or an unusable `url`/`token` from `api/host` (not a
+ * ws(s) url, unparseable, with a fragment) is reported through `onError` and
+ * goes through the normal reconnect path; none of them can end the process.
+ * `stop()` also aborts an `api/host` request still in flight.
+ *
  * This class only frames/deframes; admission control and WebRTC live in
  * `transport.ts`.
  */
 import { WebSocket, type ClientOptions } from './ws.js';
 import type http from 'node:http';
 import { Reader, Writer, deflateRaw, inflateRaw } from '../codec/index.js';
-import { DEFAULT_WS_ORIGIN, HostToMaster, MasterCloseCode, MasterToHost, NetDefaults } from './constants.js';
+import { DEFAULT_WS_ORIGIN, HostToMaster, MasterCloseCode, MasterToHost, MAX_REMOTE_CANDIDATES, NetDefaults } from './constants.js';
 import type { IceCandidateInit } from './ice.js';
 import { bytesToConn, connBytesToText } from './ip.js';
 import { MasterError, requestHostSession, type MasterHttpOptions } from './master-http.js';
@@ -41,10 +47,18 @@ export interface SignalingOffer {
   joinData: Reader;
 }
 
-export interface HostSignalingOptions extends MasterHttpOptions {
+/** Largest legitimate master frame: an offer is at most `signalingInflateLimit` inflated, plus a short header. */
+const MAX_MESSAGE_BYTES = 256 * 1024;
+/** Longest renewed token (message 6) kept; the host sends it back with every reconnect. */
+const MAX_TOKEN_BYTES = 4096;
+
+export interface HostSignalingOptions extends Omit<MasterHttpOptions, 'signal'> {
   /** Headless token (`HBInit({token})`); replaced by the master's message 6. */
   token: string;
-  /** Overrides the WS URL returned by `api/host` (proxies, custom backends). */
+  /**
+   * Overrides the WS URL returned by `api/host` (proxies, custom backends). Any
+   * scheme `ws` accepts is allowed here; the url the master returns must be ws(s).
+   */
   wsUrl?: string | null;
   /** WS Origin header (default `https://html5.haxball.com`; null = none). */
   origin?: string | null;
@@ -69,6 +83,11 @@ export interface HostSignalingHandlers {
   onOpen?(): void;
   /** Message 5: the room id (link = `play?c=<id>`). Called again after reconnects. */
   onRoomId?(roomId: string): void;
+  /**
+   * Message 1, before its payload is inflated: `false` drops the offer (the
+   * handler already answered the master, if at all).
+   */
+  onOfferPreflight?(peerId: number, ip: string, conn: string): boolean;
   /** Message 1 (already deframed; malformed offers are rejected with code 0 here). */
   onOffer?(offer: SignalingOffer): void;
   /** Message 4. */
@@ -91,6 +110,8 @@ export class HostSignaling {
   private ws: WebSocket | null = null;
   private stopped = true;
   private generation = 0;
+  /** Aborts the `api/host` request of the connect attempt in progress. */
+  private httpAbort: AbortController | null = null;
 
   private roomInfo: Uint8Array | null = null;
   private roomInfoDirty = false;
@@ -121,19 +142,21 @@ export class HostSignaling {
   start(rcr = ''): void {
     if (!this.stopped) return;
     this.stopped = false;
-    void this.connect(rcr);
+    this.kick(rcr);
   }
 
   /** Retries the HTTP step with a captcha response after {@link HostSignalingHandlers.onRecaptcha}. */
   useRecaptchaToken(rcr: string): void {
     if (this.stopped) return;
-    void this.connect(rcr);
+    this.kick(rcr);
   }
 
   /** Closes everything and disables reconnection. */
   stop(): void {
     this.stopped = true;
     this.generation++;
+    this.httpAbort?.abort();
+    this.httpAbort = null;
     this.clearTimers();
     this.dropSocket();
   }
@@ -228,6 +251,25 @@ export class HostSignaling {
 
   // ------------------------------------------------------------------ internals
 
+  /** Runs {@link connect}; a failure it did not report itself (a throwing handler…) must not escape as an unhandled rejection. */
+  private kick(rcr: string): void {
+    const p = this.connect(rcr);
+    const gen = this.generation;
+    void p.catch((err: unknown) => {
+      try {
+        this.handlers.onError?.(err as Error);
+      } catch {
+        /* handler bug */
+      }
+      if (gen !== this.generation || this.stopped) return;
+      try {
+        this.lost(1006, true);
+      } catch {
+        /* handler bug */
+      }
+    });
+  }
+
   private async connect(rcr: string): Promise<void> {
     const gen = ++this.generation;
     if (this.ws !== null) {
@@ -236,14 +278,18 @@ export class HostSignaling {
       this.lost(1000, false);
     }
     this.clearTimers();
+    this.httpAbort?.abort();
+    const ac = (this.httpAbort = new AbortController());
     let session;
     try {
-      session = await requestHostSession(this.token, rcr, this.opts);
+      session = await requestHostSession(this.token, rcr, { ...this.opts, signal: ac.signal });
     } catch (err) {
       if (gen !== this.generation || this.stopped) return;
       this.handlers.onError?.(err as Error);
       this.lost(0, true);
       return;
+    } finally {
+      if (this.httpAbort === ac) this.httpAbort = null;
     }
     if (gen !== this.generation || this.stopped) return;
     if (session.action === 'recaptcha') {
@@ -260,10 +306,20 @@ export class HostSignaling {
     const wsOpts: ClientOptions = {
       headers,
       perMessageDeflate: false,
+      maxPayload: MAX_MESSAGE_BYTES,
       handshakeTimeout: this.opts.handshakeTimeoutMs ?? NetDefaults.signalingHandshakeTimeoutMs,
     };
     if (this.opts.agent) wsOpts.agent = this.opts.agent as http.Agent;
-    const ws = new WebSocket(`${base}?token=${session.token}`, wsOpts);
+    let ws: WebSocket;
+    try {
+      // `wsUrl` is the operator's; the url the master hands out must be a plain ws(s) one.
+      if (this.opts.wsUrl == null && !/^wss?:\/\//i.test(base)) throw new MasterError('invalid-response', 'api/host: url is not a ws(s) url');
+      ws = new WebSocket(`${base}?token=${session.token}`, wsOpts);
+    } catch (err) {
+      this.handlers.onError?.(err as Error);
+      this.lost(1006, true);
+      return;
+    }
     ws.binaryType = 'nodebuffer';
     this.ws = ws;
     ws.on('open', () => {
@@ -339,7 +395,7 @@ export class HostSignaling {
         ((this.opts.reconnectMinMs ?? NetDefaults.reconnectMinMs) + rnd * (this.opts.reconnectRangeMs ?? NetDefaults.reconnectRangeMs)) | 0;
       this.reconnectTimer = setTimeout(() => {
         this.reconnectTimer = null;
-        if (!this.stopped) void this.connect('');
+        if (!this.stopped) this.kick('');
       }, delay);
     }
   }
@@ -369,6 +425,7 @@ export class HostSignaling {
           this.handlers.onRoomId?.(this.roomId);
           break;
         case MasterToHost.Token:
+          if (r.remaining > MAX_TOKEN_BYTES) throw new Error('master signaling: token too long');
           this.token = r.stringRaw(r.remaining);
           break;
       }
@@ -381,6 +438,11 @@ export class HostSignaling {
   private onOfferMessage(r: Reader): void {
     const peerId = r.u32();
     const connBytes = r.bytes(r.u8());
+    const conn = bytesToConn(connBytes);
+    const ip = connBytesToText(connBytes);
+    // checks that only need the address run before the payload is inflated and parsed
+    const preflight = this.handlers.onOfferPreflight;
+    if (preflight !== undefined && !preflight(peerId, ip, conn)) return;
     let offer: SignalingOffer;
     try {
       const payload = new Reader(inflateRaw(r.bytes(), NetDefaults.signalingInflateLimit));
@@ -388,9 +450,11 @@ export class HostSignaling {
       const sdp = payload.string();
       const raw = payload.json<unknown>();
       if (!Array.isArray(raw)) throw new Error('candidates is not an array');
+      // only the first MAX_REMOTE_CANDIDATES are ever applied: the rest is not even validated
+      const n = Math.min(raw.length, MAX_REMOTE_CANDIDATES);
       const candidates: IceCandidateInit[] = [];
-      for (const c of raw) candidates.push(toCandidate(c));
-      offer = { peerId, conn: bytesToConn(connBytes), ip: connBytesToText(connBytes), reverse, sdp, candidates, joinData: payload };
+      for (let i = 0; i < n; i++) candidates.push(toCandidate(raw[i]));
+      offer = { peerId, conn, ip, reverse, sdp, candidates, joinData: payload };
     } catch {
       this.sendReject(peerId, 0);
       return;

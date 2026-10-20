@@ -26,7 +26,8 @@
  *   on every response.
  *
  * TURN (turn.ts): with an allocation, every public IPv4 remote candidate
- * gets a second pair whose "socket" is the relay (a {@link PacketIo} that
+ * (the first {@link MAX_RELAY_PEERS} distinct ones of a session) gets a
+ * second pair whose "socket" is the relay (a {@link PacketIo} that
  * wraps datagrams in ChannelData / Send indications), local type `relay`
  * in the pair priority, so it is checked after the direct pairs. The
  * relay's permission for the remote IP is requested when the pair is made.
@@ -65,6 +66,14 @@ export const MAX_PAIRS = 16;
 /** With a TURN allocation (relay pairs next to the direct ones). */
 const MAX_TX_PER_SESSION_RELAY = 180;
 export const MAX_PAIRS_RELAY = 24;
+/**
+ * Distinct signaled remote addresses (ip:port) one session gets relay pairs
+ * for. Each one becomes a peer address of the allocation, and some servers
+ * (Cloudflare) relay for only ~10 per allocation over its whole life; a
+ * client needs one or two (its srflx, a public host address). Peer-reflexive
+ * relay pairs (a request that came through the relay) are not counted.
+ */
+export const MAX_RELAY_PEERS = 4;
 /**
  * Once the session is connected, check transmissions (triggered checks for
  * NAT rebindings, and their retransmissions) draw from a refilling
@@ -248,7 +257,17 @@ export class IceScheduler implements TxnTable {
   private tick(): void {
     const now = this.o.now();
     for (const a of this.active) {
-      if (!a.tick(now)) this.active.delete(a);
+      try {
+        if (!a.tick(now)) this.active.delete(a);
+      } catch (err) {
+        // from a timer: a throw would be an uncaught exception; that agent sends no more checks
+        this.active.delete(a);
+        try {
+          console.error('[haxlite/rtc] error in an ICE check tick:', err);
+        } catch {
+          /* never propagate */
+        }
+      }
     }
     if (this.active.size === 0 && this.timer !== null) {
       clearInterval(this.timer);
@@ -345,6 +364,8 @@ export class IceAgent {
   private nextConsentAt = 0;
   /** IP the signaling server saw the peer connect from: the relays get a permission for it too. */
   private hintIp: string | null = null;
+  /** Signaled remote addresses given relay pairs so far (≤ {@link MAX_RELAY_PEERS}). */
+  private relayPeers = 0;
   /**
    * The TURN allocations this session uses (its relay candidates): a subset of the scheduler's
    * relays when the endpoint spreads sessions over several allocations; null: all of them.
@@ -391,10 +412,15 @@ export class IceAgent {
     if (this.checking) this.s.activate(this);
   }
 
-  /** Pairs on every ready relay for a remote candidate (and the relay's permission for its IP). */
+  /**
+   * Pairs on every ready relay for a remote candidate (and the relay's permission for its IP),
+   * for at most {@link MAX_RELAY_PEERS} distinct candidate addresses per session.
+   */
   private addRelayPairs(address: string, port: number, priority: number): boolean {
     const relays = this.myRelays();
     if (relays === undefined || !this.s.relayable(address)) return false;
+    const known = this.relayPeerKnown(address, port);
+    if (!known && this.relayPeers >= MAX_RELAY_PEERS) return false;
     let added = false;
     for (const r of relays) {
       if (!r.ready || this.pairs.length >= this.s.maxPairs || this.find(r, address, port) !== null) continue;
@@ -402,7 +428,14 @@ export class IceAgent {
       this.insert(r, address, port, priority, RELAY_PRIORITY);
       added = true;
     }
+    if (added && !known) this.relayPeers++;
     return added;
+  }
+
+  /** Whether (address, port) already counts as one of this session's signaled relay peers. */
+  private relayPeerKnown(address: string, port: number): boolean {
+    for (const p of this.pairs) if (!p.learned && p.port === port && this.s.isRelay(p.sock) && sameIp(p.address, address)) return true;
+    return false;
   }
 
   /**
@@ -708,9 +741,9 @@ export class IceAgent {
   }
 
   /** Pair states (tests/diagnostics). */
-  describe(): { address: string; port: number; state: 'waiting' | 'in-progress' | 'succeeded' | 'failed'; sent: number }[] {
+  describe(): { address: string; port: number; state: 'waiting' | 'in-progress' | 'succeeded' | 'failed'; sent: number; relay: boolean }[] {
     const names = ['waiting', 'in-progress', 'succeeded', 'failed'] as const;
-    return this.pairs.map((p) => ({ address: p.address, port: p.port, state: names[p.state]!, sent: p.sent }));
+    return this.pairs.map((p) => ({ address: p.address, port: p.port, state: names[p.state]!, sent: p.sent, relay: this.s.isRelay(p.sock) }));
   }
 
   private find(sock: PacketIo, address: string, port: number): Pair | null {

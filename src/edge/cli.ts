@@ -42,6 +42,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       `, tunnel v2 ${edge.tunnelPort !== null ? `UDP ${edge.tunnelPort}` : 'off'})`,
   );
   if (!opts.tls) log('WARNING: no TLS configured; use wss:// in production (tls.certFile/keyFile)');
+  if (opts.statsPath !== null && !opts.statsToken) log(`${opts.statsPath ?? '/stats'} has no token: it serves edge-wide aggregates only (stats.token for per-key stats)`);
   process.on('SIGHUP', () => {
     try {
       edge.reloadTls();

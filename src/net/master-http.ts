@@ -12,11 +12,17 @@
  * body, our headers, timeout (`MasterError('network', 'timeout')`), no
  * redirects followed (a 3xx is an `http` error, as with node:http), same error
  * kinds. Differences: Bun's fetch adds `User-Agent: Bun/<v>` (override it with
- * `headers`), `Accept` (any type) and `Accept-Encoding` (the body is decompressed
- * transparently), network error messages are Bun's, and the timeout bounds the
- * whole request instead of socket inactivity. Bun's fetch would honour
- * HTTP(S)_PROXY / ALL_PROXY while node:http ignores them: when any is set, the
- * node:http path is used, so the master is reached exactly as before.
+ * `headers`) and `Accept` (any type), network error messages are Bun's, and the
+ * timeout bounds the whole request instead of socket inactivity. Bun's fetch
+ * would honour HTTP(S)_PROXY / ALL_PROXY while node:http ignores them: when any
+ * is set, the node:http path is used, so the master is reached exactly as before.
+ *
+ * Responses are untrusted input: the body is capped per endpoint (see
+ * {@link JSON_BODY} / {@link LIST_BODY}; over the cap is an `invalid-response`
+ * error) and `timeoutMs` also bounds the whole exchange, so neither an endless
+ * nor a trickling body can hold memory or the caller. On Bun the request asks
+ * for `Accept-Encoding: identity` and turns decompression off, so a compressed
+ * reply is refused rather than inflated beyond the cap.
  */
 import type { Agent } from 'node:http';
 import { createRequire } from 'node:module';
@@ -30,8 +36,13 @@ export interface MasterHttpOptions {
   agent?: Agent;
   /** Extra request headers. */
   headers?: Record<string, string>;
-  /** Request timeout (default 15 s). */
+  /**
+   * Request timeout (default 15 s): socket inactivity and also the total time
+   * of the exchange (the room list gets twice that).
+   */
   timeoutMs?: number;
+  /** Aborts the request in flight; it then rejects with `MasterError('network', 'aborted')`. */
+  signal?: AbortSignal;
 }
 
 export type MasterErrorKind =
@@ -107,7 +118,7 @@ export async function fetchGeo(opts: MasterHttpOptions = {}): Promise<GeoLocatio
 
 /** `GET api/list` (binary). */
 export async function fetchRoomList(opts: MasterHttpOptions = {}): Promise<ListedRoom[]> {
-  const res = await request('GET', 'api/list', opts);
+  const res = await request('GET', 'api/list', opts, undefined, undefined, LIST_BODY);
   return parseRoomList(res.body);
 }
 
@@ -117,6 +128,16 @@ interface RawResponse {
   status: number;
   body: Uint8Array;
 }
+
+/** Cap on a response body and the factor of `timeoutMs` allowed for the whole exchange. */
+interface BodyLimit {
+  maxBytes: number;
+  deadlineFactor: number;
+}
+/** `api/host` / `api/geo`: JSON of a few hundred bytes. */
+const JSON_BODY: BodyLimit = { maxBytes: 64 * 1024, deadlineFactor: 1 };
+/** `api/list`: ~100 bytes per public room, the only sizeable transfer. */
+const LIST_BODY: BodyLimit = { maxBytes: 8 * 1024 * 1024, deadlineFactor: 2 };
 
 async function requestJson(
   method: string,
@@ -156,56 +177,141 @@ function useFetch(opts: MasterHttpOptions): boolean {
   return true;
 }
 
-function request(method: string, path: string, opts: MasterHttpOptions, body?: string, contentType?: string): Promise<RawResponse> {
+function request(
+  method: string,
+  path: string,
+  opts: MasterHttpOptions,
+  body?: string,
+  contentType?: string,
+  limit: BodyLimit = JSON_BODY,
+): Promise<RawResponse> {
   const url = new URL(path, opts.masterUrl ?? DEFAULT_MASTER_URL);
   const headers: Record<string, string> = { ...opts.headers };
   if (contentType) headers['Content-Type'] = contentType;
-  if (useFetch(opts)) return requestFetch(method, path, url, headers, opts.timeoutMs ?? 15_000, body);
+  const timeoutMs = opts.timeoutMs ?? 15_000;
+  if (useFetch(opts)) return requestFetch(method, path, url, headers, timeoutMs, limit, opts.signal, body);
   if (body !== undefined) headers['Content-Length'] = String(Buffer.byteLength(body));
   const mod = nodeHttp(url.protocol === 'https:');
   return new Promise<RawResponse>((resolve, reject) => {
-    const req = mod.request(url, { method, headers, agent: opts.agent }, (res) => {
+    let total: NodeJS.Timeout | undefined;
+    const ok = (value: RawResponse): void => {
+      clearTimeout(total);
+      resolve(value);
+    };
+    // The first outcome wins, so the error kind does not depend on which event follows the destroy.
+    const ko = (err: MasterError): void => {
+      clearTimeout(total);
+      reject(err);
+    };
+    const abort = (err: MasterError): void => {
+      ko(err);
+      req.destroy();
+    };
+    const req = mod.request(url, { method, headers, agent: opts.agent, signal: opts.signal }, (res) => {
+      res.on('error', (e) => ko(netError(e, opts.signal)));
+      const status = res.statusCode ?? 0;
+      if (status < 200 || status >= 300) {
+        abort(new MasterError('http', `${path}: status ${status}`, { status }));
+        return;
+      }
+      if (Number(res.headers['content-length']) > limit.maxBytes) {
+        abort(tooLarge(path));
+        return;
+      }
       const chunks: Buffer[] = [];
-      res.on('data', (c: Buffer) => chunks.push(c));
-      res.on('error', (e) => reject(new MasterError('network', e.message)));
-      res.on('end', () => {
-        const status = res.statusCode ?? 0;
-        if (status < 200 || status >= 300) {
-          reject(new MasterError('http', `${path}: status ${status}`, { status }));
+      let size = 0;
+      res.on('data', (c: Buffer) => {
+        size += c.length;
+        if (size > limit.maxBytes) {
+          chunks.length = 0;
+          abort(tooLarge(path));
           return;
         }
-        resolve({ status, body: new Uint8Array(Buffer.concat(chunks)) });
+        chunks.push(c);
       });
+      res.on('end', () => ok({ status, body: new Uint8Array(Buffer.concat(chunks)) }));
     });
-    req.setTimeout(opts.timeoutMs ?? 15_000, () => req.destroy(new Error('timeout')));
-    req.on('error', (e) => reject(e instanceof MasterError ? e : new MasterError('network', e.message)));
+    // Socket inactivity, plus a deadline for the whole exchange (a trickling body never idles).
+    req.setTimeout(timeoutMs, () => abort(timeoutError()));
+    if (timeoutMs > 0) total = setTimeout(() => abort(timeoutError()), timeoutMs * limit.deadlineFactor);
+    req.on('error', (e) => ko(netError(e, opts.signal)));
     if (body !== undefined) req.write(body);
     req.end();
   });
 }
 
 /** Bun: the same request through the built-in fetch (see the header comment). */
-async function requestFetch(method: string, path: string, url: URL, headers: Record<string, string>, timeoutMs: number, body?: string): Promise<RawResponse> {
+async function requestFetch(
+  method: string,
+  path: string,
+  url: URL,
+  headers: Record<string, string>,
+  timeoutMs: number,
+  limit: BodyLimit,
+  signal: AbortSignal | undefined,
+  body?: string,
+): Promise<RawResponse> {
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeoutMs);
-  const fail = (e: unknown): MasterError => new MasterError('network', ac.signal.aborted ? 'timeout' : String((e as Error)?.message ?? e));
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ac.abort();
+  }, timeoutMs * limit.deadlineFactor);
+  const onAbort = (): void => ac.abort();
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener('abort', onAbort, { once: true });
+  const fail = (e: unknown): MasterError =>
+    timedOut ? timeoutError() : netError(e instanceof Error ? e : new Error(String(e)), signal);
+  let done = false;
   try {
     let res: Response;
     try {
-      res = await fetch(url, { method, headers, body, redirect: 'manual', signal: ac.signal });
-    } catch (e) {
-      throw fail(e);
-    }
-    let data: ArrayBuffer;
-    try {
-      data = await res.arrayBuffer();
+      // Compressed replies are refused instead of inflated: the cap below counts what the
+      // application receives, and a tiny gzip body can inflate to gigabytes.
+      const init = { method, headers: { ...headers, 'Accept-Encoding': 'identity' }, body, redirect: 'manual', signal: ac.signal, decompress: false };
+      res = await fetch(url, init as RequestInit);
     } catch (e) {
       throw fail(e);
     }
     const status = res.status;
     if (status < 200 || status >= 300) throw new MasterError('http', `${path}: status ${status}`, { status });
-    return { status, body: new Uint8Array(data) };
+    const encoding = res.headers.get('content-encoding');
+    if (encoding !== null && encoding.trim().toLowerCase() !== 'identity') {
+      throw new MasterError('invalid-response', `${path}: unsupported content-encoding`);
+    }
+    if (Number(res.headers.get('content-length')) > limit.maxBytes) throw tooLarge(path);
+    const parts: Uint8Array[] = [];
+    let size = 0;
+    const reader = res.body?.getReader();
+    while (reader !== undefined) {
+      const chunk = await reader.read().catch((e: unknown) => {
+        throw fail(e);
+      });
+      if (chunk.done) break;
+      size += chunk.value.byteLength;
+      if (size > limit.maxBytes) throw tooLarge(path);
+      parts.push(chunk.value);
+    }
+    done = true;
+    return { status, body: parts.length === 1 ? parts[0]! : concatBytes(parts, size) };
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+    if (!done) ac.abort(); // release the connection (and any unread body) on every failure
   }
 }
+
+function concatBytes(parts: readonly Uint8Array[], size: number): Uint8Array {
+  const out = new Uint8Array(size);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.byteLength;
+  }
+  return out;
+}
+
+const tooLarge = (path: string): MasterError => new MasterError('invalid-response', `${path}: response too large`);
+const timeoutError = (): MasterError => new MasterError('network', 'timeout');
+const netError = (e: Error, signal: AbortSignal | undefined): MasterError =>
+  e instanceof MasterError ? e : new MasterError('network', signal?.aborted ? 'aborted' : e.message);

@@ -244,8 +244,12 @@ class GeometryCache {
   filters: MaskFilter[] = [];
 }
 
-/** Upper bound of distinct mask pairs kept per world (reset beyond it). */
-const MAX_FILTERS = 64;
+/**
+ * Upper bound of distinct mask pairs kept per world (reset beyond it). A
+ * world has at most 255 discs (u8 counts, MAX_WORLD_DISCS), so static masks
+ * never reach it; only masks mutated while a game runs can.
+ */
+const MAX_FILTERS = 256;
 const geometryCaches = new WeakMap<World, GeometryCache>();
 
 function geometryCache(world: World): GeometryCache {
@@ -300,7 +304,7 @@ export function invalidateGeometryCache(world: World): void {
  *     if invMass != 0) planes, segments, vertexes, all filtered by masks;
  *  3. joints, two passes.
  * No allocation per tick (the geometry filter cache only allocates when a
- * new (cMask, cGroup) pair or new geometry arrays show up).
+ * new (cMask, cGroup) pair or new geometry arrays show up; up to 256 pairs).
  */
 export function stepWorld(world: World, dt: number): void {
   const discs = world.discs;

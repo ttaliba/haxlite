@@ -30,7 +30,7 @@ import {
   type HostTransportOptions,
   type JoinRequest,
 } from '../net/index.js';
-import { HostRoom, createHostRoomState, defaultStadiumByName, type DiscPropsInput } from '../host/index.js';
+import { HostRoom, createHostRoomState, defaultStadiumByName, type BeforeOperationHook, type DiscPropsInput } from '../host/index.js';
 import type { Player } from '../room/index.js';
 import { parseHbs, type Stadium } from '../sim/index.js';
 import type {
@@ -153,6 +153,17 @@ function checkWakeFrames(v: number): number {
   return v === Infinity ? v : checkFrames('maxWakeFrames', v, 1, 600);
 }
 
+/** At least 1 ms (Infinity: no Ping events). */
+function checkPingInterval(v: number): number {
+  if (typeof v !== 'number' || !(v >= 1)) throw new RangeError('haxlite.pingIntervalMs must be a number >= 1');
+  return v;
+}
+
+/** What an `async` callback returns (its rejection is reported like an exception). */
+function isThenable(r: unknown): r is PromiseLike<unknown> {
+  return r !== null && typeof r === 'object' && typeof (r as PromiseLike<unknown>).then === 'function';
+}
+
 function copyDiscProps(props: DiscPropertiesUpdate | null | undefined): DiscPropsInput {
   const out: Record<string, number | null> = {};
   if (props == null) return out;
@@ -192,6 +203,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     heartbeatFrames: checkFrames('heartbeatFrames', hx.heartbeatFrames ?? 7, 1, 600),
     checksumIntervalFrames: checkFrames('checksumIntervalFrames', hx.checksumIntervalFrames ?? 600, 1, 1 << 20),
     maxWakeFrames: checkWakeFrames(hx.maxWakeFrames ?? 4),
+    pingIntervalMs: checkPingInterval(hx.pingIntervalMs ?? 3000),
   };
 
   const httpOpts = { masterUrl: hx.masterUrl, agent: hx.agent };
@@ -233,7 +245,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     heartbeatFrames: knobs.heartbeatFrames,
     checksumIntervalFrames: knobs.checksumIntervalFrames,
     maxWakeFrames: knobs.maxWakeFrames,
-    pingIntervalMs: hx.pingIntervalMs,
+    pingIntervalMs: knobs.pingIntervalMs,
   });
 
   // ---- lifecycle / init promise
@@ -246,17 +258,26 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
   let pendingLink: string | null = null;
   let roomLinkHandler: ((url: string) => void) | null | undefined = undefined;
 
+  const logError = (err: unknown): void => {
+    console.error('[haxlite]', err);
+  };
   const reportError = (err: unknown): void => {
     const h = ext.onError;
     if (h != null) {
       try {
-        h(err);
+        const r = h(err) as unknown;
+        // never back into onError: one that always rejects would loop
+        if (isThenable(r)) r.then(undefined, logError);
       } catch {
         /* ignore */
       }
     } else {
-      console.error('[haxlite]', err);
+      logError(err);
     }
+  };
+  /** After a user callback: a returned Promise that rejects goes to {@link reportError}. */
+  const settled = (r: unknown): void => {
+    if (isThenable(r)) r.then(undefined, reportError);
   };
 
   const finishInit = (err: unknown): void => {
@@ -294,7 +315,8 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
         return;
       }
       try {
-        h(sitekey, useRecaptchaToken);
+        const r = h(sitekey, useRecaptchaToken) as unknown;
+        if (isThenable(r)) r.then(undefined, finishInit);
       } catch (err) {
         finishInit(err);
       }
@@ -303,7 +325,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     const h = ext.onRecaptcha;
     if (h != null) {
       try {
-        h(sitekey);
+        settled(h(sitekey));
       } catch (err) {
         reportError(err);
       }
@@ -312,7 +334,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
   host.onRoomLink = (link) => {
     roomLink = link;
     const cb = roomLinkHandler;
-    if (cb != null) cb(link);
+    if (cb != null) settled(cb(link));
     else pendingLink = link;
     // peerBackend 'rtc' binds its UDP socket during signaling: resolve once it
     // listens (rtcPort set), or reject with the listen error
@@ -330,7 +352,12 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
   const defer = (fn: () => void): void => {
     deferSeq++;
     queueMicrotask(() => {
-      if (!stopped) fn();
+      if (stopped) return;
+      try {
+        fn();
+      } catch (err) {
+        reportError(err);
+      }
     });
   };
 
@@ -357,8 +384,13 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     privateList.push(u);
   };
 
-  async function stop(): Promise<void> {
-    if (stopped) return;
+  /** Every call returns the same Promise: it settles once the room is fully released. */
+  let stopping: Promise<void> | null = null;
+  function stop(): Promise<void> {
+    return (stopping ??= stopOnce());
+  }
+
+  async function stopOnce(): Promise<void> {
     stopped = true;
     if (initTimer !== null) clearTimeout(initTimer);
     initTimer = null;
@@ -378,6 +410,20 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
       if (liveRooms === 0) await shutdownWebRtc();
     }
   }
+
+  // haxlite callbacks the engine calls: set through `ext`, called through
+  // these guards (bound once) so that a rejected Promise is reported; the
+  // getters return the user's function
+  let beforeOp: BeforeOperationHook | null = null;
+  const beforeOpGuard: BeforeOperationHook = (ev, byId, frame) => {
+    const r = beforeOp!(ev, byId, frame) as unknown;
+    settled(r);
+    return r as boolean | void; // a Promise allows the event (`=== false` only)
+  };
+  let viewEnd: ((viewerId: number) => void) | null = null;
+  const viewEndGuard = (viewerId: number): void => settled(viewEnd!(viewerId));
+  let backendState: ((state: 'ready' | 'down', err: Error | null) => void) | null = null;
+  const backendStateGuard = (st: 'ready' | 'down', err: Error | null): void => settled(backendState!(st, err));
 
   const bans: BanList = transport.bans;
   const banOps: HaxliteBans = {
@@ -427,10 +473,12 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     },
     bans: banOps,
     get onBeforeOperation() {
-      return host.onBeforeOperation;
+      const h = host.onBeforeOperation;
+      return h === beforeOpGuard ? beforeOp : h;
     },
     set onBeforeOperation(h) {
-      host.onBeforeOperation = h;
+      beforeOp = h ?? null;
+      host.onBeforeOperation = beforeOp === null ? null : beforeOpGuard;
     },
     get onJoinRequest() {
       return joinHook;
@@ -469,10 +517,12 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
       return b instanceof RtcPeerBackend ? b.port : null;
     },
     get onBackendState() {
-      return transport.onBackendState;
+      const h = transport.onBackendState;
+      return h === backendStateGuard ? backendState : h;
     },
     set onBackendState(h) {
-      transport.onBackendState = h ?? null;
+      backendState = h ?? null;
+      transport.onBackendState = backendState === null ? null : backendStateGuard;
     },
     setMaxPlayers(n: number) {
       const v = castInt(n, 12);
@@ -510,10 +560,12 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
       return host.hasPrivateView(viewerId);
     },
     get onPrivateViewEnd() {
-      return host.onPrivateViewEnd;
+      const h = host.onPrivateViewEnd;
+      return h === viewEndGuard ? viewEnd : h;
     },
     set onPrivateViewEnd(h) {
-      host.onPrivateViewEnd = h ?? null;
+      viewEnd = h ?? null;
+      host.onPrivateViewEnd = viewEnd === null ? null : viewEndGuard;
     },
     stop,
     close: stop,
@@ -684,7 +736,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
             return;
           }
           try {
-            cb(link);
+            settled(cb(link));
           } catch (err) {
             reportError(err);
           }
@@ -695,82 +747,166 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
   };
 
   // ---- room hooks -> official callbacks (official `F.fi` wiring)
+  // HostRoom catches what its own callbacks throw; the room hooks below run
+  // inside apply/step, so a throwing callback is caught here and the frame
+  // completes as on the clients. A rejected Promise is reported too.
   host.onPlayerJoin = (p) => {
     const cb = room.onPlayerJoin;
-    if (cb != null) cb(playerJoinObject(p));
+    if (cb != null) settled(cb(playerJoinObject(p)));
   };
   host.onPlayerLeave = (p) => {
     const cb = room.onPlayerLeave;
-    if (cb != null) cb(playerObject(p)!);
+    if (cb != null) settled(cb(playerObject(p)!));
   };
   host.onPlayerKicked = (p, reason, ban, by) => {
     const cb = room.onPlayerKicked;
-    if (cb != null) cb(playerObject(p)!, reason, ban, playerObject(by));
+    if (cb != null) settled(cb(playerObject(p)!, reason, ban, playerObject(by)));
   };
   const hooks = host.state.hooks;
   const state = host.state;
   hooks.onTeamVictory = () => {
     const cb = room.onTeamVictory;
-    if (cb != null && state.gameState !== null) cb(host.getScores()!);
+    if (cb == null || state.gameState === null) return;
+    try {
+      settled(cb(host.getScores()!));
+    } catch (err) {
+      reportError(err);
+    }
   };
+  // not caught: official, a throwing onPlayerChat drops the sender ("Bad actor")
   hooks.onPlayerChatFilter = (p, msg) => {
     const cb = room.onPlayerChat;
+    if (cb == null) return true;
+    const r = cb(playerObject(p)!, msg) as unknown;
+    settled(r);
     // eslint-disable-next-line eqeqeq
-    return cb == null ? true : (cb(playerObject(p)!, msg) as unknown) != 0;
+    return r != 0;
   };
   hooks.onPlayerBallKick = (p) => {
     const cb = room.onPlayerBallKick;
-    if (cb != null) cb(playerObject(p)!);
+    if (cb == null) return;
+    try {
+      settled(cb(playerObject(p)!));
+    } catch (err) {
+      reportError(err);
+    }
   };
   hooks.onTeamGoal = (team) => {
     const cb = room.onTeamGoal;
-    if (cb != null && state.gameState !== null) cb(team as TeamID);
+    if (cb == null || state.gameState === null) return;
+    try {
+      settled(cb(team as TeamID));
+    } catch (err) {
+      reportError(err);
+    }
   };
   hooks.onGameStart = (by) => {
     const cb = room.onGameStart;
-    if (cb != null) cb(playerObject(by));
+    if (cb == null) return;
+    try {
+      settled(cb(playerObject(by)));
+    } catch (err) {
+      reportError(err);
+    }
   };
   hooks.onGameStop = (by) => {
     const cb = room.onGameStop;
-    if (cb != null) cb(playerObject(by));
+    if (cb == null) return;
+    try {
+      settled(cb(playerObject(by)));
+    } catch (err) {
+      reportError(err);
+    }
   };
   hooks.onPlayerTeamChange = (by, p) => {
     const cb = room.onPlayerTeamChange;
-    if (cb != null) cb(playerObject(p)!, playerObject(by));
+    if (cb == null) return;
+    try {
+      settled(cb(playerObject(p)!, playerObject(by)));
+    } catch (err) {
+      reportError(err);
+    }
   };
   hooks.onPlayerAdminChange = (by, p) => {
     const cb = room.onPlayerAdminChange;
-    if (cb != null) cb(playerObject(p)!, playerObject(by));
+    if (cb == null) return;
+    try {
+      settled(cb(playerObject(p)!, playerObject(by)));
+    } catch (err) {
+      reportError(err);
+    }
   };
   hooks.onGameTick = () => {
     const cb = room.onGameTick;
-    if (cb != null) cb();
+    if (cb == null) return;
+    try {
+      settled(cb());
+    } catch (err) {
+      reportError(err);
+    }
   };
   hooks.onGamePauseChange = (by, paused) => {
     const cb = paused ? room.onGamePause : room.onGameUnpause;
-    if (cb != null) cb(playerObject(by));
+    if (cb == null) return;
+    try {
+      settled(cb(playerObject(by)));
+    } catch (err) {
+      reportError(err);
+    }
   };
   hooks.onPositionsReset = () => {
     const cb = room.onPositionsReset;
-    if (cb != null) cb();
+    if (cb == null) return;
+    try {
+      settled(cb());
+    } catch (err) {
+      reportError(err);
+    }
   };
   hooks.onPlayerInput = (p, prev) => {
     const a = room.onPlayerActivity;
-    if (a != null) a(playerObject(p)!);
+    if (a != null) {
+      try {
+        settled(a(playerObject(p)!));
+      } catch (err) {
+        reportError(err);
+      }
+    }
     const i = room.onPlayerInput;
-    if (i != null) i(playerObject(p)!, prev);
+    if (i != null) {
+      try {
+        settled(i(playerObject(p)!, prev));
+      } catch (err) {
+        reportError(err);
+      }
+    }
   };
   hooks.onStadiumChange = (by, stadium) => {
     const cb = room.onStadiumChange;
-    if (cb != null) cb(stadium.name as string, playerObject(by));
+    if (cb == null) return;
+    try {
+      settled(cb(stadium.name as string, playerObject(by)));
+    } catch (err) {
+      reportError(err);
+    }
   };
   hooks.onKickRateLimitSet = (by, min, rate, burst) => {
     const cb = room.onKickRateLimitSet;
-    if (cb != null) cb(min, rate, burst, playerObject(by));
+    if (cb == null) return;
+    try {
+      settled(cb(min, rate, burst, playerObject(by)));
+    } catch (err) {
+      reportError(err);
+    }
   };
   hooks.onTeamsLockChange = (by, locked) => {
     const cb = room.onTeamsLockChange;
-    if (cb != null) cb(locked, playerObject(by));
+    if (cb == null) return;
+    try {
+      settled(cb(locked, playerObject(by)));
+    } catch (err) {
+      reportError(err);
+    }
   };
 
   // ---- start
@@ -779,7 +915,15 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     initResolve = resolve;
     initReject = reject;
   });
-  host.start();
+  try {
+    host.start();
+  } catch (err) {
+    // nothing awaits `ready`: leave it pending instead of rejecting it unhandled
+    initialized = true;
+    initResolve = initReject = null;
+    await stop().catch(reportError);
+    throw err;
+  }
   if (hx.waitForLink === false) finishInit(null);
   else if (!initialized) {
     const ms = hx.initTimeoutMs ?? 30_000;

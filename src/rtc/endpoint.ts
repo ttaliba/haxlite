@@ -189,6 +189,11 @@ export interface RtcEndpointStats {
   directDropped: number;
   /** The TURN allocation (null: no TURN server configured). */
   turn: TurnStats | null;
+  /**
+   * Received datagrams whose processing threw (a bug in a protocol layer or a data-layer callback):
+   * dropped, counted and logged (at most once every 10 s) instead of ending the process.
+   */
+  packetErrors: number;
 }
 
 const ICE_ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -199,6 +204,9 @@ function randomIceString(n: number): string {
   for (let i = 0; i < n; i++) s += ICE_ALNUM[b[i]! % 62]; // 256 % 62 bias is irrelevant here
   return s;
 }
+
+/** Internal errors (a datagram or a timer whose processing threw) are logged at most this often. */
+const ERROR_LOG_INTERVAL_MS = 10_000;
 
 /** Largest datagram whose exact-length scratch view is cached (≥ the 1200-byte SCTP MTU + DTLS overhead). */
 const VIEW_CACHE_MAX = 1536;
@@ -308,7 +316,10 @@ export class RtcEndpoint {
     stunResponses: 0,
     relayUnavailable: 0,
     directDropped: 0,
+    packetErrors: 0,
   };
+  /** When an internal error was last logged (see {@link internalError}). */
+  private errorLoggedAt = -ERROR_LOG_INTERVAL_MS;
 
   private constructor(opts: RtcEndpointOptions, raw: RawBound[], port: number, certificate: RtcCertificate, dataLayer: SctpFactory) {
     this.sockets = raw.map((b) => b.sock);
@@ -690,16 +701,22 @@ export class RtcEndpoint {
     c.packetsIn++;
     c.bytesIn += msg.length;
     if (msg.length === 0) return;
-    const r = this.relay;
-    if (r !== null && port === r.serverPort && sock === this.turnIo && r.serverAddress !== null) {
-      if ((address === r.serverAddress || sameIp(address, r.serverAddress)) && r.onServerPacket(msg)) return;
+    // straight from the socket's receive callback (relayed datagrams too, via onRelayPacket): a throw would be uncaught
+    try {
+      const r = this.relay;
+      if (r !== null && port === r.serverPort && sock === this.turnIo && r.serverAddress !== null) {
+        if ((address === r.serverAddress || sameIp(address, r.serverAddress)) && r.onServerPacket(msg)) return;
+      }
+      if (this.relayOnly) {
+        // nothing from a peer is answered unless it came through the relay
+        c.directDropped++;
+        return;
+      }
+      this.demux(sock, this.byAddress, msg, address, port);
+    } catch (err) {
+      c.packetErrors++;
+      this.internalError('datagram', err);
     }
-    if (this.relayOnly) {
-      // nothing from a peer is answered unless it came through the relay
-      c.directDropped++;
-      return;
-    }
-    this.demux(sock, this.byAddress, msg, address, port);
   }
 
   /** A peer's datagram unwrapped by the relay (packetsIn/bytesIn counted the outer datagram). */
@@ -714,9 +731,26 @@ export class RtcEndpoint {
     c.packetsIn++;
     c.bytesIn += msg.length;
     if (msg.length === 0 || this.closed) return;
-    const sa = relay.serverAddress;
-    if (port === relay.serverPort && sa !== null && (address === sa || sameIp(address, sa)) && relay.onServerPacket(msg)) return;
-    c.directDropped++;
+    try {
+      const sa = relay.serverAddress;
+      if (port === relay.serverPort && sa !== null && (address === sa || sameIp(address, sa)) && relay.onServerPacket(msg)) return;
+      c.directDropped++;
+    } catch (err) {
+      c.packetErrors++;
+      this.internalError('datagram', err);
+    }
+  }
+
+  /** A datagram or timer whose processing threw: logged (rate-limited), never propagated. */
+  private internalError(what: string, err: unknown): void {
+    const now = Date.now();
+    if (now - this.errorLoggedAt < ERROR_LOG_INTERVAL_MS) return;
+    this.errorLoggedAt = now;
+    try {
+      console.error(`[haxlite/rtc] error processing a ${what}:`, err);
+    } catch {
+      /* never propagate */
+    }
   }
 
   // ------------------------------------------------------------ TURN allocation pool
@@ -764,16 +798,26 @@ export class RtcEndpoint {
           return;
         }
         let relay: TurnRelay | null = null;
-        const io = new UdpIo(
-          sock,
-          (msg, address, port) => {
-            if (relay !== null) this.onRelaySocketPacket(relay, msg, address, port);
-          },
-          (err) => console.error('[haxlite/rtc] socket error:', err.message),
-        );
-        relay = this.makeRelay(io, false);
-        this.relaySockets.set(relay, sock);
-        relay.allocate();
+        // a throw here would reject this promise unhandled (fatal) and leak the socket
+        try {
+          const io = new UdpIo(
+            sock,
+            (msg, address, port) => {
+              if (relay !== null) this.onRelaySocketPacket(relay, msg, address, port);
+            },
+            (err) => console.error('[haxlite/rtc] socket error:', err.message),
+          );
+          relay = this.makeRelay(io, false);
+          this.relaySockets.set(relay, sock);
+          relay.allocate();
+        } catch (err) {
+          this.internalError('new TURN allocation', err);
+          const i = relay === null ? -1 : this.pool.indexOf(relay);
+          if (i >= 0) {
+            this.relaySockets.set(relay!, sock);
+            this.dropRelay(i); // closes the socket too
+          } else sock.close();
+        }
       },
       () => {
         this.spawning = false;
@@ -811,10 +855,19 @@ export class RtcEndpoint {
       if (r === this.relay || r === this.current[0] || r.state === 'allocating') continue;
       if ((this.relaySessions.get(r)?.size ?? 0) > 0) continue;
       if (r.ready && this.relayRoom(r) >= RtcEndpoint.RESERVE) continue; // a spare with room: kept
-      this.pool.splice(i, 1);
-      this.relayMaps.delete(r);
-      this.relaySessions.delete(r);
+      this.dropRelay(i);
+    }
+  }
+
+  /** Removes `pool[i]` from the pool, deletes its allocation and closes its own socket. */
+  private dropRelay(i: number): void {
+    const r = this.pool[i]!;
+    this.pool.splice(i, 1);
+    this.relayMaps.delete(r);
+    this.relaySessions.delete(r);
+    try {
       r.close();
+    } finally {
       const sock = this.relaySockets.get(r);
       this.relaySockets.delete(r);
       sock?.close();
@@ -937,7 +990,19 @@ export class RtcEndpoint {
     const t = setInterval(() => {
       const now = Date.now();
       // forEach: no iterator result objects
-      this.byUfrag.forEach((s) => s.checkTimers(now, this.handshakeTimeoutMs, this.idleTimeoutMs));
+      this.byUfrag.forEach((s) => {
+        try {
+          s.checkTimers(now, this.handshakeTimeoutMs, this.idleTimeoutMs);
+        } catch (err) {
+          // a session in a state its timers do not expect: closed rather than failing every second
+          this.internalError('session timer', err);
+          try {
+            s.terminate('error');
+          } catch {
+            /* torn down as far as it goes */
+          }
+        }
+      });
       if (this.byUfrag.size === 0 && this.sweepTimer !== null) {
         clearInterval(this.sweepTimer);
         this.sweepTimer = null;

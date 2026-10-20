@@ -249,8 +249,8 @@ stale-nonce=600
 haxlite ya permite `portRange`, y libjuice usa **un solo socket UDP por agente** para STUN, TURN y checks. Basta con dejar salir ese rango de puertos solo hacia los servidores TURN:
 ```nft
 table inet haxhost {
-  set turn4 { type ipv4_addr; elements = { 141.101.90.1, 162.159.207.0/24 } }   # o la IP de tu relay
-  set turn6 { type ipv6_addr; elements = { 2a06:98c1:3200::1, 2606:4700:48::1 } }
+  set turn4 { type ipv4_addr; flags interval; elements = { 141.101.90.1, 162.159.207.0/24 } }   # o la IP de tu relay
+  set turn6 { type ipv6_addr; flags interval; elements = { 2a06:98c1:3200::1, 2606:4700:48::1 } }
   chain out {
     type filter hook output priority 0; policy accept;
     udp sport 40000-40999 ip  daddr @turn4 accept
@@ -266,6 +266,7 @@ table inet haxhost {
 }
 ```
 - Configuración en haxlite: `portRange: [40000, 40999]` y `rtc: { iceTransportPolicy: 'relay' }`.
+- `flags interval` es obligatorio en cuanto un set lleve prefijos (`/24`): sin él `nft` rechaza el archivo entero y no se instala nada. Comprueba el código de salida de `nft -f` y el resultado de `nft list table inet haxhost`. La versión de `ops/haxguard/relay-only.nft` además se puede recargar sin duplicar reglas; úsala en vez de copiar este bloque.
 - Vigilar los A/AAAA de `turn.cloudflare.com` y actualizar los sets: Cloudflare exige hacerlo en menos de 14 días si cambian.
 - Esto hace que el único camino posible sea la relay, y que la IP real nunca llegue a un jugador.
 

@@ -36,11 +36,12 @@
 import { PROTOCOL_VERSION } from '../protocol.js';
 import { createChallenge, verifyAuthBlob } from './auth.js';
 import { BanList, type BanRecord } from './bans.js';
-import { DEFAULT_ICE_SERVERS, DEFAULT_ROOM_LINK_BASE, NetDefaults, RejectCode } from './constants.js';
+import { DEFAULT_ICE_SERVERS, DEFAULT_ROOM_LINK_BASE, MAX_REMOTE_CANDIDATES, NetDefaults, RejectCode } from './constants.js';
 import { EdgePeerBackend, type EdgeOptions } from './edge-client.js';
 import { encodeChallenge, encodeKick, parseHandshake, parseJoinInfo, type JoinPlayerInfo } from './handshake.js';
 import {
   candidateLine,
+  classifyAddress,
   filterCandidate,
   filterSdp,
   parseCandidate,
@@ -52,6 +53,7 @@ import {
   type IceServerConfig,
   type NativeIceServer,
 } from './ice.js';
+import { canonicalIp } from './ip.js';
 import { KeyedRateLimiter, TokenBucket } from './rate-limit.js';
 import { defaultRoomInfo, encodeRoomInfo, type RoomInfo } from './room-info.js';
 import { HostSignaling, type HostSignalingOptions, type SignalingOffer } from './signaling.js';
@@ -77,7 +79,11 @@ export type PeerState =
 export type PeerCloseReason =
   /** The remote side closed a channel or the connection failed/closed. */
   | 'closed'
-  /** No message for 10 s (`Ya.Qh`). */
+  /**
+   * No message for 10 s (`Ya.Qh`), or no handshake within
+   * {@link NetDefaults.staleChallengeMs} while the room is full and a new
+   * connection needs the seat.
+   */
   | 'timeout'
   /** Flood bucket exhausted (official `r.l(1)`; host should kick with "Bad actor"). */
   | 'flood'
@@ -154,6 +160,7 @@ export class Peer {
   /** @internal when a deferred close started (see CLOSE_LINGER_MS) */ closedAt = 0;
   /** @internal remote candidates accepted so far (capped by MAX_REMOTE_CANDIDATES) */ remoteCandidates = 0;
   /** @internal mids of the offer's m-sections (usually the shared {@link SINGLE_MID}) */ mids: readonly string[] = SINGLE_MID;
+  /** @internal canonical `ip` for the per-address limits; null when exempt (not a public address) */ limitKey: string | null = null;
 
   constructor(offer: SignalingOffer, srflxIps: string[], now: number) {
     this.id = offer.peerId;
@@ -242,14 +249,47 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   allowNullAuth?: boolean;
   /** Shared ban list (default: a new one). */
   bans?: BanList;
-  /** Async admission hook evaluated after the official checks, before WebRTC. */
-  onJoinRequest?: (req: JoinRequest) => JoinDecision | Promise<JoinDecision>;
+  /**
+   * Async admission hook evaluated after the official checks, before WebRTC.
+   * Any thenable is awaited (not only this realm's `Promise`); a value that is
+   * not a {@link JoinDecision} (e.g. `NaN`, `{reject: undefined}`, a string)
+   * is reported to onError and rejects with 4104, like a hook that throws.
+   */
+  onJoinRequest?: (req: JoinRequest) => JoinDecision | PromiseLike<JoinDecision>;
   /** Per-IP join attempt limit (not official; default off). `code` default 4104. */
   joinRateLimit?: { capacity: number; msPerToken: number; code?: number } | null;
   floodCapacity?: number;
   floodMsPerToken?: number;
+  /** Max simultaneous negotiations (4104). A positive integer; default 16 (official). */
   maxPendingNegotiations?: number;
+  /**
+   * haxlite: max connections from one address that have not joined yet
+   * (negotiating, awaiting the hook, challenged or verifying); more offers
+   * from it are refused with 4104. Default {@link NetDefaults.maxUnjoinedPerIp}
+   * (8); `Infinity` disables it. Only public addresses are counted: a
+   * loopback/private one (local tests, a proxied master) is exempt.
+   */
+  maxUnjoinedPerIp?: number;
+  /**
+   * haxlite: per-address penalty after abusive closes (`'flood'`,
+   * `'protocol'`, or `'timeout'` before the handshake): see
+   * {@link NetDefaults.abusePenalty} (default 3 tokens, one back every 20 s,
+   * then 30 s of 4104). `null` disables it. Public addresses only, like
+   * {@link maxUnjoinedPerIp}.
+   */
+  abusePenalty?: { capacity: number; msPerToken: number; blockMs: number } | null;
+  /**
+   * haxlite (default true): IP bans rely on addresses the host has verified.
+   * A kick-ban stores the conn IP and the public address of the selected ICE
+   * pair (where the player's packets come from), not the srflx IPs the
+   * client declares (which could be anyone's); at the handshake that address
+   * is checked against the bans, and so are public `host`/`prflx` candidates
+   * of the offer. `false`: official behaviour (conn + declared srflx only).
+   */
+  verifiedIpBans?: boolean;
+  /** Channel 0 must open within this time (ms, finite, > 0). Default 10000 (official). */
   channelOpenTimeoutMs?: number;
+  /** Connected peer idle timeout (ms, finite, > 0). Default 10000 (official). */
   peerIdleTimeoutMs?: number;
   /**
    * Max wait for local ICE gathering before sending the answer (default 500
@@ -326,10 +366,54 @@ export function isLibdatachannelOffer(sdp: string): boolean {
 }
 /** Minimum time between a deferred close (kick) and the native close, so the notice is delivered first. */
 const CLOSE_LINGER_MS = 500;
-/** Remote ICE candidates accepted per negotiation (the edge has the same cap, `EdgeLimits.maxRemoteCandidates`). */
-const MAX_REMOTE_CANDIDATES = 32;
 /** See {@link HostTransportOptions.answerIceWaitMs} (official {@link NetDefaults.answerIceWaitMs}). */
 const DEFAULT_ANSWER_ICE_WAIT_MS = NetDefaults.answerIceWaitMs;
+
+/**
+ * A count limit: a positive integer, or `Infinity` (no limit) where allowed.
+ * `NaN` (e.g. `Number(process.env.X)` unset) would silently disable a `>=` check.
+ */
+function checkLimit(name: string, v: number | null | undefined, def: number, unbounded: boolean): number {
+  if (v == null) return def;
+  if (typeof v !== 'number' || !(v >= 1) || (v === Infinity ? !unbounded : !Number.isInteger(v))) {
+    throw new RangeError(`${name} must be an integer >= 1${unbounded ? ' or Infinity' : ''} (got ${String(v)})`);
+  }
+  return v;
+}
+
+/** A duration in ms: finite and > 0 (`Infinity`/`NaN` would never expire, 0 would expire everything). */
+function checkMs(name: string, v: number | null | undefined, def: number): number {
+  if (v == null) return def;
+  if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) {
+    throw new RangeError(`${name} must be a finite number of ms > 0 (got ${String(v)})`);
+  }
+  return v;
+}
+
+/** Key for the per-address limits: the canonical IP when public, null (exempt) otherwise. */
+function limitKeyOf(ip: string): string | null {
+  return classifyAddress(ip) === 'public' ? canonicalIp(ip) : null;
+}
+
+const isCloseCode = (n: number): boolean => Number.isInteger(n) && n >= 0 && n <= 0xffff;
+
+/**
+ * `onJoinRequest` result as a close code (`-1` accepts), or null when it is
+ * not a {@link JoinDecision}. Codes are sent as u16.
+ */
+function decisionCode(d: unknown): number | null {
+  if (d === undefined || d === null || d === true) return -1;
+  if (d === false) return RejectCode.Banned;
+  if (typeof d === 'number') return isCloseCode(d) ? d : null;
+  if (typeof d === 'object') {
+    if ('reject' in d) {
+      const code = (d as { reject: unknown }).reject;
+      return typeof code === 'number' && isCloseCode(code) ? code : null;
+    }
+    if ((d as { accept?: unknown }).accept === true) return -1;
+  }
+  return null;
+}
 
 export class HostTransport {
   readonly bans: BanList;
@@ -381,6 +465,16 @@ export class HostTransport {
   private readonly joined: Peer[] = [];
   private readonly deferredDestroy: Peer[] = [];
   private readonly joinLimiter: KeyedRateLimiter | null;
+  private readonly maxPending: number;
+  private readonly maxUnjoinedPerIp: number;
+  private readonly channelOpenTimeoutMs: number;
+  private readonly peerIdleTimeoutMs: number;
+  private readonly verifiedIpBans: boolean;
+  /** Abusive closes per address ({@link HostTransportOptions.abusePenalty}). */
+  private readonly abuseStrikes: KeyedRateLimiter | null;
+  private readonly abuseBlockMs: number;
+  /** Address -> time until which its offers are refused. */
+  private readonly blockedUntil = new Map<string, number>();
   private sweepTimer: NodeJS.Timeout | null = null;
   private running = false;
 
@@ -403,6 +497,21 @@ export class HostTransport {
 
   constructor(opts: HostTransportOptions) {
     this.opts = opts;
+    this.maxPending = checkLimit('maxPendingNegotiations', opts.maxPendingNegotiations, NetDefaults.maxPendingNegotiations, false);
+    this.maxUnjoinedPerIp = checkLimit('maxUnjoinedPerIp', opts.maxUnjoinedPerIp, NetDefaults.maxUnjoinedPerIp, true);
+    this.channelOpenTimeoutMs = checkMs('channelOpenTimeoutMs', opts.channelOpenTimeoutMs, NetDefaults.channelOpenTimeoutMs);
+    this.peerIdleTimeoutMs = checkMs('peerIdleTimeoutMs', opts.peerIdleTimeoutMs, NetDefaults.peerIdleTimeoutMs);
+    this.verifiedIpBans = opts.verifiedIpBans ?? true;
+    const ap = opts.abusePenalty === undefined ? NetDefaults.abusePenalty : opts.abusePenalty;
+    const apd = NetDefaults.abusePenalty;
+    this.abuseStrikes =
+      ap === null
+        ? null
+        : new KeyedRateLimiter(
+            checkLimit('abusePenalty.capacity', ap.capacity, apd.capacity, false),
+            checkMs('abusePenalty.msPerToken', ap.msPerToken, apd.msPerToken),
+          );
+    this.abuseBlockMs = ap === null ? 0 : checkMs('abusePenalty.blockMs', ap.blockMs, apd.blockMs);
     if (opts.backend != null) this.backend = opts.backend;
     else if (opts.edge != null) this.backend = new EdgePeerBackend(opts.edge);
     else if (opts.peerBackend === 'rtc') {
@@ -441,6 +550,15 @@ export class HostTransport {
       { ...opts },
       {
         onRoomId: (id) => this.callUser(() => this.onRoomLink?.(this.roomLink ?? '', id)),
+        onOfferPreflight: (peerId, ip, conn) => {
+          try {
+            return this.preflight(peerId, ip, conn);
+          } catch (err) {
+            this.reportError(err);
+            this.signaling.sendReject(peerId, RejectCode.TooManyPending);
+            return false;
+          }
+        },
         onOffer: (offer) => this.safely(() => this.handleOffer(offer)),
         onCandidate: (peerId, c) => this.safely(() => this.handleRemoteCandidate(peerId, c)),
         onDisconnect: () => this.safely(() => this.dropPending('shutdown')),
@@ -494,7 +612,9 @@ export class HostTransport {
       this.pending.size === 0 &&
       this.connected.length === 0 &&
       this.deferredDestroy.length === 0 &&
-      (this.joinLimiter === null || this.joinLimiter.size === 0)
+      (this.joinLimiter === null || this.joinLimiter.size === 0) &&
+      (this.abuseStrikes === null || this.abuseStrikes.size === 0) &&
+      this.blockedUntil.size === 0
     ) {
       clearInterval(this.sweepTimer);
       this.sweepTimer = null;
@@ -674,7 +794,7 @@ export class HostTransport {
 
   /**
    * `Wa.Mg`: sends `[5][u8 ban][reason][byName]` on channel 0, optionally bans
-   * (conn + srflx IPs, plus `auth` with `banAuth`), then closes. Returns the
+   * (see {@link banPeer}; plus `auth` with `banAuth`), then closes. Returns the
    * ban record (keep its id for clearBan). The KickBanPlayer event broadcast
    * is the host's job.
    */
@@ -686,9 +806,29 @@ export class HostTransport {
     return rec;
   }
 
-  /** Official kick-ban storage (`Aa.vg`): conn IP + srflx IPs (+ auth if asked). */
+  /**
+   * Kick-ban storage (+ auth if asked): conn IP + the public address of the
+   * selected ICE pair with `verifiedIpBans` (default), or the official
+   * `Aa.vg` conn IP + declared srflx IPs ({@link Peer.ips}) without it.
+   */
   banPeer(peer: Peer, opts: { auth?: boolean; note?: string | null } = {}): BanRecord {
-    return this.bans.addPeer(peer.ips, opts.auth ? peer.auth : null, opts.note ?? peer.info?.name ?? null);
+    const ips = this.verifiedIpBans ? this.verifiedIps(peer) : peer.ips;
+    return this.bans.addPeer(ips, opts.auth ? peer.auth : null, opts.note ?? peer.info?.name ?? null);
+  }
+
+  /**
+   * Addresses the host has seen for itself: the conn IP (from the master) and
+   * the selected pair's remote address when public (a private/loopback one
+   * may be shared by every player, e.g. behind a proxy).
+   */
+  private verifiedIps(peer: Peer): string[] {
+    const out = [peer.ip];
+    const ra = peer.remoteAddress;
+    if (ra !== null && classifyAddress(ra) === 'public') {
+      const c = canonicalIp(ra);
+      if (c !== null && c !== canonicalIp(peer.ip)) out.push(c);
+    }
+    return out;
   }
 
   // ================================================================== admission
@@ -699,44 +839,113 @@ export class HostTransport {
     if (cb !== null) this.callUser(() => cb({ peerId: offer.peerId, ip: offer.ip, conn: offer.conn }, code, why));
   }
 
-  /** `Aa.$g` + `Wa.Xg` + hook. */
+  /**
+   * Checks that only need the conn address, run before the offer payload is
+   * inflated and parsed: `Aa.$g` (pending, conn ban), haxlite's per-address
+   * limits, `joinRateLimit` and `Wa.Xg` capacity. False: the offer is dropped.
+   */
+  private preflight(peerId: number, ip: string, conn: string): boolean {
+    if (!this.running) return false;
+    // ids are unique per signaling session: any answer to a repeat would reach the live negotiation
+    if (this.pending.has(peerId)) {
+      this.log(`peer ${peerId}: duplicate offer ignored`);
+      return false;
+    }
+    if (!this.backend.ready) return this.refuse(peerId, ip, conn, RejectCode.TooManyPending, `${this.backend.kind} backend not ready`);
+    if (this.pending.size >= this.maxPending) {
+      return this.refuse(peerId, ip, conn, RejectCode.TooManyPending, 'too many pending negotiations');
+    }
+    if (this.bans.isIpBanned(ip)) return this.refuse(peerId, ip, conn, RejectCode.Banned, 'banned conn');
+    const now = performance.now();
+    const key = limitKeyOf(ip);
+    if (key !== null) {
+      const until = this.blockedUntil.get(key);
+      if (until !== undefined && now < until) {
+        return this.refuse(peerId, ip, conn, RejectCode.TooManyPending, 'address blocked after abusive connections');
+      }
+      if (this.maxUnjoinedPerIp !== Infinity && this.unjoinedFrom(key) >= this.maxUnjoinedPerIp) {
+        return this.refuse(peerId, ip, conn, RejectCode.TooManyPending, 'too many unjoined connections from this address');
+      }
+    }
+    if (this.joinLimiter !== null) {
+      this.ensureSweep(); // prunes the limiter's buckets
+      if (!this.joinLimiter.take(ip, now)) {
+        return this.refuse(peerId, ip, conn, this.opts.joinRateLimit?.code ?? RejectCode.TooManyPending, 'join rate limit');
+      }
+    }
+    // Wa.Xg
+    if (this.connected.length >= this.maxPlayers && !this.evictStaleChallenged(now)) {
+      return this.refuse(peerId, ip, conn, RejectCode.Full, 'room full');
+    }
+    return true;
+  }
+
+  private refuse(peerId: number, ip: string, conn: string, code: number, why: string): false {
+    this.reject({ peerId, ip, conn }, code, why);
+    return false;
+  }
+
+  /** Connections from `key` that have not joined: pending ones and those still handshaking. */
+  private unjoinedFrom(key: string): number {
+    let n = 0;
+    for (const p of this.pending.values()) if (p.limitKey === key) n++;
+    const conns = this.connected;
+    for (let i = 0; i < conns.length; i++) {
+      const p = conns[i]!;
+      if (p.limitKey === key && p.state !== 'joined') n++;
+    }
+    return n;
+  }
+
+  /**
+   * Room full: closes the connection that has waited longest for its
+   * handshake, once past {@link NetDefaults.staleChallengeMs}. False if none.
+   */
+  private evictStaleChallenged(now: number): boolean {
+    let oldest: Peer | null = null;
+    const conns = this.connected;
+    for (let i = 0; i < conns.length; i++) {
+      const p = conns[i]!;
+      // a challenged peer has sent nothing yet: lastMessageAt is when channel 0 opened
+      if (p.state !== 'challenged' || now - p.lastMessageAt < NetDefaults.staleChallengeMs) continue;
+      if (oldest === null || p.lastMessageAt < oldest.lastMessageAt) oldest = p;
+    }
+    if (oldest === null) return false;
+    this.log(`peer ${oldest.id}: no handshake, seat given to a new connection`);
+    this.closePeer(oldest, 'timeout');
+    return true;
+  }
+
+  /** `Aa.$g` (srflx bans) + `Wa.Xg` (version, password) + hook; the rest ran in {@link preflight}. */
   private handleOffer(offer: SignalingOffer): void {
     if (!this.running) return;
-    if (!this.backend.ready) {
-      this.reject(offer, RejectCode.TooManyPending, `${this.backend.kind} backend not ready`);
-      return;
-    }
-    if (this.pending.size >= (this.opts.maxPendingNegotiations ?? NetDefaults.maxPendingNegotiations)) {
-      this.reject(offer, RejectCode.TooManyPending, 'too many pending negotiations');
-      return;
-    }
-    if (this.bans.isIpBanned(offer.ip)) {
-      this.reject(offer, RejectCode.Banned, 'banned conn');
-      return;
-    }
+    if (this.pending.has(offer.peerId)) return; // see preflight
     const srflx: string[] = [];
     const addresses: string[] = [];
-    for (const c of offer.candidates) {
-      const parsed = parseCandidate(c.candidate);
-      if (parsed !== null) addresses.push(parsed.address);
-      const ip = parsed !== null && parsed.type === 'srflx' ? parsed.address : null;
-      if (ip !== null) {
+    const cands = offer.candidates;
+    // only these are applied (signaling already drops the rest)
+    const n = Math.min(cands.length, MAX_REMOTE_CANDIDATES);
+    for (let i = 0; i < n; i++) {
+      const parsed = parseCandidate(cands[i]!.candidate);
+      if (parsed === null) continue;
+      const ip = parsed.address;
+      addresses.push(ip);
+      if (parsed.type === 'srflx') {
         if (this.bans.isIpBanned(ip)) {
           this.reject(offer, RejectCode.Banned, 'banned srflx');
           return;
         }
         if (srflx.length < MAX_REMOTE_CANDIDATES && srflx.indexOf(ip) < 0) srflx.push(ip);
+      } else if (
+        this.verifiedIpBans &&
+        (parsed.type === 'host' || parsed.type === 'prflx') &&
+        classifyAddress(ip) === 'public' &&
+        this.bans.isIpBanned(ip)
+      ) {
+        // a public address labelled host/prflx (LAN addresses are never checked)
+        this.reject(offer, RejectCode.Banned, 'banned candidate');
+        return;
       }
-    }
-    if (this.joinLimiter !== null) this.ensureSweep(); // prunes the limiter's buckets
-    if (this.joinLimiter !== null && !this.joinLimiter.take(offer.ip)) {
-      this.reject(offer, this.opts.joinRateLimit?.code ?? RejectCode.TooManyPending, 'join rate limit');
-      return;
-    }
-    // Wa.Xg
-    if (this.connected.length >= this.maxPlayers) {
-      this.reject(offer, RejectCode.Full, 'room full');
-      return;
     }
     let version: number;
     try {
@@ -756,6 +965,7 @@ export class HostTransport {
     }
 
     const peer = new Peer(offer, srflx, performance.now());
+    peer.limitKey = limitKeyOf(offer.ip);
     this.pending.set(peer.id, peer);
     this.ensureSweep();
     const hook = this.opts.onJoinRequest;
@@ -773,21 +983,22 @@ export class HostTransport {
       version,
       password,
     };
-    let result: JoinDecision | Promise<JoinDecision>;
+    let result: unknown;
     try {
       result = hook(req);
+      // any thenable (another realm's Promise, Bluebird…), not only `instanceof Promise`
+      if (result !== null && (typeof result === 'object' || typeof result === 'function') && typeof (result as PromiseLike<unknown>).then === 'function') {
+        Promise.resolve(result as PromiseLike<unknown>).then(
+          (d) => this.safely(() => this.applyDecision(peer, offer, d)),
+          (err) => this.safely(() => this.hookFailed(peer, offer, err)),
+        );
+        return;
+      }
     } catch (err) {
       this.hookFailed(peer, offer, err);
       return;
     }
-    if (result instanceof Promise) {
-      result.then(
-        (d) => this.safely(() => this.applyDecision(peer, offer, d)),
-        (err) => this.safely(() => this.hookFailed(peer, offer, err)),
-      );
-    } else {
-      this.applyDecision(peer, offer, result);
-    }
+    this.applyDecision(peer, offer, result);
   }
 
   private hookFailed(peer: Peer, offer: SignalingOffer, err: unknown): void {
@@ -795,12 +1006,14 @@ export class HostTransport {
     this.applyDecision(peer, offer, RejectCode.TooManyPending);
   }
 
-  private applyDecision(peer: Peer, offer: SignalingOffer, d: JoinDecision): void {
+  private applyDecision(peer: Peer, offer: SignalingOffer, d: unknown): void {
     if (peer.state !== 'validating' || this.pending.get(peer.id) !== peer) return; // dropped meanwhile
-    let code = -1;
-    if (d === false) code = RejectCode.Banned;
-    else if (typeof d === 'number') code = d;
-    else if (d !== null && typeof d === 'object' && 'reject' in d) code = d.reject;
+    let code = decisionCode(d);
+    if (code === null) {
+      // fail closed: an admission filter must not let in what it meant to refuse
+      this.reportError(new TypeError(`onJoinRequest returned an invalid decision (${typeof d === 'number' ? String(d) : typeof d})`));
+      code = RejectCode.TooManyPending;
+    }
     if (code >= 0) {
       this.pending.delete(peer.id);
       peer.state = 'closed';
@@ -1016,17 +1229,17 @@ export class HostTransport {
   /** `la.Qd` + `Wa.Ah`. */
   private onChannelZeroOpen(peer: Peer): void {
     this.log(`peer ${peer.id}: channel 0 open`);
-    this.pending.delete(peer.id);
+    if (this.pending.get(peer.id) === peer) this.pending.delete(peer.id);
     this.sendEnd(peer);
     if (peer.timer !== null) clearTimeout(peer.timer);
     peer.timer = null;
-    if (this.connected.length >= this.maxPlayers) {
+    const now = performance.now();
+    if (this.connected.length >= this.maxPlayers && !this.evictStaleChallenged(now)) {
       peer.state = 'closed';
       peer.closeReason = 'full';
       this.destroyNative(peer);
       return;
     }
-    const now = performance.now();
     peer.state = 'challenged';
     peer.lastMessageAt = now;
     peer.bucket = new TokenBucket(
@@ -1148,7 +1361,8 @@ export class HostTransport {
       this.closePeer(peer, 'auth', true);
       return;
     }
-    if (this.bans.isAuthBanned(auth)) {
+    const ra = peer.remoteAddress;
+    if (this.bans.isAuthBanned(auth) || (this.verifiedIpBans && ra !== null && this.bans.isIpBanned(ra))) {
       this.send(peer, 0, encodeKick('You are banned from this room.', true, null));
       this.closePeer(peer, 'banned', true);
       return;
@@ -1191,6 +1405,7 @@ export class HostTransport {
     }
     peer.state = 'closed';
     peer.closeReason = reason;
+    if (reason === 'flood' || reason === 'protocol' || (reason === 'timeout' && state === 'challenged')) this.strike(peer);
     const ci = this.connected.indexOf(peer);
     if (ci >= 0) this.connected.splice(ci, 1);
     if (state === 'joined') {
@@ -1205,6 +1420,19 @@ export class HostTransport {
     if (state === 'joined') {
       const cb = this.onPeerClose;
       if (cb !== null) this.callUser(() => cb(peer, reason));
+    }
+  }
+
+  /** An abusive close: once its address runs out of tokens, its offers are refused for a while. */
+  private strike(peer: Peer): void {
+    const key = peer.limitKey;
+    const strikes = this.abuseStrikes;
+    if (key === null || strikes === null || !this.running) return;
+    const now = performance.now();
+    this.ensureSweep(); // prunes the strikes and the blocks
+    if (!strikes.take(key, now)) {
+      this.blockedUntil.set(key, now + this.abuseBlockMs);
+      this.log(`address ${key} blocked for ${this.abuseBlockMs} ms after abusive connections`);
     }
   }
 
@@ -1236,19 +1464,21 @@ export class HostTransport {
       }
       dd.length = keep;
     }
-    const openTimeout = this.opts.channelOpenTimeoutMs ?? NetDefaults.channelOpenTimeoutMs;
+    const openTimeout = this.channelOpenTimeoutMs;
     for (const p of this.pending.values()) {
       if (now - p.createdAt < openTimeout) continue;
       if (p.state === 'negotiating') this.failNegotiation(p, 'channel open timeout');
       // an onJoinRequest hook that never settles must not hold a negotiation slot forever (late decisions are ignored)
       else if (p.state === 'validating') this.failNegotiation(p, 'join request timeout');
     }
-    const idle = this.opts.peerIdleTimeoutMs ?? NetDefaults.peerIdleTimeoutMs;
+    const idle = this.peerIdleTimeoutMs;
     const conns = this.connected;
     for (let i = conns.length - 1; i >= 0; i--) {
       const p = conns[i]!;
       if (now - p.lastMessageAt >= idle) this.closePeer(p, 'timeout');
     }
     this.joinLimiter?.prune(now);
+    this.abuseStrikes?.prune(now);
+    if (this.blockedUntil.size > 0) for (const [k, until] of this.blockedUntil) if (now >= until) this.blockedUntil.delete(k);
   }
 }

@@ -57,8 +57,12 @@ export const MAX_WORLD_DISCS = 255;
  *  - StartGame: a new world of the largest stadium (current or queued
  *    SetStadium) + every player in a team now + every player those events
  *    could put in a team.
+ * Every player has at most one disc, so the discs players can add are also
+ * bounded by `maxPlayers`, the most players the room can hold at once (host
+ * player included; the current count if higher): queued events that cannot
+ * apply (e.g. AutoTeams from a non-admin) never count past it.
  */
-export function discLimitViolation(rs: RoomState, ev: RoomEvent, queued: readonly RoomEvent[] = []): string | null {
+export function discLimitViolation(rs: RoomState, ev: RoomEvent, queued: readonly RoomEvent[] = [], maxPlayers = Infinity): string | null {
   const type = ev.type;
   if (type !== EventType.SetPlayerTeam && type !== EventType.AutoTeams && type !== EventType.StartGame) return null;
   let gainers: Set<number> | null = null; // players a queued SetPlayerTeam may give a disc
@@ -104,13 +108,16 @@ export function discLimitViolation(rs: RoomState, ev: RoomEvent, queued: readonl
     if (own === 0) return null;
     what = 'autoTeams';
   }
-  const gain = (gainers?.size ?? 0) + autoGain + own;
+  const players = rs.players;
+  const cap = players.length > maxPlayers ? players.length : maxPlayers;
+  let gain = (gainers?.size ?? 0) + autoGain + own;
+  if (gain > cap) gain = cap;
   const gs = rs.gameState;
   let max = gs !== null ? gs.world.discs.length + gain : 0;
   if (start) {
-    let n = stadiumDiscs + gain;
-    const players = rs.players;
-    for (let i = 0; i < players.length; i++) if (players[i]!.team !== 0) n++;
+    let inTeams = gain;
+    for (let i = 0; i < players.length; i++) if (players[i]!.team !== 0) inTeams++;
+    const n = stadiumDiscs + (inTeams > cap ? cap : inTeams);
     if (n > max) max = n;
   }
   if (max > MAX_WORLD_DISCS) return `${what}: the world could reach ${max} discs (max ${MAX_WORLD_DISCS})`;
@@ -290,6 +297,12 @@ export class Sequencer {
   onBeforeOperation: BeforeOperationHook | null = null;
   /** Exceptions thrown by room hooks while applying events or stepping (they never abort the loop). */
   onError: ((err: unknown) => void) | null = null;
+  /**
+   * The most players the room can hold at once, host player included
+   * (bounds the disc count of queued events, {@link discLimitViolation});
+   * null = unbounded.
+   */
+  playerLimit: (() => number) | null = null;
 
   /**
    * Private views (clients whose world differs from the room's), in creation
@@ -373,7 +386,13 @@ export class Sequencer {
         this.eventCounter += this.eventsInFrame;
         this.eventsInFrame = 0;
         this.frame++;
-        if (this.onFrameStepped !== null) this.onFrameStepped(this.frame);
+        if (this.onFrameStepped !== null) {
+          try {
+            this.onFrameStepped(this.frame);
+          } catch (err) {
+            this.reportError(err);
+          }
+        }
       }
       while (c < count) {
         const ev = list[c]!;
@@ -457,7 +476,14 @@ export class Sequencer {
       this.reportError(err);
     }
     if (this.views.length > 0) this.applyToViews(ev);
-    if (this.onEventApplied !== null) this.onEventApplied(ev);
+    // a throw here would leave the event queued (applied again) or unsent
+    if (this.onEventApplied !== null) {
+      try {
+        this.onEventApplied(ev);
+      } catch (err) {
+        this.reportError(err);
+      }
+    }
     this.eventsInFrame++;
   }
 
@@ -644,7 +670,13 @@ export class Sequencer {
             this.reportError(err);
           }
         }
-        if (this.onEventApplied !== null) this.onEventApplied(shared);
+        if (this.onEventApplied !== null) {
+          try {
+            this.onEventApplied(shared);
+          } catch (err) {
+            this.reportError(err);
+          }
+        }
       } finally {
         this.depth--;
       }
@@ -682,6 +714,11 @@ export class Sequencer {
     if (this.onError !== null) this.onError(err);
   }
 
+  private maxPlayers(): number {
+    const f = this.playerLimit;
+    return f === null ? Infinity : f();
+  }
+
   // ================================================================ host (`Wa`)
 
   /**
@@ -690,7 +727,7 @@ export class Sequencer {
    * then broadcast on `ru` when any connection exists.
    */
   hostEvent(ev: RoomEvent): void {
-    const tooMany = discLimitViolation(this.rs, ev, this.queue);
+    const tooMany = discLimitViolation(this.rs, ev, this.queue, this.maxPlayers());
     if (tooMany !== null) {
       this.reportError(new Error(tooMany));
       return;
@@ -766,7 +803,7 @@ export class Sequencer {
     ev.clientSeq = clientSeq;
     ev.byId = client.playerId;
     if (!ev.validate(this.rs)) return null;
-    if (discLimitViolation(this.rs, ev, this.queue) !== null) return null;
+    if (discLimitViolation(this.rs, ev, this.queue, this.maxPlayers()) !== null) return null;
     const hook = this.onBeforeOperation;
     if (hook !== null && hook(ev, client.playerId, requested) === false) return null;
     const variants = this.makeVariants(ev);

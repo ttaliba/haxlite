@@ -700,8 +700,11 @@ export class DtlsServer {
     this.helloReassembly = null;
     this.nextReceiveSeq = msgSeq + 1;
     this.nextSendSeq = msgSeq;
-    this.writeSeqHi[0] = recSeqHi;
-    this.writeSeqLo[0] = recSeqLo;
+    // Each direction numbers its records from 0, but our HelloVerifyRequest reused an earlier
+    // ClientHello's record sequence: continue from this (later) one, or the peer's epoch-0
+    // replay window drops flight 4 and the join waits for a retransmission. Low 32 bits only
+    // (a real peer is still near 0 here): a hostile value cannot approach the 48-bit limit.
+    if (this.opts.helloVerify === true && recSeqHi === 0) this.writeSeqLo[0] = recSeqLo;
     this.appendTranscript(HandshakeType.ClientHello, msgSeq, body);
     try {
       this.negotiate(ch);
@@ -985,7 +988,7 @@ export class DtlsServer {
     let lo = this.writeSeqLo[epoch]! + 1;
     if (lo > 0xffffffff) {
       lo = 0;
-      this.writeSeqHi[epoch] = this.writeSeqHi[epoch]! + 1;
+      this.writeSeqHi[epoch] = (this.writeSeqHi[epoch]! + 1) & 0xffff; // 48-bit sequence space
     }
     this.writeSeqLo[epoch] = lo;
   }
@@ -1056,7 +1059,8 @@ export class DtlsServer {
     const t = setTimeout(() => {
       this.retransmitTimer = null;
       if (this.state !== 'handshake' || this.lastFlight === null) return;
-      this.sendFlight(this.lastFlight);
+      this.resendFlight(this.lastFlight);
+      if (this.state !== 'handshake') return;
       this.retransmitMs = Math.min(this.retransmitMs * 2, 8000);
       this.armRetransmitTimer();
     }, this.retransmitMs);
@@ -1077,7 +1081,19 @@ export class DtlsServer {
     if (now - this.lastPeerTriggeredRetransmit < 250) return;
     this.lastPeerTriggeredRetransmit = now;
     // fresh record sequence numbers; CCS + Finished keep their epochs (0 / 1)
-    this.sendFlight(flight);
+    this.resendFlight(flight);
+  }
+
+  /**
+   * Retransmission outside the handshake's try/catch (timer callback, peer-triggered resend):
+   * an error fails this handshake instead of escaping to the event loop or the socket callback.
+   */
+  private resendFlight(flight: OutMessage[]): void {
+    try {
+      this.sendFlight(flight);
+    } catch (err) {
+      this.fail(AlertDescription.InternalError, `dtls-error:internal-${(err as Error).message}`);
+    }
   }
 
   // ------------------------------------------------------------ teardown

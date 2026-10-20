@@ -104,7 +104,7 @@ export interface HostRoomOptions {
   heartbeatFrames?: number;
   /** Frames between CheckConsistency events (default 600 = 10 s, official). */
   checksumIntervalFrames?: number;
-  /** Ping event period (default 3000 ms). Only runs while clients are connected. */
+  /** Ping event period (default 3000 ms, at least 1; Infinity: none). Only runs while clients are connected. */
   pingIntervalMs?: number;
   /**
    * While a game runs, the host simulates at least every this many frames
@@ -311,7 +311,7 @@ export class HostRoom {
   private readonly ready: HostConnection[] = [];
   /** Ban record id by kicked player id (official `Cc`), for clearBan(playerId). */
   private readonly bansByPlayer = new Map<number, number>();
-  /** off `wh`. */
+  /** off `wh` (next id to try; see {@link allocPlayerId}). */
   private nextPlayerId = 1;
   private running = false;
   private hbFrames: number;
@@ -350,7 +350,7 @@ export class HostRoom {
     this.hbFrames = HostRoom.checkFrames('heartbeatFrames', opts.heartbeatFrames ?? HostDefaults.heartbeatFrames, 600);
     this.csFrames = HostRoom.checkFrames('checksumIntervalFrames', opts.checksumIntervalFrames ?? HostDefaults.checksumIntervalFrames, 1 << 20);
     this.wakeFrames = HostRoom.checkWakeFrames(opts.maxWakeFrames ?? HostDefaults.maxWakeFrames);
-    this.pingIntervalMs = opts.pingIntervalMs ?? HostDefaults.pingIntervalMs;
+    this.pingIntervalMs = HostRoom.checkPingInterval(opts.pingIntervalMs ?? HostDefaults.pingIntervalMs);
     const sink: SequencerSink = {
       // one tunnel message for everyone when the players are behind a haxlite Edge
       broadcast: (data, channel, skip) => {
@@ -371,6 +371,11 @@ export class HostRoom {
       inputDelayFrames: opts.inputDelayFrames ?? HostDefaults.inputDelayFrames,
     });
     this.sequencer.onError = (err) => this.reportError(err);
+    // the transport refuses joins past maxPlayers: at most that many clients + the host player
+    this.sequencer.playerLimit = () => {
+      const n = this.transport.getRoomInfo().maxPlayers;
+      return typeof n === 'number' && n >= 0 ? n + 1 : Infinity;
+    };
     this.sequencer.onViewConverged = (id) => {
       this.discOverrides.delete(id);
       const cb = this.onPrivateViewEnd;
@@ -477,6 +482,12 @@ export class HostRoom {
     if (typeof v !== 'number' || !Number.isInteger(v) || v < 1 || v > max) {
       throw new RangeError(`${name} must be an integer in [1, ${max}] (got ${v})`);
     }
+    return v;
+  }
+
+  /** A period below 1 ms (or NaN) would leave the next Ping always due: a busy loop. */
+  private static checkPingInterval(v: number): number {
+    if (typeof v !== 'number' || !(v >= 1)) throw new RangeError(`pingIntervalMs must be >= 1 (got ${v})`);
     return v;
   }
 
@@ -970,18 +981,39 @@ export class HostRoom {
     // 2. reconcile: a disc that differs from the room's gets the room's values (f32) in every
     //    world that does not hide / override it; those get a no-op in the same slot
     let fix: number[] | null = null;
+    const views = seq.views;
+    const a = gs.world.discs;
+    const n = a.length;
+    // excluded discs of every view (excludedFor), built once per call
+    const excl = this.exclScratch;
+    for (let vi = 0; vi < views.length; vi++) {
+      if (vi === excl.length || excl[vi]!.length < n) excl[vi] = new Uint8Array(n > 256 ? n : 256);
+      this.fillExcluded(views[vi]!, excl[vi]!, n);
+    }
+    if (this.fixMark.length < n) this.fixMark = new Uint8Array(n);
+    const mark = this.fixMark;
+    mark.fill(0, 0, n);
     for (const viewerId of this.reconciling) {
-      const v = seq.getView(viewerId);
-      if (v === null) {
+      let vi = -1;
+      for (let k = 0; k < views.length; k++) {
+        if (views[k]!.playerId === viewerId) {
+          vi = k;
+          break;
+        }
+      }
+      if (vi < 0) {
         if (!this.hiddenFor.has(viewerId)) this.reconciling.delete(viewerId);
         continue;
       }
-      const a = gs.world.discs;
-      const b = v.rs.gameState?.world.discs;
-      if (b === undefined || b.length !== a.length) continue;
-      for (let i = 0; i < a.length; i++) {
-        if (fix?.includes(i) || this.excludedFor(viewerId, i)) continue;
-        if (discDiffMask(a[i]!, b[i]!) !== 0) (fix ??= []).push(i);
+      const ex = excl[vi]!;
+      const b = views[vi]!.rs.gameState?.world.discs;
+      if (b === undefined || b.length !== n) continue;
+      for (let i = 0; i < n; i++) {
+        if (mark[i] !== 0 || ex[i] !== 0) continue;
+        if (discDiffMask(a[i]!, b[i]!) !== 0) {
+          mark[i] = 1;
+          (fix ??= []).push(i);
+        }
       }
     }
     if (fix === null) return;
@@ -1000,6 +1032,27 @@ export class HostRoom {
       const props: DiscPropsInput = {};
       for (const name of DISC_FIELDS) if ((mask & (1 << DiscProp[name])) !== 0) props[name] = room[name];
       seq.privateSlot(keep, SetDiscPropertiesEvent.create(i, false, props));
+    }
+  }
+
+  /** Per view of {@link syncHidden}: 1 for the discs it excludes. */
+  private readonly exclScratch: Uint8Array[] = [];
+  /** Discs already in syncHidden's fix list. */
+  private fixMark = new Uint8Array(256);
+
+  /** `out[i] = 1` for every disc `i < n` that {@link excludedFor} excludes for view `v`, else 0. */
+  private fillExcluded(v: { readonly playerId: number; readonly rs: RoomState }, out: Uint8Array, n: number): void {
+    out.fill(0, 0, n);
+    const ov = this.discOverrides.get(v.playerId);
+    if (ov !== undefined) for (const k of ov.keys()) if (k >= 0 && k < n) out[k] = 1;
+    const set = this.hiddenFor.get(v.playerId);
+    const b = v.rs.gameState?.world.discs;
+    if (set === undefined || b === undefined) return;
+    for (const pid of set) {
+      const d = getPlayer(v.rs, pid)?.disc;
+      if (d == null) continue;
+      const k = b.indexOf(d);
+      if (k >= 0 && k < n) out[k] = 1;
     }
   }
 
@@ -1393,7 +1446,7 @@ export class HostRoom {
     this.run(() => {
       if (peer.state !== 'joined' || !this.running) return;
       this.catchUp();
-      const id = this.nextPlayerId++;
+      const id = this.allocPlayerId();
       const c = new HostConnection(id, peer, info.auth, info.conn);
       peer.playerId = id;
       peer.userData = c;
@@ -1406,6 +1459,25 @@ export class HostRoom {
       this.transport.send(peer, Channel.ReliableOrdered, this.sequencer.snapshot(id));
       this.updatePingTimer();
     });
+  }
+
+  /**
+   * Player id for a new connection: official `wh++`, but ids travel as u16
+   * (event header byId, snapshot), so after 0xFFFF the count restarts at 1
+   * and skips ids still in use: connected, in the room, holding a ban
+   * (clearBan(id)) or the author of a queued event. Id 0 is the host.
+   */
+  private allocPlayerId(): number {
+    for (let tries = 0; tries < 0xffff; tries++) {
+      const id = this.nextPlayerId;
+      this.nextPlayerId = id >= 0xffff ? 1 : id + 1;
+      if (this.connections.has(id) || getPlayer(this.state, id) !== null || this.bansByPlayer.has(id)) continue;
+      const queue = this.sequencer.queue;
+      let queued = false;
+      for (let i = 0; i < queue.length && !queued; i++) queued = queue[i]!.byId === id;
+      if (!queued) return id;
+    }
+    throw new Error('no free player id');
   }
 
   private connectionOf(peer: Peer): HostConnection | null {

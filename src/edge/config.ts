@@ -87,7 +87,7 @@ function portRange(v: string): [number, number] {
  * | `HAXLITE_EDGE_PUBLIC_ADDRESSES` | `'rtc'`: announced IPs, comma-separated |
  * | `HAXLITE_EDGE_TUNNEL_PORT` | tunnel v2 UDP port (`off` disables tunnel v2) |
  * | `HAXLITE_EDGE_STATS_TOKEN` | bearer token for `GET /stats` |
- * | `HAXLITE_EDGE_LOG_INTERVAL_MS` | stats log line period |
+ * | `HAXLITE_EDGE_LOG_INTERVAL_MS` | stats log line period (0 = off, at most 2147483647) |
  */
 export function loadEdgeConfig(argv: readonly string[] = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): EdgeServerOptions {
   let file = env.HAXLITE_EDGE_CONFIG;
@@ -131,6 +131,8 @@ export function loadEdgeConfig(argv: readonly string[] = process.argv.slice(2), 
   const port = env.HAXLITE_EDGE_PORT ? Number(env.HAXLITE_EDGE_PORT) : (cfg.listen?.port ?? 8443);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`bad port ${port}`);
   const logEvery = env.HAXLITE_EDGE_LOG_INTERVAL_MS ? Number(env.HAXLITE_EDGE_LOG_INTERVAL_MS) : (cfg.stats?.logIntervalMs ?? 60_000);
+  // setInterval treats anything above 2^31-1 ms as 1 ms
+  if (!(logEvery >= 0 && logEvery <= 0x7fffffff)) throw new Error(`bad log interval ${logEvery} (0-2147483647 ms)`);
 
   return {
     host: env.HAXLITE_EDGE_HOST ?? cfg.listen?.host ?? '0.0.0.0',

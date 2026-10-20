@@ -40,7 +40,6 @@
     "test:interop": "vitest run -c test/rtc-interop/vitest.config.ts"
   },
   "dependencies": {
-    "json5": "^2.2.3",
     "ws": "^8.22.0"
   },
   "optionalDependencies": {
@@ -50,6 +49,7 @@
     "@types/node": "^26.6.5",
     "@types/ws": "^8.18.2",
     "haxball.js": "5.1.0",
+    "json5": "^2.2.3",
     "node-haxball": "2.3.1",
     "pako": "^2.2.0",
     "playwright-core": "1.56.1",

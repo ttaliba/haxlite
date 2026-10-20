@@ -440,7 +440,8 @@ describe('limits and moderation', () => {
   });
 
   it('kick with ban: notice delivered, conn + srflx banned, rejoin -> 4102, clear -> ok', async () => {
-    const { roomId, t, rejects } = await startHost({ sweepIntervalMs: 50 });
+    // official storage of declared srflx IPs (the default stores verified addresses: admission-limits.test.ts)
+    const { roomId, t, rejects } = await startHost({ sweepIntervalMs: 50, verifiedIpBans: false });
     const j = nextJoin(t);
     const c = join(roomId, { extraCandidates: [srflx('192.0.2.99')] });
     const { peer } = await j;

@@ -38,7 +38,11 @@ export class HbsParseError extends Error {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Json = any;
 
-/** `json5` is loaded on the first text that is not plain JSON (most rooms never need it). */
+/**
+ * `json5` is loaded on the first text that is not plain JSON (most rooms never
+ * need it). Only its parser is used; scripts/build.mjs inlines this require
+ * into the bundle, so the published package does not depend on json5.
+ */
 let json5Parse: ((text: string) => Json) | null = null;
 /**
  * JSON5 is a superset of JSON and, for plain JSON text, yields the same value
@@ -51,7 +55,7 @@ function parseJson5(text: string): Json {
   try {
     return JSON.parse(text);
   } catch {
-    if (json5Parse === null) json5Parse = (createRequire(import.meta.url)('json5') as typeof import('json5')).parse;
+    if (json5Parse === null) json5Parse = createRequire(import.meta.url)('json5/lib/parse.js') as (text: string) => Json;
     return json5Parse(text);
   }
 }

@@ -8,6 +8,19 @@
  * for per-event limits (chat 10/900 ms, stadium 10/2000 ms, sync 2/10000 ms).
  */
 
+/**
+ * Throws a `RangeError` unless the bucket parameters are usable: `capacity` is
+ * at least 1 (`Infinity` allowed) and `msPerToken` a finite number above 0.
+ * A zero interval would make the bucket accept everything and NaN would make
+ * it reject everything, so a bad value must fail where the limiter is built.
+ */
+export function assertBucketParams(capacity: number, msPerToken: number): void {
+  if (!(capacity >= 1)) throw new RangeError(`token bucket capacity must be a number >= 1, got ${capacity}`);
+  if (!(msPerToken > 0 && msPerToken < Infinity)) {
+    throw new RangeError(`token bucket msPerToken must be a finite number > 0, got ${msPerToken}`);
+  }
+}
+
 export class TokenBucket {
   // Numeric initializers on purpose: a bare declaration defines the field as
   // `undefined` first, which makes V8 store `last` (a double, updated on every
@@ -19,7 +32,9 @@ export class TokenBucket {
   /** Reference time of the last refill (`Rc`). */
   private last = 0;
 
+  /** @throws RangeError when `capacity` or `msPerToken` is not usable (see {@link assertBucketParams}). */
   constructor(capacity: number, msPerToken: number, now: number = performance.now()) {
+    assertBucketParams(capacity, msPerToken);
     this.capacity = capacity;
     this.msPerToken = msPerToken;
     this.tokens = capacity;
@@ -64,7 +79,9 @@ export class KeyedRateLimiter {
   readonly capacity: number;
   readonly msPerToken: number;
 
+  /** @throws RangeError when `capacity` or `msPerToken` is not usable (see {@link assertBucketParams}). */
   constructor(capacity: number, msPerToken: number) {
+    assertBucketParams(capacity, msPerToken);
     this.capacity = capacity;
     this.msPerToken = msPerToken;
   }

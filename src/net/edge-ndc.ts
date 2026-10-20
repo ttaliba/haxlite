@@ -14,6 +14,9 @@ import { closeNative, createDataChannel, createPeerConnection, shutdownWebRtc, w
 
 export { LocalPeerLink, shutdownWebRtc, webRtcStats };
 
+/** Queued bytes on a tunnel channel above which {@link NdcTunnelPlane.send} refuses frames. */
+const TUNNEL_BUFFER_LIMIT = 8 << 20;
+
 export interface NdcTunnelEvents {
   /** Every tunnel channel is open. */
   onOpen(): void;
@@ -53,6 +56,15 @@ export class NdcTunnelPlane {
     const total = CHANNELS.length + lanes - 1;
     this.dcs = new Array<DataChannel | null>(total).fill(null);
     this.dcOpen = new Array<boolean>(total).fill(false);
+    try {
+      this.openChannels(pc, total, onError);
+    } catch (err) {
+      this.close(); // the caller never gets the instance: do not leave the native connection behind
+      throw err;
+    }
+  }
+
+  private openChannels(pc: PeerConnection, total: number, onError: (err: Error) => void): void {
     for (let i = 0; i < total; i++) {
       const cfg = CHANNELS[i] ?? { label: `ro${i - 2}`, ordered: true, reliable: true };
       const dc = createDataChannel(
@@ -121,6 +133,7 @@ export class NdcTunnelPlane {
     const dc = this.dcs[ch];
     if (dc == null || !this.dcOpen[ch]) return false;
     try {
+      if (dc.bufferedAmount() > TUNNEL_BUFFER_LIMIT) return false;
       return dc.sendMessageBinary(frame as Buffer);
     } catch {
       return false;
