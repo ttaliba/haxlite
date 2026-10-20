@@ -200,11 +200,11 @@ haxlite trata como entrada no fiable a los jugadores, al servidor maestro, al ed
 | Callbacks y errores | una excepción o una promesa rechazada en un callback va a `onError` y el frame se completa; las rachas de errores idénticos se coalescen (60, luego un resumen por segundo) | `onError`, `errorRepeatBurst`, `errorRepeatWindowMs` |
 | Opciones inválidas | `RangeError` al crear la sala en lugar de aceptar `NaN`, `0` o negativos en silencio | valores válidos en docs/11 |
 | Servidor maestro | cuerpos con tope (64 KiB; 8 MiB la lista), plazo total de la petición, URL de señalización `ws(s)` y mensajes de ≤ 256 KiB | `transport.timeoutMs` |
-| Edge | topes por IP y pool de sockets sin autenticar (HTTP 429/503 con `Retry-After`); `/stats` sin token solo con agregados (`redacted: true`); `ws://` hacia hosts públicos rechazado | `limits.*`, `stats.token`, `edge.allowInsecure` ([docs/09](docs/09-haxlite-edge.md), [docs/12](docs/12-referencia-operacion.md)) |
+| Edge | topes por IP y pool sin autenticar, repartido por fuente (429/503 con `Retry-After`); `/stats` sin token: solo agregados (`redacted: true`); `ws://` hacia hosts públicos rechazado | `limits.*`, `stats.token`, `edge.allowInsecure` ([docs/09](docs/09-haxlite-edge.md), [docs/12](docs/12-referencia-operacion.md)) |
 | WebRTC propio | límites por paquete en SCTP, cierre ante agotamiento de secuencia o error interno en DTLS, tope de pares TURN por sesión | sin opciones ([docs/10](docs/10-haxlite-rtc.md)) |
 | Replays y estadios | lectura con tope (32 MiB, 2^21 eventos), grabación que se congela a 16 MiB o 2^21 eventos, estadios que no caben en el cable rechazados | `readReplay(bytes, opts)`, `recorder.maxBytes` / `maxEvents`, `ReplayPlayer` |
 
-Detrás de un proxy inverso (nginx, caddy) el Edge ve todas las conexiones desde la IP del proxy: los topes por IP no se aplican a orígenes loopback o privados salvo `limits.perIpLimitsApplyToPrivate`, y `limits.trustForwardedFor` usa la última entrada de `X-Forwarded-For` ([docs/12 §3.6](docs/12-referencia-operacion.md)). Los jugadores tras una misma NAT o CGNAT comparten los límites por dirección: para grupos grandes sube `maxUnjoinedPerIp` o desactívalo con `Infinity`.
+Detrás de un proxy inverso (nginx, caddy) el Edge ve todas las conexiones desde la IP del proxy: los topes por IP no se aplican a orígenes loopback o privados salvo `limits.perIpLimitsApplyToPrivate`. `limits.trustForwardedFor` usa la última entrada de `X-Forwarded-For` (`true`: solo loopback; proxy no local: lista de IP/CIDR; [docs/12 §3.6](docs/12-referencia-operacion.md)). Tras una misma NAT o CGNAT se comparten los límites por dirección: sube `maxUnjoinedPerIp` (o `Infinity`).
 
 ## Benchmarks
 

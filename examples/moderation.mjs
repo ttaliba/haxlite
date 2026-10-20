@@ -3,7 +3,7 @@
 //    start-up before any WebRTC work (IP/CIDR) and, for a banned `auth` that
 //    comes back from a new IP, by re-applying the native kick-ban on join
 //    (which records the new IP too: the `conn` IP and the public address of
-//    the selected ICE pair, see `transport.verifiedIpBans`);
+//    the selected ICE pair if the client declared it, see `transport.verifiedIpBans`);
 //  - quarantine: players whose `auth` was never seen before cannot chat for a
 //    while (their messages are dropped with onPlayerChat → false);
 //  - mute/unmute, ban/unban/banrange commands for admins;
@@ -106,7 +106,7 @@ room.onPlayerJoin = (player) => {
   if (ban !== undefined) {
     // A banned auth coming from an IP we did not know: re-apply the native
     // kick-ban (bans this connection's `conn` IP and the public address of its
-    // ICE pair) and remember the new IPs. `srflxIps` are declared by the client
+    // ICE pair, if the client declared it) and remember the new IPs. `srflxIps` are declared by the client
     // and not verified (a hostile client can list somebody else's address
     // there): persist `conn.remoteAddress` instead if you ban shared addresses.
     const conn = room.haxlite.getPlayerConnection(player.id);

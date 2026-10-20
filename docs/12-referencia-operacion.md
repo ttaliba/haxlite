@@ -88,7 +88,7 @@ Todos salen de `package.json` → `scripts`. Los argumentos extra se pasan tras 
 
 | Script | Comando real | Qué hace | Notas |
 |---|---|---|---|
-| `build` | `node scripts/build.mjs` | `tsc -p tsconfig.build.json` a un directorio temporal, empaqueta con rolldown (entradas `index` y `edge/cli`, un *chunk* compartido, minificado, ASCII), copia los `.d.ts` y deja el resultado en `dist/` | Flags de `scripts/build.mjs`: `--out <dir>` (por defecto `dist`), `--no-minify`. Borra el destino antes de compilar. Lo necesita `bin/haxlite-edge.js` (`import '../dist/edge/cli.js'`) |
+| `build` | `node scripts/build.mjs` | `tsc -p tsconfig.build.json` a un directorio temporal, empaqueta con rolldown (entradas `index` y `edge/cli`, un *chunk* compartido, minificado, ASCII), copia los `.d.ts` y deja el resultado en `dist/` | Flags de `scripts/build.mjs`: `--out <dir>` (por defecto `dist`), `--no-minify`. Borra el destino antes de compilar. Lo necesita `bin/haxlite-edge.js` (`import '../dist/edge/cli.js'`). **`--out` debe caer dentro del árbol del repo** si el resultado se va a publicar: el parser de `json5` solo se empaqueta en ese caso; con `--out` fuera, el `dist` sale unos 25 KB más pequeño, deja `require('json5/lib/parse.js')` en tiempo de ejecución y falla al parsear un `.hbs` con comentarios si `json5` (devDependency) no está instalado ([docs/13](13-notas-de-version.md)) |
 | `typecheck` | `tsc -p tsconfig.json --noEmit && tsc -p tsconfig.build.json --noEmit` | Comprueba tipos de `src/`, `test/` y `vitest.config.ts`, y luego solo `src/` con `erasableSyntaxOnly` | `tsconfig.build.json` prohíbe `enum`, `namespace` y propiedades de parámetro en `src/`, para poder ejecutarlo sin compilar con `--experimental-strip-types` |
 | `test` | `vitest run` | Dos proyectos: `ndc` (todo `test/**/*.test.ts` y `src/**/*.test.ts`) y `rtc` (las suites host/API/transporte repetidas con `peerBackend: 'rtc'`) | Pool `forks`, tiempo límite de 60 s por prueba (`vitest.config.ts`). Las pruebas con Chromium se omiten solas si no hay navegador |
 | `test:watch` | `vitest` | Igual, en modo observación | - |
@@ -259,12 +259,12 @@ Los sockets UDP del túnel piden búferes de 4 MiB de recepción y de envío (`s
 | Clave | Tipo | Defecto | Qué limita |
 |---|---|---|---|
 | `maxSessions` | entero | `1000` | Túneles (salas) **autenticados** simultáneos en el Edge. Exceso → cierre 4429 «edge full» (también si se llena mientras el host autentica) y `terminate` forzado a los 2 s |
-| `maxPreAuthSessions` | entero | `1024` | Sockets de túnel en fase `Hello` → `Auth`, contados aparte de `maxSessions` (`0` = sin límite). Con el pool lleno el recién llegado recibe HTTP `503`, salvo que el socket anónimo más antiguo lleve ≥ 5 s sin autenticar: ese se cierra con 4408 «auth timeout» para hacerle sitio |
+| `maxPreAuthSessions` | entero | `1024` | Sockets de túnel en fase `Hello` → `Auth`, contados aparte de `maxSessions` (`0` = sin límite). Con el pool lleno el recién llegado **entra** cerrando con 4408 «auth timeout» el socket sin autenticar más antiguo de la fuente (IP, /64 o cliente reenviado) que más plazas ocupa, o el suyo propio si es esa fuente. Solo responde HTTP `503` cuando cada fuente tiene una plaza y el socket más antiguo lleva menos de `min(1 s, authTimeoutMs / 4)` sin autenticar (la gracia no es configurable). Las fuentes loopback/privadas exentas de los otros topes participan en el reparto, por IP (o /64) |
 | `maxPreAuthPerIp` | entero | `256` | Sockets sin autenticar por origen público (IPv6: por /64); más → HTTP `429` (`0` = sin límite) |
 | `ipConnectCapacity` | entero | `256` | Ráfaga del *token bucket* de *upgrades* nuevos por origen público (IPv6: por /64); agotado → HTTP `429`. `0` desactiva el límite |
 | `ipConnectMsPerToken` | ms | `20` | Un *upgrade* nuevo por origen cada este intervalo (50 por segundo sostenidos). Con `ipConnectCapacity > 0` debe ser finito y > 0, si no `RangeError` al arrancar |
-| `perIpLimitsApplyToPrivate` | bool | `false` | Aplica `maxPreAuthPerIp` e `ipConnect*` también a orígenes loopback, privados (RFC 1918, 100.64.0.0/10, `fc00::/7`) y *link-local*. Por defecto están exentos: detrás de un proxy inverso todos los hosts comparten esa dirección |
-| `trustForwardedFor` | bool | `false` | Si el socket viene de un origen no público, la clave de los topes por origen es la **última** entrada de `X-Forwarded-For`. Solo con un proxy que la añada (§3.6) |
+| `perIpLimitsApplyToPrivate` | bool | `false` | Aplica `maxPreAuthPerIp` e `ipConnect*` también a orígenes loopback, privados (RFC 1918, 100.64.0.0/10, `fc00::/7`) y *link-local*. Por defecto están exentos: detrás de un proxy inverso todos los hosts comparten esa dirección. El servidor registra la primera conexión de una fuente exenta (como mucho una vez por hora) |
+| `trustForwardedFor` | bool o lista | `false` | Proxies en los que se confía para usar la **última** entrada de `X-Forwarded-For` como clave de los topes por origen y del reparto del pool. `true`: solo loopback (127.0.0.0/8, `::1`; un proxy en la misma máquina). Lista de IP/CIDR (`["172.18.0.0/16"]`, la IP del pod del ingress): esos proxies, necesaria con docker-compose, Kubernetes o un balanceador; una entrada inválida lanza `RangeError` al arrancar. La cabecera de cualquier otra fuente se ignora. Se aceptan entradas con puerto (`ip:puerto`, `[v6]:puerto`). Con un proxy de confianza, una cabecera ausente o inutilizable deja la clave en el proxy (la segunda se registra, como mucho una vez por hora). Solo con un proxy que la añada (§3.6) |
 | `maxSessionsPerKey` | entero | `16` | Sesiones por clave (cuota por defecto; ver `keys[].maxSessions`) |
 | `maxPeersPerKey` | entero | `256` | Jugadores por clave en todas sus sesiones (ver `keys[].maxPeers`) |
 | `maxPeersPerSession` | entero | `40` | Jugadores por sala. Se comunica al host en `AuthOk` (tope `0xffff`) |
@@ -309,7 +309,7 @@ solo permita UDP hacia la IP del Edge garantiza que el host nunca le hable direc
   key (docs/09 §4), pero ofertas y slots solo van cifrados con TLS. **Usa `wss://` en producción.**
 * Alternativa: terminar TLS en nginx/caddy con `proxy_pass` WebSocket a `127.0.0.1:<listen.port>`.
   Solo pasa el control; el UDP del túnel hay que fijarlo (`tunnel.port`) y abrirlo aparte.
-* Con un proxy inverso todos los hosts llegan desde su IP (loopback o privada), así que los topes por origen (`maxPreAuthPerIp`, `ipConnect*`) no se aplican por defecto a esas conexiones (`perIpLimitsApplyToPrivate: false`); ponerlo a `true` limitaría al proxy entero. Con `trustForwardedFor: true` la clave pasa a ser la última entrada de `X-Forwarded-For` (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`), y solo debe activarse si nada salvo el proxy llega al Edge desde una dirección privada. Alternativa: `limit_conn` / `limit_req` en el proxy. El CLI avisa al arrancar si escucha en loopback sin ninguna de las dos opciones. Detalle en docs/09 §3.
+* Con un proxy inverso todos los hosts llegan desde su IP (loopback o privada), así que los topes por origen (`maxPreAuthPerIp`, `ipConnect*`) no se aplican por defecto a esas conexiones (`perIpLimitsApplyToPrivate: false`); ponerlo a `true` limitaría al proxy entero. Con `trustForwardedFor` la clave pasa a ser la última entrada de `X-Forwarded-For` (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`): `true` confía solo en loopback (nginx o caddy en la misma máquina) y, para un proxy en otro contenedor, pod o nodo, hay que dar la lista de IP/CIDR (`"trustForwardedFor": ["172.18.0.0/16"]`); la cabecera de cualquier otra fuente se ignora, y solo debe listarse un proxy que añada la entrada. Quien usaba `true` con un proxy no local debe pasar a la lista. Alternativa: `limit_conn` / `limit_req` en el proxy. Los orígenes exentos participan en el reparto del pool de sockets sin autenticar (`maxPreAuthSessions`), por IP. El CLI avisa al arrancar (§3.9). Detalle en docs/09 §3.
 
 ### 3.7 Claves de API
 
@@ -336,13 +336,13 @@ solo permita UDP hacia la IP del Edge garantiza que el host nunca le hable direc
 | 4400 | `Protocol` | Mensaje malformado o fuera de límites |
 | 4401 | `AuthFailed` | MAC o clave inválidos |
 | 4402 | `Version` | Versión de protocolo incompatible |
-| 4408 | `Timeout` | `authTimeoutMs` o `dataPlaneTimeoutMs` vencidos, o una sesión sin autenticar (≥ 5 s) desalojada para hacer sitio cuando se llena `maxPreAuthSessions` (motivo «auth timeout») |
+| 4408 | `Timeout` | `authTimeoutMs` o `dataPlaneTimeoutMs` vencidos, o una sesión sin autenticar cerrada para hacer sitio a un recién llegado cuando se llena `maxPreAuthSessions` (motivo «auth timeout»; la más antigua de la fuente que más plazas ocupa) |
 | 4429 | `Quota` | Cuota de sesiones (clave o Edge lleno: «edge full», en el *upgrade* y al autenticar) |
 | 4503 | `Shutdown` | El Edge se apaga (SIGINT/SIGTERM): los hosts reconectan |
 
 (`src/net/edge-protocol.ts`, `EdgeCloseCode`.)
 
-Antes de abrir el WebSocket, el *upgrade* puede responderse con HTTP `429 Too Many Requests` (se agotó `ipConnectCapacity` o `maxPreAuthPerIp`) o `503 Service Unavailable` (pool de `maxPreAuthSessions` lleno y ningún socket evictable). Ambas llevan `Connection: close`, `Retry-After: 1` y `Content-Length: 0`; un cliente WebSocket las ve como un fallo del *handshake*, no como un cierre 44xx.
+Antes de abrir el WebSocket, el *upgrade* puede responderse con HTTP `429 Too Many Requests` (se agotó `ipConnectCapacity` o `maxPreAuthPerIp`) o `503 Service Unavailable` (pool de `maxPreAuthSessions` lleno, cada fuente con una sola plaza y el socket más antiguo con menos de `min(1 s, authTimeoutMs / 4)`). Ambas llevan `Connection: close`, `Retry-After: 1` y `Content-Length: 0`; un cliente WebSocket las ve como un fallo del *handshake*, no como un cierre 44xx.
 
 ### 3.9 Endpoint `/stats`, log y señales
 
@@ -364,7 +364,7 @@ Antes de abrir el WebSocket, el *upgrade* puede responderse con HTTP `429 Too Ma
 * **Log** (a `stdout`, con marca ISO por línea): arranque, `players: haxlite-rtc on UDP <puerto>, announcing …`,
   `tunnel v2: UDP <dirección>:<puerto>`, y cada `stats.logIntervalMs` una línea
   `stats sessions=… peers=… rtc=abiertas/sesiones udp=túneles [pcs=…] rss=…MB | clave: Ns/Mp in X pps out Y pps`.
-* **Avisos de arranque** (`cli.ts`): `WARNING: no TLS configured; use wss:// in production…`; `listening on loopback (reverse proxy?): per-address tunnel limits do not apply to proxied connections (limits.trustForwardedFor)` si `listen.host` es loopback y no hay `trustForwardedFor` ni `perIpLimitsApplyToPrivate`; y `<ruta> has no token: it serves edge-wide aggregates only (stats.token for per-key stats)` si el endpoint de stats está activo sin token. El id de clave y los errores de oferta que llegan del host se escriben en el log con los caracteres de control y de separación de línea escapados (`\n`, `\r`, `\xNN`, `\uNNNN`).
+* **Avisos de arranque** (`cli.ts`): `WARNING: no TLS configured; use wss:// in production…`; salvo con `perIpLimitsApplyToPrivate: true`, `listening on loopback (reverse proxy?): per-address tunnel limits do not apply to proxied connections (limits.trustForwardedFor)` si `listen.host` es loopback y no hay `trustForwardedFor`, y en los demás casos (también al escuchar en `0.0.0.0`: SNAT de Docker/Kubernetes, un balanceador) `per-address tunnel limits do not apply to loopback/private sources …` (con `trustForwardedFor`, `… other than clients forwarded by a trusted proxy`); y `<ruta> has no token: it serves edge-wide aggregates only (stats.token for per-key stats)` si el endpoint de stats está activo sin token. El servidor escribe además, como mucho una vez por hora y tipo, `source X is exempt from the per-address limits (loopback/private address: …)` en la primera conexión de una fuente exenta y `X-Forwarded-For from proxy X has no usable last entry …` cuando un proxy de confianza manda una cabecera inutilizable. El id de clave y los errores de oferta que llegan del host se escriben en el log con los caracteres de control y de separación de línea escapados (`\n`, `\r`, `\xNN`, `\uNNNN`).
 * **Señales:** `SIGHUP` → recargar TLS; `SIGINT`/`SIGTERM` → cierra todos los túneles con 4503 y
   termina (código 0). Una segunda señal mientras se apaga se ignora.
 * Sin temporizadores en vacío: un Edge sin sesiones no despierta nunca (docs/09 §6).
@@ -424,6 +424,7 @@ El paquete no lee ninguna otra variable: ni `HAXLITE_*` genéricas, ni `NODE_ENV
 | `HAXLITE_CHROMIUM` | `/opt/pw-browsers/chromium-1194/chrome-linux/chrome` | Ejecutable de Chromium para `test/rtc-interop`, `test/rtc/chromium-dtls.test.ts`, `test/rtc/sctp/chromium.test.ts` y `bench/rtc`. Sin él las pruebas se omiten |
 | `HAXBALL_CLIENT_DIR` | vacío | Directorio con el cliente web oficial sin modificar (`game.html`, `game-min.js`, `res.dat`, `vendor/*.js`). Sin él `official-client*.interop.ts` se omiten (docs/10 §4.3) |
 | `HAXLITE_TURN_ICE` | vacío | Archivo JSON con la respuesta de `generate-ice-servers` de Cloudflare para `official-client-turn.interop.ts` (necesita red) |
+| `HAXLITE_REQUIRE_OPS` | sin definir | `1` convierte en fallos los casos de `test/ops` (nft, netns, XDP, clang) que se omitirían por falta de herramienta o de privilegio; sin él se omiten escribiendo `[ops] skipped: <motivo>` en stderr (§7, punto 7) |
 | `HAXBALL_CLIENT_JS` | `game-min.js` (relativa al directorio de trabajo) | `game-min.js` del cliente oficial para `test/replay`. Si el archivo no existe, esas pruebas se omiten |
 | `HAXLITE_REPLAY_FRAMES` | `12000` | Longitud del escenario de `test/replay/replay.test.ts` |
 | `HAXLITE_DIFF_TICKS` | `5000` | Ticks por corrida de `test/room/diff.test.ts` |
@@ -873,6 +874,7 @@ configuraciones para copiar y adaptar (verificado: ningún archivo de `src/` ni 
 * **Job `test`** («Node 22.x / 24.x / 26.x», `ubuntu-latest`, 30 min, `fail-fast: false`):
   `npm ci` → `npm run typecheck` → `npm run build` → `npx vitest run` (ambos proyectos, `ndc` y
   `rtc`). Las pruebas con Chromium se omiten (no hay navegador en el job).
+  El job no instala `clang`, `libbpf-dev`, `nftables` ni usa `sudo`: los casos de `test/ops` que necesitan esas herramientas o privilegios (el XDP siempre; netns e IPv6 según el runner) se omiten diciendo el motivo, y no hay un job con `HAXLITE_REQUIRE_OPS=1` (§7, punto 7).
 * **Job `interop`** («Interop (Chromium)», Node 24.x, 45 min, `continue-on-error: true`: **no hace
   fallar** el flujo): instala el Chromium que fija `playwright-core` con
   `npx playwright-core install --with-deps chromium`; fija `PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/pw-browsers`
@@ -1044,7 +1046,7 @@ lo que se deduce del código y de docs/10:
 
 ### 9.5 Publicación del paquete
 
-Flujo descrito por `publish.yml` y el encabezado del propio archivo:
+Flujo descrito por `publish.yml` y el encabezado del propio archivo (el `dist/` se construye con `npm run build`, dentro del repo: con `--out` fuera del árbol el parser de `json5` no se empaqueta, §2):
 
 ```sh
 # versión nueva en package.json, commit, y:

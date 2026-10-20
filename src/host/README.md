@@ -114,7 +114,7 @@ host.start();
 | `onPlayerLeave(player)` | `onPlayerLeave` | every removal (leave, kick, ban, "Bad actor") |
 | `onPlayerKicked(player, reason, ban, byPlayer)` | `onPlayerKicked` | after `onPlayerLeave` when there was a reason; `byPlayer` null = host id 0 without a host player |
 | `onRoomLink(link)` | `onRoomLink` | |
-| `onBeforeOperation(ev, byId, requestedFrame)` | — (node-haxball `onOperationReceived`) | client events only, after frame assignment and the chat filter; return `false` to drop; payload mutable; throw = "Bad actor" |
+| `onBeforeOperation(ev, byId, requestedFrame)` | — (node-haxball `onOperationReceived`) | client events only, after frame assignment and the chat filter; return `false` to drop; payload mutable; throw = "Bad actor"; a client SetStadium that does not fit the wire (`wireError()`) is dropped and reported to `onError` before the hook is called, and dropped after it if the hook edited the stadium past the limits |
 | `onEventApplied(ev)` | (`Ab`) | every applied event (recording/diagnostics) |
 | `onBadActor(playerId, err)` | — | diagnostics |
 | `onError(err)` | — | exceptions thrown by callbacks/hooks are reported here and never break the engine; runs of identical errors are coalesced (see below) |
@@ -214,7 +214,7 @@ multicast tunnel message (the local backend loops `send`).
   official loop would abort and re-apply events later).
 * Player ids are u16 on the wire: after 0xFFFF the counter restarts at 1 and skips ids in use (connected, in the room, holding a ban for `clearBan(id)`, or the author of a queued event). When bans hold every other id the oldest ban's id is reused (the ban stays in force; `clearBan(oldId)` no longer finds it); with none free the peer is closed and `Error('no free player id')` goes to `onError`. The official counter has no cap.
 * The disc count that queued events (AutoTeams, SetPlayerTeam) can still add is bounded by the most players the room can hold at once, host player included (`Sequencer.playerLimit`; `discLimitViolation(rs, ev, queued, maxPlayers)`), so queued events that could never apply do not make a valid host or admin action fail near 255 discs.
-* A SetStadium from a client that inflates to more than 262 144 bytes (`STADIUM_INFLATE_LIMIT`) is a codec error and kicks the sender ('Bad actor'); one that decodes but does not fit the wire when we re-encode it is dropped and reported to `onError` without kicking the admin.
+* A SetStadium from a client that inflates to more than 262 144 bytes (`STADIUM_INFLATE_LIMIT`) is a codec error and kicks the sender ('Bad actor'); one that decodes but does not fit the wire when we re-encode it is dropped and reported to `onError` without kicking the admin. The check runs before `onBeforeOperation` (the hook never sees an event that would be dropped) and again after it, in case the hook edited the stadium past the limits.
 * `setScoreLimit/TimeLimit` coerce to int (`| 0`): the official host applies a non-integer
   limit unconverted while clients read the i32, which can desync game-end logic.
 * node-haxball extensions (events 24–26) are neither sent nor accepted (a client sending one is
