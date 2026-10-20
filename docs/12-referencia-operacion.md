@@ -56,8 +56,8 @@
 |---|---|---|---|
 | Node.js | `>= 22` | `package.json` → `engines.node` | CI prueba 22.x, 24.x y 26.x (`.github/workflows/ci.yml`). La máquina de pruebas del proyecto usa Node 26.8 y 22.22 |
 | Bun | 1.x; el proyecto lo prueba con 1.4 | `README.md`, `docs/07` | Opcional. Es el runtime de producción de las salas (docs/07 §«Escenarios de producción y Bun»). Los benchmarks lo localizan con `$BUN_PATH` o `bun` del `PATH` |
-| `ws` | `^8.22.0` | `package.json` → `dependencies` | Obligatoria |
-| `json5` | `^2.2.3` | `package.json` → `dependencies` | Obligatoria (el archivo de configuración del Edge **no** la usa: es JSON estricto, ver §3.4) |
+| `ws` | `^8.22.0` | `package.json` → `dependencies` | Obligatoria. Es la única dependencia de ejecución obligatoria del paquete publicado |
+| `json5` | `^2.2.3` | `package.json` → `devDependencies` | Solo para compilar y probar. El parser (`json5/lib/parse.js`) va incluido en `dist` con su licencia MIT en un comentario (`scripts/build.mjs`) y se carga en la primera cadena que `JSON.parse` rechaza (`src/sim/hbs.ts`); el paquete publicado no depende de `json5`. El archivo de configuración del Edge tampoco la usa: es JSON estricto, ver §3.4 |
 | `node-datachannel` | `^0.33.4` | `package.json` → `optionalDependencies` | **Opcional.** Solo se carga con `peerBackend: 'ndc'` (el valor por defecto de la sala), `playerBackend: 'ndc'` del Edge o el túnel legado `dataPlane: 'webrtc'`. Con `npm install --omit=optional` haxlite se instala igual |
 | TypeScript | `^7.0.2` | `devDependencies` | Solo para compilar y comprobar tipos |
 | `rolldown` | `1.2.13` | `devDependencies` | Empaquetador de `npm run build` y de los benchmarks |
@@ -164,8 +164,8 @@ Solo algunas opciones tienen variable de entorno (§3.3). El resto (`listen.path
 `limits.*`, `tunnel.*` salvo el puerto, `webrtc.*` salvo `bindAddress`, el primer puerto de
 `portRange` y `publicAddresses`) solo se fijan en el archivo.
 
-El archivo se lee con `JSON.parse`: **JSON estricto, sin comentarios ni comas finales** (aunque
-`json5` es una dependencia del paquete, no se usa aquí).
+El archivo se lee con `JSON.parse`: **JSON estricto, sin comentarios ni comas finales** (`json5` no se
+usa aquí: ni siquiera es una dependencia de ejecución del paquete publicado, §1).
 
 ### 3.3 Variables de entorno del Edge
 
@@ -184,7 +184,7 @@ El archivo se lee con `JSON.parse`: **JSON estricto, sin comentarios ni comas fi
 | `HAXLITE_EDGE_PUBLIC_ADDRESSES` | IPs separadas por comas | ver §3.4 | `webrtc.publicAddresses` | Direcciones **anunciadas** a los jugadores (`rtc`: las únicas) |
 | `HAXLITE_EDGE_TUNNEL_PORT` | entero 0–65535 u `off` | = puerto TCP | `tunnel.port` / `tunnel.udp=false` | `off` desactiva el túnel v2 (los hosts caen al WebSocket). Cadena vacía = no fijada. Otro valor → error |
 | `HAXLITE_EDGE_STATS_TOKEN` | cadena | sin token | `stats.token` | Token *bearer* de `GET /stats` |
-| `HAXLITE_EDGE_LOG_INTERVAL_MS` | ms | `60000` | `stats.logIntervalMs` | Periodo de la línea de estadísticas. `0` la apaga. Un valor no numérico (NaN) la apaga sin error (no se valida) |
+| `HAXLITE_EDGE_LOG_INTERVAL_MS` | ms | `60000` | `stats.logIntervalMs` | Periodo de la línea de estadísticas. `0` la apaga. Debe ser un número entre 0 y 2147483647; fuera de rango o no numérico (p. ej. `off`) el arranque falla con `Error` «bad log interval N (0-2147483647 ms)» |
 
 ### 3.4 Archivo de configuración (JSON)
 
@@ -216,8 +216,8 @@ Esqueleto completo (`EdgeConfigFile` en `config.ts`):
 | `keysFile` | ruta | - | Más claves: array JSON o `id:secreto` por línea | Env: `HAXLITE_EDGE_KEYS_FILE` |
 | `playerBackend` | `"rtc"` / `"ndc"` | `"rtc"` | Cómo se atiende WebRTC de los jugadores | `rtc` = haxlite-rtc (TypeScript puro, 1 puerto UDP, ICE-lite). `ndc` = node-datachannel (addon nativo, carga perezosa) |
 | `stats.path` | cadena o `null` | `/stats` | Ruta HTTP(S) de las estadísticas; `null` desactiva el endpoint | Solo archivo |
-| `stats.token` | cadena o `null` | `null` | Token *bearer*; sin él, `/stats` es público en ese puerto | Env: `HAXLITE_EDGE_STATS_TOKEN` |
-| `stats.logIntervalMs` | ms | `60000` | Periodo del resumen en el log; `0` = apagado | Env: `HAXLITE_EDGE_LOG_INTERVAL_MS` |
+| `stats.token` | cadena o `null` | `null` | Token *bearer* de `GET /stats`. Sin él, `/stats` responde `200` con solo agregados de todo el Edge (`keys` vacío; `webrtc`, `rtc` y `tunnel` a `null`; `redacted: true`); con él, la respuesta completa | Env: `HAXLITE_EDGE_STATS_TOKEN` |
+| `stats.logIntervalMs` | ms | `60000` | Periodo del resumen en el log; `0` = apagado. De 0 a 2147483647, si no el arranque falla | Env: `HAXLITE_EDGE_LOG_INTERVAL_MS` |
 
 #### `webrtc` (jugadores) - `EdgeWebRtcOptions`
 
@@ -258,7 +258,13 @@ Los sockets UDP del túnel piden búferes de 4 MiB de recepción y de envío (`s
 
 | Clave | Tipo | Defecto | Qué limita |
 |---|---|---|---|
-| `maxSessions` | entero | `1000` | Túneles (salas) simultáneos en el Edge. Exceso → cierre 4429 «edge full» |
+| `maxSessions` | entero | `1000` | Túneles (salas) **autenticados** simultáneos en el Edge. Exceso → cierre 4429 «edge full» (también si se llena mientras el host autentica) y `terminate` forzado a los 2 s |
+| `maxPreAuthSessions` | entero | `1024` | Sockets de túnel en fase `Hello` → `Auth`, contados aparte de `maxSessions` (`0` = sin límite). Con el pool lleno el recién llegado recibe HTTP `503`, salvo que el socket anónimo más antiguo lleve ≥ 5 s sin autenticar: ese se cierra con 4408 «auth timeout» para hacerle sitio |
+| `maxPreAuthPerIp` | entero | `256` | Sockets sin autenticar por origen público (IPv6: por /64); más → HTTP `429` (`0` = sin límite) |
+| `ipConnectCapacity` | entero | `256` | Ráfaga del *token bucket* de *upgrades* nuevos por origen público (IPv6: por /64); agotado → HTTP `429`. `0` desactiva el límite |
+| `ipConnectMsPerToken` | ms | `20` | Un *upgrade* nuevo por origen cada este intervalo (50 por segundo sostenidos). Con `ipConnectCapacity > 0` debe ser finito y > 0, si no `RangeError` al arrancar |
+| `perIpLimitsApplyToPrivate` | bool | `false` | Aplica `maxPreAuthPerIp` e `ipConnect*` también a orígenes loopback, privados (RFC 1918, 100.64.0.0/10, `fc00::/7`) y *link-local*. Por defecto están exentos: detrás de un proxy inverso todos los hosts comparten esa dirección |
+| `trustForwardedFor` | bool | `false` | Si el socket viene de un origen no público, la clave de los topes por origen es la **última** entrada de `X-Forwarded-For`. Solo con un proxy que la añada (§3.6) |
 | `maxSessionsPerKey` | entero | `16` | Sesiones por clave (cuota por defecto; ver `keys[].maxSessions`) |
 | `maxPeersPerKey` | entero | `256` | Jugadores por clave en todas sus sesiones (ver `keys[].maxPeers`) |
 | `maxPeersPerSession` | entero | `40` | Jugadores por sala. Se comunica al host en `AuthOk` (tope `0xffff`) |
@@ -274,8 +280,10 @@ Los sockets UDP del túnel piden búferes de 4 MiB de recepción y de envío (`s
 | `allowWsDataPlane` | bool | `true` | Aceptar sesiones con los datos por WebSocket. Con `false` y sin plano UDP/WebRTC disponible el host recibe un error |
 
 Constantes no configurables (`EdgeLimits`, `src/net/edge-protocol.ts`): SDP ≤ 16 384 B, candidato ≤ 1024 B,
-`mid` ≤ 64, id de clave ≤ 128, ≤ 32 candidatos remotos por jugador, payload de jugador ≤ 262 144 B,
+`mid` ≤ 64, id de clave ≤ 128, ≤ 32 candidatos remotos y ≤ 32 locales retransmitidos por jugador (`maxLocalCandidates`), payload de jugador ≤ 262 144 B,
 mensaje WebSocket ≤ 262 144 + 64 B, 16 carriles `ro`.
+
+Validación al construir `EdgeServer`: cada valor de `limits` de la lista de contadores (`maxSessions`, `maxPreAuthSessions`, `maxPreAuthPerIp`, `ipConnectCapacity`, `maxSessionsPerKey`, `maxPeersPerKey`, `maxPeersPerSession`, `maxPendingPerSession`) debe ser un número ≥ 0, si no `RangeError` («limits.<nombre> must be a number >= 0, got X»); los *buckets* (`peerOpen*`, `flood*`, `ipConnect*`) exigen capacidad ≥ 1 y `MsPerToken` finito > 0. Los plazos `channelOpenTimeoutMs`, `authTimeoutMs`, `dataPlaneTimeoutMs`, `keepAliveMs`, `statsLogIntervalMs` (programático) y `webrtc.consentTimeoutMs` se acotan a 2147483647 ms (un valor mayor se dispararía en ~1 ms) y `NaN` lanza `RangeError` («<nombre> must be a number of milliseconds»).
 
 ### 3.5 Puertos y firewall
 
@@ -301,6 +309,7 @@ solo permita UDP hacia la IP del Edge garantiza que el host nunca le hable direc
   key (docs/09 §4), pero ofertas y slots solo van cifrados con TLS. **Usa `wss://` en producción.**
 * Alternativa: terminar TLS en nginx/caddy con `proxy_pass` WebSocket a `127.0.0.1:<listen.port>`.
   Solo pasa el control; el UDP del túnel hay que fijarlo (`tunnel.port`) y abrirlo aparte.
+* Con un proxy inverso todos los hosts llegan desde su IP (loopback o privada), así que los topes por origen (`maxPreAuthPerIp`, `ipConnect*`) no se aplican por defecto a esas conexiones (`perIpLimitsApplyToPrivate: false`); ponerlo a `true` limitaría al proxy entero. Con `trustForwardedFor: true` la clave pasa a ser la última entrada de `X-Forwarded-For` (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`), y solo debe activarse si nada salvo el proxy llega al Edge desde una dirección privada. Alternativa: `limit_conn` / `limit_req` en el proxy. El CLI avisa al arrancar si escucha en loopback sin ninguna de las dos opciones. Detalle en docs/09 §3.
 
 ### 3.7 Claves de API
 
@@ -327,17 +336,19 @@ solo permita UDP hacia la IP del Edge garantiza que el host nunca le hable direc
 | 4400 | `Protocol` | Mensaje malformado o fuera de límites |
 | 4401 | `AuthFailed` | MAC o clave inválidos |
 | 4402 | `Version` | Versión de protocolo incompatible |
-| 4408 | `Timeout` | `authTimeoutMs` o `dataPlaneTimeoutMs` vencidos |
-| 4429 | `Quota` | Cuota de sesiones (clave o Edge lleno) |
+| 4408 | `Timeout` | `authTimeoutMs` o `dataPlaneTimeoutMs` vencidos, o una sesión sin autenticar (≥ 5 s) desalojada para hacer sitio cuando se llena `maxPreAuthSessions` (motivo «auth timeout») |
+| 4429 | `Quota` | Cuota de sesiones (clave o Edge lleno: «edge full», en el *upgrade* y al autenticar) |
 | 4503 | `Shutdown` | El Edge se apaga (SIGINT/SIGTERM): los hosts reconectan |
 
 (`src/net/edge-protocol.ts`, `EdgeCloseCode`.)
+
+Antes de abrir el WebSocket, el *upgrade* puede responderse con HTTP `429 Too Many Requests` (se agotó `ipConnectCapacity` o `maxPreAuthPerIp`) o `503 Service Unavailable` (pool de `maxPreAuthSessions` lleno y ningún socket evictable). Ambas llevan `Connection: close`, `Retry-After: 1` y `Content-Length: 0`; un cliente WebSocket las ve como un fallo del *handshake*, no como un cierre 44xx.
 
 ### 3.9 Endpoint `/stats`, log y señales
 
 * **`GET <stats.path>`** (por defecto `/stats`), mismo puerto TCP que el control, con TLS si lo hay.
   Con `stats.token`, exige `Authorization: Bearer <token>` (comparación en tiempo constante); sin
-  él o con uno erróneo → `401`. Cualquier otra ruta o método → `404`. Respuesta `application/json`,
+  la cabecera o con una errónea → `401`. **Sin `stats.token`** responde `200` con solo agregados de todo el Edge (`uptimeSec`, `playerBackend`, `sessions`, `peers`, `authFailures`, `dataPlanes`, `memoryRssMb`; `keys: []`; `webrtc`, `rtc` y `tunnel` a `null`; `redacted: true`, campo que no aparece con token ni en `EdgeServer.stats()`) y no reinicia la ventana de pps. Cualquier otra ruta o método → `404`. Respuesta `application/json`,
   `Cache-Control: no-store`.
 
   ```sh
@@ -353,6 +364,7 @@ solo permita UDP hacia la IP del Edge garantiza que el host nunca le hable direc
 * **Log** (a `stdout`, con marca ISO por línea): arranque, `players: haxlite-rtc on UDP <puerto>, announcing …`,
   `tunnel v2: UDP <dirección>:<puerto>`, y cada `stats.logIntervalMs` una línea
   `stats sessions=… peers=… rtc=abiertas/sesiones udp=túneles [pcs=…] rss=…MB | clave: Ns/Mp in X pps out Y pps`.
+* **Avisos de arranque** (`cli.ts`): `WARNING: no TLS configured; use wss:// in production…`; `listening on loopback (reverse proxy?): per-address tunnel limits do not apply to proxied connections (limits.trustForwardedFor)` si `listen.host` es loopback y no hay `trustForwardedFor` ni `perIpLimitsApplyToPrivate`; y `<ruta> has no token: it serves edge-wide aggregates only (stats.token for per-key stats)` si el endpoint de stats está activo sin token. El id de clave y los errores de oferta que llegan del host se escriben en el log con los caracteres de control y de separación de línea escapados (`\n`, `\r`, `\xNN`, `\uNNNN`).
 * **Señales:** `SIGHUP` → recargar TLS; `SIGINT`/`SIGTERM` → cierra todos los túneles con 4503 y
   termina (código 0). Una segunda señal mientras se apaga se ignora.
 * Sin temporizadores en vacío: un Edge sin sesiones no despierta nunca (docs/09 §6).
@@ -365,6 +377,7 @@ solo permita UDP hacia la IP del Edge garantiza que el host nunca le hable direc
 existente; entonces `host`/`port`/`tls` se ignoran) y `log`. Métodos: `stats()`, `url(host?)`,
 `reloadTls()`, `close({ shutdownWebRtc })`; propiedades `tunnelPort`, `playerPort`, `address`.
 La API completa está en [11 - Referencia de la API](11-referencia-api.md).
+`EdgeServer.start()` cierra el listener y las conexiones que abrió si `listen()` falla. Los límites inválidos de `limits` y los plazos `NaN` lanzan `RangeError` al construir (ver §3.4).
 
 ---
 

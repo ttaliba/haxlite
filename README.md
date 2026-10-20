@@ -27,6 +27,7 @@ haxlite habla el protocolo 9 bit a bit con los clientes oficiales del navegador 
 - [Extensiones propias](#extensiones-propias)
 - [Cómo se conectan los jugadores](#cómo-se-conectan-los-jugadores)
 - [Ajustes de netcode](#ajustes-de-netcode)
+- [Seguridad y robustez](#seguridad-y-robustez)
 - [Benchmarks](#benchmarks)
 - [Arquitectura](#arquitectura)
 - [Documentación](#documentación)
@@ -47,7 +48,7 @@ haxlite habla el protocolo 9 bit a bit con los clientes oficiales del navegador 
 | **Ocultar la IP del host** | Relay TURN integrado y *gateway* [haxlite Edge](docs/09-haxlite-edge.md) para que la IP del host no llegue nunca a un jugador. |
 | **Extras que el oficial no tiene** | Varias salas por proceso, visuales privados por jugador, jugadores ocultos, bans por IP / rango CIDR / `auth`, límite de intentos de entrada, grabación asíncrona. |
 | **Node y Bun** | Node.js ≥ 22 y Bun (probado con 1.4), usando en Bun los caminos más baratos (`fetch`, E/S UDP nativa con `sendMany`). |
-| **Dos dependencias** | `ws` y `json5`. `node-datachannel` es opcional. |
+| **Una dependencia** | `ws`. `node-datachannel` es opcional. El parser de `json5` va incluido en `dist` (MIT, aviso en el propio archivo), no es una dependencia de ejecución. |
 
 ## Instalación
 
@@ -58,7 +59,7 @@ npm install https://github.com/ttaliba/haxlite/releases/download/v1.0.0/haxlite-
 npm install https://github.com/ttaliba/haxlite/releases/download/v1.0.0/haxlite-1.0.0.tgz --omit=optional
 
 # o, desde este repositorio:
-npm install && npm run build         # genera dist/ con los .d.ts
+npm install && npm run build         # genera dist/ con los .d.ts (JSDoc en la API HBInit, la raíz y los módulos de operador)
 ```
 
 El paquete se instala con el nombre `haxlite`. Todavía no está en npmjs.com; el archivo `.tgz` de cada versión se adjunta en [Releases](https://github.com/ttaliba/haxlite/releases).
@@ -123,7 +124,7 @@ Mismo modelo de ejecución: los métodos que cambian el estado se aplican en un 
 |---|---|---|
 | `HBInit` | síncrono | `await HBInit(config)`: resuelve cuando el maestro asigna el enlace; un `onRoomLink` asignado después lo recibe igual |
 | Token caducado | captcha en la página / `InvalidRoomTokenError` sin capturar | promesa rechazada con `InvalidRoomTokenError`, o flujo `haxlite.onRecaptcha` |
-| Excepciones en callbacks | rompen el bucle del motor | se notifican a `room.haxlite.onError` (por defecto `console.error`); un `onPlayerChat` que lanza sigue expulsando al emisor, como el oficial |
+| Excepciones en callbacks | rompen el bucle del motor | se notifican a `room.haxlite.onError` (por defecto `console.error`) y el frame se completa; una promesa rechazada de un callback se notifica igual; las rachas de errores idénticos se coalescen; un `onPlayerChat` que lanza sigue expulsando al emisor, como el oficial |
 | `setScoreLimit/TimeLimit(3.5)` | aplica el valor sin convertir | convierte a entero |
 | `clearBans()` | vacía la lista de bans | vacía los bans de `kickPlayer(…, true)`; los de `room.haxlite.bans` (IP, rango, auth) se quitan con `room.haxlite.bans.clear()` |
 | Varias salas | una por página (`Can't init twice`) | varias por proceso |
@@ -156,11 +157,12 @@ room.haxlite.onBeforeOperation = (event, byPlayerId, frame) => true; // false de
 | `onJoinRequest(req)` | gancho previo a WebRTC con IP, `conn`, IPs *srflx*, versión y contraseña; puede ser `async` |
 | `bans` | `addIp`, `addRange` (CIDR IPv4/IPv6), `addAuth`, `list`, `remove`, `clear`…; compartible entre salas |
 | `allowNullAuth`, `joinRateLimit` | sin jugadores anónimos; límite de intentos por IP |
+| `transport.maxUnjoinedPerIp`, `transport.abusePenalty`, `transport.verifiedIpBans` | protecciones por dirección activas por defecto: conexiones sin unir por IP (12), penalización por abusos y bans de IP verificados. Desactivarlas: `Infinity`, `null`, `false` ([Seguridad y robustez](#seguridad-y-robustez)) |
 | `onBeforeOperation(ev, byId, frame)` | ve cada evento de cliente antes de aplicarlo: `false` lo descarta, puede modificarlo |
 | `onRecaptcha` / `useRecaptchaToken` | flujo de captcha cuando el maestro lo pide |
 | `peerBackend`, `rtc`, `edge` | cómo se conectan los jugadores ([ver abajo](#cómo-se-conectan-los-jugadores)) |
 | `stop()` / `close()` | cierra temporizadores, señalización y conexiones; Node termina solo |
-| `stopRecordingAsync()` | como `stopRecording()` pero el deflate corre fuera del bucle (≈ 3 ms en vez de ≈ 280 ms con una hora de grabación) |
+| `stopRecordingAsync()` | como `stopRecording()` pero el deflate corre fuera del bucle (siempre con nivel 6; el síncrono usa nivel 1 en Node por encima de 64 KiB). La grabación tiene tope (16 MiB o 2 097 152 eventos): al alcanzarlo se congela y `room.haxlite.recordingTruncated` pasa a `true` |
 | `setDiscPropertiesFor`, `clearDiscOverrides`… | **visuales privados**: cambia un disco solo en el mundo de un jugador sin desincronizar a nadie (máscaras de visión, marcadores) |
 | `hidePlayerFor`, `showPlayerFor`, `setPlayerHiddenFor`… | **jugadores ocultos**: el jugador desaparece solo para ese espectador (visión por zonas, espectadores que no deben ver a ciertos jugadores). No es seguridad: un cliente modificado sigue pudiendo saber dónde está |
 | `getPlayerConnection(id)` | `auth`, `conn`, IP, IPs *srflx*, ping |
@@ -185,6 +187,24 @@ Los clientes oficiales se adaptan a estos ajustes sin cambios, porque el host le
 | `inputDelayFrames` | 2 (como el oficial) | frames entre «ahora» y el frame en que se aplica el input de un cliente. Más retardo = menos inputs tarde (y menos correcciones) con *jitter*, a cambio de más latencia de control |
 | `heartbeatFrames` | 7 | cada cuántos frames envía el host el *heartbeat*. Bajar a 2–3 acorta la extrapolación y reduce las correcciones visibles de los demás jugadores, a ≈ 9 bytes por cliente y *heartbeat* |
 | `checksumIntervalFrames` | 600 | periodo del *CheckConsistency* que detecta desincronización |
+
+## Seguridad y robustez
+
+haxlite trata como entrada no fiable a los jugadores, al servidor maestro, al edge y a los ficheros `.hbr2`. Lo siguiente está activo por defecto y cada fila indica cómo se ajusta. Referencia completa: [docs/11](docs/11-referencia-api.md) (opciones, errores y códigos de cierre) y [docs/12](docs/12-referencia-operacion.md) (Edge, firewall). Qué cambió respecto a versiones anteriores y cómo volver atrás: [docs/13](docs/13-notas-de-version.md).
+
+| Qué protege | Qué hace por defecto | Cómo se configura |
+|---|---|---|
+| Entrada de jugadores | admisión antes de crear WebRTC (16 negociaciones, bans, sala llena); como mucho 12 conexiones sin unir por dirección pública; penalización por abusos (20 fichas, una cada 3 s; agotadas, una conexión cada 3 s durante 30 s); decisiones de `onJoinRequest` validadas | `transport.maxPendingNegotiations`, `transport.maxUnjoinedPerIp`, `transport.abusePenalty`, `joinRateLimit`, `allowNullAuth`, `onJoinRequest` |
+| Bans de IP | el kick-ban guarda la IP de `conn` y la dirección del par ICE si el cliente la declaró; no guarda las IP *srflx* declaradas, que podrían ser de un tercero | `transport.verifiedIpBans`, `bans` |
+| Jugadores que no leen | se cierra con `'stalled'` al jugador con más de 1 MiB sin confirmar durante 10 s | `transport.maxPeerBufferedBytes`, `transport.peerBufferedTimeoutMs` |
+| Callbacks y errores | una excepción o una promesa rechazada en un callback va a `onError` y el frame se completa; las rachas de errores idénticos se coalescen (60, luego un resumen por segundo) | `onError`, `errorRepeatBurst`, `errorRepeatWindowMs` |
+| Opciones inválidas | `RangeError` al crear la sala en lugar de aceptar `NaN`, `0` o negativos en silencio | valores válidos en docs/11 |
+| Servidor maestro | cuerpos con tope (64 KiB; 8 MiB la lista), plazo total de la petición, URL de señalización `ws(s)` y mensajes de ≤ 256 KiB | `transport.timeoutMs` |
+| Edge | topes por IP y pool de sockets sin autenticar (HTTP 429/503 con `Retry-After`); `/stats` sin token solo con agregados (`redacted: true`); `ws://` hacia hosts públicos rechazado | `limits.*`, `stats.token`, `edge.allowInsecure` ([docs/09](docs/09-haxlite-edge.md), [docs/12](docs/12-referencia-operacion.md)) |
+| WebRTC propio | límites por paquete en SCTP, cierre ante agotamiento de secuencia o error interno en DTLS, tope de pares TURN por sesión | sin opciones ([docs/10](docs/10-haxlite-rtc.md)) |
+| Replays y estadios | lectura con tope (32 MiB, 2^21 eventos), grabación que se congela a 16 MiB o 2^21 eventos, estadios que no caben en el cable rechazados | `readReplay(bytes, opts)`, `recorder.maxBytes` / `maxEvents`, `ReplayPlayer` |
+
+Detrás de un proxy inverso (nginx, caddy) el Edge ve todas las conexiones desde la IP del proxy: los topes por IP no se aplican a orígenes loopback o privados salvo `limits.perIpLimitsApplyToPrivate`, y `limits.trustForwardedFor` usa la última entrada de `X-Forwarded-For` ([docs/12 §3.6](docs/12-referencia-operacion.md)). Los jugadores tras una misma NAT o CGNAT comparten los límites por dirección: para grupos grandes sube `maxUnjoinedPerIp` o desactívalo con `Infinity`.
 
 ## Benchmarks
 
@@ -253,6 +273,7 @@ Más detalle: [docs/06 - Arquitectura](docs/06-arquitectura-haxlite.md) y el con
 |---|---|
 | [11 - Referencia de la API](docs/11-referencia-api.md) | **todos** los parámetros de `HBInit`, `config.haxlite` / `room.haxlite`, métodos, callbacks, tipos y errores |
 | [12 - Referencia de operación](docs/12-referencia-operacion.md) | Edge (CLI, variables de entorno, JSON), scripts de npm, arnés de benchmarks, firewall `haxguard`, CI y despliegue en producción |
+| [13 - Notas de versión](docs/13-notas-de-version.md) | cambios de comportamiento por defecto y cómo volver al anterior, cambios en los `.d.ts` y en las dependencias |
 | [09 - haxlite Edge](docs/09-haxlite-edge.md) | gateway que oculta la IP del host: arquitectura, despliegue, seguridad |
 | [10 - haxlite-rtc](docs/10-haxlite-rtc.md) | WebRTC propio: ICE, DTLS, SCTP, TURN, interoperabilidad y benchmarks |
 | [08 - Ocultar y proteger la IP](docs/08-ocultar-ip.md) | por qué se ve la IP, Cloudflare TURN, anti-DDoS, `haxguard` (más en [`docs/ip/`](docs/ip/01-exposicion-ip.md)) |
@@ -275,7 +296,7 @@ Investigación hecha leyendo el código de librerías públicas (fuentes y versi
 
 ```sh
 npm install
-npm run build          # dist/ con los .d.ts (rolldown)
+npm run build          # dist/ con los .d.ts (rolldown; JSDoc en la API HBInit, la raíz y los módulos de operador)
 npm run typecheck      # tsc sobre src y sobre la configuración de build
 npm test               # suite completa (vitest)
 npm run test:interop   # interoperabilidad WebRTC con Chromium y el cliente oficial

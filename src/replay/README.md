@@ -4,14 +4,27 @@ Owner: engineer R. Depends on `codec`, `room` (and `sim` through `room`); never 
 
 | Export | Purpose |
 |---|---|
-| `ReplayRecorder` | HBInit `startRecording()` / `stopRecording()` → official `.hbr2` bytes |
-| `readReplay(bytes)` → `ReplayData` | header, goal markers, initial RoomState bytes, events (absolute frames) |
+| `ReplayRecorder` | HBInit `startRecording()` / `stopRecording()` → official `.hbr2` bytes; the event log is capped (`maxBytes`, `maxEvents`) and the recording freezes at the cap |
+| `readReplay(bytes, opts?)` → `ReplayData` | header, goal markers, initial RoomState bytes, events (absolute frames); capped by `ReplayReadOptions` (`maxBodyBytes`, `maxEvents`) |
 | `writeReplay(data)` | `ReplayData` → `.hbr2` (after editing/trimming) |
-| `ReplayPlayer` | deterministic re-simulation: `seek(frame)`, `step(n)`, `finish()` |
-| `replayBody`, `readReplayHeader` | tooling/tests: inflated body, header only |
+| `ReplayPlayer` | deterministic re-simulation: `seek(frame)`, `step(n)`, `finish()`, and `seekAsync` / `finishAsync` that yield to the event loop; `ReplayPlayerOptions` = read caps + `maxSeekMs` + `maxFrames` |
+| `replayBody(bytes, maxBodyBytes?)`, `readReplayHeader` | tooling/tests: inflated body (same cap as `readReplay`), header only |
 | `ReplayFormatError`, `ReplayVersionError` | malformed file / version ≠ 3 |
 
-## File layout (verified byte-for-byte against the official recorder)
+## Limits (hostile files and long matches)
+
+| Constant / option | Default | Applies to |
+|---|---|---|
+| `REPLAY_MAX_BODY_BYTES` / `maxBodyBytes` | 32 MiB (33 554 432) | inflated body of `readReplay`, `replayBody` and `new ReplayPlayer(bytes)`; over it: `ReplayFormatError` `replay body larger than maxBodyBytes (N)` |
+| `REPLAY_MAX_EVENTS` / `maxEvents` | 2^21 (2 097 152) | events `readReplay` decodes (`ReplayFormatError` `too many events (more than maxEvents = N)`) and events a `ReplayRecorder` holds |
+| `REPLAY_RECORD_MAX_BYTES` / `ReplayRecorder.maxBytes` | 16 MiB (16 777 216) | event log of a recording (initial state plus events) |
+| `REPLAY_PLAYER_MAX_FRAMES` / `ReplayPlayer.maxFrames` | 2^24 (16 777 216, about 77 h at 60 Hz) | `seek` / `finish` target when there is no time budget |
+| `ReplayPlayer.maxSeekMs` / `seek(n, { maxMs })` | `Infinity` | optional time budget of `seek` / `finish` |
+| `sliceMs` of `seekAsync` / `finishAsync` | 8 ms | longest stretch simulated before yielding |
+
+`Infinity` removes a cap; an invalid value (negative, `NaN`) gives the default. The recorder caps are chosen so that a recording made with the defaults reads back with the default read caps. All of these are exported from the `replay` namespace.
+
+## File layout (inflated body verified byte-for-byte against the official recorder)
 
 ```
 "HBR2"  u32 version=3  u32 totalFrames (frameAtStop − frameAtStart)
@@ -25,6 +38,7 @@ deflateRaw(
 All big-endian. The two Δ chains are independent. Replays carry no `order`/`clientSeq`.
 Compressed bytes come from `node:zlib` and may differ from the official pako output; the
 inflated body is identical (no hash covers compressed bytes; every reader inflates).
+`stop()` / `snapshot()` deflate at level 1 on Node (2 on Bun) when the body is over 64 KiB (`SYNC_FAST_BODY`; about 3 % larger files, a 10 to 100 times shorter stall) and at level 6 below it; `stopAsync()` / `snapshotAsync()` always use level 6, so above that size the compressed bytes of the two differ while the inflated body is the same.
 
 ## Integration contract for the host (`src/host`) / HBInit facade
 
@@ -36,6 +50,7 @@ This is exactly the official `Ma.rg` loop (`apply → Ab(ev)` … `Ca.Da(1)`, `d
 1. **One recorder per room**, created once and reused (keeps its buffers while they
    stay at their initial size; a long recording's event log is released at stop):
    `readonly recorder = new ReplayRecorder();`
+   The log is capped: `new ReplayRecorder(version, { maxBytes, maxEvents })` or the `maxBytes` / `maxEvents` properties (defaults 16 MiB and 2^21, `Infinity` = none). At the cap the recording **freezes**: later events and goals are not recorded, the file ends at the frame of the first event left out, `recorder.truncated` is true and `onTruncated(frame)` is called once (from inside `onEvent`). `HostRoom` reports it once per recording through `onError` and exposes `recordingTruncated`; from HBInit use `room.haxlite.host.recorder.maxBytes` / `.maxEvents` and `room.haxlite.recordingTruncated`. Below the cap the bytes are unchanged.
 
 2. **`startRecording()`** (HBInit, returns nothing):
    ```ts
@@ -75,8 +90,8 @@ This is exactly the official `Ma.rg` loop (`apply → Ab(ev)` … `Ca.Da(1)`, `d
    ```
    The returned array is a fresh copy owned by the caller. `recorder.snapshot(frame)`
    returns the same file without stopping (autosave); `recorder.cancel()` drops it.
-   `recorder.stopAsync(frame)` / `snapshotAsync(frame)` return the same bytes but
-   deflate on the libuv threadpool (a 7.6 MB body: ~270 ms of event loop -> ~3 ms);
+   `recorder.stopAsync(frame)` / `snapshotAsync(frame)` return the same inflated body but
+   deflate on the libuv threadpool at level 6 (a 7.6 MB body: ~270 ms of event loop at level 6 -> ~3 ms);
    recording stops synchronously. `HostRoom.stopRecordingAsync()` and the HBInit
    `room.stopRecordingAsync()` (a haxlite extension: the official API only has the
    synchronous `stopRecording`) expose it.
@@ -91,6 +106,8 @@ with the final frame, i.e. the exact state the host had when it called `stop`.
 Seeking backwards re-decodes the initial state and re-simulates (no intermediate snapshots
 exist in the format). `player.onReset = (rs) => { rs.hooks.… = … }` installs callbacks
 that fire during re-simulation; `player.onEvent` is called after each replayed event.
+
+Re-simulating costs real time, set by the file's stadium and players rather than by its size. `seek(n)` and `finish()` run to the target unless (a) it is above `maxFrames` and there is no time budget, which throws a `RangeError` at once (`replay seek beyond maxFrames (T > M); use seekAsync, a time budget or a higher maxFrames`), or (b) a time budget is set (`new ReplayPlayer(bytes, { maxSeekMs })`, `player.maxSeekMs`, `seek(n, { maxMs })` or `finish({ maxMs })`; default `Infinity`) and runs out: `RangeError` `replay seek budget exceeded (F/T frames)`, with the player at a consistent frame after at least one chunk of ticks, and the next call continues from there. `seekAsync(n, { sliceMs = 8, signal })` and `finishAsync({ sliceMs, signal })` simulate in slices and yield to the event loop in between; an aborted `signal` rejects the promise with `signal.reason` and leaves the player where it got to. Use them for files you do not trust, and do not use the player until the promise settles. `new ReplayPlayer(bytes, opts)` also takes the read caps (`maxBodyBytes`, `maxEvents`). A SetStadium that decodes but that our deflate cannot fit in the u16 length no longer fails the read: `SetStadiumEvent.read` accepts it and `wireError()` reports it.
 
 ## Tests (`test/replay/`)
 

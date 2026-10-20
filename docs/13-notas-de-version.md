@@ -1,0 +1,93 @@
+# 13 - Notas de versión: cambios de comportamiento por defecto y cómo volver al anterior
+
+Esta página recoge lo que cambia respecto al código anterior a las correcciones de seguridad y estabilidad, para quien actualiza una sala o un Edge que ya funcionaba. Cada fila dice qué había antes, qué hay ahora y la **opción exacta** que devuelve el comportamiento anterior. Donde dice «sin opción», el cambio no se puede desactivar: es una corrección y la fila solo avisa de qué notará quien dependía del comportamiento anterior.
+
+Los valores por defecto y los mensajes de error salen del código (`src/`); el detalle de cada opción está en [11 - Referencia de la API](11-referencia-api.md) y en [12 - Referencia de operación](12-referencia-operacion.md). Un valor que se pasa a una opción nueva y que el código no acepta lanza `RangeError` al crear la sala (ver la fila «Opciones numéricas validadas»).
+
+## 1. Admisión, bans y jugadores conectados
+
+Opciones de `config.haxlite.transport` (se pasan tal cual a `HostTransport`).
+
+| Cambio | Antes | Ahora | Cómo restaurar el comportamiento anterior | A quién afecta |
+|---|---|---|---|---|
+| Conexiones sin unir por dirección | Solo el tope global de 16 negociaciones simultáneas | Como mucho 12 conexiones sin unir por dirección pública (IPv6: por /64); la siguiente oferta recibe 4104 «too many unjoined connections from this address». Loopback y redes privadas están exentas | `maxUnjoinedPerIp: Infinity` | Grupos tras una misma NAT o CGNAT (colegios, cibercafés) que entran a la vez; quien probaba con muchas conexiones desde una IP pública |
+| Penalización por abusos | Ninguna | Por dirección pública: 20 fichas, una se repone cada 3 s; cada cierre abusivo (flood o texto, mensaje inválido antes de unirse, no completar el *handshake*) gasta una. Sin fichas, durante 30 s la dirección recibe una conexión nueva cada 3 s y el resto 4104 «address blocked after abusive connections» | `abusePenalty: null` (para el rechazo total anterior a un carril lento: `abusePenalty: { …, admitEveryMs: Infinity }`) | Grupos tras una misma NAT con algún cliente que falla el *handshake* o hace flood |
+| Bans de IP verificados | `kickPlayer(…, true)` guardaba la IP de `conn` y las IP *srflx* que declara el cliente; solo se comprobaban `conn` y *srflx* | Guarda `conn` y la dirección pública del par ICE elegido si el cliente la declaró como candidato `host` o `srflx`; no guarda las *srflx* declaradas. Comprueba la dirección remota del par en el *handshake* («You are banned from this room.») y rechaza con 4102 «banned candidate» una oferta con un candidato `host`/`prflx` público baneado | `verifiedIpBans: false` | Quien banea con `kickPlayer(…, true)` o `banPeer`; scripts que leen `bans.list()` y esperaban las *srflx* en los registros `'peer'` |
+| Jugador que no lee lo que se le envía | Sin límite: un cliente que cierra su ventana pero sigue enviando conservaba hasta el búfer SCTP entero | Se cierra con el motivo `'stalled'` al jugador con más de 1 MiB sin confirmar durante 10 s (backends `ndc` y `rtc`; el edge tiene los suyos). La sala lo trata como una salida normal | `maxPeerBufferedBytes: Infinity` | Clientes con enlaces que se atascan más de 10 s; backends propios que implementen `PeerLink.queuedBytes` |
+| Sala llena y conexiones sin *handshake* | El recién llegado recibía 4100 aunque hubiese conexiones paradas | La conexión con el desafío enviado y sin responder desde hace 5 s cede su plaza (cierre `'timeout'`) cuando la nueva abre el canal 0; si ya no hay ninguna rancia, la nueva se cierra con `'full'` | Sin opción (constante `NetDefaults.staleChallengeMs`) | Salas que se llenan a menudo |
+| Orden de las comprobaciones | Sala llena y `joinRateLimit` después de las *srflx* baneadas; las ofertas mal formadas de IP baneadas, limitadas o con sala llena recibían 0 | Sala llena y `joinRateLimit` antes; esas ofertas reciben 4102, 4104 o 4100 y ya no se inflan. Solo se examinan los 32 primeros candidatos de la oferta. Una oferta con el `peerId` de una negociación viva se ignora sin respuesta | Sin opción | Quien lee `onJoinRejected` o los códigos de cierre |
+| Decisión de `onJoinRequest` | Un número o `reject` fuera de 0..65535 o no numérico no se validaba (no verificado qué recibía el cliente); se esperaba solo un `Promise` | Se espera cualquier objeto con `then`. Un número que no es código de cierre, o un `reject` mal formado, rechaza con 4104 y se informa por `onError` (`TypeError` «onJoinRequest returned an invalid decision (…)»). Un valor de otra forma (cadena, array, objeto sin `reject`) sigue aceptando, con un único `onError` por transporte. **`{ accept: false }` acepta**: para rechazar usa `false`, un código o `{ reject: n }` | Sin opción | Ganchos `onJoinRequest` que devolvían valores no previstos |
+| Opciones numéricas validadas | `NaN`, `0` o negativos se aceptaban en silencio o fallaban tarde (p. ej. al abrir el canal 0 de cada jugador) | `RangeError` al crear la sala: `maxPendingNegotiations`, `maxUnjoinedPerIp`, `abusePenalty.*`, `channelOpenTimeoutMs`, `peerIdleTimeoutMs`, `peerBufferedTimeoutMs`, `maxPeerBufferedBytes`, `floodCapacity`, `floodMsPerToken`, `version`, `joinRateLimit.code`, `sweepIntervalMs`, `answerIceWaitMs`, `reverseIceDelayMs`, `challengeDelayMs`; `setMaxPlayers(n)` exige un entero en 0..255 | Sin opción: pasa valores válidos ([docs/11 §6](11-referencia-api.md#6-errores-y-códigos-de-cierre)) | Configuraciones con `NaN` por una variable de entorno sin definir o con `0` para «desactivar» |
+| `joinRateLimit` inválido | `capacity: 0` desactivaba el límite, `NaN` bloqueaba a todos y los negativos daban un comportamiento errático | `capacity` ≥ 1 y `msPerToken` finito > 0, si no `RangeError` | `joinRateLimit: null` | Quien usaba `capacity: 0` para apagarlo |
+| `pingIntervalMs` | Sin validación (un valor negativo producía un bucle de unos 800 *Ping* por segundo) | Número ≥ 1 o `Infinity`; si no, `RangeError` y `HBInit` se rechaza | `pingIntervalMs: Infinity` para no emitir *Ping* | Quien pasaba `0` o negativos |
+
+## 2. Callbacks, errores y estadios
+
+| Cambio | Antes | Ahora | Cómo restaurar el comportamiento anterior | A quién afecta |
+|---|---|---|---|---|
+| Promesas rechazadas de los callbacks | Quedaban como rechazos sin manejar | Van a `room.haxlite.onError` (o `console.error('[haxlite]', err)`). Una promesa rechazada de `onBeforeOperation` se reporta y el evento se permite | Sin opción | Procesos con un manejador global de `unhandledRejection` que contaban esos errores |
+| Rachas de errores idénticos | Cada error se entregaba | Tras 60 entregas del mismo error (nombre y mensaje) llega un `RepeatedError` por segundo con `count` y `cause` | `errorRepeatBurst: Infinity` | Quien cuenta errores en `onError` o en los logs |
+| `SetStadium` que no cabe en el cable | `setCustomStadium` lo aplicaba en el host y los clientes nunca lo recibían | `setCustomStadium` y `HostRoom.setStadium` lanzan `Error` («Stadium too large: deflated N > 65535» o «Stadium has a list over 255 items») antes de aplicar nada | Sin opción | Estadios con más de 255 *joints*, puntos de aparición, etc. |
+| `SetStadium` de un cliente | Sin tope de inflado | Más de 262 144 B inflados: se expulsa al emisor («Bad actor»); chat de más de 840 B y avatar de más de 48 B se rechazan antes de decodificar | Sin opción | Clientes modificados |
+| Ids de jugador | El contador crecía sin tope | Del 1 al 65 535; después vuelve a 1 y salta los ids en uso. Con todos ocupados por bans se reutiliza el del ban más antiguo (`clearBan(idViejo)` ya no lo encuentra) | Sin opción | Salas con más de 65 535 entradas por ejecución |
+| Tope de discos de los eventos encolados | Los eventos encolados de no admins podían hacer rechazar acciones válidas | Se acota por el número máximo de jugadores de la sala (anfitrión incluido) | Sin opción | Salas con estadios cerca de 255 discos |
+| `stop()` / `close()` | Cada llamada podía crear una promesa distinta | Devuelven siempre la misma promesa, que se resuelve al liberar la sala; si `host.start()` lanza, la sala se detiene y el error se relanza | Sin opción | Código que comparaba las promesas |
+
+## 3. Replays
+
+| Cambio | Antes | Ahora | Cómo restaurar el comportamiento anterior | A quién afecta |
+|---|---|---|---|---|
+| Lectura | Sin tope de cuerpo inflado ni de eventos | `readReplay`, `replayBody` y `new ReplayPlayer(bytes)` rechazan (`ReplayFormatError`) más de 32 MiB inflados o 2 097 152 eventos | `readReplay(bytes, { maxBodyBytes: Infinity, maxEvents: Infinity })`; igual en `new ReplayPlayer(bytes, { … })` | Quien lee replays oficiales de más de unas dos horas |
+| Grabación | Sin tope | El registro se congela a 16 MiB o 2 097 152 eventos: el replay termina en ese frame, `room.haxlite.recordingTruncated` pasa a `true` y se avisa una vez por `onError` | `room.haxlite.host.recorder.maxBytes = Infinity` y `room.haxlite.host.recorder.maxEvents = Infinity` (o `new ReplayRecorder(3, { maxBytes: Infinity, maxEvents: Infinity })`); leerlo exige subir también los topes de lectura | Salas con partidas continuas de más de unas dos horas por grabación |
+| `ReplayPlayer.seek` / `finish` | Sin límite | Sin presupuesto de tiempo por defecto (`maxSeekMs: Infinity`), pero un destino por encima de `maxFrames` (16 777 216, unas 77 h) lanza `RangeError` al instante. Nuevos `seekAsync` / `finishAsync` | `new ReplayPlayer(bytes, { maxFrames: Infinity })` | Quien abre cabeceras con `totalFrames` enormes |
+| Deflate de `stopRecording()` / snapshot | Nivel 6 | Con un cuerpo de más de 65 536 B, nivel 1 en Node (2 en Bun): ficheros un 3 % mayores y una pausa 10 a 100 veces menor. `stopRecordingAsync()` sigue en nivel 6 | Sin opción: usa `stopRecordingAsync()` para el nivel 6. El cuerpo inflado es idéntico | Quien compara los bytes comprimidos de las dos variantes |
+
+## 4. Edge: lado host (`haxlite.edge`)
+
+| Cambio | Antes | Ahora | Cómo restaurar el comportamiento anterior | A quién afecta |
+|---|---|---|---|---|
+| `ws://` hacia un host público | Cualquier `ws://` valía | Lanza `Error` al crear el backend (`HBInit` se rechaza). Loopback y redes privadas (RFC 1918, 100.64.0.0/10, link-local, `fc00::/7`, nombres de una etiqueta, `.local`, `.internal`, `.lan`, `.home.arpa`) siguen valiendo, con un aviso en el log | `allowInsecure: true` | Hosts que llegan a un edge público por `ws://` |
+| `fallbackWs` con `ws://` público | `true` | `false` si el `ws://` público se acepta por `allowInsecure` (el respaldo iría en claro). Un edge sin UDP da entonces error en lugar de caer al WebSocket | `fallbackWs: true` | Quien usa `allowInsecure` y el respaldo por WebSocket |
+| Reconexión del túnel | Tras pasar a `ready`, el *backoff* se reiniciaba y la reconexión era inmediata | Una sesión que estuvo `ready` menos de 10 s reconecta tras el *backoff* × (0,8 a 1,2) y este sigue creciendo | `reconnectStableMs: 0` | Edges que aceptan la sesión y la cierran enseguida |
+| *Pong* del edge | Bastaba con recibir tráfico del edge | Con el túnel v2, el edge debe contestar a los *Ping* del host dentro de `max(pingTimeoutMs, 2 × pingIntervalMs)`; si no, el túnel falla y se reconecta | Sin opción (`pingTimeoutMs` mayor amplía el plazo) | Edges ocupados que no contestan los *Ping* |
+| Plano WebSocket | Sin límite de cola | Se descartan los mensajes `uu` con más de 256 KiB en cola; con más de 8 MiB el túnel falla («tunnel send buffer overflow») y se reconecta | Sin opción | Edges que dejan de leer |
+
+## 5. Edge: lado servidor (`haxlite-edge`, `EdgeServer`)
+
+| Cambio | Antes | Ahora | Cómo restaurar el comportamiento anterior | A quién afecta |
+|---|---|---|---|---|
+| `GET /stats` sin `stats.token` | Respondía el detalle completo, también por clave | Responde `200` con solo agregados del edge (`keys: []`; `webrtc`, `rtc` y `tunnel` a `null`; `redacted: true`) | Configurar `stats.token` (`HAXLITE_EDGE_STATS_TOKEN`) y enviar `Authorization: Bearer <token>`: devuelve la respuesta completa | Monitorización que leía `ppsIn/Out` por clave sin token: sigue recibiendo 200, ahora con datos retenidos |
+| Topes por origen y pool sin autenticar | Ninguno por origen; `maxSessions` contaba todos los sockets | `maxPreAuthSessions` 1024, `maxPreAuthPerIp` 256, `ipConnectCapacity` 256 con `ipConnectMsPerToken` 20, solo para orígenes públicos; HTTP 429/503 con `Retry-After: 1` | `maxPreAuthSessions: 0`, `maxPreAuthPerIp: 0`, `ipConnectCapacity: 0` | Operadores con muchos hosts que reconectan a la vez desde una IP pública |
+| Detrás de un proxy inverso | No aplicable | Los topes por origen no se aplican a orígenes loopback, privados ni *link-local* | `limits.perIpLimitsApplyToPrivate: true` los aplica también (el proxy entero cuenta como un origen); `limits.trustForwardedFor: true` usa la última entrada de `X-Forwarded-For` | Despliegues con nginx o caddy |
+| `maxSessions` | Contaba todos los sockets del túnel | Cuenta solo los autenticados; el exceso cierra con 4429 y `terminate` a los 2 s | Sin opción | Edges cerca de su tope |
+| `HAXLITE_EDGE_LOG_INTERVAL_MS` / `stats.logIntervalMs` | Un valor no numérico apagaba el log sin error | Debe estar entre 0 y 2147483647; si no, el arranque falla («bad log interval N (0-2147483647 ms)») | `0` apaga el log | Despliegues con `off` u otro valor no numérico |
+| Plazos y límites de `limits` | Sin validación al arrancar | Los plazos se acotan a 2147483647 ms y `NaN` o un límite inválido lanzan `RangeError` al arrancar | Sin opción | Configuraciones con valores erróneos |
+
+## 6. Servidor maestro y señalización
+
+| Cambio | Antes | Ahora | Cómo restaurar el comportamiento anterior | A quién afecta |
+|---|---|---|---|---|
+| Cuerpo de las respuestas | Sin tope | 64 KiB en `api/host` y `api/geo`; 8 MiB en `api/list`: `MasterError('invalid-response')` «response too large» | Sin opción | Maestros propios con respuestas grandes |
+| `timeoutMs` | En Node, solo un plazo de inactividad del socket | Además, plazo total: ×1 en `api/host` y `api/geo`, ×2 en `api/list` | Sin opción (en la ruta `node:http`, `timeoutMs: 0` quita el plazo) | Redes muy lentas hacia el maestro |
+| Bun, `content-encoding` | Se descomprimía en silencio | Se pide `Accept-Encoding: identity`; otra codificación da `MasterError('invalid-response')` | Sin opción | Maestros propios detrás de un proxy que comprime |
+| URL y mensajes de la señalización | Sin validar | La URL de `api/host` debe ser `ws(s)` (si no, `onError` y reintento); mensajes de más de 256 KiB cierran el enlace; token renovado de más de 4096 B se ignora | Sin opción (`wsUrl` sustituye la URL) | Maestros propios |
+
+## 7. haxlite-rtc
+
+Sin opciones y sin efecto en clientes oficiales. Cambia lo que ocurre con pares hostiles o con fallos internos: ver [docs/10 §2.1 y §2.2](10-haxlite-rtc.md).
+
+| Cambio | Antes | Ahora | Cómo restaurar el comportamiento anterior | A quién afecta |
+|---|---|---|---|---|
+| DTLS: numeración de la época 0 y agotamiento | Los registros del flight 4 seguían el número de secuencia del ClientHello; al agotarse el espacio de 48 bits se lanzaba un `RangeError` | Se numeran desde 0 con ICE completo (con `helloVerify`, desde el del ClientHello que trae la cookie); agotar la secuencia cierra la sesión con `dtls-error:sequence-exhausted` | Sin opción | Nadie con clientes reales (no lo comprueban) |
+| Errores internos de DTLS, SCTP y del endpoint | Una excepción en un temporizador o un datagrama podía tumbar el proceso | La sesión se cierra (`dtls-error:internal-…`, `sctp:internal-error`, `error`) o el datagrama se descarta y cuenta en `rtcStats().packetErrors` | Sin opción | Operadores que vigilaban esas razones de cierre |
+| Pares TURN por sesión | Todos los candidatos señalados podían recibir pares relay | Como mucho 4 direcciones remotas vivas distintas (8 en la vida de la sesión) | Sin opción (constantes `MAX_RELAY_PEERS`, `MAX_RELAY_PEERS_TOTAL`) | Jugadores que ofrecen muchos candidatos y dependen de relay |
+| Clasificación IPv6 | NAT64, 6to4 e IPv4-compatibles no tenían tratamiento propio | Se clasifican por la IPv4 incrustada si no es pública; las IPv4-compatibles son `reserved` | Sin opción | Redes con NAT64 o 6to4 con IPv4 privada |
+
+## 8. Paquete: `.d.ts` y dependencias
+
+| Cambio | Antes | Ahora | Cómo restaurar el comportamiento anterior | A quién afecta |
+|---|---|---|---|---|
+| JSDoc en los `.d.ts` publicados | Todos los módulos conservaban sus comentarios | Se conserva en `api/`, en los ficheros de la raíz y en 13 módulos orientados al operador (`net/transport`, `net/signaling`, `net/master-http`, `net/rtc-backend`, `net/edge-client`, `net/bans`, `host/host-room`, `edge/server`, `edge/tunnel-udp`, `replay/format`, `replay/reader`, `replay/player`, `replay/recorder`) y, dentro de ellos, en los miembros de `Peer`, `BanList` y `ReplayPlayer` y en `ReplayRecorder.maxBytes` y `.truncated`. El resto (`rtc`, `sim`, `codec`, `room`, el secuenciador, los protocolos de edge y de `peer-backend`) va sin comentarios, y se quitan los de miembros `private` y los anteriores a `import` y reexportaciones. Los tipos son idénticos | Sin opción (lista `DOC_MODULES` y `DOC_MEMBERS` en `scripts/build.mjs`) | Quien lee los `.d.ts` en el editor: el *hover* de los módulos internos ya no muestra comentarios |
+| Dependencias de ejecución | `ws` y `json5` | Solo `ws` (más `node-datachannel` opcional). El parser de `json5` va dentro de `dist`, con su licencia MIT en un comentario, y se carga en la primera cadena que `JSON.parse` rechaza; `json5` pasa a `devDependencies` | Sin opción | Quien instalaba el paquete y dependía de que `json5` llegase transitivamente: ahora debe instalarlo él |
+
+Medido con `npm run build` y `npm pack --dry-run` en esta versión: tarball de 209,1 kB, 678,9 kB descomprimido, 91 archivos.

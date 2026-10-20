@@ -112,6 +112,8 @@ API key; `okMac` prueba que el edge también conoce la clave (autenticación **m
 TLS) y ata su clave efímera, el connId y el destino UDP. Un `okMac` inválido es un `EdgeError`
 fatal de tipo `auth`.
 
+**Alcance de la autenticación del edge.** El `okMac` solo viaja en el `AuthOk` cuando se concede el plano UDP (arriba), y es entonces cuando el host lo comprueba (`src/net/edge-client.ts`). Con el plano `ws` o `webrtc` no hay esa prueba. Sin TLS, el canal de control es legible por cualquiera en el camino y, en el plano WebSocket, también los mensajes de los jugadores: usa `wss://` y un secreto de al menos 22 caracteres (el host avisa si es más corto sobre `ws://`).
+
 **Flags** (`Auth` = pedidos; `AuthOk` = concedidos, nunca más de lo pedido):
 
 | Flag | Valor | |
@@ -234,7 +236,7 @@ const room = await HBInit({
       url: 'wss://edge.midominio.com:8443/tunnel',
       key: 'alice:9fH3…',        // la entrega el operador del edge
       // dataPlane: 'udp',       // (por defecto) túnel v2; 'webrtc' = PeerConnection legada; 'ws'
-      // fallbackWs: true,       // (por defecto) si el UDP al edge está bloqueado, todo por el WS
+      // fallbackWs: true,       // (por defecto, salvo con un ws:// público aceptado por allowInsecure) si el UDP al edge está bloqueado, todo por el WS
     },
   },
 });
@@ -247,18 +249,24 @@ Con `HostTransport` directamente: `new HostTransport({ token, edge: { url, key }
 
 | Opción (`haxlite.edge`) | Por defecto | |
 |---|---|---|
-| `url` | — | `wss://host:puerto/tunnel` (`ws://` solo para pruebas/LAN) |
+| `url` | — | `wss://host:puerto/tunnel`. `ws://` solo se acepta sin más hacia loopback y redes privadas (con aviso en el log); hacia un host público exige `allowInsecure: true` (ver «Política de `ws://`» abajo) |
 | `key` | — | `"<keyId>:<secret>"` |
 | `dataPlane` | `'udp'` | `'udp'` = túnel v2 (§1.3, sin addons); `'webrtc'` = PeerConnection node-datachannel (carga el addon); `'ws'` = forzar el WebSocket |
 | `roLanes` | `true` | pedir los carriles `ro` (§1.2); `false` = un solo canal `ro` en el túnel |
 | `tunnelAead` | `'auto'` | solo `dataPlane: 'udp'`: AEAD que se pide para el túnel v2 (§1.3). `'auto'` = ChaCha20-Poly1305 (Node y Bun); `'chacha20-poly1305'` lo pide siempre; `'aes-128-gcm'` nunca. El edge decide; uno anterior concede AES-128-GCM |
-| `fallbackWs` | `true` | si el plano UDP no sube en `dataPlaneTimeoutMs` (o el edge no lo concede), todo por el WebSocket (queda en WS hasta reiniciar la sala) |
+| `fallbackWs` | `true` (`false` con un `ws://` público aceptado por `allowInsecure`) | si el plano UDP no sube en `dataPlaneTimeoutMs` (o el edge no lo concede), todo por el WebSocket (queda en WS hasta reiniciar la sala). Con un `ws://` público iría en claro y lo podría forzar quien esté en el camino; `fallbackWs: true` lo activa |
+| `allowInsecure` | `false` | acepta una URL `ws://` cuyo host no es loopback ni de red privada (sin TLS: el canal de control es legible en el camino) |
 | `bindAddress` | — | dirección local para el WS y el socket UDP del túnel |
 | `iceServers` / `portRange` | ninguno / — | solo `dataPlane: 'webrtc'` |
 | `connectTimeoutMs` / `dataPlaneTimeoutMs` | 10 s / 5 s | |
-| `reconnectMinMs` / `reconnectMaxMs` | 250 ms / 10 s | backoff exponencial; tras una caída el primer reintento es inmediato |
-| `pingIntervalMs` / `pingTimeoutMs` | 5 s / 15 s | también el keep-alive UDP y su timeout |
+| `reconnectMinMs` / `reconnectMaxMs` | 250 ms / 10 s | backoff exponencial. Tras un túnel que estuvo `ready` al menos `reconnectStableMs` el primer reintento es inmediato y el backoff vuelve a `reconnectMinMs`; tras uno más corto, el retardo es el backoff × (0,8 a 1,2) y sigue creciendo |
+| `reconnectStableMs` | 10 s | tiempo mínimo en `ready` para que una caída cuente como la de un túnel sano; evita un bucle de reconexión con un edge que acepta la sesión y la cae enseguida |
+| `pingIntervalMs` / `pingTimeoutMs` | 5 s / 15 s | también el keep-alive UDP y su timeout. Con el túnel v2 el edge debe contestar con *Pong* a los *Ping* del host, aunque esté ocupado con datos: sin *Pong* durante `max(pingTimeoutMs, 2 × pingIntervalMs)` el túnel falla con «tunnel timed out (the edge does not answer pings)» y el host reconecta |
 | `wsOptions` | — | opciones del cliente `ws` (p. ej. `ca` para un certificado propio) |
+
+**Política de `ws://`** (`src/net/edge-client.ts`). `wss://` no tiene restricciones. Con `ws://`: loopback (`localhost`, 127.0.0.0/8, `::1`, IPv4 mapeadas 127.x) se acepta sin aviso; una red privada (RFC 1918, 100.64.0.0/10, 169.254.0.0/16, `fc00::/7`, `fe80::/10`, IPv4 mapeadas privadas, nombres de una sola etiqueta y los acabados en `.local`, `.internal`, `.lan` o `.home.arpa`) se acepta con el aviso «WARNING: ws:// edge url without TLS (private network)…»; cualquier otro host lanza `Error` al crear el backend (`HBInit` se rechaza) salvo con `allowInsecure: true`. En ese caso `fallbackWs` vale `false` por defecto y un edge que no concede UDP, o que habla el protocolo 1, da un error en lugar de caer al WebSocket en claro; añade `fallbackWs: true` para el respaldo. Otros avisos del log: «WARNING: short edge key secret…» (secreto de menos de 22 caracteres sobre `ws://`) y «WARNING: TLS certificate verification is off…» (`wsOptions.rejectUnauthorized: false`).
+
+**Plano WebSocket y contrapresión.** Los mensajes no fiables (`uu`) se descartan si hay más de 262 144 B en la cola del socket; con más de 8 388 608 B en cola el túnel falla con `EdgeError` «tunnel send buffer overflow (the edge does not read)» y se reconecta. El túnel WebRTC legado (`dataPlane: 'webrtc'`) devuelve `false` en `send` con más de 8 388 608 B en el canal. No son configurables.
 
 Comportamiento:
 
@@ -268,7 +276,7 @@ Comportamiento:
   `initTimeoutMs`.
 * **Caída del túnel:** los jugadores conectados se pierden (el cliente oficial no puede
   reconectarse ni renegociar), se emiten sus `onPlayerLeave` y `onBackendState('down')`; el host
-  reintenta enseguida y con backoff. Mientras tanto las entradas se rechazan con 4104. La sala
+  reintenta (sin espera si el túnel llevaba al menos `reconnectStableMs` en `ready`; si no, con backoff). Mientras tanto las entradas se rechazan con 4104. La sala
   (link, estado, bans) sigue viva; al volver: `onBackendState('ready')`.
 * `iceServers`, `iceCandidatePolicy` y `portRange` del host **no se usan** con edge: el host no
   crea PeerConnections de jugadores (el test E2E lo verifica).
@@ -276,8 +284,7 @@ Comportamiento:
   módulo del túnel legado se importa solo con `'webrtc'`, y `src/net/webrtc.ts` carga el addon
   recién en la primera PeerConnection). `test/edge/edge-no-native.test.ts` lo verifica (§8).
 * `getPlayerConnection(id).remoteAddress`: dirección del jugador **vista por el edge** (la del
-  par nominado). Los bans oficiales siguen siendo por `conn` + srflx (llegan por el master),
-  igual que sin edge.
+  par nominado). Con `transport.verifiedIpBans` (por defecto) un kick-ban guarda `conn` y esa dirección si el jugador la declaró como candidato `host`/`srflx`; con `verifiedIpBans: false`, `conn` + srflx declaradas (llegan por el master), igual que sin edge.
 * `edgeStats()` → `{state, dataPlane: 'udp'|'webrtc'|'ws', roLanes, sessionId, rttMs, peers,
   sessions, bytes/messages In/Out, udp}`; `rttMs` es el RTT del plano UDP cuando existe; `udp`
   trae los contadores del túnel v2 (datagramas, rechazados, ratchets, estado SCTP,
@@ -367,6 +374,7 @@ WantedBy=multi-user.target
   **SIGHUP recarga el certificado** sin cortar túneles). Alternativa: terminar TLS en nginx/caddy
   con `proxy_pass` de WebSocket a `127.0.0.1:8443` (solo el control; el UDP no pasa por ahí:
   entonces fijar `tunnel.port` y abrirlo aparte).
+* **Detrás de un proxy inverso** todos los hosts llegan desde la IP del proxy (loopback o privada). Por eso `limits.maxPreAuthPerIp`, `ipConnectCapacity` y `ipConnectMsPerToken` **no se aplican por defecto** a orígenes loopback, privados (RFC 1918, 100.64.0.0/10, `fc00::/7`) ni *link-local* (`limits.perIpLimitsApplyToPrivate: false`): si se aplicaran, un solo cliente podría dejar fuera a todos los hosts. Con `limits.trustForwardedFor: true`, cuando el socket viene de un origen no público la clave de esos topes es la **última** entrada de `X-Forwarded-For` (la que añadió el proxy; las anteriores las pone el cliente). El proxy debe añadirla (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`) y solo debe activarse si nada más que el proxy alcanza el edge desde una dirección privada. Sin ello, limita en el proxy (`limit_conn` / `limit_req`). El CLI avisa al arrancar si escucha en loopback sin `trustForwardedFor` ni `perIpLimitsApplyToPrivate`. La regla nft `ct state new limit rate 20/second` de §3.1 es global, no por IP.
 * SIGINT/SIGTERM cierran todos los túneles con 4503; los hosts reconectan solos (al reiniciar el
   edge se pierden los jugadores conectados).
 * Desarrollo, sin compilar: `npm run edge -- --config edge.json` o
@@ -381,7 +389,7 @@ WantedBy=multi-user.target
 | TCP 8443 (control) | abierto (autenticado con HMAC); si los hosts tienen IP fija, mejor solo desde ellas. Rate-limit de conexiones nuevas (`ct state new limit rate 20/second`) |
 | UDP 8443 (túnel v2) | **solo de los hosts** si tienen IP fija; si no, abierto: sin un `connId` vigente y un MAC válido el edge no responde nada (§4) |
 | UDP 40000 (jugadores, `webrtc.port`) | descartar fragmentos, puertos origen < 1024 y reflectores, aceptar STUN con límite por origen. Con `'rtc'` es **un** puerto para todos los jugadores. [`ops/haxguard/haxguard.nft`](../ops/haxguard/haxguard.nft) es la plantilla de esas reglas, pero **no sirve tal cual** para el Edge: (1) su `ROOM_PORTS` por defecto es `20000-20999` y todo UDP fuera de él pasa sin filtrar (hay que cambiarlo al puerto de jugadores del edge); (2) solo deja pasar a las IP de los conjuntos `active4/6` y `pending4/6`, que debe llenar un sidecar privilegiado (haxguard) **que no está en el repo**; con los conjuntos vacíos, tras cambiar `ROOM_PORTS` solo pasa el STUN y se descartan el DTLS/SCTP de los jugadores; (3) está escrita para salas `ndc` con `enableIceUdpMux`. Sin sidecar hay que adaptar una copia que conserve solo las reglas generales (fragmentos, puertos origen < 1024, reflectores, límite de STUN) y no el descarte final |
-| `GET /stats` | ponerle `stats.token` o no exponerlo (bind privado / firewall) |
+| `GET /stats` | ponerle `stats.token`; sin él responde `200` con solo agregados de todo el edge (§5), sin datos por clave. Aun así, mejor no exponerlo (bind privado / firewall) |
 
 Con `playerBackend: 'ndc'` el rango es `portRange` (una PeerConnection por puerto salvo
 `enableIceUdpMux`, que permite la atribución por puerto de 08 §3).
@@ -456,6 +464,7 @@ Varias salas en un mismo host = varias sesiones de túnel con la misma clave (cu
   la clave), jugadores por sala y por clave, negociaciones simultáneas por sala (16, como el
   4104 oficial) y ritmo de `PeerOpen` (ráfaga 30, 1 cada 100 ms). Excederlas devuelve
   `PeerClosed(Limit)` (el host lo trata como negociación fallida) o cierra con 4429.
+* **Sockets sin autenticar y ritmo por origen:** los túneles en fase `Hello` → `Auth` se cuentan aparte (`maxPreAuthSessions`, 1024) y `maxSessions` solo cuenta los autenticados. Con el pool lleno, el recién llegado recibe HTTP 503, salvo que el socket anónimo más antiguo lleve ≥ 5 s sin autenticar: ese se cierra con 4408 «auth timeout» para hacerle sitio. Por origen público (IPv6: por /64) hay un máximo de sockets sin autenticar (`maxPreAuthPerIp`, 256) y un *token bucket* de *upgrades* nuevos (`ipConnectCapacity` 256, uno más cada `ipConnectMsPerToken` 20 ms); al excederlos, HTTP 429. Las respuestas 429 y 503 llevan `Connection: close` y `Retry-After: 1`. Un edge lleno de sesiones autenticadas cierra con 4429 «edge full» (y fuerza `terminate` a los 2 s), también al autenticar si se llena entre medias.
 * **Flood de jugadores:** *token bucket* oficial (100, 1/16 ms) por jugador **en el edge**: el
   exceso no llega al túnel; el edge cierra al jugador y avisa `PeerClosed(Flood)`, y el host lo
   expulsa con "Bad actor" (misma semántica que el host oficial; el host conserva además su propio
@@ -506,7 +515,12 @@ no los sustituyen; `--config` gana sobre `HAXLITE_EDGE_CONFIG`): `HAXLITE_EDGE_H
 | `tunnel.idleTimeoutMs` | 30 000 | túnel sin datagramas autenticados |
 | `tunnel.aead` | `'auto'` | AEAD que se concede a los hosts que piden ChaCha20-Poly1305 (§1.3): `'auto'` = ChaCha20-Poly1305 (Node y Bun); `'chacha20-poly1305'` lo concede siempre que se pida; `'aes-128-gcm'` nunca. Quien no lo pide recibe AES-128-GCM |
 | `tunnel.allowWebRtc` | true | conceder el túnel legado a quien lo pida (carga node-datachannel en ese momento) |
-| `limits.maxSessions` | 1000 | túneles simultáneos |
+| `limits.maxSessions` | 1000 | túneles **autenticados** simultáneos; exceso → 4429 «edge full» |
+| `limits.maxPreAuthSessions` | 1024 | sockets de túnel en fase `Hello` → `Auth`, aparte de `maxSessions` (`0` = sin límite). Lleno → HTTP 503, salvo que el más antiguo lleve ≥ 5 s sin autenticar (se cierra con 4408 «auth timeout») |
+| `limits.maxPreAuthPerIp` | 256 | sockets sin autenticar por origen público (IPv6: por /64); más → HTTP 429 (`0` = sin límite) |
+| `limits.ipConnectCapacity` / `ipConnectMsPerToken` | 256 / 20 | *token bucket* de *upgrades* nuevos por origen público (ráfaga 256, 50 por segundo sostenidos); agotado → HTTP 429 (`ipConnectCapacity: 0` lo desactiva) |
+| `limits.perIpLimitsApplyToPrivate` | false | aplica los tres topes anteriores también a orígenes loopback, privados y *link-local* |
+| `limits.trustForwardedFor` | false | si el socket viene de un origen no público, la clave de los topes por origen es la última entrada de `X-Forwarded-For` |
 | `limits.maxSessionsPerKey` / `maxPeersPerKey` | 16 / 256 | cuotas por defecto de cada clave |
 | `limits.maxPeersPerSession` | 40 | jugadores por sala |
 | `limits.maxPendingPerSession` | 16 | negociaciones en curso por sala |
@@ -524,6 +538,8 @@ clave `{sessions, peers, bytesIn/Out, messagesIn/Out, ppsIn/Out, floods}` (pps d
 anterior), `rtc` (contadores del endpoint de jugadores: sesiones, abiertas, STUN rechazados,
 handshakes…), `tunnel` (puerto, túneles, datagramas, `unknownConn`, `rateLimited`, `rejected`,
 `migrations`), `webrtc` (objetos nativos; `null` si node-datachannel nunca se cargó) y RSS.
+
+Sin `stats.token`, `GET /stats` responde `200` con **solo agregados** de todo el edge: `uptimeSec`, `playerBackend`, `sessions`, `peers`, `authFailures`, `dataPlanes` y `memoryRssMb`, con `keys: []`, `webrtc`, `rtc` y `tunnel` a `null` y `redacted: true`. Ese campo solo aparece en esta respuesta anónima (no con token ni en `EdgeServer.stats()`) y permite distinguir «dato retenido» de «no hay claves» o «túnel apagado». El detalle por clave exige `stats.token` / `HAXLITE_EDGE_STATS_TOKEN`. `stats.logIntervalMs` / `HAXLITE_EDGE_LOG_INTERVAL_MS` acepta de 0 a 2147483647 ms; fuera de rango o no numérico, el arranque falla («bad log interval N (0-2147483647 ms)»). Los plazos `channelOpenTimeoutMs`, `authTimeoutMs`, `dataPlaneTimeoutMs` y `keepAliveMs` se acotan a 2147483647 ms, y un valor no numérico o un límite inválido en `limits` lanza `RangeError` al arrancar el edge.
 
 ## 6. Límites y decisiones
 
