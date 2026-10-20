@@ -110,15 +110,20 @@ export const NetDefaults = {
    * have not joined yet (negotiating, awaiting `onJoinRequest`, challenged or
    * verifying). Three quarters of {@link maxPendingNegotiations}: one address
    * never takes every negotiation slot, while 10 players behind one NAT can
-   * still join at once (a reverse retry replaces its abandoned direct
-   * attempt, see {@link directAttemptMs}). Joined players are never counted.
+   * still join at once (at the limit a reverse retry replaces an abandoned
+   * direct attempt, see {@link directAttemptMs}). Joined players are never
+   * counted.
    */
   maxUnjoinedPerIp: 12,
   /**
    * Official client: a direct (non-reverse) attempt that has not connected
    * after 4 s is given up and retried once with the reverse flag (node-haxball
-   * `Ii(4e3)`). A reverse offer from an address replaces the oldest direct
-   * negotiation of that address still without channel 0 after this long.
+   * `Ii(4e3)`). Such an attempt is not counted by the preflight check of
+   * {@link maxUnjoinedPerIp}; once the address is at that limit (or the
+   * negotiation table would be full), a reverse offer from it replaces its
+   * oldest direct negotiation still without channel 0 after this long. Below
+   * the limit nothing is replaced: the attempt may be another player's on a
+   * slow link (channel 0 may open until `channelOpenTimeoutMs`).
    */
   directAttemptMs: 4_000,
   /**
@@ -133,7 +138,8 @@ export const NetDefaults = {
    * (flood, protocol violation, no handshake; closes decided by the room are
    * not counted): each takes a token (`capacity`, one back every
    * `msPerToken`); once none is left, for `blockMs` the address only gets one
-   * new connection every `admitEveryMs`, the rest are refused with 4104.
+   * new connection every `admitEveryMs` (taken by the first one that opens
+   * channel 0), the rest are refused with 4104.
    * 20 tokens, one back every 3 s: 10 players behind one NAT can each time
    * out twice a minute without effect, and keeping an address limited takes
    * at least one abusive close every 3 s.

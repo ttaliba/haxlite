@@ -3,13 +3,16 @@
  * Needs clang with the linux headers, a C compiler with libbpf and a privileged user able to load
  * BPF programs; the cases are skipped otherwise. Nothing is attached to an interface and no map is
  * pinned: the program is loaded, fed synthetic frames and released.
+ * Loading BPF needs root (CAP_BPF), so an unprivileged `npx vitest run` skips every case here,
+ * saying why; HAXLITE_REQUIRE_OPS=1 turns the skip into a failure (run it as root, docs/12 section 7).
  */
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, type TestContext } from 'vitest';
+import { needs } from './ops-env.js';
 
 const src = (name: string): string => fileURLToPath(new URL(`../../ops/haxguard/${name}`, import.meta.url));
 const harness = fileURLToPath(new URL('./xdp_test_run.c', import.meta.url));
@@ -38,7 +41,7 @@ beforeAll(() => {
   if (cc.error || /bpf\/(libbpf|bpf)\.h|cannot find -lbpf/.test(cc.stderr)) return void (why = 'no C compiler or libbpf');
   expect(cc.status, cc.stderr).toBe(0);
   const run = spawnSync(bin, [obj], { encoding: 'utf8' });
-  if (run.status === 77) return void (why = 'the kernel refuses to load BPF programs here');
+  if (run.status === 77) return void (why = `the kernel refuses to load BPF programs here (needs root or CAP_BPF; ${run.stderr.trim()})`);
   expect(run.status, run.stderr).toBe(0);
   results = Object.fromEntries(
     run.stdout
@@ -53,23 +56,29 @@ afterAll(() => {
   if (tmp) rmSync(tmp, { recursive: true, force: true });
 });
 
+/** What the harness printed; skips the case (fails it under HAXLITE_REQUIRE_OPS=1) when it could not run. */
+function runResults(ctx: TestContext): Record<string, number> {
+  needs(ctx, results ? null : why);
+  return results!;
+}
+
 describe('ops/haxguard XDP sketch (BPF_PROG_TEST_RUN)', () => {
   it('a clock that runs behind another CPU does not refill the global buckets', (ctx) => {
-    if (!results) return ctx.skip(why);
+    const results = runResults(ctx);
     // gbucket last_ns is 30 s ahead of the clock the packet reads, with no tokens left.
     expect(results.stun_global_clock_behind_of_50).toBe(0);
     expect(results.pending_global_clock_behind_of_50).toBe(0);
   });
 
   it('an idle global bucket still refills up to its burst and no further', (ctx) => {
-    if (!results) return ctx.skip(why);
+    const results = runResults(ctx);
     // STUN_GLOBAL_BURST is 500; a few ms of refill at 2000/s may add a handful.
     expect(results.stun_global_idle_of_600).toBeGreaterThanOrEqual(500);
     expect(results.stun_global_idle_of_600).toBeLessThan(560);
   });
 
   it('judges only UDP to the room ports; fragments and malformed packets go first', (ctx) => {
-    if (!results) return ctx.skip(why);
+    const results = runResults(ctx);
     expect(results.other_port_plain).toBe(XDP_PASS);
     // IP options do not change the verdict for a port that is not a room.
     expect(results.other_port_ip_options).toBe(XDP_PASS);
@@ -85,7 +94,7 @@ describe('ops/haxguard XDP sketch (BPF_PROG_TEST_RUN)', () => {
   });
 
   it('keeps the lanes: unknown non-STUN dropped, STUN burst per source, players and expiry', (ctx) => {
-    if (!results) return ctx.skip(why);
+    const results = runResults(ctx);
     expect(results.unknown_non_stun).toBe(XDP_DROP);
     expect(results.stun_one_source_of_30).toBe(10);
     expect(results.active_expired_non_stun).toBe(XDP_DROP);

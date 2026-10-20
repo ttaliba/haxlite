@@ -1,7 +1,8 @@
 /**
  * ops/haxguard configuration checks. The nft files are validated with `nft -c`
  * inside a throwaway user+network namespace (nothing is loaded into the host);
- * those cases are skipped when nft or unprivileged namespaces are unavailable.
+ * those cases are skipped (reason printed; failed under HAXLITE_REQUIRE_OPS=1)
+ * when nft or unprivileged namespaces are unavailable.
  * The text checks pin the properties `nft -c` cannot see (a syntactically valid
  * ruleset can still blackhole the whole interface).
  */
@@ -9,6 +10,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { needs, why } from './ops-env.js';
 
 const dir = fileURLToPath(new URL('../../ops/haxguard/', import.meta.url));
 const file = (name: string): string => dir + name;
@@ -16,8 +18,10 @@ const read = (name: string): string => readFileSync(file(name), 'utf8');
 const NFT_FILES = ['haxguard.nft', 'relay-only.nft', 'canary-counters.nft'];
 
 const inNs = (script: string) => spawnSync('unshare', ['-rn', 'sh', '-c', script], { encoding: 'utf8' });
-const hasNft = inNs('nft --version').status === 0;
-const hasClang = spawnSync('clang', ['--version']).status === 0;
+const nftProbe = inNs('nft --version');
+const noNft = nftProbe.status === 0 ? null : why('nft or unprivileged user+net namespaces (unshare -rn) unavailable', nftProbe);
+const clangProbe = spawnSync('clang', ['--version'], { encoding: 'utf8' });
+const noClang = clangProbe.status === 0 ? null : why('clang unavailable', clangProbe);
 
 /** Bodies of every `set name { ... }` block (brace-balanced, comments stripped). */
 function setBlocks(src: string): { name: string; body: string }[] {
@@ -49,7 +53,8 @@ function chainRules(src: string, chain: string): string[] {
 }
 
 describe('ops/haxguard nft files', () => {
-  it.skipIf(!hasNft).each(NFT_FILES)('%s passes nft -c', (name) => {
+  it.for(NFT_FILES)('%s passes nft -c', (name, ctx) => {
+    needs(ctx, noNft);
     const r = inNs(`nft -c -f ${file(name)}`);
     expect(r.stderr).toBe('');
     expect(r.status).toBe(0);
@@ -63,7 +68,8 @@ describe('ops/haxguard nft files', () => {
     }
   });
 
-  it.skipIf(!hasNft)('relay-only.nft reloads without duplicating rules', () => {
+  it('relay-only.nft reloads without duplicating rules', (ctx) => {
+    needs(ctx, noNft);
     const f = file('relay-only.nft');
     const r = inNs(`nft -f ${f} && nft -f ${f} && nft -f ${f} && nft list chain inet haxhost out`);
     expect(r.status).toBe(0);
@@ -76,6 +82,14 @@ describe('ops/haxguard nft files', () => {
     expect(last).toMatch(/^udp dport \$ROOM_PORTS\b.*\bdrop$/);
     // Every unconditional verdict would take TCP, ICMP and ARP/ND down with it.
     for (const rule of rules) expect(rule).not.toMatch(/^counter name \w+ drop$/);
+  });
+
+  it('haxguard.nft keys the unknown-STUN meter per IPv4 address and per IPv6 /64 by default', () => {
+    const src = read('haxguard.nft');
+    // IPv6 has no CGNAT and a /64 is what a subscriber gets: a bucket per address lets one /64 owner
+    // mint 2^64 bursts and leaves only the global budget (shared by every room) between it and the players.
+    expect(src).toMatch(/^define STUN_V4_MASK = 255\.255\.255\.255$/m);
+    expect(src).toMatch(/^define STUN_V6_MASK = ffff:ffff:ffff:ffff::$/m);
   });
 
   it('haxguard.nft caps the pending lane and keys the unknown-STUN meter by a configurable source mask', () => {
@@ -91,7 +105,8 @@ describe('ops/haxguard nft files', () => {
 });
 
 describe('ops/haxguard XDP sketch', () => {
-  it.skipIf(!hasClang)('compiles for bpf', () => {
+  it('compiles for bpf', (ctx) => {
+    needs(ctx, noClang);
     const arch = spawnSync('uname', ['-m'], { encoding: 'utf8' }).stdout.trim();
     const r = spawnSync(
       'clang',
@@ -99,7 +114,7 @@ describe('ops/haxguard XDP sketch', () => {
       { encoding: 'utf8' },
     );
     // Without the linux headers (asm/types.h) there is nothing to assert about the source.
-    if (/'asm\/types\.h' file not found/.test(r.stderr)) return;
+    needs(ctx, /'asm\/types\.h' file not found/.test(r.stderr) ? 'linux headers (asm/types.h, package linux-libc-dev) not found' : null);
     expect(r.stderr).toBe('');
     expect(r.status).toBe(0);
   });

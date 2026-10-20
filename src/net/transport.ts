@@ -170,6 +170,7 @@ export class Peer {
   /** @internal mids of the offer's m-sections (usually the shared {@link SINGLE_MID}) */ mids: readonly string[] = SINGLE_MID;
   /** @internal canonical `ip` for the per-address limits; null when exempt (not a public address) */ limitKey: string | null = null;
   /** @internal when the link's queue was first seen over `maxPeerBufferedBytes` (-1: it is not) */ backlogSince = -1;
+  /** @internal admitted while its address was limited: needs the slow lane's slot when channel 0 opens */ slowLane = false;
 
   constructor(offer: SignalingOffer, srflxIps: string[], now: number) {
     this.id = offer.peerId;
@@ -205,14 +206,17 @@ export interface JoinRequest {
 
 /**
  * Hook result: `undefined`/`null`/`true`/`{accept: true}` accepts; `false`
- * rejects with 4102; a close code (integer 0..65535) or `{reject: code}`
- * rejects with that code. A number that is not a close code, or a `reject`
- * key whose value is not one, rejects with 4104 and is reported to onError,
- * like a hook that throws or a promise that rejects. Any other value (a
- * string, an array, an object without `reject`) accepts, as before, and is
+ * and `{accept: false}` reject with 4102 (`RejectCode.Banned`, the code of a
+ * refusal without one); a close code (integer 0..65535) or `{reject: code}`
+ * rejects with that code. A number that is not a close code, a `reject` key
+ * whose value is not one, or an `accept` key that is not a boolean rejects
+ * with 4104 and is reported to onError, like a hook that throws, a promise
+ * that rejects or a value whose properties cannot be read (a throwing getter
+ * or Proxy). Any other value (a string, an array, an object with neither
+ * `reject` nor `accept`, e.g. a database row) accepts, as before, and is
  * reported to onError once.
  */
-export type JoinDecision = void | null | boolean | number | { accept: true } | { reject: number };
+export type JoinDecision = void | null | boolean | number | { accept: boolean } | { reject: number };
 
 /** Everything known about a joining player, given to onPeerJoin. */
 export interface JoinInfo extends JoinPlayerInfo {
@@ -265,10 +269,11 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   bans?: BanList;
   /**
    * Async admission hook evaluated after the official checks, before WebRTC.
-   * Any thenable is awaited (not only this realm's `Promise`). A malformed
-   * rejection (`NaN`, `-1`, `{reject: undefined}`…) is reported to onError
-   * and rejects with 4104, like a hook that throws; other values outside
-   * {@link JoinDecision} accept (see there).
+   * Any thenable is awaited (not only this realm's `Promise`). `{accept:
+   * false}` rejects with 4102, like `false`. A malformed decision (`NaN`,
+   * `-1`, `{reject: undefined}`, `{accept: 'no'}`…) or one that throws when
+   * read is reported to onError and rejects with 4104, like a hook that
+   * throws; other values outside {@link JoinDecision} accept (see there).
    */
   onJoinRequest?: (req: JoinRequest) => JoinDecision | PromiseLike<JoinDecision>;
   /** Per-IP join attempt limit (not official; default off). `code` default 4104. */
@@ -282,9 +287,11 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   /**
    * haxlite: max connections from one address (IPv6: one /64) that have not
    * joined yet (negotiating, awaiting the hook, challenged or verifying);
-   * more offers from it are refused with 4104. A reverse retry replaces the
-   * abandoned direct attempt it follows instead of counting twice (see
-   * {@link NetDefaults.directAttemptMs}). Default
+   * more offers from it are refused with 4104. Once the address is at the
+   * limit (or the {@link maxPendingNegotiations} table would be full), a
+   * reverse retry replaces the oldest abandoned direct attempt of the address
+   * instead of counting twice (see {@link NetDefaults.directAttemptMs});
+   * below it every attempt runs until its own timeout. Default
    * {@link NetDefaults.maxUnjoinedPerIp} (12); `Infinity` disables it. Only
    * public addresses are counted: a loopback/private one (local tests, a
    * proxied master) is exempt.
@@ -299,12 +306,26 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
    * that throws or the chat limit) and seats given to a new connection are
    * never counted. Each abusive close takes a token (`capacity`, one back
    * every `msPerToken` ms); once none is left, for `blockMs` the address gets
-   * one new connection every `admitEveryMs` (optional, default
-   * {@link NetDefaults.abusePenalty}`.admitEveryMs`; `Infinity` refuses them
-   * all) and the rest are refused with 4104. Default
-   * {@link NetDefaults.abusePenalty} (20 tokens, one back every 3 s, 30 s of
-   * one connection every 3 s); `null` disables it. Public addresses only,
-   * like {@link maxUnjoinedPerIp}: players behind one NAT share it.
+   * one new connection every `admitEveryMs` and the rest are refused with
+   * 4104. That slot is taken by the first connection of the address that
+   * opens channel 0, not by an offer: offers that are refused later
+   * (password, version, hook), fail or never complete take nothing, and a
+   * connection that opens channel 0 after another one took the slot is
+   * closed before the challenge (`'failed'`, not counted as abuse). Offers
+   * are refused at once until `admitEveryMs` after the slot was taken (or
+   * after the address was limited).
+   *
+   * `admitEveryMs` is optional, default
+   * {@link NetDefaults.abusePenalty}`.admitEveryMs` (3 s), also for an object
+   * that omits it: earlier versions refused every connection for `blockMs`
+   * (a one-time notice on `log`, or `console.warn`, says so); `Infinity`
+   * restores that. `0` is refused with a RangeError: use `null` to disable
+   * the penalty. Default {@link NetDefaults.abusePenalty} (20 tokens, one
+   * back every 3 s, 30 s of one connection every 3 s); `null` disables it.
+   * Public addresses only, like {@link maxUnjoinedPerIp}: players behind one
+   * NAT share it, and a co-tenant that keeps opening working connections and
+   * abusing them can keep taking the slot (ban it by `auth`, or tune or
+   * disable the penalty).
    */
   abusePenalty?: { capacity: number; msPerToken: number; blockMs: number; admitEveryMs?: number } | null;
   /**
@@ -423,6 +444,8 @@ const DEFAULT_ANSWER_ICE_WAIT_MS = NetDefaults.answerIceWaitMs;
 export const DEFAULT_MAX_PEER_BUFFERED_BYTES = 1 << 20;
 /** See {@link HostTransportOptions.peerBufferedTimeoutMs}. */
 export const DEFAULT_PEER_BUFFERED_TIMEOUT_MS = 10_000;
+/** The notice for an `abusePenalty` without `admitEveryMs` was given (once per process). */
+let slowLaneNoticeShown = false;
 /** Longest delay `setTimeout`/`setInterval` honour (a larger one fires after 1 ms). */
 const MAX_TIMER_MS = 0x7fffffff;
 
@@ -496,19 +519,24 @@ const ACCEPT_UNKNOWN = -2;
 
 /**
  * `onJoinRequest` result as a close code (u16), {@link ACCEPT} or
- * {@link ACCEPT_UNKNOWN}; null for a malformed rejection (a number that is
- * not a close code, or a `reject` key whose value is not one).
+ * {@link ACCEPT_UNKNOWN}; null for a malformed decision (a number that is
+ * not a close code, a `reject` key whose value is not one, an `accept` key
+ * that is not a boolean). Throws if reading the value throws (getter, Proxy).
  */
 function decisionCode(d: unknown): number | null {
   if (d === undefined || d === null || d === true) return ACCEPT;
   if (d === false) return RejectCode.Banned;
   if (typeof d === 'number') return isCloseCode(d) ? d : null;
-  if (typeof d === 'object') {
+  if (typeof d === 'object' && !Array.isArray(d)) {
     if ('reject' in d) {
       const code = (d as { reject: unknown }).reject;
       return typeof code === 'number' && isCloseCode(code) ? code : null;
     }
-    if ((d as { accept?: unknown }).accept === true && !Array.isArray(d)) return ACCEPT;
+    if ('accept' in d) {
+      // fail closed: `{accept: false}` is the refusal `{accept: true}` suggests
+      const a = (d as { accept: unknown }).accept;
+      return a === true ? ACCEPT : a === false ? RejectCode.Banned : null;
+    }
   }
   return ACCEPT_UNKNOWN;
 }
@@ -547,7 +575,13 @@ export class HostTransport {
   private readonly icePolicy: IceCandidatePolicy;
   private signalingStarted = false;
   private readonly reportError = (err: unknown): void => {
-    const e = err instanceof Error ? err : new Error(String(err));
+    let e: Error;
+    try {
+      e = err instanceof Error ? err : new Error(String(err));
+    } catch {
+      // a value thrown by user code whose prototype or toString throws (Proxy)
+      e = new Error('unprintable error value');
+    }
     const h = this.onError;
     try {
       if (h !== null) h(e);
@@ -642,7 +676,21 @@ export class HostTransport {
           );
     this.abuseBlockMs = ap === null ? 0 : checkMs('abusePenalty.blockMs', ap.blockMs, apd.blockMs);
     const every = ap === null ? undefined : ap.admitEveryMs;
+    if (every === 0) {
+      // ambiguous: "no slow lane" may mean refusing everything or limiting nothing
+      throw new RangeError(
+        'abusePenalty.admitEveryMs must be a finite number of ms > 0 or Infinity (got 0): Infinity refuses every new connection while the address is limited, abusePenalty: null disables the penalty',
+      );
+    }
     this.abuseAdmitEveryMs = every === Infinity ? Infinity : checkMs('abusePenalty.admitEveryMs', every, apd.admitEveryMs);
+    if (ap !== null && ap !== apd && every == null && !slowLaneNoticeShown) {
+      slowLaneNoticeShown = true;
+      const msg =
+        `[haxlite/net] abusePenalty without admitEveryMs: a limited address gets one new connection every ${apd.admitEveryMs} ms ` +
+        'instead of none, as earlier versions did; pass admitEveryMs: Infinity to refuse them all';
+      if (opts.log !== undefined) this.callUser(() => opts.log!(msg));
+      else console.warn(msg);
+    }
     if (opts.backend != null) this.backend = opts.backend;
     else if (opts.edge != null) this.backend = new EdgePeerBackend(opts.edge);
     else if (opts.peerBackend === 'rtc') {
@@ -1001,14 +1049,10 @@ export class HostTransport {
     if (this.bans.isIpBanned(ip)) return this.refuse(peerId, ip, conn, RejectCode.Banned, 'banned conn');
     const now = performance.now();
     const key = limitKeyOf(ip);
-    let limited = false;
     if (key !== null) {
-      const until = this.blockedUntil.get(key);
-      if (until !== undefined && now < until) {
-        if (now < (this.admitAt.get(key) ?? 0)) {
-          return this.refuse(peerId, ip, conn, RejectCode.TooManyPending, 'address blocked after abusive connections');
-        }
-        limited = true;
+      // slow lane: the slot is taken by the next connection that opens channel 0 (onChannelZeroOpen)
+      if (this.isLimited(key, now) && now < (this.admitAt.get(key) ?? 0)) {
+        return this.refuse(peerId, ip, conn, RejectCode.TooManyPending, 'address blocked after abusive connections');
       }
       // abandoned direct attempts are counted once the offer is known not to be their reverse retry
       if (this.maxUnjoinedPerIp !== Infinity && this.unjoinedFrom(key, now, false) >= this.maxUnjoinedPerIp) {
@@ -1025,8 +1069,13 @@ export class HostTransport {
     if (this.connected.length >= this.maxPlayers && this.staleChallenged(now) === null) {
       return this.refuse(peerId, ip, conn, RejectCode.Full, 'room full');
     }
-    if (limited) this.admitAt.set(key!, now + this.abuseAdmitEveryMs);
     return true;
+  }
+
+  /** `key` is limited after abusive connections ({@link HostTransportOptions.abusePenalty}). */
+  private isLimited(key: string, now: number): boolean {
+    const until = this.blockedUntil.get(key);
+    return until !== undefined && now < until;
   }
 
   private refuse(peerId: number, ip: string, conn: string, code: number, why: string): false {
@@ -1058,15 +1107,20 @@ export class HostTransport {
   /**
    * A reverse offer from `key` replaces the oldest abandoned direct attempt
    * from that address (most likely the one this offer retries), so a client
-   * behind a restrictive NAT does not count twice.
+   * behind a restrictive NAT does not count twice. Only called once the
+   * address is at {@link maxUnjoinedPerIp} or the negotiation table would
+   * be full: the attempt may be another player's on a slow link or a client
+   * that does not retry. False: there was none.
    */
-  private replaceAbandoned(key: string, now: number): void {
+  private replaceAbandoned(key: string, now: number): boolean {
     let oldest: Peer | null = null;
     for (const p of this.pending.values()) {
       if (p.limitKey !== key || !this.isAbandoned(p, now)) continue;
       if (oldest === null || p.createdAt < oldest.createdAt) oldest = p;
     }
-    if (oldest !== null) this.failNegotiation(oldest, 'replaced by a reverse retry');
+    if (oldest === null) return false;
+    this.failNegotiation(oldest, 'replaced by a reverse retry');
+    return true;
   }
 
   /**
@@ -1138,14 +1192,19 @@ export class HostTransport {
     const now = performance.now();
     const key = limitKeyOf(offer.ip);
     if (key !== null && this.maxUnjoinedPerIp !== Infinity) {
-      if (offer.reverse) this.replaceAbandoned(key, now);
-      if (this.unjoinedFrom(key, now, true) >= this.maxUnjoinedPerIp) {
+      let unjoined = this.unjoinedFrom(key, now, true);
+      // only when a place is needed: below the caps a slow direct attempt (another player's?) keeps going
+      if (offer.reverse && (unjoined >= this.maxUnjoinedPerIp || this.pending.size + 1 >= this.maxPending) && this.replaceAbandoned(key, now)) {
+        unjoined--;
+      }
+      if (unjoined >= this.maxUnjoinedPerIp) {
         this.reject(offer, RejectCode.TooManyPending, 'too many unjoined connections from this address');
         return;
       }
     }
     const peer = new Peer(offer, srflx, now);
     peer.limitKey = key;
+    peer.slowLane = key !== null && this.isLimited(key, now);
     for (let i = 0; i < hostIps.length; i++) peer.hostIps.push(hostIps[i]!);
     this.pending.set(peer.id, peer);
     this.ensureSweep();
@@ -1189,7 +1248,14 @@ export class HostTransport {
 
   private applyDecision(peer: Peer, offer: SignalingOffer, d: unknown): void {
     if (peer.state !== 'validating' || this.pending.get(peer.id) !== peer) return; // dropped meanwhile
-    let code = decisionCode(d);
+    let code: number | null;
+    try {
+      code = decisionCode(d);
+    } catch (err) {
+      // a getter or Proxy trap that throws: refused now, not left to the join request timeout
+      this.reportError(err);
+      code = RejectCode.TooManyPending;
+    }
     if (code === null) {
       // fail closed: an admission filter must not let in what it meant to refuse
       this.reportError(new TypeError(`onJoinRequest returned an invalid decision (${typeof d === 'number' ? String(d) : typeof d})`));
@@ -1198,7 +1264,8 @@ export class HostTransport {
       // accepted, as hooks returning e.g. a database row always were; said once
       if (!this.unknownDecisionReported) {
         this.unknownDecisionReported = true;
-        const kind = Array.isArray(d) ? 'array' : typeof d;
+        // objects only: decisionCode already read them (a revoked function Proxy would throw here)
+        const kind = typeof d === 'object' && Array.isArray(d) ? 'array' : typeof d;
         this.reportError(new TypeError(`onJoinRequest returned a value that is not a JoinDecision (${kind}): the join is accepted`));
       }
       code = ACCEPT;
@@ -1418,11 +1485,18 @@ export class HostTransport {
   /** `la.Qd` + `Wa.Ah`. */
   private onChannelZeroOpen(peer: Peer): void {
     this.log(`peer ${peer.id}: channel 0 open`);
+    const now = performance.now();
+    // Slow lane: the slot goes to the first connection that works, so offers
+    // that fail or never complete (a co-tenant's, or rejected ones) take nothing.
+    const lane = peer.slowLane && this.isLimited(peer.limitKey!, now);
+    if (lane && now < (this.admitAt.get(peer.limitKey!) ?? 0)) {
+      this.failNegotiation(peer, 'slow lane slot taken by another connection of the address');
+      return;
+    }
     if (this.pending.get(peer.id) === peer) this.pending.delete(peer.id);
     this.sendEnd(peer);
     if (peer.timer !== null) clearTimeout(peer.timer);
     peer.timer = null;
-    const now = performance.now();
     if (this.connected.length >= this.maxPlayers) {
       const stale = this.staleChallenged(now);
       if (stale === null) {
@@ -1435,6 +1509,7 @@ export class HostTransport {
       this.log(`peer ${stale.id}: no handshake, seat given to peer ${peer.id}`);
       this.closePeer(stale, 'timeout');
     }
+    if (lane) this.admitAt.set(peer.limitKey!, now + this.abuseAdmitEveryMs);
     peer.state = 'challenged';
     peer.lastMessageAt = now;
     peer.bucket = new TokenBucket(this.floodCapacity, this.floodMsPerToken, now);
@@ -1649,7 +1724,8 @@ export class HostTransport {
   /**
    * An abusive close: once its address runs out of tokens it is limited for
    * `blockMs` to one new connection every `admitEveryMs` (the first one
-   * `admitEveryMs` from now). A strike while limited keeps it limited.
+   * `admitEveryMs` from now; the slot is taken when a connection opens
+   * channel 0). A strike while limited keeps it limited.
    */
   private strike(peer: Peer): void {
     const key = peer.limitKey;

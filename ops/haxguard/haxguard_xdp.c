@@ -19,8 +19,10 @@
 //    el UDP truncado (paquetes malformados que el kernel descartaría igual). Las opciones IP (ihl > 5) solo se
 //    descartan hacia ROOM_PORT; hacia otros puertos el paquete pasa.
 //  - Sin amp_sports ni stun_servers4 (las respuestas de un STUN propio entran por el carril de STUN de desconocidos).
-//  - El carril de STUN de desconocidos limita por IP origen, igual que haxguard.nft con sus máscaras por defecto, y no hay
-//    set "lleno" que falle en abierto: stunrate4 es LRU.
+//  - deny4 solo se mira para el UDP a ROOM_PORT. haxguard.nft descarta además TCP, ICMP... de esa IP (y, igual que aquí, deja
+//    pasar su UDP a otros puertos): el XDP nunca toca lo que no sea UDP IPv4.
+//  - El carril de STUN de desconocidos limita por IP origen, igual que haxguard.nft con su máscara IPv4 por defecto (/32), y
+//    no hay set "lleno" que falle en abierto: stunrate4 es LRU.
 //  - Los topes son cubos de fichas con una carrera benigna entre CPUs (cada cola de un driver nativo puede gastar la misma
 //    ficha o recargar el mismo intervalo): el tope real puede salir más laxo que en nft, hasta como mucho el número de
 //    colas que corren a la vez. Un reloj que va hacia atrás entre CPUs (now < last_ns) cuenta como 0 s transcurridos y no

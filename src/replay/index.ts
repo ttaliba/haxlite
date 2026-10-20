@@ -8,8 +8,9 @@
  *                    inflated size and event count are capped (`ReplayReadOptions`)
  *   writeReplay      ReplayData -> .hbr2
  *   ReplayPlayer     deterministic re-simulation with seek (src/room stepRoom + event apply);
- *                    seek/finish refuse targets past `maxFrames` (optional time budget `maxSeekMs`),
- *                    seekAsync/finishAsync yield to the event loop
+ *                    seek/finish refuse more than `maxFrames` ticks per call and stop at a time
+ *                    budget (`maxSeekMs`, 60 s by default); seekAsync/finishAsync yield to the
+ *                    event loop and stop only on their `signal`
  *
  * Host integration contract: see src/replay/README.md.
  */

@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import { Writer } from '../../src/codec/index.js';
 import { Player, StartGameEvent, createRoomState, roomStateChecksum, startGame, writeRoomState } from '../../src/room/index.js';
-import { ReplayData, ReplayPlayer, writeReplay } from '../../src/replay/index.js';
+import { REPLAY_PLAYER_MAX_SEEK_MS, ReplayData, ReplayPlayer, writeReplay } from '../../src/replay/index.js';
 
 /** A started game with six players and no events: every tick costs a full physics step. */
 function hostile(totalFrames: number): Uint8Array {
@@ -35,7 +35,7 @@ describe('ReplayPlayer time budget', () => {
     // 3 M ticks: seconds of simulation, and a 4.29 G-tick file is the same call
     const file = hostile(3_000_000);
     const p = new ReplayPlayer(file);
-    expect(p.maxSeekMs).toBe(Infinity); // the budget is opt-in
+    expect(p.maxSeekMs).toBe(REPLAY_PLAYER_MAX_SEEK_MS); // finite by default, shorter on request
     const t0 = performance.now();
     expect(() => p.finish({ maxMs: 30 })).toThrow(RangeError);
     expect(performance.now() - t0).toBeLessThan(1000);

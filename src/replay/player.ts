@@ -12,11 +12,16 @@
  * before stopping) are applied only by {@link applyCurrentFrameEvents}.
  *
  * Re-simulating costs real time, and the cost per tick is set by the file (its
- * stadium and players), not by its size. `seek`/`finish` run to the target
- * (as long as it is within {@link ReplayPlayer.maxFrames}); an optional time
- * budget ({@link ReplayPlayer.maxSeekMs}) makes them stop with a `RangeError`
- * instead, and `seekAsync`/`finishAsync` give the event loop back between
- * slices. Use the latter for files you do not trust.
+ * stadium and players), not by its size: a file of a few hundred bytes can
+ * claim 2^24 ticks of a 255-disc stadium, over an hour of CPU. `seek`/`finish`
+ * refuse up front a call that would simulate more than
+ * {@link ReplayPlayer.maxFrames} ticks and stop with a `RangeError` once
+ * their time budget ({@link ReplayPlayer.maxSeekMs}, default
+ * {@link REPLAY_PLAYER_MAX_SEEK_MS}) runs out, so an untrusted file blocks the
+ * thread for at most that long. `seekAsync`/`finishAsync` have no budget and
+ * give the event loop back between slices; for a file you do not trust, pass
+ * them a `signal` (`AbortSignal.timeout(ms)`), or they keep a CPU busy for as
+ * long as the file says.
  */
 import type { RoomEvent, RoomHooks, RoomState } from '../room/index.js';
 import { stepRoom } from '../room/index.js';
@@ -28,14 +33,20 @@ import type { ReplayReadOptions } from './reader.js';
  * A header can claim 2^32 − 1 ticks (2.3 years) in a file of a few hundred bytes.
  */
 export const REPLAY_PLAYER_MAX_FRAMES = 16777216;
+/**
+ * Default {@link ReplayPlayer.maxSeekMs}: 60 s. A 20-minute replay on a
+ * 254-disc stadium (the heaviest the wire allows) re-simulates in about 20 s;
+ * the budget bounds what an untrusted file can block, not legitimate replays.
+ */
+export const REPLAY_PLAYER_MAX_SEEK_MS = 60000;
 /** Default {@link ReplayAsyncSeekOptions.sliceMs}. */
 const DEFAULT_SLICE_MS = 8;
 
 /** Options of the {@link ReplayPlayer} constructor; the read limits apply when it is given file bytes. */
 export interface ReplayPlayerOptions extends ReplayReadOptions {
-  /** Initial value of {@link ReplayPlayer.maxSeekMs}. Default `Infinity` (no time budget). */
+  /** Initial value of {@link ReplayPlayer.maxSeekMs}. Default {@link REPLAY_PLAYER_MAX_SEEK_MS}; `Infinity` = no time budget. */
   maxSeekMs?: number;
-  /** Initial value of {@link ReplayPlayer.maxFrames}. Default {@link REPLAY_PLAYER_MAX_FRAMES}. */
+  /** Initial value of {@link ReplayPlayer.maxFrames}. Default {@link REPLAY_PLAYER_MAX_FRAMES}; `Infinity` = no cap. */
   maxFrames?: number;
 }
 
@@ -69,25 +80,30 @@ export class ReplayPlayer {
   /** Called after each recorded event is applied (official player hook `hc`). */
   onEvent: ((ev: RoomEvent, rs: RoomState) => void) | null = null;
   /**
-   * Time budget in ms of one {@link seek} / {@link finish} call; past it the
-   * call throws a `RangeError`, the player stays at the frame it reached and
-   * the next call continues from there. Default `Infinity` (none): the call
-   * always reaches its target, however long the re-simulation takes.
+   * Time budget in ms of one {@link seek} / {@link finish} call, read from a
+   * monotonic clock between chunks of ticks; past it the call throws a
+   * `RangeError`, the player stays at the frame it reached and the next call
+   * continues from there. Default {@link REPLAY_PLAYER_MAX_SEEK_MS}, a guard
+   * against untrusted files; `Infinity` (for files you trust) always reaches
+   * the target, however long the re-simulation takes.
    */
   maxSeekMs: number;
   /**
-   * Furthest frame {@link seek} / {@link finish} accept without a time budget
-   * (`Infinity` = none): a target beyond it throws a `RangeError` before
-   * anything is simulated. Default {@link REPLAY_PLAYER_MAX_FRAMES}. Not
-   * applied with a budget ({@link maxSeekMs}, `opts.maxMs`) nor to
-   * {@link seekAsync} / {@link finishAsync}, which can be aborted.
+   * Most ticks one {@link seek} / {@link finish} call simulates (from the
+   * current frame, or from 0 when it rewinds); a call with more throws a
+   * `RangeError` before anything is simulated. Default
+   * {@link REPLAY_PLAYER_MAX_FRAMES}; `Infinity` = none. Applied when the
+   * call's budget is {@link REPLAY_PLAYER_MAX_SEEK_MS} or longer (the default,
+   * or none); a shorter budget is incremental seeking, which runs until the
+   * budget whatever the target. Not applied to {@link seekAsync} /
+   * {@link finishAsync}, which can be aborted.
    */
   maxFrames: number;
 
   constructor(replay: ReplayData | Uint8Array, opts: ReplayPlayerOptions = {}) {
     this.data = replay instanceof Uint8Array ? readReplay(replay, opts) : replay;
     this.rs = this.data.initialState();
-    this.maxSeekMs = opts.maxSeekMs ?? Infinity;
+    this.maxSeekMs = opts.maxSeekMs ?? REPLAY_PLAYER_MAX_SEEK_MS;
     this.maxFrames = opts.maxFrames ?? REPLAY_PLAYER_MAX_FRAMES;
   }
 
@@ -138,17 +154,19 @@ export class ReplayPlayer {
   /**
    * Moves to `frame` (clamped to [0, totalFrames]), rewinding to the start
    * first when `frame` is behind the current position. Runs synchronously for
-   * at most `opts.maxMs` (default {@link maxSeekMs}, none): past the budget it
+   * at most `opts.maxMs` (default {@link maxSeekMs}): past the budget it
    * throws a `RangeError` with the player at a consistent frame in between,
    * after at least one chunk of ticks, so repeated calls always advance.
-   * Without a budget, a target beyond {@link maxFrames} throws a `RangeError`
-   * up front, before anything is simulated.
+   * With a budget of {@link REPLAY_PLAYER_MAX_SEEK_MS} or more, a call that
+   * would simulate more than {@link maxFrames} ticks throws a `RangeError` up
+   * front, before anything is simulated.
    */
   seek(frame: number, opts: ReplaySeekOptions = {}): void {
     const target = this.clampFrame(frame);
     const budget = opts.maxMs ?? this.maxSeekMs;
-    if (budget === Infinity && target > this.maxFrames) {
-      throw new RangeError(`replay seek beyond maxFrames (${target} > ${this.maxFrames}); use seekAsync, a time budget or a higher maxFrames`);
+    const work = target < this.frame ? target : target - this.frame;
+    if (budget >= REPLAY_PLAYER_MAX_SEEK_MS && work > this.maxFrames) {
+      throw new RangeError(`replay seek beyond maxFrames (${work} ticks to simulate > ${this.maxFrames}); use seekAsync or a higher maxFrames`);
     }
     if (target < this.frame) this.reset();
     if (target > this.frame) {

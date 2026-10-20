@@ -780,7 +780,8 @@ export class Sequencer {
    * Throws {@link ProtocolViolation} (or a codec error) when the client must
    * be dropped. A SetStadium that decodes but can't be re-encoded within the
    * wire limits ({@link SetStadiumEvent.wireError}) is dropped and reported
-   * through {@link onError}; its sender stays.
+   * through {@link onError} before {@link onBeforeOperation} sees it (and
+   * after it, when the hook edited it past the limits); its sender stays.
    */
   clientMessage(client: SequencerClient, r: Reader, now: number): RoomEvent | null {
     const requested = r.u32();
@@ -811,19 +812,28 @@ export class Sequencer {
     if (!ev.validate(this.rs)) return null;
     if (discLimitViolation(this.rs, ev, this.queue, this.maxPlayers()) !== null) return null;
     const hook = this.onBeforeOperation;
-    if (hook !== null && hook(ev, client.playerId, requested) === false) return null;
-    if (type === EventType.SetStadium) {
-      // valid payload that our deflate can't fit back in the u16: dropped, the sender stays
-      const err = (ev as SetStadiumEvent).wireError();
-      if (err !== null) {
-        this.reportError(new Error(`SetStadium from player ${client.playerId} dropped: ${err}`));
+    if (hook !== null) {
+      // the hook only sees a stadium that can be sent on; checked on a probe,
+      // since the hook may edit the stadium and the event caches its deflate
+      if (type === EventType.SetStadium && this.unsendableStadium(SetStadiumEvent.create((ev as SetStadiumEvent).stadium!), client.playerId)) {
         return null;
       }
+      if (hook(ev, client.playerId, requested) === false) return null;
     }
+    // valid payload that our deflate can't fit back in the u16: dropped, the sender stays
+    if (type === EventType.SetStadium && this.unsendableStadium(ev as SetStadiumEvent, client.playerId)) return null;
     const variants = this.makeVariants(ev);
     this.submit(ev);
     this.sendSequenced(ev, variants);
     return ev;
+  }
+
+  /** Reports and returns true when a client's SetStadium can't be sent on ({@link SetStadiumEvent.wireError}). */
+  private unsendableStadium(ev: SetStadiumEvent, playerId: number): boolean {
+    const err = ev.wireError();
+    if (err === null) return false;
+    this.reportError(new Error(`SetStadium from player ${playerId} dropped: ${err}`));
+    return true;
   }
 
   /** Message 3 `[u32 frame][u32 eventCounter]` on `uu` (official `Wa.Zd`). */

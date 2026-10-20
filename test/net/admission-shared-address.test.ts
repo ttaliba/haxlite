@@ -219,8 +219,8 @@ describe('abuse penalty with a shared address', () => {
     return { victimIn, longestRefusedMs };
   }
 
-  it('an attacker behind the same address cannot lock it out, and keeping it limited costs one abusive close every 3 s', async () => {
-    // slow lane: the victim always gets in within admitEveryMs, whatever the attacker does
+  it('an attacker behind the same address striking from banked connections cannot lock it out, and keeping it limited costs one abusive close every 3 s', async () => {
+    // slow lane: the victim gets in within admitEveryMs (an attacker that also competes for the slot: admission-cotenant.test.ts)
     for (const every of [1_000, 4_000]) {
       const r = await sharedAttack({}, every);
       expect(r.longestRefusedMs, `every ${every}`).toBeLessThanOrEqual(3_000);
@@ -272,7 +272,9 @@ describe('abuse penalty with a shared address', () => {
     expect(h.offer(NAT)).toBeNull();
     expect(h.offer('198.51.100.10')).not.toBeNull(); // other addresses are not affected
     clock += 1;
-    expect(h.offer(NAT)).not.toBeNull();
+    const first = h.offer(NAT)!;
+    expect(first).not.toBeNull();
+    open(first); // the slot is taken by the connection that opens channel 0
     expect(h.offer(NAT)).toBeNull();
     clock += 2_000;
     expect(h.offer(NAT)).not.toBeNull();
@@ -385,26 +387,34 @@ describe('unjoined connections: reverse retries', () => {
     }
     expect(h.rejects).toEqual([]);
     expect(reverses.every((l) => l !== null)).toBe(true);
-    expect(directs.every((l) => l.closed)).toBe(true); // replaced
-    expect(h.t.pendingCount).toBe(10);
+    // replaced once the address reached maxUnjoinedPerIp (12): 2 run until their own timeout
+    expect(directs.filter((l) => l.closed).length).toBe(8);
+    expect(h.t.pendingCount).toBe(12);
     for (const l of reverses) {
       open(l!);
       handshake(l!);
     }
     expect(h.t.connectionCount).toBe(10);
+    clock += 6_000;
+    h.sweep();
+    expect(directs.every((l) => l.closed)).toBe(true);
+    expect(h.t.pendingCount).toBe(0);
   });
 
   it('a reverse offer only replaces direct attempts of its address older than 4 s; the cap still holds', () => {
-    const h = host();
+    const h = host({ maxUnjoinedPerIp: 3 });
     const other = h.offer('198.51.100.10')!;
     const old = h.offer(NAT)!;
     clock += 3_000;
     const young = h.offer(NAT)!;
     clock += 1_000;
-    expect(h.offer(NAT, { reverse: true })).not.toBeNull();
+    expect(h.offer(NAT, { reverse: true })).not.toBeNull(); // below the cap: nothing replaced
+    expect([other.closed, old.closed, young.closed]).toEqual([false, false, false]);
+    expect(h.offer(NAT, { reverse: true })).not.toBeNull(); // at the cap: replaces the abandoned one
     expect([other.closed, old.closed, young.closed]).toEqual([false, true, false]);
-    expect(h.offer(NAT, { reverse: true })).not.toBeNull(); // nothing left to replace: counted normally
+    expect(h.offer(NAT, { reverse: true })).toBeNull(); // nothing left to replace: counted normally
     expect(young.closed).toBe(false);
+    expect(h.rejects.map((r) => r.why)).toEqual(['too many unjoined connections from this address']);
     // abandoned direct attempts still count for direct offers: 12 at most from one address
     const h2 = host();
     for (let i = 0; i < 12; i++) h2.offer(NAT);
@@ -448,7 +458,8 @@ describe('kick-ban storage on verified addresses', () => {
 
 describe('join hook: values outside JoinDecision', () => {
   it('accept as they always did, and are reported to onError once', async () => {
-    const values: unknown[] = ['false', {}, { accept: false }, [], { ip: '198.51.100.1', banned: false }, () => false, 1n];
+    // ({accept: false} rejects: see admission-cotenant.test.ts)
+    const values: unknown[] = ['false', {}, [], { ip: '198.51.100.1', banned: false }, () => false, 1n];
     let i = 0;
     const h = host({ onJoinRequest: () => values[i++] as JoinDecision });
     for (let k = 0; k < values.length; k++) expect(h.offer(`198.51.100.${k + 1}`)).not.toBeNull();

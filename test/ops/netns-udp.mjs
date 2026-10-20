@@ -2,7 +2,10 @@
 //   send <src> <dst> <port> <count> <bytes> [stun]   datagrams from src:ephemeral (STUN Binding Request if `stun`)
 //   ephemeral <count> <dst> <port>                    one datagram from each of <count> auto-bound sockets
 //   bound <port> <dst> <dport>                        one datagram from an explicitly bound port
+//   tcp <src> <dst> <port> [ms]                       one TCP connect from src: {"result":"refused"} when the SYN
+//                                                     got an answer (no listener), "timeout" when nothing came back
 import dgram from 'node:dgram';
+import net from 'node:net';
 
 const [cmd, ...args] = process.argv.slice(2);
 
@@ -64,6 +67,19 @@ async function main() {
     const err = await sendOne(s, Buffer.alloc(32, 1), Number(dport), dst);
     s.close();
     return tally([err]);
+  }
+  if (cmd === 'tcp') {
+    const [src, dst, port, ms = '500'] = args;
+    return await new Promise((resolve) => {
+      const s = net.connect({ host: dst, port: Number(port), localAddress: src });
+      const done = (result) => {
+        s.destroy();
+        resolve({ result });
+      };
+      s.setTimeout(Number(ms), () => done('timeout'));
+      s.once('connect', () => done('connected'));
+      s.once('error', (e) => done(e.code === 'ECONNREFUSED' ? 'refused' : e.code));
+    });
   }
   throw new Error(`unknown command ${cmd}`);
 }

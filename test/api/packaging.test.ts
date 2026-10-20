@@ -8,13 +8,14 @@
  *    lazily like before, and its MIT notice travels with it.
  */
 import { spawnSync } from 'node:child_process';
-import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Writer } from '../../src/codec/index.js';
 import { parseHbs, writeStadium } from '../../src/sim/index.js';
 import { ARENA_HBS, BAD, HAND } from '../sim/hbs-corpus.js';
 import { ROOT, buildPackage, removePackage } from './build-package.js';
+import { packBuilt, stageConsumer } from './pack-package.js';
 
 let OUT = '';
 let DIST = '';
@@ -54,9 +55,18 @@ describe('declarations', () => {
     expect(internals.filter((rel) => hasComment(read(rel)))).toEqual([]);
   });
 
-  it('still describe the whole public API (consumer type-check, skipLibCheck off)', () => {
+  // The declarations are checked in a project of the system temp directory (not under the repo), with the
+  // unpacked `npm pack` tarball in its node_modules and nothing else a devDependency of the repo could
+  // provide. They need, besides the package's own dependencies:
+  //  - @types/node: `types: ['node']`, and the node:* imports of the declarations;
+  //  - @types/ws: dist/net/ws.d.ts imports the types of 'ws', which ships none, and @types/ws is only a
+  //    devDependency of haxlite, so `npm install haxlite` does not bring it.
+  // They also use TypeScript >= 5.7 (`Float64Array<ArrayBuffer>`, room/events.d.ts), which this test cannot
+  // check: it runs the repo's own compiler.
+  const CONSUMER_TYPES = ['@types/node', '@types/ws'];
+  const consumerCheck = (proj: string) => {
     writeFileSync(
-      path.join(OUT, 'consumer.ts'),
+      path.join(proj, 'consumer.ts'),
       `import { HBInit, HostRoom, net, sim, type HostRoomOptions, type PlayerObject, type RoomObject } from 'haxlite';
 const opts: HostRoomOptions | undefined = undefined;
 const t: typeof net.HostTransport = net.HostTransport;
@@ -68,15 +78,43 @@ export async function f(): Promise<[RoomObject, PlayerObject[], typeof HostRoom,
 `,
     );
     writeFileSync(
-      path.join(OUT, 'tsconfig.json'),
+      path.join(proj, 'tsconfig.json'),
       JSON.stringify({
         compilerOptions: { target: 'ES2023', module: 'NodeNext', moduleResolution: 'NodeNext', strict: true, noEmit: true, skipLibCheck: false, types: ['node'] },
         files: ['consumer.ts'],
       }),
     );
-    const r = spawnSync(process.execPath, [path.join(ROOT, 'node_modules/typescript/bin/tsc'), '-p', path.join(OUT, 'tsconfig.json')], { encoding: 'utf8' });
-    expect(r.stdout + r.stderr).toBe('');
-    expect(r.status).toBe(0);
+    return spawnSync(process.execPath, [path.join(ROOT, 'node_modules/typescript/bin/tsc'), '-p', path.join(proj, 'tsconfig.json')], { cwd: proj, encoding: 'utf8' });
+  };
+
+  it('still describe the whole public API (consumer type-check, skipLibCheck off)', () => {
+    const packed = packBuilt(OUT);
+    const proj = stageConsumer(packed, CONSUMER_TYPES);
+    try {
+      expect(proj.startsWith(ROOT)).toBe(false);
+      const r = consumerCheck(proj);
+      expect(r.stdout + r.stderr).toBe('');
+      expect(r.status).toBe(0);
+    } finally {
+      rmSync(proj, { recursive: true, force: true });
+      packed.cleanup();
+    }
+  }, 60_000);
+
+  it('need @types/ws from the consumer: it is not installed with the package, and nothing in the repo stands in for it', () => {
+    const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as Record<string, Record<string, string> | undefined>;
+    // If this fails the package now brings @types/ws: drop it from CONSUMER_TYPES and this case.
+    for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies']) expect(pkg[field]?.['@types/ws'], field).toBeUndefined();
+    const packed = packBuilt(OUT);
+    const proj = stageConsumer(packed, ['@types/node']);
+    try {
+      const r = consumerCheck(proj);
+      expect(r.status).not.toBe(0);
+      expect(r.stdout + r.stderr).toMatch(/net\/ws\.d\.ts\(1,\d+\): error TS7016: Could not find a declaration file for module 'ws'/);
+    } finally {
+      rmSync(proj, { recursive: true, force: true });
+      packed.cleanup();
+    }
   }, 60_000);
 });
 

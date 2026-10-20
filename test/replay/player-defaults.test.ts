@@ -1,8 +1,9 @@
 /**
- * ReplayPlayer defaults: seek/finish have no time budget (a legitimate
- * replay re-simulates to the end whatever the machine or its load), and a
- * header claiming more frames than {@link REPLAY_PLAYER_MAX_FRAMES} fails up
- * front instead of blocking. The time budget stays available on request.
+ * ReplayPlayer defaults: without a time budget (`maxSeekMs: Infinity`) a
+ * legitimate replay re-simulates to the end whatever the machine or its
+ * load, and a header claiming more frames than {@link REPLAY_PLAYER_MAX_FRAMES}
+ * fails up front instead of blocking. A shorter budget stays available on
+ * request.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Writer } from '../../src/codec/index.js';
@@ -39,7 +40,7 @@ describe('ReplayPlayer defaults', () => {
     const bytes = file(20_000, 40, 8);
     const ref = new ReplayPlayer(bytes);
     ref.step(20_000);
-    const p = new ReplayPlayer(bytes);
+    const p = new ReplayPlayer(bytes, { maxSeekMs: Infinity });
     expect(p.maxSeekMs).toBe(Infinity);
     expect(p.maxFrames).toBe(REPLAY_PLAYER_MAX_FRAMES);
     // every clock read is 10 s later: any time budget is long exhausted
@@ -71,7 +72,8 @@ describe('ReplayPlayer defaults', () => {
     // the frames within the cap are still reachable
     p.seek(600);
     expect(p.frame).toBe(600);
-    expect(() => p.seek(REPLAY_PLAYER_MAX_FRAMES + 1)).toThrow(RangeError);
+    // the cap counts the ticks to simulate from the current frame
+    expect(() => p.seek(600 + REPLAY_PLAYER_MAX_FRAMES + 1)).toThrow(RangeError);
     expect(p.frame).toBe(600);
   });
 
@@ -85,9 +87,9 @@ describe('ReplayPlayer defaults', () => {
     const q = new ReplayPlayer(bytes, { maxFrames: 1000 });
     q.seek(1000);
     expect(q.frame).toBe(1000);
-    expect(() => q.seek(1001)).toThrow(RangeError);
+    expect(() => q.seek(2001)).toThrow(RangeError);
     q.maxFrames = 2000;
-    q.seek(1001);
-    expect(q.frame).toBe(1001);
+    q.seek(2001);
+    expect(q.frame).toBe(2001);
   });
 });

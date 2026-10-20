@@ -18,7 +18,7 @@
  */
 import type dgram from 'node:dgram';
 import { createRequire } from 'node:module';
-import { isIP } from 'node:net';
+import { isIP, type LookupFunction } from 'node:net';
 import { WebSocket, type ClientOptions, type RawData } from './ws.js';
 import { Reader, Writer } from '../codec/index.js';
 import { CHANNELS } from './constants.js';
@@ -67,8 +67,10 @@ export interface EdgeOptions {
    * and private-network hosts (RFC 1918, 100.64.0.0/10, link-local, fc00::/7,
    * IPv4-mapped private addresses, single-label names and `.local`,
    * `.internal`, `.lan` and `.home.arpa` names; the private ones log a
-   * warning). For any other host it is refused unless {@link allowInsecure} is
-   * set.
+   * warning). Such a name (e.g. a Docker service, `ws://edge:8443`) is checked
+   * on every connection: if it resolves to (or the socket reaches) a public
+   * address, the connection is refused like a public host. For any other host
+   * it is refused unless {@link allowInsecure} is set.
    */
   url: string;
   /** API key issued by the edge operator: `"<keyId>:<secret>"`. */
@@ -78,15 +80,17 @@ export interface EdgeOptions {
    * be established within `dataPlaneTimeoutMs` (or the edge does not grant
    * it), carry all player traffic over the WebSocket instead (TCP:
    * head-of-line blocking, slightly more latency). Default true, except for a
-   * public `ws://` url accepted through {@link allowInsecure}, where it is
-   * false: the fallback carries player traffic in clear and could otherwise be
-   * forced by whoever sits on the path.
+   * public `ws://` url accepted through {@link allowInsecure} (or a `ws://`
+   * name that resolved to a public address), where it is false: the fallback
+   * carries player traffic in clear and could otherwise be forced by whoever
+   * sits on the path.
    */
   fallbackWs?: boolean;
   /**
    * Accept a `ws://` url whose host is neither loopback nor on a private
-   * network (no TLS: the control channel is readable on the path, see
-   * {@link url}; the key still authenticates the edge). Default false.
+   * network, or whose private-looking name resolves to a public address (no
+   * TLS: the control channel is readable on the path, see {@link url}; the
+   * key still authenticates the edge). Default false.
    */
   allowInsecure?: boolean;
   /**
@@ -262,6 +266,10 @@ export class EdgePeerBackend implements PeerBackend {
   private readyAt = 0;
   /** Public `ws://` url accepted through {@link EdgeOptions.allowInsecure}. */
   private insecure = false;
+  /** @internal `ws://` url whose host is a name taken as private: each connection checks where it resolves. */
+  readonly checkResolved: boolean = false;
+  /** @internal The current connection's name resolved to a public address (accepted through allowInsecure). */
+  resolvedPublic = false;
   /** @internal */ readonly counters = { bytesOut: 0, bytesIn: 0, messagesOut: 0, messagesIn: 0 };
 
   constructor(opts: EdgeOptions) {
@@ -282,6 +290,8 @@ export class EdgePeerBackend implements PeerBackend {
           );
         }
         this.insecure = true;
+      } else if (isIP(urlHost(opts.url)) === 0) {
+        this.checkResolved = true;
       }
       this.log(`WARNING: ws:// edge url without TLS${scope === 'private' ? ' (private network)' : ''}: the control channel is readable by anyone on the path`);
       if (secret.length < 22) this.log('WARNING: short edge key secret: a captured Auth lets an eavesdropper guess it offline');
@@ -292,12 +302,38 @@ export class EdgePeerBackend implements PeerBackend {
 
   /** @internal effective {@link EdgeOptions.fallbackWs} (its default depends on the url). */
   get fallbackWs(): boolean {
-    return this.opts.fallbackWs ?? !this.insecure;
+    return this.opts.fallbackWs ?? !(this.insecure || this.resolvedPublic);
   }
 
   /** @internal appended to "fallbackWs is off" errors when the default (public `ws://` url) turned it off. */
   get fallbackWsHint(): string {
-    return this.opts.fallbackWs === undefined && this.insecure ? ' (off by default for a public ws:// url: set fallbackWs: true to allow it)' : '';
+    return this.opts.fallbackWs === undefined && (this.insecure || this.resolvedPublic)
+      ? ' (off by default for a public ws:// url: set fallbackWs: true to allow it)'
+      : '';
+  }
+
+  /**
+   * @internal Error for a connection to `address` (what the `ws://` name
+   * resolved to, or the socket's peer) when it is public and the url was only
+   * accepted as private; null if allowed (public with allowInsecure: noted,
+   * the WebSocket fallback then defaults to off).
+   */
+  resolvedCheck(address: string): EdgeError | null {
+    if (hostScope(address.replace(/%.*$/, '')) !== 'public') return null;
+    const host = urlHost(this.opts.url);
+    if (this.opts.allowInsecure !== true) {
+      return new EdgeError(
+        `ws:// edge name ${host} resolved to a public address (${printable(address, 64)}): ` +
+          'use wss://, or set allowInsecure: true in the edge options to accept plaintext',
+        'connect',
+        true,
+      );
+    }
+    if (!this.resolvedPublic) {
+      this.resolvedPublic = true;
+      this.log(`WARNING: ws:// edge name ${host} resolved to a public address (${printable(address, 64)}): plaintext over the Internet`);
+    }
+    return null;
   }
 
   get ready(): boolean {
@@ -615,8 +651,33 @@ class TunnelSession {
       ...o.wsOptions,
     };
     if (o.bindAddress !== undefined) wsOpts.localAddress = o.bindAddress;
+    let refused: EdgeError | null = null;
+    if (backend.checkResolved) {
+      // the name was taken as private by its look: hold every connection to what it resolves to
+      backend.resolvedPublic = false;
+      const extra = wsOpts as ClientOptions & { lookup?: LookupFunction };
+      const lookup: LookupFunction = extra.lookup ?? (createRequire(import.meta.url)('node:dns') as typeof import('node:dns')).lookup;
+      extra.lookup = (hostname, options, callback) => {
+        lookup(hostname, options, (err, address, family) => {
+          if (err === null) {
+            const list = typeof address === 'string' ? [address] : address.map((a) => a.address);
+            for (let i = 0; i < list.length && refused === null; i++) refused = backend.resolvedCheck(list[i]!);
+            if (refused !== null) err = Object.assign(new Error(refused.message), { code: 'EACCES' });
+          }
+          callback(err, address, family);
+        });
+      };
+    }
     this.ws = new WebSocket(o.url, wsOpts);
     this.ws.binaryType = 'nodebuffer';
+    if (backend.checkResolved) {
+      // also the peer actually reached (a lookup the runtime or an agent bypassed), before any Auth
+      this.ws.on('upgrade', (res) => {
+        const peer = res.socket.remoteAddress;
+        if (refused === null && peer !== undefined) refused = backend.resolvedCheck(peer);
+        if (refused !== null) this.fail(refused);
+      });
+    }
     this.deadline = setTimeout(() => this.fail(new EdgeError('connect/auth timeout', 'connect')), o.connectTimeoutMs ?? 10_000);
     this.ws.on('message', (data: RawData, isBinary: boolean) => {
       try {
@@ -627,7 +688,7 @@ class TunnelSession {
     });
     this.ws.on('close', (code: number, reason: Buffer) => this.onWsClose(code, reason.toString('utf8')));
     this.ws.on('error', (err: Error) => {
-      if (this.phase !== Phase.Closed) this.fail(new EdgeError(`websocket: ${err.message}`, 'connect'));
+      if (this.phase !== Phase.Closed) this.fail(refused ?? new EdgeError(`websocket: ${err.message}`, 'connect'));
     });
   }
 

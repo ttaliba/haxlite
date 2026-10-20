@@ -44,8 +44,20 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   );
   if (!opts.tls) log('WARNING: no TLS configured; use wss:// in production (tls.certFile/keyFile)');
   const lim = opts.limits ?? {};
-  if (classifyAddress(opts.host ?? '') === 'loopback' && lim.trustForwardedFor !== true && lim.perIpLimitsApplyToPrivate !== true) {
-    log('listening on loopback (reverse proxy?): per-address tunnel limits do not apply to proxied connections (limits.trustForwardedFor)');
+  const trust = lim.trustForwardedFor;
+  const trusting = trust === true || (Array.isArray(trust) && trust.length > 0);
+  if (lim.perIpLimitsApplyToPrivate !== true) {
+    if (!trusting && classifyAddress(opts.host ?? '') === 'loopback') {
+      log('listening on loopback (reverse proxy?): per-address tunnel limits do not apply to proxied connections (limits.trustForwardedFor)');
+    } else {
+      // behind Docker/Kubernetes SNAT or a load balancer every client arrives from a private address
+      log(
+        'per-address tunnel limits do not apply to loopback/private sources (reverse proxy, Docker/Kubernetes SNAT, LAN)' +
+          (trusting
+            ? ' other than clients forwarded by a trusted proxy'
+            : ': set limits.trustForwardedFor to the proxy addresses, or limits.perIpLimitsApplyToPrivate when hosts connect directly'),
+      );
+    }
   }
   if (opts.statsPath !== null && !opts.statsToken) log(`${opts.statsPath ?? '/stats'} has no token: it serves edge-wide aggregates only (stats.token for per-key stats)`);
   process.on('SIGHUP', () => {
