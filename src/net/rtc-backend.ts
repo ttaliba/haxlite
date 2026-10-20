@@ -63,8 +63,8 @@ import type { PeerBackend, PeerLink, PeerLinkEvents, PeerOfferInfo } from './pee
 
 export interface RtcBackendOptions {
   /**
-   * UDP port shared by every player (default 0 = ephemeral; set a fixed port
-   * and open it in the firewall for production).
+   * UDP port shared by every player, 0–65535 (default 0 = ephemeral; set a
+   * fixed port and open it in the firewall for production).
    */
   port?: number;
   /**
@@ -118,9 +118,9 @@ export interface RtcBackendOptions {
    * else `'public'`). Not applied to explicit `publicAddresses`.
    */
   iceCandidatePolicy?: IceCandidatePolicy;
-  /** Re-query the STUN servers at a new session when the last result is older (default 60 000 ms). */
+  /** Re-query the STUN servers at a new session when the last result is older (default 60 000 ms; >= 0, `Infinity`: never). */
   gatherRefreshMs?: number;
-  /** Advertised port when a 1:1 NAT maps a different one (default: the bound port). */
+  /** Advertised port (1–65535) when a 1:1 NAT maps a different one (default: the bound port). */
   publicPort?: number;
   /** DTLS certificate (default: {@link certificateFile}, else one ECDSA P-256 key per process, generated synchronously once). */
   certificate?: RtcCertificate;
@@ -143,11 +143,14 @@ export interface RtcBackendOptions {
    * spoofed ClientHello could aim that flight at a victim). See RtcEndpointOptions.
    */
   helloVerify?: boolean;
-  /** No ICE consent from an open session for this long → closed (default 30 000 ms). */
+  /** No ICE consent from an open session for this long → closed (ms, finite, > 0; default 30 000). */
   idleTimeoutMs?: number;
-  /** A session not open this long after the offer → closed (default 20 000 ms; the transport's own 10 s open timeout fires first). */
+  /**
+   * A session not open this long after the offer → closed (ms, finite, > 0;
+   * default 20 000; the transport's own 10 s open timeout fires first).
+   */
   handshakeTimeoutMs?: number;
-  /** Session cap of the endpoint (default 10 000; the transport's 16-pending / maxPlayers limits apply first). */
+  /** Session cap of the endpoint, a positive integer (default 10 000; the transport's 16-pending / maxPlayers limits apply first). */
   maxSessions?: number;
   /**
    * Frame batching of outgoing game events (default 0 = off: every message
@@ -191,6 +194,35 @@ export function detectPublicAddresses(opts: { ipv6?: boolean } = {}): string[] {
     }
   }
   return out;
+}
+
+/**
+ * Throws a `RangeError` for an unusable numeric option (the endpoint checks
+ * them too, but only once it is brought up, after the room was announced).
+ */
+function checkBackendOptions(o: RtcBackendOptions): void {
+  const port = (name: string, v: number | undefined, min: number): void => {
+    if (v !== undefined && (typeof v !== 'number' || !Number.isInteger(v) || v < min || v > 65535)) {
+      throw new RangeError(`peerBackend 'rtc': ${name} must be an integer in ${min}..65535 (got ${String(v)})`);
+    }
+  };
+  const ms = (name: string, v: number | undefined): void => {
+    if (v !== undefined && (typeof v !== 'number' || !(v > 0 && v < Infinity))) {
+      throw new RangeError(`peerBackend 'rtc': ${name} must be a finite number of ms > 0 (got ${String(v)})`);
+    }
+  };
+  port('port', o.port, 0);
+  port('publicPort', o.publicPort, 1);
+  ms('idleTimeoutMs', o.idleTimeoutMs);
+  ms('handshakeTimeoutMs', o.handshakeTimeoutMs);
+  const g = o.gatherRefreshMs;
+  if (g !== undefined && (typeof g !== 'number' || !(g >= 0))) {
+    throw new RangeError(`peerBackend 'rtc': gatherRefreshMs must be a number of ms >= 0 or Infinity (got ${String(g)})`);
+  }
+  const m = o.maxSessions;
+  if (m !== undefined && (typeof m !== 'number' || !Number.isSafeInteger(m) || m < 1)) {
+    throw new RangeError(`peerBackend 'rtc': maxSessions must be a positive integer (got ${String(m)})`);
+  }
 }
 
 /** Resolves {@link RtcBackendOptions.publicAddresses} (explicit or detected) for ICE-lite. Throws when none. */
@@ -472,7 +504,8 @@ export class RtcPeerBackend implements PeerBackend {
       this.publicAddresses = [];
       this.iceServers = [];
     } else {
-      // fail fast (synchronously: HostTransport/HBInit construction) on bad / missing (lite) public addresses
+      // fail fast (synchronously: HostTransport/HBInit construction) on bad numbers and bad / missing (lite) public addresses
+      checkBackendOptions(opts);
       this.publicAddresses = opts.iceLite === true || opts.publicAddresses !== undefined ? resolvePublicAddresses(opts) : undefined;
       this.iceServers =
         opts.iceLite === true ? [] : (opts.iceServers ?? (opts.publicAddresses !== undefined ? [] : (defaults.iceServers ?? DEFAULT_ICE_SERVERS)));
@@ -715,6 +748,10 @@ class DeferredRtcPeerLink implements PeerLink {
     return this.link !== null && this.link.send(index, data);
   }
 
+  queuedBytes(): number {
+    return this.link !== null ? this.link.queuedBytes() : 0;
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -822,6 +859,11 @@ class RtcPeerLink implements PeerLink {
       }
     }
     return this.s.send(index, data);
+  }
+
+  /** Unacknowledged SCTP bytes of the session (its three channels share one association). */
+  queuedBytes(): number {
+    return this.s.bufferedAmount;
   }
 
   /** End of the iteration / frame boundary (or close): sends what was bundled or held. Never throws. */

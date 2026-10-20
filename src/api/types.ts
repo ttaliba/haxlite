@@ -157,7 +157,11 @@ export interface RoomObject {
   setScoreLimit(limit: number): void;
   /** Minutes. No effect while a game is running. */
   setTimeLimit(limitInMinutes: number): void;
-  /** Parses `.hbs` text; throws synchronously on invalid stadiums. */
+  /**
+   * Parses `.hbs` text; throws synchronously on invalid stadiums, and on one
+   * that can't travel in a SetStadium event (deflated over 65535 bytes, or
+   * more than 255 of any element; haxlite).
+   */
   setCustomStadium(stadiumFileContents: string): void;
   /** Built-in stadium by exact name; throws "Stadium doesn't exist". */
   setDefaultStadium(stadiumName: string): void;
@@ -259,6 +263,15 @@ export interface HaxliteConfig {
   maxWakeFrames?: number;
   /** Ping event period in ms [3000]. */
   pingIntervalMs?: number;
+  /**
+   * Identical errors (same name and message) passed to `room.haxlite.onError`
+   * (or the console) before the rest of the run is coalesced into one summary
+   * per {@link errorRepeatWindowMs} (a `RepeatedError` whose `cause` is the
+   * last of them, `count` how many) [60]; `Infinity` = report every one.
+   */
+  errorRepeatBurst?: number;
+  /** Summary window of {@link errorRepeatBurst}, ms [1000]. */
+  errorRepeatWindowMs?: number;
 
   /** Master base URL ending in `/` ["https://www.haxball.com/rs/"]. */
   masterUrl?: string;

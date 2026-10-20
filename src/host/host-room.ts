@@ -82,7 +82,51 @@ export const HostDefaults = {
    * of 7 frames that is 2 wake-ups per heartbeat (~17/s, official 20/s).
    */
   maxWakeFrames: 4,
+  /** One second of errors from a per-tick callback before identical ones are coalesced. */
+  errorRepeatBurst: 60,
+  /** Summary interval of coalesced errors. */
+  errorRepeatWindowMs: 1000,
 } as const;
+
+/** Distinct error messages tracked for coalescing; past it, new ones are delivered as they come. */
+const MAX_ERROR_KEYS = 64;
+
+/** Coalescing key of an error (name + message), or null when it can't be read. */
+function errorKey(err: unknown): string | null {
+  try {
+    return err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Delivered to {@link HostRoom.onError} in place of identical errors (same
+ * name and message) the room coalesced; see
+ * {@link HostRoomOptions.errorRepeatBurst}. `cause` is the last of them.
+ */
+export class RepeatedError extends Error {
+  /** Identical errors not delivered during the window. */
+  readonly count: number;
+  constructor(key: string, last: unknown, count: number, windowMs: number) {
+    super(`${key} (repeated ${count} more times in ${windowMs} ms)`, { cause: last });
+    this.name = 'RepeatedError';
+    this.count = count;
+  }
+}
+
+/** A run of identical errors (see {@link HostRoom.reportError}). */
+interface ErrorRun {
+  /** Errors in the run (delivered up to the burst). */
+  seen: number;
+  /** Errors in the current window. */
+  hits: number;
+  /** Not delivered in the current window. */
+  suppressed: number;
+  last: unknown;
+  /** Room-clock ms the current window ends. */
+  until: number;
+}
 
 export interface HostRoomOptions {
   transport: HostTransport;
@@ -115,6 +159,18 @@ export interface HostRoomOptions {
    * same. Lower = more wake-ups; `Infinity` = only at heartbeats/messages.
    */
   maxWakeFrames?: number;
+  /**
+   * Identical errors (same name and message) delivered to
+   * {@link HostRoom.onError} before the rest of the run is coalesced: from
+   * then on they are counted and one {@link RepeatedError} per
+   * {@link errorRepeatWindowMs} reports how many there were. The run ends
+   * after a window without that error. Distinct errors are delivered as
+   * they come. Default 60 (a callback that throws on every tick gets one
+   * second through, then one summary per second); `Infinity` = deliver all.
+   */
+  errorRepeatBurst?: number;
+  /** Window of {@link errorRepeatBurst}, ms (default 1000). */
+  errorRepeatWindowMs?: number;
   /** Clock (ms) for tests. Default `performance.now`. */
   now?: () => number;
 }
@@ -328,6 +384,12 @@ export class HostRoom {
   private pingDue = Infinity;
   private readonly deferred: (() => void)[] = [];
   private flushing = false;
+  private readonly errorBurst: number;
+  private readonly errorWindowMs: number;
+  /** Runs of identical errors by {@link errorKey}. */
+  private readonly errorRuns = new Map<string, ErrorRun>();
+  /** Room-clock ms the earliest error window ends (Infinity: none). */
+  private errorFlushAt = Infinity;
   private readonly pongWriter = new Writer(32);
   /** Reused for every client message (a nested message gets its own). */
   private readonly reader = new Reader(new Uint8Array(0));
@@ -351,6 +413,12 @@ export class HostRoom {
     this.csFrames = HostRoom.checkFrames('checksumIntervalFrames', opts.checksumIntervalFrames ?? HostDefaults.checksumIntervalFrames, 1 << 20);
     this.wakeFrames = HostRoom.checkWakeFrames(opts.maxWakeFrames ?? HostDefaults.maxWakeFrames);
     this.pingIntervalMs = HostRoom.checkPingInterval(opts.pingIntervalMs ?? HostDefaults.pingIntervalMs);
+    const burst = opts.errorRepeatBurst ?? HostDefaults.errorRepeatBurst;
+    const windowMs = opts.errorRepeatWindowMs ?? HostDefaults.errorRepeatWindowMs;
+    if (!(burst >= 1)) throw new RangeError(`errorRepeatBurst must be >= 1 (got ${burst})`);
+    if (!(windowMs > 0 && windowMs < Infinity)) throw new RangeError(`errorRepeatWindowMs must be > 0 and finite (got ${windowMs})`);
+    this.errorBurst = burst;
+    this.errorWindowMs = windowMs;
     const sink: SequencerSink = {
       // one tunnel message for everyone when the players are behind a haxlite Edge
       broadcast: (data, channel, skip) => {
@@ -435,6 +503,7 @@ export class HostRoom {
     this.transport.stop();
     this.deferred.length = 0;
     this.rec?.cancel();
+    this.flushErrorRuns(Infinity);
   }
 
   /** `.hbr2` recorder (one per room, reused; created on first use): see {@link startRecording}. */
@@ -639,9 +708,17 @@ export class HostRoom {
     this.emit(SetGamePlayLimitEvent.create(1, limit | 0));
   }
 
-  /** Any stadium object (only applied when no game is running, like official). */
+  /**
+   * Any stadium object (only applied when no game is running, like official).
+   * Throws, before anything is applied, when it can't travel in a SetStadium
+   * event: a deflated body over 65535 bytes or a custom stadium with more than
+   * 255 of any element ({@link SetStadiumEvent.wireError}).
+   */
   setStadium(stadium: Stadium): void {
-    this.emit(SetStadiumEvent.create(stadium));
+    const ev = SetStadiumEvent.create(stadium);
+    const err = ev.wireError();
+    if (err !== null) throw new Error(err);
+    this.emit(ev);
   }
 
   /** Parses `.hbs` text (throws the parse error, like official `setCustomStadium`). */
@@ -710,8 +787,15 @@ export class HostRoom {
     this.transport.setRequireRecaptcha(on);
   }
 
-  /** Not runtime-changeable in the official API; haxlite extension (the API clamps 2..30 at init). */
+  /**
+   * Not runtime-changeable in the official API; haxlite extension (the API
+   * clamps 2..30). Throws a RangeError unless `n` is an integer in 0..255
+   * (NaN would leave the room without a cap).
+   */
   setMaxPlayers(n: number): void {
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 0 || n > 255) {
+      throw new RangeError(`maxPlayers must be an integer in [0, 255] (got ${String(n)})`);
+    }
     this.transport.setMaxPlayers(n);
   }
 
@@ -1140,6 +1224,7 @@ export class HostRoom {
       }
     }
     if ((this.hiddenFor.size > 0 || this.reconciling.size > 0) && !this.sequencer.busy) this.invoke(this.syncHiddenFn);
+    if (this.errorFlushAt !== Infinity && this.now() >= this.errorFlushAt) this.flushErrorRuns(this.now());
     this.schedule();
   }
 
@@ -1151,7 +1236,61 @@ export class HostRoom {
     }
   }
 
+  /**
+   * Hands `err` to {@link onError}, coalescing runs of identical errors
+   * (see {@link HostRoomOptions.errorRepeatBurst}).
+   */
   private reportError(err: unknown): void {
+    if (this.onError === null) return;
+    if (this.errorBurst === Infinity) {
+      this.deliverError(err);
+      return;
+    }
+    const now = this.now();
+    if (now >= this.errorFlushAt) this.flushErrorRuns(now);
+    const key = errorKey(err);
+    let run = key === null ? undefined : this.errorRuns.get(key);
+    if (run === undefined) {
+      if (key === null || this.errorRuns.size >= MAX_ERROR_KEYS) {
+        this.deliverError(err);
+        return;
+      }
+      run = { seen: 0, hits: 0, suppressed: 0, last: null, until: now + this.errorWindowMs };
+      this.errorRuns.set(key, run);
+      if (run.until < this.errorFlushAt) this.errorFlushAt = run.until;
+    }
+    run.hits++;
+    if (++run.seen <= this.errorBurst) {
+      this.deliverError(err);
+      return;
+    }
+    run.suppressed++;
+    run.last = err;
+  }
+
+  /** Ends the error windows due at `now` (Infinity: all): summaries, then a new window or the end of the run. */
+  private flushErrorRuns(now: number): void {
+    let next = Infinity;
+    for (const [key, run] of this.errorRuns) {
+      if (now < run.until) {
+        if (run.until < next) next = run.until;
+        continue;
+      }
+      const n = run.suppressed;
+      const last = run.last;
+      if (run.hits === 0 || now === Infinity) this.errorRuns.delete(key);
+      else {
+        run.hits = run.suppressed = 0;
+        run.last = null;
+        run.until = now + this.errorWindowMs;
+        if (run.until < next) next = run.until;
+      }
+      if (n > 0) this.deliverError(new RepeatedError(key, last, n, this.errorWindowMs));
+    }
+    this.errorFlushAt = next;
+  }
+
+  private deliverError(err: unknown): void {
     const h = this.onError;
     if (h !== null) {
       try {

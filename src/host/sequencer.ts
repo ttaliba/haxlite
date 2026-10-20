@@ -23,6 +23,7 @@ import {
   EVENT_META,
   PAUSED_TICKS,
   SetDiscPropertiesEvent,
+  SetStadiumEvent,
   checkClientSender,
   createEvent,
   readRoomState,
@@ -724,12 +725,15 @@ export class Sequencer {
   /**
    * Host's own event (official `Wa.oc`): `byId = 0`, frame = current frame
    * (+ input delay + handicap for `delay` events), apply/queue, heartbeat,
-   * then broadcast on `ru` when any connection exists.
+   * then broadcast on `ru` when any connection exists. A SetStadium that
+   * can't be encoded ({@link SetStadiumEvent.wireError}) is refused before it
+   * is applied, like one over the disc limit.
    */
   hostEvent(ev: RoomEvent): void {
-    const tooMany = discLimitViolation(this.rs, ev, this.queue, this.maxPlayers());
-    if (tooMany !== null) {
-      this.reportError(new Error(tooMany));
+    const refused =
+      ev.type === EventType.SetStadium ? (ev as SetStadiumEvent).wireError() : discLimitViolation(this.rs, ev, this.queue, this.maxPlayers());
+    if (refused !== null) {
+      this.reportError(new Error(refused));
       return;
     }
     ev.byId = 0;

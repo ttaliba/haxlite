@@ -31,7 +31,7 @@ import {
   type JoinRequest,
 } from '../net/index.js';
 import { HostRoom, createHostRoomState, defaultStadiumByName, type BeforeOperationHook, type DiscPropsInput } from '../host/index.js';
-import type { Player } from '../room/index.js';
+import { SetStadiumEvent, type Player } from '../room/index.js';
 import { parseHbs, type Stadium } from '../sim/index.js';
 import type {
   AnnouncementSound,
@@ -153,6 +153,15 @@ function checkWakeFrames(v: number): number {
   return v === Infinity ? v : checkFrames('maxWakeFrames', v, 1, 600);
 }
 
+/** Validated here so a bad value fails before any network I/O, like the other knobs. */
+function checkErrorRepeat(burst: number, windowMs: number): { burst: number; windowMs: number } {
+  if (typeof burst !== 'number' || !(burst >= 1)) throw new RangeError('haxlite.errorRepeatBurst must be a number >= 1');
+  if (typeof windowMs !== 'number' || !(windowMs > 0 && windowMs < Infinity)) {
+    throw new RangeError('haxlite.errorRepeatWindowMs must be a finite number > 0');
+  }
+  return { burst, windowMs };
+}
+
 /** At least 1 ms (Infinity: no Ping events). */
 function checkPingInterval(v: number): number {
   if (typeof v !== 'number' || !(v >= 1)) throw new RangeError('haxlite.pingIntervalMs must be a number >= 1');
@@ -204,6 +213,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     checksumIntervalFrames: checkFrames('checksumIntervalFrames', hx.checksumIntervalFrames ?? 600, 1, 1 << 20),
     maxWakeFrames: checkWakeFrames(hx.maxWakeFrames ?? 4),
     pingIntervalMs: checkPingInterval(hx.pingIntervalMs ?? 3000),
+    errorRepeat: checkErrorRepeat(hx.errorRepeatBurst ?? 60, hx.errorRepeatWindowMs ?? 1000),
   };
 
   const httpOpts = { masterUrl: hx.masterUrl, agent: hx.agent };
@@ -246,6 +256,8 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     checksumIntervalFrames: knobs.checksumIntervalFrames,
     maxWakeFrames: knobs.maxWakeFrames,
     pingIntervalMs: knobs.pingIntervalMs,
+    errorRepeatBurst: knobs.errorRepeat.burst,
+    errorRepeatWindowMs: knobs.errorRepeat.windowMs,
   });
 
   // ---- lifecycle / init promise
@@ -631,7 +643,11 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
       } catch (err) {
         throw new Error(err instanceof Error ? err.message : String(err), { cause: err });
       }
-      defer(() => host.setStadium(s));
+      // a stadium the clients can't receive is refused here, synchronously (haxlite)
+      const ev = SetStadiumEvent.create(s);
+      const wire = ev.wireError();
+      if (wire !== null) throw new Error(wire);
+      defer(() => host.emit(ev));
     },
     setDefaultStadium(stadiumName: string) {
       const s = defaultStadiumByName(stadiumName);

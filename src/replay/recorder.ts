@@ -211,19 +211,26 @@ export class ReplayRecorder {
   /**
    * Records `ev` (its `byId`, type and payload) as applied at `frame`. Call it
    * right AFTER `ev.apply(rs)`, for every event applied to the room, in
-   * application order. No-op when not recording.
+   * application order. No-op when not recording. An event that fails to
+   * encode rethrows and leaves nothing in the log.
    */
   onEvent(ev: RoomEvent, frame: number): void {
     if (!this.open) return;
     const w = this.events!;
-    if (w.pos >= this.limit) {
+    const start = w.pos;
+    if (start >= this.limit) {
       this.freeze(frame);
       return;
     }
-    w.varUint(frame - this.lastEventFrame);
+    try {
+      w.varUint(frame - this.lastEventFrame);
+      w.u16(ev.byId);
+      writeEvent(w, ev);
+    } catch (err) {
+      w.pos = start;
+      throw err;
+    }
     this.lastEventFrame = frame;
-    w.u16(ev.byId);
-    writeEvent(w, ev);
     this.eventCount++;
   }
 

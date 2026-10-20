@@ -54,7 +54,7 @@ import {
   type NativeIceServer,
 } from './ice.js';
 import { canonicalIp } from './ip.js';
-import { KeyedRateLimiter, TokenBucket } from './rate-limit.js';
+import { KeyedRateLimiter, TokenBucket, assertBucketParams } from './rate-limit.js';
 import { defaultRoomInfo, encodeRoomInfo, type RoomInfo } from './room-info.js';
 import { HostSignaling, type HostSignalingOptions, type SignalingOffer } from './signaling.js';
 import { Writer } from '../codec/index.js';
@@ -102,7 +102,14 @@ export type PeerCloseReason =
   /** Negotiation failed/timed out before channel 0 opened. */
   | 'failed'
   /** Transport stopped or signaling lost during negotiation. */
-  | 'shutdown';
+  | 'shutdown'
+  /**
+   * haxlite: the peer stopped taking what the host sends (more than
+   * {@link HostTransportOptions.maxPeerBufferedBytes} unacknowledged for
+   * {@link HostTransportOptions.peerBufferedTimeoutMs}), e.g. a client that
+   * keeps its receive window closed while still sending.
+   */
+  | 'stalled';
 
 /** `mids` of an offer with one m-section whose mid is `0` (every HaxBall client): shared by all peers. */
 const SINGLE_MID: readonly string[] = Object.freeze(['0']);
@@ -161,6 +168,7 @@ export class Peer {
   /** @internal remote candidates accepted so far (capped by MAX_REMOTE_CANDIDATES) */ remoteCandidates = 0;
   /** @internal mids of the offer's m-sections (usually the shared {@link SINGLE_MID}) */ mids: readonly string[] = SINGLE_MID;
   /** @internal canonical `ip` for the per-address limits; null when exempt (not a public address) */ limitKey: string | null = null;
+  /** @internal when the link's queue was first seen over `maxPeerBufferedBytes` (-1: it is not) */ backlogSince = -1;
 
   constructor(offer: SignalingOffer, srflxIps: string[], now: number) {
     this.id = offer.peerId;
@@ -258,7 +266,9 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   onJoinRequest?: (req: JoinRequest) => JoinDecision | PromiseLike<JoinDecision>;
   /** Per-IP join attempt limit (not official; default off). `code` default 4104. */
   joinRateLimit?: { capacity: number; msPerToken: number; code?: number } | null;
+  /** Per-connection flood bucket size (>= 1). Default 100 (official `new Ra(100, 16)`). */
   floodCapacity?: number;
+  /** Flood bucket refill: one message every this many ms (finite, > 0). Default 16 (official). */
   floodMsPerToken?: number;
   /** Max simultaneous negotiations (4104). A positive integer; default 16 (official). */
   maxPendingNegotiations?: number;
@@ -292,6 +302,25 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   /** Connected peer idle timeout (ms, finite, > 0). Default 10000 (official). */
   peerIdleTimeoutMs?: number;
   /**
+   * haxlite: a connected peer whose backend keeps more than this many bytes
+   * unacknowledged (sent by the host, not yet taken by the client) for
+   * {@link peerBufferedTimeoutMs} is closed with `'stalled'`. Default
+   * {@link DEFAULT_MAX_PEER_BUFFERED_BYTES} (1 MiB, minutes of game traffic
+   * for one player); a positive integer, `Infinity` disables it. Checked on
+   * each sweep, for backends whose links report it (`'ndc'` and `'rtc'`; an
+   * edge applies its own limits). Without it a client that closes its
+   * receive window but keeps sending keeps up to the SCTP send buffer
+   * (4 MiB, more in arena) per connection for as long as it stays.
+   */
+  maxPeerBufferedBytes?: number;
+  /**
+   * How long (ms, finite, > 0) the queue must stay over
+   * {@link maxPeerBufferedBytes} before the peer is closed. Default
+   * {@link DEFAULT_PEER_BUFFERED_TIMEOUT_MS} (10 000): a burst (a large
+   * stadium) or a short network outage drains well before.
+   */
+  peerBufferedTimeoutMs?: number;
+  /**
    * Max wait for local ICE gathering before sending the answer (default 500
    * ms, official `ub.li`). Backends with `answerOnFirstCandidate`
    * (node-datachannel) answer as soon as one candidate passes
@@ -314,7 +343,7 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
    * use {@link rtcEndpoint} (`rtcEndpoint.ipv6`) instead.
    */
   rtc?: Partial<Omit<NdcRtcConfig, 'iceServers'>>;
-  /** Housekeeping period (timeouts, deferred closes). Default 1000 ms. */
+  /** Housekeeping period (timeouts, deferred closes; ms, > 0). Default 1000 ms. */
   sweepIntervalMs?: number;
   /**
    * Delay between channel-0 open and the challenge, for every client (official:
@@ -368,6 +397,12 @@ export function isLibdatachannelOffer(sdp: string): boolean {
 const CLOSE_LINGER_MS = 500;
 /** See {@link HostTransportOptions.answerIceWaitMs} (official {@link NetDefaults.answerIceWaitMs}). */
 const DEFAULT_ANSWER_ICE_WAIT_MS = NetDefaults.answerIceWaitMs;
+/** See {@link HostTransportOptions.maxPeerBufferedBytes}. */
+export const DEFAULT_MAX_PEER_BUFFERED_BYTES = 1 << 20;
+/** See {@link HostTransportOptions.peerBufferedTimeoutMs}. */
+export const DEFAULT_PEER_BUFFERED_TIMEOUT_MS = 10_000;
+/** Longest delay `setTimeout`/`setInterval` honour (a larger one fires after 1 ms). */
+const MAX_TIMER_MS = 0x7fffffff;
 
 /**
  * A count limit: a positive integer, or `Infinity` (no limit) where allowed.
@@ -386,6 +421,26 @@ function checkMs(name: string, v: number | null | undefined, def: number): numbe
   if (v == null) return def;
   if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) {
     throw new RangeError(`${name} must be a finite number of ms > 0 (got ${String(v)})`);
+  }
+  return v;
+}
+
+/**
+ * A timer delay in ms: within what timers honour, and > 0 (`positive`) or
+ * >= 0. `NaN` and out-of-range values make Node fire after 1 ms.
+ */
+function checkDelay(name: string, v: number | null | undefined, def: number, positive: boolean): number {
+  if (v == null) return def;
+  if (typeof v !== 'number' || !(positive ? v > 0 : v >= 0) || !(v <= MAX_TIMER_MS)) {
+    throw new RangeError(`${name} must be a number of ms ${positive ? '> 0' : '>= 0'} and <= ${MAX_TIMER_MS} (got ${String(v)})`);
+  }
+  return v;
+}
+
+/** `maxPlayers`: sent as a u8 in RoomInfo; `NaN` would disable the 4100 check. */
+function checkMaxPlayers(v: number): number {
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 255) {
+    throw new RangeError(`maxPlayers must be an integer in 0..255 (got ${String(v)})`);
   }
   return v;
 }
@@ -469,6 +524,15 @@ export class HostTransport {
   private readonly maxUnjoinedPerIp: number;
   private readonly channelOpenTimeoutMs: number;
   private readonly peerIdleTimeoutMs: number;
+  private readonly maxPeerBufferedBytes: number;
+  private readonly peerBufferedTimeoutMs: number;
+  private readonly floodCapacity: number;
+  private readonly floodMsPerToken: number;
+  private readonly sweepIntervalMs: number;
+  private readonly answerIceWaitMs: number;
+  private readonly reverseIceDelayMs: number;
+  /** `challengeDelayMs`, or -1: by offer origin. */
+  private readonly challengeDelayMs: number;
   private readonly verifiedIpBans: boolean;
   /** Abusive closes per address ({@link HostTransportOptions.abusePenalty}). */
   private readonly abuseStrikes: KeyedRateLimiter | null;
@@ -501,6 +565,22 @@ export class HostTransport {
     this.maxUnjoinedPerIp = checkLimit('maxUnjoinedPerIp', opts.maxUnjoinedPerIp, NetDefaults.maxUnjoinedPerIp, true);
     this.channelOpenTimeoutMs = checkMs('channelOpenTimeoutMs', opts.channelOpenTimeoutMs, NetDefaults.channelOpenTimeoutMs);
     this.peerIdleTimeoutMs = checkMs('peerIdleTimeoutMs', opts.peerIdleTimeoutMs, NetDefaults.peerIdleTimeoutMs);
+    this.maxPeerBufferedBytes = checkLimit('maxPeerBufferedBytes', opts.maxPeerBufferedBytes, DEFAULT_MAX_PEER_BUFFERED_BYTES, true);
+    this.peerBufferedTimeoutMs = checkMs('peerBufferedTimeoutMs', opts.peerBufferedTimeoutMs, DEFAULT_PEER_BUFFERED_TIMEOUT_MS);
+    // the bucket is built when channel 0 opens: a bad value must fail here, not on every join
+    this.floodCapacity = opts.floodCapacity ?? NetDefaults.floodCapacity;
+    this.floodMsPerToken = opts.floodMsPerToken ?? NetDefaults.floodMsPerToken;
+    assertBucketParams(this.floodCapacity, this.floodMsPerToken);
+    this.sweepIntervalMs = checkDelay('sweepIntervalMs', opts.sweepIntervalMs, 1000, true);
+    this.answerIceWaitMs = checkDelay('answerIceWaitMs', opts.answerIceWaitMs, DEFAULT_ANSWER_ICE_WAIT_MS, false);
+    this.reverseIceDelayMs = checkDelay('reverseIceDelayMs', opts.reverseIceDelayMs, NetDefaults.reverseIceDelayMs, false);
+    this.challengeDelayMs = checkDelay('challengeDelayMs', opts.challengeDelayMs, -1, false);
+    const ver = opts.version;
+    if (ver != null && (typeof ver !== 'number' || !Number.isInteger(ver) || ver < 0 || ver > 0xffff)) {
+      throw new RangeError(`version must be an integer in 0..65535 (got ${String(ver)})`);
+    }
+    const jc = opts.joinRateLimit?.code;
+    if (jc != null && !isCloseCode(jc)) throw new RangeError(`joinRateLimit.code must be an integer in 0..65535 (got ${String(jc)})`);
     this.verifiedIpBans = opts.verifiedIpBans ?? true;
     const ap = opts.abusePenalty === undefined ? NetDefaults.abusePenalty : opts.abusePenalty;
     const apd = NetDefaults.abusePenalty;
@@ -539,7 +619,7 @@ export class HostTransport {
     this.icePolicy = this.backend.prefiltered ? 'all' : (opts.iceCandidatePolicy ?? 'public');
     this.bans = opts.bans ?? new BanList();
     this.password = opts.password ?? null;
-    this.maxPlayers = opts.maxPlayers ?? 12;
+    this.maxPlayers = checkMaxPlayers(opts.maxPlayers ?? 12);
     this.isPublic = opts.public ?? false;
     this.roomInfo = { ...defaultRoomInfo(), ...opts.roomInfo, version: opts.version ?? PROTOCOL_VERSION };
     this.roomInfo.password = this.password !== null;
@@ -602,7 +682,7 @@ export class HostTransport {
    */
   private ensureSweep(): void {
     if (this.sweepTimer !== null || !this.running) return;
-    this.sweepTimer = setInterval(this.sweepTick, this.opts.sweepIntervalMs ?? 1000);
+    this.sweepTimer = setInterval(this.sweepTick, this.sweepIntervalMs);
   }
 
   private readonly sweepTick = (): void => {
@@ -693,8 +773,9 @@ export class HostTransport {
     this.publishRoomInfo();
   }
 
+  /** @throws RangeError unless `n` is an integer in 0..255. */
   setMaxPlayers(n: number): void {
-    this.maxPlayers = n;
+    this.maxPlayers = checkMaxPlayers(n);
     this.roomInfo.maxPlayers = n;
     this.publishRoomInfo();
   }
@@ -1031,7 +1112,7 @@ export class HostTransport {
     const mids = sdpMids(offer.sdp);
     peer.mids = mids.length === 1 && mids[0] === '0' ? SINGLE_MID : mids;
     peer.challengeDelay =
-      this.opts.challengeDelayMs ?? (isLibdatachannelOffer(offer.sdp) ? LIBDATACHANNEL_CHALLENGE_DELAY_MS : 0);
+      this.challengeDelayMs >= 0 ? this.challengeDelayMs : isLibdatachannelOffer(offer.sdp) ? LIBDATACHANNEL_CHALLENGE_DELAY_MS : 0;
     const events: PeerLinkEvents = {
       onLocalDescription: (sdp) => this.safely(() => this.onLocalDescription(peer, sdp)),
       onLocalCandidate: (cand, mid) => this.safely(() => this.onLocalCandidate(peer, cand, mid)),
@@ -1107,10 +1188,7 @@ export class HostTransport {
     if (peer.gatheringDone) this.sendAnswer(peer);
     else if (this.backend.answerOnFirstCandidate === true && peer.localCandidates.length > 0) this.answerSoon(peer);
     else {
-      peer.timer = setTimeout(
-        () => this.safely(() => this.sendAnswer(peer)),
-        this.opts.answerIceWaitMs ?? DEFAULT_ANSWER_ICE_WAIT_MS,
-      );
+      peer.timer = setTimeout(() => this.safely(() => this.sendAnswer(peer)), this.answerIceWaitMs);
     }
   }
 
@@ -1199,7 +1277,7 @@ export class HostTransport {
     };
     if (peer.reverse) {
       // harmless once the peer is gone (link null): unref'd so it never keeps a stopped host alive
-      setTimeout(() => this.safely(apply), this.opts.reverseIceDelayMs ?? NetDefaults.reverseIceDelayMs).unref();
+      setTimeout(() => this.safely(apply), this.reverseIceDelayMs).unref();
     } else apply();
   }
 
@@ -1242,11 +1320,7 @@ export class HostTransport {
     }
     peer.state = 'challenged';
     peer.lastMessageAt = now;
-    peer.bucket = new TokenBucket(
-      this.opts.floodCapacity ?? NetDefaults.floodCapacity,
-      this.opts.floodMsPerToken ?? NetDefaults.floodMsPerToken,
-      now,
-    );
+    peer.bucket = new TokenBucket(this.floodCapacity, this.floodMsPerToken, now);
     this.connected.push(peer);
     peer.challenge = createChallenge();
     const delay = peer.challengeDelay;
@@ -1423,6 +1497,26 @@ export class HostTransport {
     }
   }
 
+  /**
+   * Closes `peer` once its link has kept more than `maxPeerBufferedBytes`
+   * unacknowledged for `peerBufferedTimeoutMs` (sampled on each sweep). A
+   * client that pings to dodge the idle timeout but never takes what it is
+   * sent would otherwise hold the whole send buffer for as long as it stays.
+   */
+  private checkBacklog(peer: Peer, now: number): void {
+    const link = peer.link;
+    const queued = link !== null && link.queuedBytes !== undefined ? link.queuedBytes() : 0;
+    if (!(queued > this.maxPeerBufferedBytes)) {
+      peer.backlogSince = -1;
+      return;
+    }
+    if (peer.backlogSince < 0) peer.backlogSince = now;
+    else if (now - peer.backlogSince >= this.peerBufferedTimeoutMs) {
+      this.log(`peer ${peer.id}: ${queued} bytes unacknowledged for ${Math.round(now - peer.backlogSince)} ms`);
+      this.closePeer(peer, 'stalled');
+    }
+  }
+
   /** An abusive close: once its address runs out of tokens, its offers are refused for a while. */
   private strike(peer: Peer): void {
     const key = peer.limitKey;
@@ -1472,10 +1566,12 @@ export class HostTransport {
       else if (p.state === 'validating') this.failNegotiation(p, 'join request timeout');
     }
     const idle = this.peerIdleTimeoutMs;
+    const backlog = this.maxPeerBufferedBytes !== Infinity;
     const conns = this.connected;
     for (let i = conns.length - 1; i >= 0; i--) {
       const p = conns[i]!;
       if (now - p.lastMessageAt >= idle) this.closePeer(p, 'timeout');
+      else if (backlog) this.checkBacklog(p, now);
     }
     this.joinLimiter?.prune(now);
     this.abuseStrikes?.prune(now);

@@ -32,6 +32,34 @@ import { UdpIo, literalLookup, type PacketIo } from './udp.js';
 import { TurnRelay, turnServers, type TurnStats, type TurnServerSpec } from './turn.js';
 import { sameIp } from './gather.js';
 
+/**
+ * Throws a `RangeError` for a numeric option that would silently disable a
+ * limit or a timer: `NaN` passes no comparison, `Infinity` never expires, a
+ * port outside 0–65535 cannot be bound or announced. Absent options keep their defaults.
+ */
+function checkEndpointOptions(o: RtcEndpointOptions): void {
+  const int = (name: string, v: number | undefined, min: number, max: number, unbounded = false): void => {
+    if (v === undefined) return;
+    if (typeof v !== 'number' || !(v >= min) || (v === Infinity ? !unbounded : !Number.isInteger(v) || v > max)) {
+      throw new RangeError(`RtcEndpoint: ${name} must be an integer in ${min}..${max}${unbounded ? ' or Infinity' : ''} (got ${String(v)})`);
+    }
+  };
+  const ms = (name: string, v: number | undefined, unbounded: boolean): void => {
+    if (v === undefined) return;
+    if (typeof v !== 'number' || (unbounded ? !(v >= 0) : !(v > 0 && v < Infinity))) {
+      throw new RangeError(`RtcEndpoint: ${name} must be ${unbounded ? 'a number of ms >= 0 or Infinity' : 'a finite number of ms > 0'} (got ${String(v)})`);
+    }
+  };
+  int('port', o.port, 0, 65535);
+  int('publicPort', o.publicPort, 1, 65535);
+  int('maxSessions', o.maxSessions, 1, Number.MAX_SAFE_INTEGER);
+  int('maxTurnAllocations', o.maxTurnAllocations, 1, Number.MAX_SAFE_INTEGER);
+  int('turnPeersPerAllocation', o.turnPeersPerAllocation, 1, Number.MAX_SAFE_INTEGER, true);
+  ms('idleTimeoutMs', o.idleTimeoutMs, false);
+  ms('handshakeTimeoutMs', o.handshakeTimeoutMs, false);
+  ms('gatherRefreshMs', o.gatherRefreshMs, true);
+}
+
 /** A socket bound by {@link RtcEndpoint.listen}, before the endpoint wraps it. */
 interface RawBound {
   sock: Socket;
@@ -40,7 +68,7 @@ interface RawBound {
 }
 
 export interface RtcEndpointOptions {
-  /** UDP port (default 0 = ephemeral). With two families both sockets use the same port. */
+  /** UDP port, an integer 0–65535 (default 0 = ephemeral). With two families both sockets use the same port. */
   port?: number;
   /**
    * Bind address (default: the wildcard of each family present in
@@ -99,10 +127,11 @@ export interface RtcEndpointOptions {
    * addresses per allocation over its whole life (Cloudflare: ~10); a client uses one or two. The
    * endpoint keeps a pool of allocations (the first from its own socket, the others from sockets of
    * their own), gives each new session the relay candidate of one with room left, keeps a spare one
-   * ready, and deletes exhausted ones once their sessions are gone.
+   * ready, and deletes exhausted ones once their sessions are gone. An integer >= 1 (values below
+   * 2 count as 2) or `Infinity`.
    */
   turnPeersPerAllocation?: number;
-  /** TURN: most allocations at once (default 64). */
+  /** TURN: most allocations at once, a positive integer (default 64). */
   maxTurnAllocations?: number;
   /**
    * Which interface addresses become host candidates, and which remote
@@ -110,18 +139,22 @@ export interface RtcEndpointOptions {
    * `CandidatePolicy` in gather.ts). Not applied to {@link publicAddresses}.
    */
   candidatePolicy?: CandidatePolicy;
-  /** Re-query the STUN servers at a new session when the last result is older than this (default 60 000 ms). */
+  /**
+   * Re-query the STUN servers at a new session when the last result is older than this (default
+   * 60 000 ms; >= 0, `Infinity`: never).
+   */
   gatherRefreshMs?: number;
-  /** Advertised port when a 1:1 NAT maps a different one (default: the bound port). */
+  /** Advertised port (1–65535) when a 1:1 NAT maps a different one (default: the bound port). */
   publicPort?: number;
   /** DTLS identity (default: {@link certificateFile} if set, else the process-wide {@link RtcCertificate.processDefault}). */
   certificate?: RtcCertificate;
   /** Load/persist the DTLS identity in this PEM file ({@link RtcCertificate.loadOrCreate}). */
   certificateFile?: string;
-  /** Close an open session after this long without ICE consent (default 30 000 ms). */
+  /** Close an open session after this long without ICE consent (ms, finite, > 0; default 30 000). */
   idleTimeoutMs?: number;
-  /** Close a session not open this long after createSession (default 20 000 ms). */
+  /** Close a session not open this long after createSession (ms, finite, > 0; default 20 000). */
   handshakeTimeoutMs?: number;
+  /** Most sessions at once, a positive integer (default 10 000); `createSession` throws beyond it. */
   maxSessions?: number;
   /** Data-channel layer factory (default: `SctpAssociation` from ./sctp). */
   dataLayer?: SctpFactory;
@@ -479,8 +512,9 @@ export class RtcEndpoint {
     this.gatherer.start();
   }
 
-  /** Binds the socket(s). */
+  /** Binds the socket(s). Rejects with a `RangeError` on an unusable numeric option (see {@link RtcEndpointOptions}). */
   static async listen(opts: RtcEndpointOptions): Promise<RtcEndpoint> {
+    checkEndpointOptions(opts);
     let pubs = opts.publicAddresses;
     const lite = opts.iceLite === true;
     const ipv6 = opts.ipv6 === true;

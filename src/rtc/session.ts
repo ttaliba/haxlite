@@ -533,6 +533,12 @@ export class RtcSessionImpl implements RtcSession, IceAgentOwner, GatherWaiter {
     return s !== null && s.send(channelId, data);
   }
 
+  /** See {@link RtcSession.bufferedAmount}. */
+  get bufferedAmount(): number {
+    const s = this.sctp;
+    return s === null ? 0 : (s.bufferedAmount ?? 0);
+  }
+
   /** Corks the SCTP association (see {@link RtcSession.cork}); balanced by {@link uncork}. */
   cork(): void {
     const s = this.sctp;
