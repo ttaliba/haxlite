@@ -1,6 +1,6 @@
 # 11 - Referencia de la API de haxlite
 
-Referencia completa de lo que ofrece **haxlite** (paquete `haxlite` 1.0.0, Node.js ≥ 22 o Bun) a quien lo usa como librería: `HBInit(config)`, el objeto `room`, las extensiones `config.haxlite` / `room.haxlite` y los módulos de uso avanzado.
+Referencia completa de lo que ofrece **haxlite** (paquete `haxlite` 1.1.0, Node.js ≥ 22 o Bun) a quien lo usa como librería: `HBInit(config)`, el objeto `room`, las extensiones `config.haxlite` / `room.haxlite` y los módulos de uso avanzado.
 
 Todo lo que aquí figura sale del código (`src/api/types.ts`, `src/api/hbinit.ts`, `src/host/`, `src/net/`, `src/rtc/`, `src/replay/`, `src/sim/`); cada valor por defecto se comprobó en la línea de código que lo aplica. Lo que no se pudo confirmar va marcado **(no verificado)**. Para el porqué de cada ajuste, véanse los documentos enlazados: [04 netcode](04-netcode-y-sincronizacion.md), [06 arquitectura](06-arquitectura-haxlite.md), [09 Edge](09-haxlite-edge.md), [10 haxlite-rtc](10-haxlite-rtc.md) y [ip/02 TURN](ip/02-turn.md). Los cambios de comportamiento por defecto y la opción exacta para volver al comportamiento anterior están en [13 notas de versión](13-notas-de-version.md). La guía de uso rápido está en la sección «haxlite: uso» del [README](../README.md).
 

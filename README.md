@@ -53,10 +53,10 @@ haxlite habla el protocolo 9 bit a bit con los clientes oficiales del navegador 
 ## Instalación
 
 ```sh
-npm install https://github.com/ttaliba/haxlite/releases/download/v1.0.0/haxlite-1.0.0.tgz
+npm install https://github.com/ttaliba/haxlite/releases/download/v1.1.0/haxlite-1.1.0.tgz
 
 # sin node-datachannel: solo peerBackend 'rtc' o edge con 'rtc'
-npm install https://github.com/ttaliba/haxlite/releases/download/v1.0.0/haxlite-1.0.0.tgz --omit=optional
+npm install https://github.com/ttaliba/haxlite/releases/download/v1.1.0/haxlite-1.1.0.tgz --omit=optional
 
 # o, desde este repositorio:
 npm install && npm run build         # genera dist/ con los .d.ts (JSDoc en la API HBInit, la raíz y los módulos de operador)
