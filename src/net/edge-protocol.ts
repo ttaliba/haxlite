@@ -170,8 +170,10 @@ export const EdgeLimits = {
   maxCandidate: 1_024,
   maxMid: 64,
   maxKeyId: 128,
-  /** Remote candidates accepted per player connection. */
+  /** Remote candidates accepted per player connection (host → edge) and for the tunnel PeerConnection. */
   maxRemoteCandidates: 32,
+  /** Local candidates relayed per player connection (edge → host). */
+  maxLocalCandidates: 32,
   /** Max `udpHost` length in `AuthOk`. */
   maxUdpHost: 255,
   /** Max player payload (bytes). */

@@ -56,8 +56,8 @@
 |---|---|---|---|
 | Node.js | `>= 22` | `package.json` → `engines.node` | CI prueba 22.x, 24.x y 26.x (`.github/workflows/ci.yml`). La máquina de pruebas del proyecto usa Node 26.8 y 22.22 |
 | Bun | 1.x; el proyecto lo prueba con 1.4 | `README.md`, `docs/07` | Opcional. Es el runtime de producción de las salas (docs/07 §«Escenarios de producción y Bun»). Los benchmarks lo localizan con `$BUN_PATH` o `bun` del `PATH` |
-| `ws` | `^8.22.0` | `package.json` → `dependencies` | Obligatoria |
-| `json5` | `^2.2.3` | `package.json` → `dependencies` | Obligatoria (el archivo de configuración del Edge **no** la usa: es JSON estricto, ver §3.4) |
+| `ws` | `^8.22.0` | `package.json` → `dependencies` | Obligatoria. Es la única dependencia de ejecución obligatoria del paquete publicado |
+| `json5` | `^2.2.3` | `package.json` → `devDependencies` | Solo para compilar y probar. El parser (`json5/lib/parse.js`) va incluido en `dist` con su licencia MIT en un comentario (`scripts/build.mjs`) y se carga en la primera cadena que `JSON.parse` rechaza (`src/sim/hbs.ts`); el paquete publicado no depende de `json5`. El archivo de configuración del Edge tampoco la usa: es JSON estricto, ver §3.4 |
 | `node-datachannel` | `^0.33.4` | `package.json` → `optionalDependencies` | **Opcional.** Solo se carga con `peerBackend: 'ndc'` (el valor por defecto de la sala), `playerBackend: 'ndc'` del Edge o el túnel legado `dataPlane: 'webrtc'`. Con `npm install --omit=optional` haxlite se instala igual |
 | TypeScript | `^7.0.2` | `devDependencies` | Solo para compilar y comprobar tipos |
 | `rolldown` | `1.2.13` | `devDependencies` | Empaquetador de `npm run build` y de los benchmarks |
@@ -88,7 +88,7 @@ Todos salen de `package.json` → `scripts`. Los argumentos extra se pasan tras 
 
 | Script | Comando real | Qué hace | Notas |
 |---|---|---|---|
-| `build` | `node scripts/build.mjs` | `tsc -p tsconfig.build.json` a un directorio temporal, empaqueta con rolldown (entradas `index` y `edge/cli`, un *chunk* compartido, minificado, ASCII), copia los `.d.ts` y deja el resultado en `dist/` | Flags de `scripts/build.mjs`: `--out <dir>` (por defecto `dist`), `--no-minify`. Borra el destino antes de compilar. Lo necesita `bin/haxlite-edge.js` (`import '../dist/edge/cli.js'`) |
+| `build` | `node scripts/build.mjs` | `tsc -p tsconfig.build.json` a un directorio temporal, empaqueta con rolldown (entradas `index` y `edge/cli`, un *chunk* compartido, minificado, ASCII), copia los `.d.ts` y deja el resultado en `dist/` | Flags de `scripts/build.mjs`: `--out <dir>` (por defecto `dist`), `--no-minify`. Borra el destino antes de compilar. Lo necesita `bin/haxlite-edge.js` (`import '../dist/edge/cli.js'`). **`--out` debe caer dentro del árbol del repo** si el resultado se va a publicar: el parser de `json5` solo se empaqueta en ese caso; con `--out` fuera, el `dist` sale unos 25 KB más pequeño, deja `require('json5/lib/parse.js')` en tiempo de ejecución y falla al parsear un `.hbs` con comentarios si `json5` (devDependency) no está instalado ([docs/13](13-notas-de-version.md)) |
 | `typecheck` | `tsc -p tsconfig.json --noEmit && tsc -p tsconfig.build.json --noEmit` | Comprueba tipos de `src/`, `test/` y `vitest.config.ts`, y luego solo `src/` con `erasableSyntaxOnly` | `tsconfig.build.json` prohíbe `enum`, `namespace` y propiedades de parámetro en `src/`, para poder ejecutarlo sin compilar con `--experimental-strip-types` |
 | `test` | `vitest run` | Dos proyectos: `ndc` (todo `test/**/*.test.ts` y `src/**/*.test.ts`) y `rtc` (las suites host/API/transporte repetidas con `peerBackend: 'rtc'`) | Pool `forks`, tiempo límite de 60 s por prueba (`vitest.config.ts`). Las pruebas con Chromium se omiten solas si no hay navegador |
 | `test:watch` | `vitest` | Igual, en modo observación | - |
@@ -164,8 +164,8 @@ Solo algunas opciones tienen variable de entorno (§3.3). El resto (`listen.path
 `limits.*`, `tunnel.*` salvo el puerto, `webrtc.*` salvo `bindAddress`, el primer puerto de
 `portRange` y `publicAddresses`) solo se fijan en el archivo.
 
-El archivo se lee con `JSON.parse`: **JSON estricto, sin comentarios ni comas finales** (aunque
-`json5` es una dependencia del paquete, no se usa aquí).
+El archivo se lee con `JSON.parse`: **JSON estricto, sin comentarios ni comas finales** (`json5` no se
+usa aquí: ni siquiera es una dependencia de ejecución del paquete publicado, §1).
 
 ### 3.3 Variables de entorno del Edge
 
@@ -184,7 +184,7 @@ El archivo se lee con `JSON.parse`: **JSON estricto, sin comentarios ni comas fi
 | `HAXLITE_EDGE_PUBLIC_ADDRESSES` | IPs separadas por comas | ver §3.4 | `webrtc.publicAddresses` | Direcciones **anunciadas** a los jugadores (`rtc`: las únicas) |
 | `HAXLITE_EDGE_TUNNEL_PORT` | entero 0–65535 u `off` | = puerto TCP | `tunnel.port` / `tunnel.udp=false` | `off` desactiva el túnel v2 (los hosts caen al WebSocket). Cadena vacía = no fijada. Otro valor → error |
 | `HAXLITE_EDGE_STATS_TOKEN` | cadena | sin token | `stats.token` | Token *bearer* de `GET /stats` |
-| `HAXLITE_EDGE_LOG_INTERVAL_MS` | ms | `60000` | `stats.logIntervalMs` | Periodo de la línea de estadísticas. `0` la apaga. Un valor no numérico (NaN) la apaga sin error (no se valida) |
+| `HAXLITE_EDGE_LOG_INTERVAL_MS` | ms | `60000` | `stats.logIntervalMs` | Periodo de la línea de estadísticas. `0` la apaga. Debe ser un número entre 0 y 2147483647; fuera de rango o no numérico (p. ej. `off`) el arranque falla con `Error` «bad log interval N (0-2147483647 ms)» |
 
 ### 3.4 Archivo de configuración (JSON)
 
@@ -216,8 +216,8 @@ Esqueleto completo (`EdgeConfigFile` en `config.ts`):
 | `keysFile` | ruta | - | Más claves: array JSON o `id:secreto` por línea | Env: `HAXLITE_EDGE_KEYS_FILE` |
 | `playerBackend` | `"rtc"` / `"ndc"` | `"rtc"` | Cómo se atiende WebRTC de los jugadores | `rtc` = haxlite-rtc (TypeScript puro, 1 puerto UDP, ICE-lite). `ndc` = node-datachannel (addon nativo, carga perezosa) |
 | `stats.path` | cadena o `null` | `/stats` | Ruta HTTP(S) de las estadísticas; `null` desactiva el endpoint | Solo archivo |
-| `stats.token` | cadena o `null` | `null` | Token *bearer*; sin él, `/stats` es público en ese puerto | Env: `HAXLITE_EDGE_STATS_TOKEN` |
-| `stats.logIntervalMs` | ms | `60000` | Periodo del resumen en el log; `0` = apagado | Env: `HAXLITE_EDGE_LOG_INTERVAL_MS` |
+| `stats.token` | cadena o `null` | `null` | Token *bearer* de `GET /stats`. Sin él, `/stats` responde `200` con solo agregados de todo el Edge (`keys` vacío; `webrtc`, `rtc` y `tunnel` a `null`; `redacted: true`); con él, la respuesta completa | Env: `HAXLITE_EDGE_STATS_TOKEN` |
+| `stats.logIntervalMs` | ms | `60000` | Periodo del resumen en el log; `0` = apagado. De 0 a 2147483647, si no el arranque falla | Env: `HAXLITE_EDGE_LOG_INTERVAL_MS` |
 
 #### `webrtc` (jugadores) - `EdgeWebRtcOptions`
 
@@ -258,7 +258,13 @@ Los sockets UDP del túnel piden búferes de 4 MiB de recepción y de envío (`s
 
 | Clave | Tipo | Defecto | Qué limita |
 |---|---|---|---|
-| `maxSessions` | entero | `1000` | Túneles (salas) simultáneos en el Edge. Exceso → cierre 4429 «edge full» |
+| `maxSessions` | entero | `1000` | Túneles (salas) **autenticados** simultáneos en el Edge. Exceso → cierre 4429 «edge full» (también si se llena mientras el host autentica) y `terminate` forzado a los 2 s |
+| `maxPreAuthSessions` | entero | `1024` | Sockets de túnel en fase `Hello` → `Auth`, contados aparte de `maxSessions` (`0` = sin límite). Con el pool lleno el recién llegado **entra** cerrando con 4408 «auth timeout» el socket sin autenticar más antiguo de la fuente (IP, /64 o cliente reenviado) que más plazas ocupa, o el suyo propio si es esa fuente. Solo responde HTTP `503` cuando cada fuente tiene una plaza y el socket más antiguo lleva menos de `min(1 s, authTimeoutMs / 4)` sin autenticar (la gracia no es configurable). Las fuentes loopback/privadas exentas de los otros topes participan en el reparto, por IP (o /64) |
+| `maxPreAuthPerIp` | entero | `256` | Sockets sin autenticar por origen público (IPv6: por /64); más → HTTP `429` (`0` = sin límite) |
+| `ipConnectCapacity` | entero | `256` | Ráfaga del *token bucket* de *upgrades* nuevos por origen público (IPv6: por /64); agotado → HTTP `429`. `0` desactiva el límite |
+| `ipConnectMsPerToken` | ms | `20` | Un *upgrade* nuevo por origen cada este intervalo (50 por segundo sostenidos). Con `ipConnectCapacity > 0` debe ser finito y > 0, si no `RangeError` al arrancar |
+| `perIpLimitsApplyToPrivate` | bool | `false` | Aplica `maxPreAuthPerIp` e `ipConnect*` también a orígenes loopback, privados (RFC 1918, 100.64.0.0/10, `fc00::/7`) y *link-local*. Por defecto están exentos: detrás de un proxy inverso todos los hosts comparten esa dirección. El servidor registra la primera conexión de una fuente exenta (como mucho una vez por hora) |
+| `trustForwardedFor` | bool o lista | `false` | Proxies en los que se confía para usar la **última** entrada de `X-Forwarded-For` como clave de los topes por origen y del reparto del pool. `true`: solo loopback (127.0.0.0/8, `::1`; un proxy en la misma máquina). Lista de IP/CIDR (`["172.18.0.0/16"]`, la IP del pod del ingress): esos proxies, necesaria con docker-compose, Kubernetes o un balanceador; una entrada inválida lanza `RangeError` al arrancar. La cabecera de cualquier otra fuente se ignora. Se aceptan entradas con puerto (`ip:puerto`, `[v6]:puerto`). Con un proxy de confianza, una cabecera ausente o inutilizable deja la clave en el proxy (la segunda se registra, como mucho una vez por hora). Solo con un proxy que la añada (§3.6) |
 | `maxSessionsPerKey` | entero | `16` | Sesiones por clave (cuota por defecto; ver `keys[].maxSessions`) |
 | `maxPeersPerKey` | entero | `256` | Jugadores por clave en todas sus sesiones (ver `keys[].maxPeers`) |
 | `maxPeersPerSession` | entero | `40` | Jugadores por sala. Se comunica al host en `AuthOk` (tope `0xffff`) |
@@ -274,8 +280,10 @@ Los sockets UDP del túnel piden búferes de 4 MiB de recepción y de envío (`s
 | `allowWsDataPlane` | bool | `true` | Aceptar sesiones con los datos por WebSocket. Con `false` y sin plano UDP/WebRTC disponible el host recibe un error |
 
 Constantes no configurables (`EdgeLimits`, `src/net/edge-protocol.ts`): SDP ≤ 16 384 B, candidato ≤ 1024 B,
-`mid` ≤ 64, id de clave ≤ 128, ≤ 32 candidatos remotos por jugador, payload de jugador ≤ 262 144 B,
+`mid` ≤ 64, id de clave ≤ 128, ≤ 32 candidatos remotos y ≤ 32 locales retransmitidos por jugador (`maxLocalCandidates`), payload de jugador ≤ 262 144 B,
 mensaje WebSocket ≤ 262 144 + 64 B, 16 carriles `ro`.
+
+Validación al construir `EdgeServer`: cada valor de `limits` de la lista de contadores (`maxSessions`, `maxPreAuthSessions`, `maxPreAuthPerIp`, `ipConnectCapacity`, `maxSessionsPerKey`, `maxPeersPerKey`, `maxPeersPerSession`, `maxPendingPerSession`) debe ser un número ≥ 0, si no `RangeError` («limits.<nombre> must be a number >= 0, got X»); los *buckets* (`peerOpen*`, `flood*`, `ipConnect*`) exigen capacidad ≥ 1 y `MsPerToken` finito > 0. Los plazos `channelOpenTimeoutMs`, `authTimeoutMs`, `dataPlaneTimeoutMs`, `keepAliveMs`, `statsLogIntervalMs` (programático) y `webrtc.consentTimeoutMs` se acotan a 2147483647 ms (un valor mayor se dispararía en ~1 ms) y `NaN` lanza `RangeError` («<nombre> must be a number of milliseconds»).
 
 ### 3.5 Puertos y firewall
 
@@ -301,6 +309,7 @@ solo permita UDP hacia la IP del Edge garantiza que el host nunca le hable direc
   key (docs/09 §4), pero ofertas y slots solo van cifrados con TLS. **Usa `wss://` en producción.**
 * Alternativa: terminar TLS en nginx/caddy con `proxy_pass` WebSocket a `127.0.0.1:<listen.port>`.
   Solo pasa el control; el UDP del túnel hay que fijarlo (`tunnel.port`) y abrirlo aparte.
+* Con un proxy inverso todos los hosts llegan desde su IP (loopback o privada), así que los topes por origen (`maxPreAuthPerIp`, `ipConnect*`) no se aplican por defecto a esas conexiones (`perIpLimitsApplyToPrivate: false`); ponerlo a `true` limitaría al proxy entero. Con `trustForwardedFor` la clave pasa a ser la última entrada de `X-Forwarded-For` (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`): `true` confía solo en loopback (nginx o caddy en la misma máquina) y, para un proxy en otro contenedor, pod o nodo, hay que dar la lista de IP/CIDR (`"trustForwardedFor": ["172.18.0.0/16"]`); la cabecera de cualquier otra fuente se ignora, y solo debe listarse un proxy que añada la entrada. Quien usaba `true` con un proxy no local debe pasar a la lista. Alternativa: `limit_conn` / `limit_req` en el proxy. Los orígenes exentos participan en el reparto del pool de sockets sin autenticar (`maxPreAuthSessions`), por IP. El CLI avisa al arrancar (§3.9). Detalle en docs/09 §3.
 
 ### 3.7 Claves de API
 
@@ -327,17 +336,19 @@ solo permita UDP hacia la IP del Edge garantiza que el host nunca le hable direc
 | 4400 | `Protocol` | Mensaje malformado o fuera de límites |
 | 4401 | `AuthFailed` | MAC o clave inválidos |
 | 4402 | `Version` | Versión de protocolo incompatible |
-| 4408 | `Timeout` | `authTimeoutMs` o `dataPlaneTimeoutMs` vencidos |
-| 4429 | `Quota` | Cuota de sesiones (clave o Edge lleno) |
+| 4408 | `Timeout` | `authTimeoutMs` o `dataPlaneTimeoutMs` vencidos, o una sesión sin autenticar cerrada para hacer sitio a un recién llegado cuando se llena `maxPreAuthSessions` (motivo «auth timeout»; la más antigua de la fuente que más plazas ocupa) |
+| 4429 | `Quota` | Cuota de sesiones (clave o Edge lleno: «edge full», en el *upgrade* y al autenticar) |
 | 4503 | `Shutdown` | El Edge se apaga (SIGINT/SIGTERM): los hosts reconectan |
 
 (`src/net/edge-protocol.ts`, `EdgeCloseCode`.)
+
+Antes de abrir el WebSocket, el *upgrade* puede responderse con HTTP `429 Too Many Requests` (se agotó `ipConnectCapacity` o `maxPreAuthPerIp`) o `503 Service Unavailable` (pool de `maxPreAuthSessions` lleno, cada fuente con una sola plaza y el socket más antiguo con menos de `min(1 s, authTimeoutMs / 4)`). Ambas llevan `Connection: close`, `Retry-After: 1` y `Content-Length: 0`; un cliente WebSocket las ve como un fallo del *handshake*, no como un cierre 44xx.
 
 ### 3.9 Endpoint `/stats`, log y señales
 
 * **`GET <stats.path>`** (por defecto `/stats`), mismo puerto TCP que el control, con TLS si lo hay.
   Con `stats.token`, exige `Authorization: Bearer <token>` (comparación en tiempo constante); sin
-  él o con uno erróneo → `401`. Cualquier otra ruta o método → `404`. Respuesta `application/json`,
+  la cabecera o con una errónea → `401`. **Sin `stats.token`** responde `200` con solo agregados de todo el Edge (`uptimeSec`, `playerBackend`, `sessions`, `peers`, `authFailures`, `dataPlanes`, `memoryRssMb`; `keys: []`; `webrtc`, `rtc` y `tunnel` a `null`; `redacted: true`, campo que no aparece con token ni en `EdgeServer.stats()`) y no reinicia la ventana de pps. Cualquier otra ruta o método → `404`. Respuesta `application/json`,
   `Cache-Control: no-store`.
 
   ```sh
@@ -353,6 +364,7 @@ solo permita UDP hacia la IP del Edge garantiza que el host nunca le hable direc
 * **Log** (a `stdout`, con marca ISO por línea): arranque, `players: haxlite-rtc on UDP <puerto>, announcing …`,
   `tunnel v2: UDP <dirección>:<puerto>`, y cada `stats.logIntervalMs` una línea
   `stats sessions=… peers=… rtc=abiertas/sesiones udp=túneles [pcs=…] rss=…MB | clave: Ns/Mp in X pps out Y pps`.
+* **Avisos de arranque** (`cli.ts`): `WARNING: no TLS configured; use wss:// in production…`; salvo con `perIpLimitsApplyToPrivate: true`, `listening on loopback (reverse proxy?): per-address tunnel limits do not apply to proxied connections (limits.trustForwardedFor)` si `listen.host` es loopback y no hay `trustForwardedFor`, y en los demás casos (también al escuchar en `0.0.0.0`: SNAT de Docker/Kubernetes, un balanceador) `per-address tunnel limits do not apply to loopback/private sources …` (con `trustForwardedFor`, `… other than clients forwarded by a trusted proxy`); y `<ruta> has no token: it serves edge-wide aggregates only (stats.token for per-key stats)` si el endpoint de stats está activo sin token. El servidor escribe además, como mucho una vez por hora y tipo, `source X is exempt from the per-address limits (loopback/private address: …)` en la primera conexión de una fuente exenta y `X-Forwarded-For from proxy X has no usable last entry …` cuando un proxy de confianza manda una cabecera inutilizable. El id de clave y los errores de oferta que llegan del host se escriben en el log con los caracteres de control y de separación de línea escapados (`\n`, `\r`, `\xNN`, `\uNNNN`).
 * **Señales:** `SIGHUP` → recargar TLS; `SIGINT`/`SIGTERM` → cierra todos los túneles con 4503 y
   termina (código 0). Una segunda señal mientras se apaga se ignora.
 * Sin temporizadores en vacío: un Edge sin sesiones no despierta nunca (docs/09 §6).
@@ -365,6 +377,7 @@ solo permita UDP hacia la IP del Edge garantiza que el host nunca le hable direc
 existente; entonces `host`/`port`/`tls` se ignoran) y `log`. Métodos: `stats()`, `url(host?)`,
 `reloadTls()`, `close({ shutdownWebRtc })`; propiedades `tunnelPort`, `playerPort`, `address`.
 La API completa está en [11 - Referencia de la API](11-referencia-api.md).
+`EdgeServer.start()` cierra el listener y las conexiones que abrió si `listen()` falla. Los límites inválidos de `limits` y los plazos `NaN` lanzan `RangeError` al construir (ver §3.4).
 
 ---
 
@@ -411,6 +424,7 @@ El paquete no lee ninguna otra variable: ni `HAXLITE_*` genéricas, ni `NODE_ENV
 | `HAXLITE_CHROMIUM` | `/opt/pw-browsers/chromium-1194/chrome-linux/chrome` | Ejecutable de Chromium para `test/rtc-interop`, `test/rtc/chromium-dtls.test.ts`, `test/rtc/sctp/chromium.test.ts` y `bench/rtc`. Sin él las pruebas se omiten |
 | `HAXBALL_CLIENT_DIR` | vacío | Directorio con el cliente web oficial sin modificar (`game.html`, `game-min.js`, `res.dat`, `vendor/*.js`). Sin él `official-client*.interop.ts` se omiten (docs/10 §4.3) |
 | `HAXLITE_TURN_ICE` | vacío | Archivo JSON con la respuesta de `generate-ice-servers` de Cloudflare para `official-client-turn.interop.ts` (necesita red) |
+| `HAXLITE_REQUIRE_OPS` | sin definir | `1` convierte en fallos los casos de `test/ops` (nft, netns, XDP, clang) que se omitirían por falta de herramienta o de privilegio; sin él se omiten escribiendo `[ops] skipped: <motivo>` en stderr (§7, punto 7) |
 | `HAXBALL_CLIENT_JS` | `game-min.js` (relativa al directorio de trabajo) | `game-min.js` del cliente oficial para `test/replay`. Si el archivo no existe, esas pruebas se omiten |
 | `HAXLITE_REPLAY_FRAMES` | `12000` | Longitud del escenario de `test/replay/replay.test.ts` |
 | `HAXLITE_DIFF_TICKS` | `5000` | Ticks por corrida de `test/room/diff.test.ts` |
@@ -786,15 +800,15 @@ configuraciones para copiar y adaptar (verificado: ningún archivo de `src/` ni 
 
 | Archivo | Qué hace | Cómo se carga | Parámetros a editar |
 |---|---|---|---|
-| `haxguard.nft` | Tabla `netdev haxguard` en el hook **ingress** (`priority -500`, antes de conntrack) de la interfaz pública. Para los puertos de sala, en orden: descarta fragmentos UDP/IPv6; deja pasar el UDP que no va a `ROOM_PORTS`; descarta IPs en `deny4/6`; descarta puerto origen < 1024 (reflexión DNS/NTP/CLDAP/SNMP…); acepta jugadores de `active4/6` con tope de 1000 pps por IP (ráfaga 200); acepta respuestas de `stun_servers4`; descarta puertos origen de reflectores (`amp_sports`); acepta IPs de `pending4/6` (20 s); acepta STUN de desconocidos (`udp length >= 28`, cookie `0x2112a442`) con límite de 5/s (ráfaga 10) por origen y 2000/s global; **descarta todo lo demás**. Contadores `c_*` por regla | `nft -c -f ops/haxguard/haxguard.nft` (validar) y `nft -f ops/haxguard/haxguard.nft` (cargar, como root). La línea `destroy table netdev haxguard` hace el archivo idempotente (requiere un nftables con `destroy`; versión mínima no verificada). Quitar: `nft delete table netdev haxguard` | `define WAN = "eth0"` (interfaz) y `define ROOM_PORTS = 20000-20999` (**por defecto no coincide con los 40000 de docs/09**: ajusta al `webrtc.port`/`rtc.port` real). El rango debe quedar fuera de `net.ipv4.ip_local_port_range` (32768-60999) |
-| `haxguard_xdp.c` | Boceto **XDP solo IPv4** equivalente al anterior: mapas `active4`, `pending4` (hash con caducidad), `deny4` (LPM), `stunrate4` (LRU) y contadores per-CPU `stats`; mismos pasos y límites (5 pps, ráfaga 10) | `clang -O2 -g -target bpf -c haxguard_xdp.c -o haxguard_xdp.o`; luego `ip link set dev eth0 xdpgeneric obj haxguard_xdp.o sec xdp` (o `xdpdrv`/`xdp-loader load -m native`). Mapas anclados en `/sys/fs/bpf/haxguard/`; se actualizan con `bpftool map update pinned …` | `ROOM_PORT_MIN/MAX` (20000-20999), `STUN_PPS_PER_SRC`, `STUN_BURST`. No compilado ni cargado en esta revisión (no verificado) |
-| `relay-only.nft` | Tabla `inet haxhost` para el **host** con `iceTransportPolicy: 'relay'` y node-datachannel: solo deja salir/entrar UDP del rango `40000-40999` hacia/desde las IP del servidor TURN; cualquier otro UDP de ese rango se descarta (cierra la fuga de *checks* directos de libjuice, docs/08, docs/ip/02 §5.3) | `nft -f ops/haxguard/relay-only.nft` | Los sets `turn4`/`turn6` (IP de Cloudflare TURN o de tu relay; hay que vigilar sus A/AAAA) y el rango de puertos, que debe coincidir con `portRange: [40000, 40999]` |
+| `haxguard.nft` | Tabla `netdev haxguard` en el hook **ingress** (`priority -500`, antes de conntrack) de la interfaz pública. Solo filtra el **UDP hacia `ROOM_PORTS`**; TCP, ICMP, ARP/ND y el UDP a otros puertos pasan por `policy accept`. En orden: descarta los fragmentos UDP IPv4 **de cualquier puerto** y todos los fragmentos IPv6; deja pasar el UDP que no va a `ROOM_PORTS`; descarta IPs en `deny4/6` (TCP, ICMP y el UDP a `ROOM_PORTS`; el UDP de esa IP a otros puertos ya pasó en el paso anterior); descarta puerto origen < 1024 (reflexión DNS/NTP/CLDAP/SNMP…); acepta jugadores de `active4/6` con tope de 1000 pps por IP (ráfaga 200); acepta respuestas de `stun_servers4`; descarta puertos origen de reflectores (`amp_sports`); acepta IPs de `pending4/6` (20 s) salvo bogons (`bogons4/6`), con tope de 500 pps por IP (ráfaga 300) y 10 000 pps global (ráfaga 2000); acepta STUN de desconocidos (`udp length >= 28`, cookie `0x2112a442`) con límite de 5/s (ráfaga 10) por **cubo de origen** (una IP en IPv4, un /64 en IPv6; lo fijan `STUN_V4_MASK`/`STUN_V6_MASK`) y 2000/s global; **descarta el resto del UDP hacia `ROOM_PORTS`**. Contadores `c_*` por regla; `c_stun_setfull` cuenta los STUN que no cupieron en `stunrate4/6` (set lleno: el límite por origen no se aplicó) | `nft -c -f ops/haxguard/haxguard.nft` (validar) y `nft -f ops/haxguard/haxguard.nft` (cargar, como root; comprobar el código de salida). Las líneas `table netdev haxguard` + `delete table netdev haxguard` hacen el archivo idempotente con cualquier nftables, sin `destroy`; **recargar vacía `active`/`pending`/`deny`** (el sidecar tiene que repoblarlos). Quitar: `nft delete table netdev haxguard` | `define WAN = "eth0"` (interfaz) y `define ROOM_PORTS = 20000-20999` (**por defecto no coincide con los 40000 de docs/09**: ajusta al `webrtc.port`/`rtc.port` real); `STUN_V4_MASK` (por defecto `255.255.255.255`: un cubo por IP, de modo que los jugadores de un mismo CGNAT no comparten ráfaga; `255.255.255.0` agrupa por /24 si hay un atacante con un /24 propio, a costa de ese reparto) y `STUN_V6_MASK` (por defecto `ffff:ffff:ffff:ffff::`, un cubo por /64: IPv6 no tiene CGNAT y un /64 es lo que recibe un abonado, de modo que con la máscara completa quien posee un /64 originaría 2^64 direcciones sin suplantar, cada una con su ráfaga, y solo le frenaría el tope global de 2000/s que comparten todas las salas del host; un /64 compartido, como un Wi-Fi público, comparte ráfaga igual que un NAT44; no frena a quien tenga un /56 o un /48, 256 o 65 536 cubos: vigila `c_stun_ok` y `c_stun_over`; se cambia en el `define` y se recarga); con el set `stunrate` lleno el límite por origen se salta con cualquier máscara y solo queda el global (`c_stun_setfull`). Vaciar `bogons4/6` si los jugadores llegan por red privada. El rango debe quedar fuera de `net.ipv4.ip_local_port_range` (32768-60999) |
+| `haxguard_xdp.c` | Boceto **XDP IPv4** (con hasta 2 etiquetas 802.1Q/802.1ad) con los pasos de `haxguard.nft` y sus topes: 1000 pps por jugador `active` (`actrate4`), 500 pps por IP y 10 000 pps global en `pending` (con bogons), 5 pps/ráfaga 10 por origen y 2000/s global para STUN de desconocidos, y contadores per-CPU `stats` (`S_*_OVER` cuentan los descartes por tope). `expires_ns` de `active4`/`pending4` es `CLOCK_MONOTONIC` y **0 significa caducado**; los HASH no borran lo caducado, el sidecar debe hacerlo. **Diferencias con el nft**: sin `amp_sports` ni `stun_servers4`; cubo STUN por IP (como el nft por defecto en IPv4); `deny4` solo se mira para el UDP a `ROOM_PORT` (el nft descarta además TCP, ICMP… de esa IP); **sin filtro IPv6**: el UDP IPv6 a `ROOM_PORT` se cuenta en `S_V6` y pasa (`-DHG_DROP_V6` lo descarta, y también corta a los jugadores IPv6) y las cabeceras de extensión no se recorren; usar con `ipv6:false` o junto a `haxguard.nft`. Los fragmentos UDP IPv4 de cualquier puerto y los paquetes malformados (cabecera IPv4 < 20 B, UDP truncado) se descartan antes de mirar el puerto; las opciones IP (`ihl` > 5) solo se descartan hacia `ROOM_PORT`. Los cubos de fichas son una carrera benigna entre CPUs (con varias colas el tope real puede quedar por encima del nominal); un reloj que va hacia atrás entre CPUs cuenta como 0 s y no recarga el cubo | `clang -O2 -g -target bpf -I/usr/include/$(uname -m)-linux-gnu -c haxguard_xdp.c -o haxguard_xdp.o` (el `-I` da `asm/types.h` en Debian/Ubuntu; paquete `linux-libc-dev`); luego `ip link set dev eth0 xdpgeneric obj haxguard_xdp.o sec xdp` (o `xdpdrv`/`xdp-loader load -m native`). Mapas anclados en `/sys/fs/bpf/haxguard/`; se actualizan con `bpftool map update pinned …` | `ROOM_PORT_MIN/MAX` (20000-20999) y los `*_PPS`/`*_BURST`. Compilado, cargado (`xdpgeneric`, kernel 6.18) y probado con `BPF_PROG_TEST_RUN` (`test/ops/haxguard-xdp-run.test.ts`, necesita root, clang y libbpf; si faltan se omite diciendo el motivo, y con `HAXLITE_REQUIRE_OPS=1` falla; el CI no lo ejecuta, §7 punto 7); sin probar con tráfico real, con `xdpdrv` ni con etiquetas VLAN en hardware. Al actualizar desde una versión anterior, desanclar los mapas (`stats` pasa de 8 a 16 entradas) |
+| `relay-only.nft` | Tabla `inet haxhost` para el **host** con `iceTransportPolicy: 'relay'` y node-datachannel: solo deja salir/entrar UDP del rango `40000-40999` hacia/desde las IP del servidor TURN; cualquier otro UDP de ese rango se descarta (cierra la fuga de *checks* directos de libjuice, docs/08, docs/ip/02 §5.3). Las reglas valen para **cualquier** proceso del host: el rango tiene que quedar fuera de los puertos efímeros (`net.ipv4.ip_local_reserved_ports=40000-40999`, persistente en `/etc/sysctl.d/`, o mover el rango fuera de `net.ipv4.ip_local_port_range`, 32768-60999 por defecto); sin eso ~3,5 % de los sockets UDP sin puerto fijo (resolver DNS…) pierden salida y respuestas | `nft -c -f` (validar) y `nft -f ops/haxguard/relay-only.nft`; comprobar el código de salida (la carga es atómica: si falla no se instala nada) y `nft list table inet haxhost`. Idempotente: recargar no duplica reglas | Los sets `turn4`/`turn6` (IP de Cloudflare TURN o de tu relay; hay que vigilar sus A/AAAA; llevan `flags interval`, necesario para los prefijos) y `define RELAY_PORTS` (el rango de puertos, que debe coincidir con `portRange: [40000, 40999]`) |
 | `canary-counters.nft` | Tabla `inet ipresearch_test` **solo de conteo** (sin `drop`): contadores por `(daddr, dport)` en `41000-41999` para atribuir ataques por dirección («canary addressing», docs/ip/04 §1.4) | `nft -f ops/haxguard/canary-counters.nft`; leer con `nft -j list set inet ipresearch_test canary4` | Rango de puertos. En producción conviene moverlo a una tabla `netdev`/ingress |
 
 **Advertencias de uso (léelas antes de cargar `haxguard.nft`):**
 
 1. **El archivo, tal como está, bloquea el juego.** Solo deja pasar a un origen desconocido el STUN
-   inicial; todo lo demás (DTLS, SCTP) cae en el paso 8 («todo lo demás hacia los puertos de sala»)
+   inicial; todo lo demás (DTLS, SCTP) cae en el paso 8 («todo el UDP hacia los puertos de sala»)
    salvo que su IP esté en `active4/6` o `pending4/6`. Esos conjuntos los debe mantener un *sidecar*
    con privilegios que **no existe en el repositorio** (docs/08 §3 lo lista como pendiente: eventos
    `onPeerPending`/`onPeerAddress`/`onPeerGone`). Sin él, el firewall solo sirve como esqueleto o
@@ -806,6 +820,48 @@ configuraciones para copiar y adaptar (verificado: ningún archivo de `src/` ni 
    verificado en producción).
 4. Un firewall en el host **no** detiene un ataque que sature el enlace: hace falta mitigación del
    proveedor (docs/ip/03).
+5. **Alcance.** `haxguard.nft` solo filtra el UDP hacia `ROOM_PORTS`: TCP (SSH, WebSocket al master),
+   ICMP, ARP/ND y el UDP a otros puertos pasan por `policy accept`. No sustituye a un firewall del host
+   (el bloque `haxguard_tcp` del final del archivo es un punto de partida). Una IP en `deny4/6` pierde
+   TCP, ICMP y el UDP a `ROOM_PORTS`, pero **su UDP a otros puertos sigue entrando**: la regla que deja
+   pasar el UDP que no va a `ROOM_PORTS` va antes que la de `deny` (para un baneo total del host, mover
+   las dos reglas de `deny` antes de ella, a costa de un lookup más por cada paquete UDP ajeno; el XDP
+   solo aplica `deny4` al UDP a `ROOM_PORT`). Los fragmentos UDP IPv4 se descartan sea cual sea el puerto (un
+   DNS/EDNS, IKE o syslog grande al mismo host dejaría de llegar; en tal caso hay que quitar la primera
+   regla de `ingress`) y los fragmentos IPv6 se descartan sea cual sea su protocolo. En el XDP, además,
+   se descartan los paquetes malformados (cabecera IPv4 < 20 B, UDP truncado).
+6. **Contrato del sidecar** (detallado en la cabecera del `.nft`): en `pending` solo la IP que vio el
+   master y 2-4 srflx válidos (IP literal unicast global; nunca la lista completa de candidatos, que
+   la elige el cliente), con tope global de entradas; `active` se refresca cada 60 s (caduca a los
+   5 min: si el sidecar muere, todos los jugadores se cortan a la vez, hay que supervisarlo) y se borra
+   al salir; `deny` con `timeout` explícito y prefijo /64 en IPv6; recargar el `.nft` vacía los sets;
+   un `add` que falla por set lleno es un error a tratar y alertar. Para un jugador por TURN hay que
+   autorizar el origen que ve el kernel (el servidor TURN), no la dirección interna del par.
+7. **Validación.** `test/ops/` valida con `nft -c -f` cada `.nft`, compila el XDP y, si hay `unshare`,
+   `ip` y `nft`, carga los `.nft` en espacios de nombres desechables con paquetes reales (cubo STUN por
+   IP en IPv4 y por /64 en IPv6, set `stunrate` lleno y `c_stun_setfull`, baneos, fragmentos,
+   `relay-only.nft` y puertos efímeros); con root, clang y libbpf ejecuta además el XDP con
+   `BPF_PROG_TEST_RUN`. Los casos IPv6 inyectan tramas Ethernet+IPv6+UDP por `AF_PACKET` desde `python3`
+   (`test/ops/netns-v6.py`): ejercitan las reglas `ip6` del hook ingress con paquetes reales aunque el
+   kernel no tenga IPv6, pero **no** la pila IPv6 que hay detrás (sin sockets v6, ND ni ICMPv6), y el XDP no
+   filtra IPv6. `nft -c` no detecta un `drop` demasiado ancho; solo una prueba con tráfico lo hace (un SYN
+   TCP y ARP atraviesan el ingress en estas pruebas; ICMP y ND no están cubiertos).
+
+   **Qué corre en el CI y cómo ejecutarlo todo.** `ci.yml` ejecuta `npx vitest run` como usuario normal y
+   sin instalar paquetes, así que el XDP (necesita root o `CAP_BPF`, `clang`, `linux-libc-dev` y
+   `libbpf-dev`) no se carga nunca allí, y los casos de netns dependen de que el runner permita
+   `unshare -rn` (en Ubuntu 24.04 puede hacer falta `sysctl kernel.apparmor_restrict_unprivileged_userns=0`)
+   y traiga `nft`, `ip` y `python3`. Cada caso al que le falte algo se omite **diciendo el motivo**: imprime
+   `[ops] skipped: <motivo>` en stderr (visible con el reporter por defecto; el motivo es además la nota del
+   caso en el reporter `verbose`). Con `HAXLITE_REQUIRE_OPS=1` esas omisiones son fallos, para un runner o
+   una máquina que debe cubrirlo todo. Ejecución completa con privilegios:
+
+   ```sh
+   sudo apt-get install -y clang linux-libc-dev libbpf-dev nftables iproute2 python3
+   sudo env "PATH=$PATH" HAXLITE_REQUIRE_OPS=1 npx vitest run test/ops --project ndc
+   ```
+
+   Tras editar un `.nft` o el XDP conviene correrlo así antes de subir el cambio.
 
 ---
 
@@ -818,6 +874,7 @@ configuraciones para copiar y adaptar (verificado: ningún archivo de `src/` ni 
 * **Job `test`** («Node 22.x / 24.x / 26.x», `ubuntu-latest`, 30 min, `fail-fast: false`):
   `npm ci` → `npm run typecheck` → `npm run build` → `npx vitest run` (ambos proyectos, `ndc` y
   `rtc`). Las pruebas con Chromium se omiten (no hay navegador en el job).
+  El job no instala `clang`, `libbpf-dev`, `nftables` ni usa `sudo`: los casos de `test/ops` que necesitan esas herramientas o privilegios (el XDP siempre; netns e IPv6 según el runner) se omiten diciendo el motivo, y no hay un job con `HAXLITE_REQUIRE_OPS=1` (§7, punto 7).
 * **Job `interop`** («Interop (Chromium)», Node 24.x, 45 min, `continue-on-error: true`: **no hace
   fallar** el flujo): instala el Chromium que fija `playwright-core` con
   `npx playwright-core install --with-deps chromium`; fija `PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/pw-browsers`
@@ -989,7 +1046,7 @@ lo que se deduce del código y de docs/10:
 
 ### 9.5 Publicación del paquete
 
-Flujo descrito por `publish.yml` y el encabezado del propio archivo:
+Flujo descrito por `publish.yml` y el encabezado del propio archivo (el `dist/` se construye con `npm run build`, dentro del repo: con `--out` fuera del árbol el parser de `json5` no se empaqueta, §2):
 
 ```sh
 # versión nueva en package.json, commit, y:

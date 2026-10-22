@@ -85,7 +85,51 @@ export const HostDefaults = {
    * of 7 frames that is 2 wake-ups per heartbeat (~17/s, official 20/s).
    */
   maxWakeFrames: 4,
+  /** One second of errors from a per-tick callback before identical ones are coalesced. */
+  errorRepeatBurst: 60,
+  /** Summary interval of coalesced errors. */
+  errorRepeatWindowMs: 1000,
 } as const;
+
+/** Distinct error messages tracked for coalescing; past it, new ones are delivered as they come. */
+const MAX_ERROR_KEYS = 64;
+
+/** Coalescing key of an error (name + message), or null when it can't be read. */
+function errorKey(err: unknown): string | null {
+  try {
+    return err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Delivered to {@link HostRoom.onError} in place of identical errors (same
+ * name and message) the room coalesced; see
+ * {@link HostRoomOptions.errorRepeatBurst}. `cause` is the last of them.
+ */
+export class RepeatedError extends Error {
+  /** Identical errors not delivered during the window. */
+  readonly count: number;
+  constructor(key: string, last: unknown, count: number, windowMs: number) {
+    super(`${key} (repeated ${count} more times in ${windowMs} ms)`, { cause: last });
+    this.name = 'RepeatedError';
+    this.count = count;
+  }
+}
+
+/** A run of identical errors (see {@link HostRoom.reportError}). */
+interface ErrorRun {
+  /** Errors in the run (delivered up to the burst). */
+  seen: number;
+  /** Errors in the current window. */
+  hits: number;
+  /** Not delivered in the current window. */
+  suppressed: number;
+  last: unknown;
+  /** Room-clock ms the current window ends. */
+  until: number;
+}
 
 export interface HostRoomOptions {
   transport: HostTransport;
@@ -107,7 +151,7 @@ export interface HostRoomOptions {
   heartbeatFrames?: number;
   /** Frames between CheckConsistency events (default 600 = 10 s, official). */
   checksumIntervalFrames?: number;
-  /** Ping event period (default 3000 ms). Only runs while clients are connected. */
+  /** Ping event period (default 3000 ms, at least 1; Infinity: none). Only runs while clients are connected. */
   pingIntervalMs?: number;
   /**
    * While a game runs, the host simulates at least every this many frames
@@ -118,6 +162,18 @@ export interface HostRoomOptions {
    * same. Lower = more wake-ups; `Infinity` = only at heartbeats/messages.
    */
   maxWakeFrames?: number;
+  /**
+   * Identical errors (same name and message) delivered to
+   * {@link HostRoom.onError} before the rest of the run is coalesced: from
+   * then on they are counted and one {@link RepeatedError} per
+   * {@link errorRepeatWindowMs} reports how many there were. The run ends
+   * after a window without that error. Distinct errors are delivered as
+   * they come. Default 60 (a callback that throws on every tick gets one
+   * second through, then one summary per second); `Infinity` = deliver all.
+   */
+  errorRepeatBurst?: number;
+  /** Window of {@link errorRepeatBurst}, ms (default 1000). */
+  errorRepeatWindowMs?: number;
   /** Clock (ms) for tests. Default `performance.now`. */
   now?: () => number;
 }
@@ -401,7 +457,7 @@ export class HostRoom {
   private readonly ready: HostConnection[] = [];
   /** Ban record id by kicked player id (official `Cc`), for clearBan(playerId). */
   private readonly bansByPlayer = new Map<number, number>();
-  /** off `wh`. */
+  /** off `wh` (next id to try; see {@link allocPlayerId}). */
   private nextPlayerId = 1;
   private running = false;
   private hbFrames: number;
@@ -418,6 +474,12 @@ export class HostRoom {
   private pingDue = Infinity;
   private readonly deferred: (() => void)[] = [];
   private flushing = false;
+  private readonly errorBurst: number;
+  private readonly errorWindowMs: number;
+  /** Runs of identical errors by {@link errorKey}. */
+  private readonly errorRuns = new Map<string, ErrorRun>();
+  /** Room-clock ms the earliest error window ends (Infinity: none). */
+  private errorFlushAt = Infinity;
   private readonly pongWriter = new Writer(32);
   /** Reused for every client message (a nested message gets its own). */
   private readonly reader = new Reader(new Uint8Array(0));
@@ -440,7 +502,13 @@ export class HostRoom {
     this.hbFrames = HostRoom.checkFrames('heartbeatFrames', opts.heartbeatFrames ?? HostDefaults.heartbeatFrames, 600);
     this.csFrames = HostRoom.checkFrames('checksumIntervalFrames', opts.checksumIntervalFrames ?? HostDefaults.checksumIntervalFrames, 1 << 20);
     this.wakeFrames = HostRoom.checkWakeFrames(opts.maxWakeFrames ?? HostDefaults.maxWakeFrames);
-    this.pingIntervalMs = opts.pingIntervalMs ?? HostDefaults.pingIntervalMs;
+    this.pingIntervalMs = HostRoom.checkPingInterval(opts.pingIntervalMs ?? HostDefaults.pingIntervalMs);
+    const burst = opts.errorRepeatBurst ?? HostDefaults.errorRepeatBurst;
+    const windowMs = opts.errorRepeatWindowMs ?? HostDefaults.errorRepeatWindowMs;
+    if (!(burst >= 1)) throw new RangeError(`errorRepeatBurst must be >= 1 (got ${burst})`);
+    if (!(windowMs > 0 && windowMs < Infinity)) throw new RangeError(`errorRepeatWindowMs must be > 0 and finite (got ${windowMs})`);
+    this.errorBurst = burst;
+    this.errorWindowMs = windowMs;
     const sink: SequencerSink = {
       // one tunnel message for everyone when the players are behind a haxlite Edge
       broadcast: (data, channel, skip) => {
@@ -461,6 +529,11 @@ export class HostRoom {
       inputDelayFrames: opts.inputDelayFrames ?? HostDefaults.inputDelayFrames,
     });
     this.sequencer.onError = (err) => this.reportError(err);
+    // the transport refuses joins past maxPlayers: at most that many clients + the host player
+    this.sequencer.playerLimit = () => {
+      const n = this.transport.getRoomInfo().maxPlayers;
+      return typeof n === 'number' && n >= 0 ? n + 1 : Infinity;
+    };
     this.sequencer.onViewConverged = (id) => {
       this.discOverrides.delete(id);
       const cb = this.onPrivateViewEnd;
@@ -520,11 +593,31 @@ export class HostRoom {
     this.transport.stop();
     this.deferred.length = 0;
     this.rec?.cancel();
+    this.flushErrorRuns(Infinity);
   }
 
-  /** `.hbr2` recorder (one per room, reused; created on first use): see {@link startRecording}. */
+  /**
+   * `.hbr2` recorder (one per room, reused; created on first use): see
+   * {@link startRecording}. When a recording freezes at the recorder's cap
+   * the room reports it once through {@link onError}.
+   */
   get recorder(): ReplayRecorder {
-    return (this.rec ??= new ReplayRecorder());
+    let rec = this.rec;
+    if (rec === null) {
+      rec = this.rec = new ReplayRecorder();
+      rec.onTruncated = (frame) =>
+        this.reportError(
+          new Error(
+            `replay recording truncated at frame ${frame} (recorder.maxBytes ${rec!.maxBytes} / maxEvents ${rec!.maxEvents} reached); the replay ends there`,
+          ),
+        );
+    }
+    return rec;
+  }
+
+  /** True once the current/last recording froze at the recorder's cap (see {@link recorder}). */
+  get recordingTruncated(): boolean {
+    return this.rec !== null && this.rec.truncated;
   }
 
   get isRunning(): boolean {
@@ -567,6 +660,12 @@ export class HostRoom {
     if (typeof v !== 'number' || !Number.isInteger(v) || v < 1 || v > max) {
       throw new RangeError(`${name} must be an integer in [1, ${max}] (got ${v})`);
     }
+    return v;
+  }
+
+  /** A period below 1 ms (or NaN) would leave the next Ping always due: a busy loop. */
+  private static checkPingInterval(v: number): number {
+    if (typeof v !== 'number' || !(v >= 1)) throw new RangeError(`pingIntervalMs must be >= 1 (got ${v})`);
     return v;
   }
 
@@ -718,9 +817,17 @@ export class HostRoom {
     this.emit(SetGamePlayLimitEvent.create(1, limit | 0));
   }
 
-  /** Any stadium object (only applied when no game is running, like official). */
+  /**
+   * Any stadium object (only applied when no game is running, like official).
+   * Throws, before anything is applied, when it can't travel in a SetStadium
+   * event: a deflated body over 65535 bytes or a custom stadium with more than
+   * 255 of any element ({@link SetStadiumEvent.wireError}).
+   */
   setStadium(stadium: Stadium): void {
-    this.emit(SetStadiumEvent.create(stadium));
+    const ev = SetStadiumEvent.create(stadium);
+    const err = ev.wireError();
+    if (err !== null) throw new Error(err);
+    this.emit(ev);
   }
 
   /** Parses `.hbs` text (throws the parse error, like official `setCustomStadium`). */
@@ -789,8 +896,15 @@ export class HostRoom {
     this.transport.setRequireRecaptcha(on);
   }
 
-  /** Not runtime-changeable in the official API; haxlite extension (the API clamps 2..30 at init). */
+  /**
+   * Not runtime-changeable in the official API; haxlite extension (the API
+   * clamps 2..30). Throws a RangeError unless `n` is an integer in 0..255
+   * (NaN would leave the room without a cap).
+   */
   setMaxPlayers(n: number): void {
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 0 || n > 255) {
+      throw new RangeError(`maxPlayers must be an integer in [0, 255] (got ${String(n)})`);
+    }
     this.transport.setMaxPlayers(n);
   }
 
@@ -1060,18 +1174,39 @@ export class HostRoom {
     // 2. reconcile: a disc that differs from the room's gets the room's values (f32) in every
     //    world that does not hide / override it; those get a no-op in the same slot
     let fix: number[] | null = null;
+    const views = seq.views;
+    const a = gs.world.discs;
+    const n = a.length;
+    // excluded discs of every view (excludedFor), built once per call
+    const excl = this.exclScratch;
+    for (let vi = 0; vi < views.length; vi++) {
+      if (vi === excl.length || excl[vi]!.length < n) excl[vi] = new Uint8Array(n > 256 ? n : 256);
+      this.fillExcluded(views[vi]!, excl[vi]!, n);
+    }
+    if (this.fixMark.length < n) this.fixMark = new Uint8Array(n);
+    const mark = this.fixMark;
+    mark.fill(0, 0, n);
     for (const viewerId of this.reconciling) {
-      const v = seq.getView(viewerId);
-      if (v === null) {
+      let vi = -1;
+      for (let k = 0; k < views.length; k++) {
+        if (views[k]!.playerId === viewerId) {
+          vi = k;
+          break;
+        }
+      }
+      if (vi < 0) {
         if (!this.hiddenFor.has(viewerId)) this.reconciling.delete(viewerId);
         continue;
       }
-      const a = gs.world.discs;
-      const b = v.rs.gameState?.world.discs;
-      if (b === undefined || b.length !== a.length) continue;
-      for (let i = 0; i < a.length; i++) {
-        if (fix?.includes(i) || this.excludedFor(viewerId, i)) continue;
-        if (discDiffMask(a[i]!, b[i]!) !== 0) (fix ??= []).push(i);
+      const ex = excl[vi]!;
+      const b = views[vi]!.rs.gameState?.world.discs;
+      if (b === undefined || b.length !== n) continue;
+      for (let i = 0; i < n; i++) {
+        if (mark[i] !== 0 || ex[i] !== 0) continue;
+        if (discDiffMask(a[i]!, b[i]!) !== 0) {
+          mark[i] = 1;
+          (fix ??= []).push(i);
+        }
       }
     }
     if (fix === null) return;
@@ -1090,6 +1225,27 @@ export class HostRoom {
       const props: DiscPropsInput = {};
       for (const name of DISC_FIELDS) if ((mask & (1 << DiscProp[name])) !== 0) props[name] = room[name];
       seq.privateSlot(keep, SetDiscPropertiesEvent.create(i, false, props));
+    }
+  }
+
+  /** Per view of {@link syncHidden}: 1 for the discs it excludes. */
+  private readonly exclScratch: Uint8Array[] = [];
+  /** Discs already in syncHidden's fix list. */
+  private fixMark = new Uint8Array(256);
+
+  /** `out[i] = 1` for every disc `i < n` that {@link excludedFor} excludes for view `v`, else 0. */
+  private fillExcluded(v: { readonly playerId: number; readonly rs: RoomState }, out: Uint8Array, n: number): void {
+    out.fill(0, 0, n);
+    const ov = this.discOverrides.get(v.playerId);
+    if (ov !== undefined) for (const k of ov.keys()) if (k >= 0 && k < n) out[k] = 1;
+    const set = this.hiddenFor.get(v.playerId);
+    const b = v.rs.gameState?.world.discs;
+    if (set === undefined || b === undefined) return;
+    for (const pid of set) {
+      const d = getPlayer(v.rs, pid)?.disc;
+      if (d == null) continue;
+      const k = b.indexOf(d);
+      if (k >= 0 && k < n) out[k] = 1;
     }
   }
 
@@ -1274,6 +1430,7 @@ export class HostRoom {
       }
     }
     if ((this.hiddenFor.size > 0 || this.reconciling.size > 0) && !this.sequencer.busy) this.invoke(this.syncHiddenFn);
+    if (this.errorFlushAt !== Infinity && this.now() >= this.errorFlushAt) this.flushErrorRuns(this.now());
     this.schedule();
   }
 
@@ -1285,7 +1442,61 @@ export class HostRoom {
     }
   }
 
+  /**
+   * Hands `err` to {@link onError}, coalescing runs of identical errors
+   * (see {@link HostRoomOptions.errorRepeatBurst}).
+   */
   private reportError(err: unknown): void {
+    if (this.onError === null) return;
+    if (this.errorBurst === Infinity) {
+      this.deliverError(err);
+      return;
+    }
+    const now = this.now();
+    if (now >= this.errorFlushAt) this.flushErrorRuns(now);
+    const key = errorKey(err);
+    let run = key === null ? undefined : this.errorRuns.get(key);
+    if (run === undefined) {
+      if (key === null || this.errorRuns.size >= MAX_ERROR_KEYS) {
+        this.deliverError(err);
+        return;
+      }
+      run = { seen: 0, hits: 0, suppressed: 0, last: null, until: now + this.errorWindowMs };
+      this.errorRuns.set(key, run);
+      if (run.until < this.errorFlushAt) this.errorFlushAt = run.until;
+    }
+    run.hits++;
+    if (++run.seen <= this.errorBurst) {
+      this.deliverError(err);
+      return;
+    }
+    run.suppressed++;
+    run.last = err;
+  }
+
+  /** Ends the error windows due at `now` (Infinity: all): summaries, then a new window or the end of the run. */
+  private flushErrorRuns(now: number): void {
+    let next = Infinity;
+    for (const [key, run] of this.errorRuns) {
+      if (now < run.until) {
+        if (run.until < next) next = run.until;
+        continue;
+      }
+      const n = run.suppressed;
+      const last = run.last;
+      if (run.hits === 0 || now === Infinity) this.errorRuns.delete(key);
+      else {
+        run.hits = run.suppressed = 0;
+        run.last = null;
+        run.until = now + this.errorWindowMs;
+        if (run.until < next) next = run.until;
+      }
+      if (n > 0) this.deliverError(new RepeatedError(key, last, n, this.errorWindowMs));
+    }
+    this.errorFlushAt = next;
+  }
+
+  private deliverError(err: unknown): void {
     const h = this.onError;
     if (h !== null) {
       try {
@@ -1583,7 +1794,11 @@ export class HostRoom {
     this.run(() => {
       if (peer.state !== 'joined' || !this.running) return;
       this.catchUp();
-      const id = this.nextPlayerId++;
+      const id = this.allocPlayerId();
+      if (id < 0) {
+        this.transport.close(peer, 'host');
+        throw new Error('no free player id');
+      }
       const c = new HostConnection(id, peer, info.auth, info.conn, this.now(), this.hostLag);
       peer.playerId = id;
       peer.userData = c;
@@ -1596,6 +1811,41 @@ export class HostRoom {
       this.transport.send(peer, Channel.ReliableOrdered, this.sequencer.snapshot(id));
       this.updatePingTimer();
     });
+  }
+
+  /**
+   * Player id for a new connection: official `wh++`, but ids travel as u16
+   * (event header byId, snapshot), so after 0xFFFF the count restarts at 1
+   * and skips ids still in use: connected, in the room, holding a ban
+   * (clearBan(id)) or the author of a queued event. Id 0 is the host. When
+   * bans hold every other id, the id of the oldest ban is reused: the ban
+   * stays in force, only clearBan(oldId) no longer finds it. -1 when no id
+   * is free at all.
+   */
+  private allocPlayerId(): number {
+    // banned ids are never connected, so this many taken ids leave none free
+    if (this.bansByPlayer.size + this.connections.size < 0xffff) {
+      for (let tries = 0; tries < 0xffff; tries++) {
+        const id = this.nextPlayerId;
+        this.nextPlayerId = id >= 0xffff ? 1 : id + 1;
+        if (this.bansByPlayer.has(id) || !this.idFree(id)) continue;
+        return id;
+      }
+    }
+    for (const id of this.bansByPlayer.keys()) {
+      if (!this.idFree(id)) continue;
+      this.bansByPlayer.delete(id);
+      return id;
+    }
+    return -1;
+  }
+
+  /** `id` is neither connected, in the room nor the author of a queued event. */
+  private idFree(id: number): boolean {
+    if (this.connections.has(id) || getPlayer(this.state, id) !== null) return false;
+    const queue = this.sequencer.queue;
+    for (let i = 0; i < queue.length; i++) if (queue[i]!.byId === id) return false;
+    return true;
   }
 
   private connectionOf(peer: Peer): HostConnection | null {

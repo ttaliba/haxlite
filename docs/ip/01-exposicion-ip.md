@@ -133,10 +133,10 @@ decide el master, lo razonable es que **la oferta no llegue al host** hasta reso
 |---|---|---|---|
 | 1 | ≥16 pendientes → 4104 | idem (`maxPendingNegotiations`) | No |
 | 2 | `conn` baneada → 4102 | idem (`BanList`, admite CIDR) | No |
-| 3 | IP srflx de la oferta baneada → 4102 | idem | No |
-| 4 | — | rate limit por IP (`joinRateLimit`) | No |
-| 5 | `Oe` = `Wa.Xg`: llena 4100, versión 4103, contraseña 4101 | idem | No |
-| 6 | — | `onJoinRequest` (async) con `ip`, `srflxIps`, `candidateAddresses`, `password`, `reverse` | No |
+| 3 | IP srflx de la oferta baneada → 4102 | idem, pero después de la sala llena y de `joinRateLimit` (filas 4 y 5); con `verifiedIpBans` también un candidato `host`/`prflx` público baneado | No |
+| 4 | — | antes de inflar la oferta: dirección limitada por `abusePenalty` y `maxUnjoinedPerIp` (4104), y rate limit por IP (`joinRateLimit`) | No |
+| 5 | `Oe` = `Wa.Xg`: llena 4100, versión 4103, contraseña 4101 | sala llena (4100) antes de inflar la oferta, con asiento cedido por una conexión sin *handshake* desde hace 5 s; versión y contraseña como el oficial | No |
+| 6 | — | `maxUnjoinedPerIp` contando las negociaciones directas abandonadas (4104) y `onJoinRequest` (async) con `ip`, `srflxIps`, `candidateAddresses`, `password`, `reverse` | No |
 | 7 | crear PC, answer, esperar ICE ≤500 ms, **enviar answer** | idem, pero con node-datachannel la answer sale con el primer candidato permitido (`answerIceWaitMs` = 500 ms solo si no hay ninguno) | **SÍ** |
 | 8 | canal 0 abierto: sala llena → cierre | idem | Sí |
 | 9 | challenge → firma → `auth` | idem (+ `allowNullAuth:false`) | Sí |

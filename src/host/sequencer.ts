@@ -23,6 +23,7 @@ import {
   EVENT_META,
   PAUSED_TICKS,
   SetDiscPropertiesEvent,
+  SetStadiumEvent,
   checkClientSender,
   createEvent,
   readRoomState,
@@ -57,8 +58,12 @@ export const MAX_WORLD_DISCS = 255;
  *  - StartGame: a new world of the largest stadium (current or queued
  *    SetStadium) + every player in a team now + every player those events
  *    could put in a team.
+ * Every player has at most one disc, so the discs players can add are also
+ * bounded by `maxPlayers`, the most players the room can hold at once (host
+ * player included; the current count if higher): queued events that cannot
+ * apply (e.g. AutoTeams from a non-admin) never count past it.
  */
-export function discLimitViolation(rs: RoomState, ev: RoomEvent, queued: readonly RoomEvent[] = []): string | null {
+export function discLimitViolation(rs: RoomState, ev: RoomEvent, queued: readonly RoomEvent[] = [], maxPlayers = Infinity): string | null {
   const type = ev.type;
   if (type !== EventType.SetPlayerTeam && type !== EventType.AutoTeams && type !== EventType.StartGame) return null;
   let gainers: Set<number> | null = null; // players a queued SetPlayerTeam may give a disc
@@ -104,13 +109,16 @@ export function discLimitViolation(rs: RoomState, ev: RoomEvent, queued: readonl
     if (own === 0) return null;
     what = 'autoTeams';
   }
-  const gain = (gainers?.size ?? 0) + autoGain + own;
+  const players = rs.players;
+  const cap = players.length > maxPlayers ? players.length : maxPlayers;
+  let gain = (gainers?.size ?? 0) + autoGain + own;
+  if (gain > cap) gain = cap;
   const gs = rs.gameState;
   let max = gs !== null ? gs.world.discs.length + gain : 0;
   if (start) {
-    let n = stadiumDiscs + gain;
-    const players = rs.players;
-    for (let i = 0; i < players.length; i++) if (players[i]!.team !== 0) n++;
+    let inTeams = gain;
+    for (let i = 0; i < players.length; i++) if (players[i]!.team !== 0) inTeams++;
+    const n = stadiumDiscs + (inTeams > cap ? cap : inTeams);
     if (n > max) max = n;
   }
   if (max > MAX_WORLD_DISCS) return `${what}: the world could reach ${max} discs (max ${MAX_WORLD_DISCS})`;
@@ -293,6 +301,12 @@ export class Sequencer {
   onBeforeOperation: BeforeOperationHook | null = null;
   /** Exceptions thrown by room hooks while applying events or stepping (they never abort the loop). */
   onError: ((err: unknown) => void) | null = null;
+  /**
+   * The most players the room can hold at once, host player included
+   * (bounds the disc count of queued events, {@link discLimitViolation});
+   * null = unbounded.
+   */
+  playerLimit: (() => number) | null = null;
 
   /**
    * Private views (clients whose world differs from the room's), in creation
@@ -376,7 +390,13 @@ export class Sequencer {
         this.eventCounter += this.eventsInFrame;
         this.eventsInFrame = 0;
         this.frame++;
-        if (this.onFrameStepped !== null) this.onFrameStepped(this.frame);
+        if (this.onFrameStepped !== null) {
+          try {
+            this.onFrameStepped(this.frame);
+          } catch (err) {
+            this.reportError(err);
+          }
+        }
       }
       while (c < count) {
         const ev = list[c]!;
@@ -460,7 +480,14 @@ export class Sequencer {
       this.reportError(err);
     }
     if (this.views.length > 0) this.applyToViews(ev);
-    if (this.onEventApplied !== null) this.onEventApplied(ev);
+    // a throw here would leave the event queued (applied again) or unsent
+    if (this.onEventApplied !== null) {
+      try {
+        this.onEventApplied(ev);
+      } catch (err) {
+        this.reportError(err);
+      }
+    }
     this.eventsInFrame++;
   }
 
@@ -647,7 +674,13 @@ export class Sequencer {
             this.reportError(err);
           }
         }
-        if (this.onEventApplied !== null) this.onEventApplied(shared);
+        if (this.onEventApplied !== null) {
+          try {
+            this.onEventApplied(shared);
+          } catch (err) {
+            this.reportError(err);
+          }
+        }
       } finally {
         this.depth--;
       }
@@ -685,17 +718,25 @@ export class Sequencer {
     if (this.onError !== null) this.onError(err);
   }
 
+  private maxPlayers(): number {
+    const f = this.playerLimit;
+    return f === null ? Infinity : f();
+  }
+
   // ================================================================ host (`Wa`)
 
   /**
    * Host's own event (official `Wa.oc`): `byId = 0`, frame = current frame
    * (+ input delay + handicap for `delay` events), apply/queue, heartbeat,
-   * then broadcast on `ru` when any connection exists.
+   * then broadcast on `ru` when any connection exists. A SetStadium that
+   * can't be encoded ({@link SetStadiumEvent.wireError}) is refused before it
+   * is applied, like one over the disc limit.
    */
   hostEvent(ev: RoomEvent): void {
-    const tooMany = discLimitViolation(this.rs, ev, this.queue);
-    if (tooMany !== null) {
-      this.reportError(new Error(tooMany));
+    const refused =
+      ev.type === EventType.SetStadium ? (ev as SetStadiumEvent).wireError() : discLimitViolation(this.rs, ev, this.queue, this.maxPlayers());
+    if (refused !== null) {
+      this.reportError(new Error(refused));
       return;
     }
     ev.byId = 0;
@@ -742,7 +783,10 @@ export class Sequencer {
    * frame, `fg` validation (chat filter), {@link onBeforeOperation}, then
    * apply/queue and broadcast to every client (author included) on `ru`.
    * Throws {@link ProtocolViolation} (or a codec error) when the client must
-   * be dropped.
+   * be dropped. A SetStadium that decodes but can't be re-encoded within the
+   * wire limits ({@link SetStadiumEvent.wireError}) is dropped and reported
+   * through {@link onError} before {@link onBeforeOperation} sees it (and
+   * after it, when the hook edited it past the limits); its sender stays.
    */
   clientMessage(client: SequencerClient, r: Reader, now: number): RoomEvent | null {
     const requested = r.u32();
@@ -771,13 +815,30 @@ export class Sequencer {
     ev.clientSeq = clientSeq;
     ev.byId = client.playerId;
     if (!ev.validate(this.rs)) return null;
-    if (discLimitViolation(this.rs, ev, this.queue) !== null) return null;
+    if (discLimitViolation(this.rs, ev, this.queue, this.maxPlayers()) !== null) return null;
     const hook = this.onBeforeOperation;
-    if (hook !== null && hook(ev, client.playerId, requested) === false) return null;
+    if (hook !== null) {
+      // the hook only sees a stadium that can be sent on; checked on a probe,
+      // since the hook may edit the stadium and the event caches its deflate
+      if (type === EventType.SetStadium && this.unsendableStadium(SetStadiumEvent.create((ev as SetStadiumEvent).stadium!), client.playerId)) {
+        return null;
+      }
+      if (hook(ev, client.playerId, requested) === false) return null;
+    }
+    // valid payload that our deflate can't fit back in the u16: dropped, the sender stays
+    if (type === EventType.SetStadium && this.unsendableStadium(ev as SetStadiumEvent, client.playerId)) return null;
     const variants = this.makeVariants(ev);
     this.submit(ev);
     this.sendSequenced(ev, variants);
     return ev;
+  }
+
+  /** Reports and returns true when a client's SetStadium can't be sent on ({@link SetStadiumEvent.wireError}). */
+  private unsendableStadium(ev: SetStadiumEvent, playerId: number): boolean {
+    const err = ev.wireError();
+    if (err === null) return false;
+    this.reportError(new Error(`SetStadium from player ${playerId} dropped: ${err}`));
+    return true;
   }
 
   /** Message 3 `[u32 frame][u32 eventCounter]` on `uu` (official `Wa.Zd`). */

@@ -700,8 +700,11 @@ export class DtlsServer {
     this.helloReassembly = null;
     this.nextReceiveSeq = msgSeq + 1;
     this.nextSendSeq = msgSeq;
-    this.writeSeqHi[0] = recSeqHi;
-    this.writeSeqLo[0] = recSeqLo;
+    // Each direction numbers its records from 0, but our HelloVerifyRequest reused an earlier
+    // ClientHello's record sequence: continue from this (later) one, or the peer's epoch-0
+    // replay window drops flight 4 and the join waits for a retransmission. Low 32 bits only
+    // (a real peer is still near 0 here): a hostile value cannot approach the 48-bit limit.
+    if (this.opts.helloVerify === true && recSeqHi === 0) this.writeSeqLo[0] = recSeqLo;
     this.appendTranscript(HandshakeType.ClientHello, msgSeq, body);
     try {
       this.negotiate(ch);
@@ -971,6 +974,10 @@ export class DtlsServer {
     const epoch = this.writeEpoch;
     const hi = this.writeSeqHi[epoch]!;
     const lo = this.writeSeqLo[epoch]!;
+    if (hi === 0xffff && lo === 0xffffffff) {
+      this.sequenceExhausted();
+      return false;
+    }
     this.nextWriteSeq(epoch);
     const n = c.seal(ContentType.ApplicationData, DTLS_1_2, epoch, hi, lo, data, rec, RECORD_HEADER);
     writeRecordHeader(rec, ContentType.ApplicationData, DTLS_1_2, epoch, hi, lo, n);
@@ -981,6 +988,11 @@ export class DtlsServer {
   /** Largest application-data record {@link send} produces (header + max plaintext + AEAD overhead). */
   static readonly MAX_RECORD = RECORD_HEADER + MAX_PLAINTEXT + 8 + TAG_LENGTH;
 
+  /**
+   * 48-bit sequence space; never wraps (RFC 6347 §4.1: a wrapped number reuses
+   * the AEAD nonce). The last number (2^48 - 1) is never sent: callers check
+   * for it and close instead.
+   */
   private nextWriteSeq(epoch: number): void {
     let lo = this.writeSeqLo[epoch]! + 1;
     if (lo > 0xffffffff) {
@@ -990,10 +1002,22 @@ export class DtlsServer {
     this.writeSeqLo[epoch] = lo;
   }
 
+  /**
+   * Write sequence space of the epoch used up: no record (not even an alert)
+   * may be sealed any more. Closes at once; `onClose` runs from a microtask
+   * because {@link send} is called from inside the caller's output path.
+   */
+  private sequenceExhausted(): void {
+    if (this.state === 'closed') return;
+    this.release();
+    queueMicrotask(() => this.opts.onClose('dtls-error:sequence-exhausted'));
+  }
+
   /** A complete record (header + protected fragment) at the current write epoch. */
   private sealRecord(type: number, payload: Uint8Array, epoch = this.writeEpoch): Buffer {
     const hi = this.writeSeqHi[epoch]!;
     const lo = this.writeSeqLo[epoch]!;
+    if (hi === 0xffff && lo === 0xffffffff) throw new Error('sequence-exhausted');
     this.nextWriteSeq(epoch);
     if (epoch === 0) {
       const rec = Buffer.allocUnsafe(RECORD_HEADER + payload.length);
@@ -1056,7 +1080,8 @@ export class DtlsServer {
     const t = setTimeout(() => {
       this.retransmitTimer = null;
       if (this.state !== 'handshake' || this.lastFlight === null) return;
-      this.sendFlight(this.lastFlight);
+      this.resendFlight(this.lastFlight);
+      if (this.state !== 'handshake') return;
       this.retransmitMs = Math.min(this.retransmitMs * 2, 8000);
       this.armRetransmitTimer();
     }, this.retransmitMs);
@@ -1077,7 +1102,19 @@ export class DtlsServer {
     if (now - this.lastPeerTriggeredRetransmit < 250) return;
     this.lastPeerTriggeredRetransmit = now;
     // fresh record sequence numbers; CCS + Finished keep their epochs (0 / 1)
-    this.sendFlight(flight);
+    this.resendFlight(flight);
+  }
+
+  /**
+   * Retransmission outside the handshake's try/catch (timer callback, peer-triggered resend):
+   * an error fails this handshake instead of escaping to the event loop or the socket callback.
+   */
+  private resendFlight(flight: OutMessage[]): void {
+    try {
+      this.sendFlight(flight);
+    } catch (err) {
+      this.fail(AlertDescription.InternalError, `dtls-error:internal-${(err as Error).message}`);
+    }
   }
 
   // ------------------------------------------------------------ teardown

@@ -84,6 +84,20 @@ export function classifyIp(address: string): AddressClass {
   let mapped = b[10] === 0xff && b[11] === 0xff;
   for (let i = 0; i < 10; i++) if (b[i] !== 0) mapped = false;
   if (mapped) return classifyIp(`${b[12]}.${b[13]}.${b[14]}.${b[15]}`);
+  // IPv4-compatible (deprecated, RFC 4291 §2.5.5.1): never a real destination
+  let compat = true;
+  for (let i = 0; i < 12; i++) if (b[i] !== 0) compat = false;
+  if (compat) return 'reserved';
+  // NAT64 well-known prefix (64:ff9b::/96) and 6to4 (2002::/16) reach the embedded IPv4: a non-public one keeps its class
+  let nat64 = b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b;
+  for (let i = 4; i < 12; i++) if (b[i] !== 0) nat64 = false;
+  if (nat64) {
+    const v4 = classifyIp(`${b[12]}.${b[13]}.${b[14]}.${b[15]}`);
+    if (v4 !== 'public') return v4;
+  } else if (b[0] === 0x20 && b[1] === 0x02) {
+    const v4 = classifyIp(`${b[2]}.${b[3]}.${b[4]}.${b[5]}`);
+    if (v4 !== 'public') return v4;
+  }
   if ((b[0]! & 0xfe) === 0xfc) return 'private';
   if (b[0] === 0xfe && (b[1]! & 0xc0) === 0x80) return 'linklocal';
   if (b[0] === 0xff) return 'reserved';

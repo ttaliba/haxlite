@@ -99,7 +99,9 @@ host.start();
 | `inputDelayFrames` (`Sb`) | 2 | Frames between "now" and the frame a client input is scheduled for. The pong carries `hostFrame + Sb`, so clients adapt automatically. Higher = fewer late (re-stamped) inputs on jittery links; lower = less input lag. E2E-tested with 1, 2, 4. |
 | `heartbeatFrames` | 7 | Clients only advance their *confirmed* state when a heartbeat (msg 3) arrives, and extrapolate from it for rendering. Lower values (e.g. 2) shorten that extrapolation window → fewer visible corrections of remote players, at ~9 bytes × clients per heartbeat on `uu`. E2E-tested with 2 and 7. |
 | `checksumIntervalFrames` | 600 | CheckConsistency period. |
-| `pingIntervalMs` | 3000 | Ping event period. |
+| `pingIntervalMs` | 3000 | Ping event period. A number >= 1, or `Infinity` for none; otherwise `RangeError` (`HostRoom`: `pingIntervalMs must be >= 1 (got X)`, HBInit: `haxlite.pingIntervalMs must be a number >= 1`). |
+| `errorRepeatBurst` | 60 | Identical errors (same name and message) delivered to `onError` before the rest of the run is coalesced into one `RepeatedError` per window. >= 1; `Infinity` = deliver all. |
+| `errorRepeatWindowMs` | 1000 | Window of `errorRepeatBurst`, ms (finite, > 0). |
 | `maxWakeFrames` | 4 | While a game runs, simulate at least every N frames without messages (hook latency / getter staleness vs wake-ups; see above). `Infinity` = only at heartbeats/messages. |
 
 ## Facade-facing API
@@ -112,10 +114,10 @@ host.start();
 | `onPlayerLeave(player)` | `onPlayerLeave` | every removal (leave, kick, ban, "Bad actor") |
 | `onPlayerKicked(player, reason, ban, byPlayer)` | `onPlayerKicked` | after `onPlayerLeave` when there was a reason; `byPlayer` null = host id 0 without a host player |
 | `onRoomLink(link)` | `onRoomLink` | |
-| `onBeforeOperation(ev, byId, requestedFrame)` | — (node-haxball `onOperationReceived`) | client events only, after frame assignment and the chat filter; return `false` to drop; payload mutable; throw = "Bad actor" |
+| `onBeforeOperation(ev, byId, requestedFrame)` | — (node-haxball `onOperationReceived`) | client events only, after frame assignment and the chat filter; return `false` to drop; payload mutable; throw = "Bad actor"; a client SetStadium that does not fit the wire (`wireError()`) is dropped and reported to `onError` before the hook is called, and dropped after it if the hook edited the stadium past the limits |
 | `onEventApplied(ev)` | (`Ab`) | every applied event (recording/diagnostics) |
 | `onBadActor(playerId, err)` | — | diagnostics |
-| `onError(err)` | — | exceptions thrown by callbacks/hooks are reported here and never break the engine |
+| `onError(err)` | — | exceptions thrown by callbacks/hooks are reported here and never break the engine; runs of identical errors are coalesced (see below) |
 
 **Do not set `state.hooks.onPlayerJoin` / `onPlayerLeave`** (HostRoom owns them) nor
 `onGoalMarker` while recording (the recorder chains it). Every other `state.hooks` slot is the
@@ -145,6 +147,8 @@ facade's. Mapping to the official `HBInit` callbacks (from `hl.js` `F.fi`):
 Official HBInit does NOT wire `onPlayerChat` (applied chat), `onChatIndicator`, `onAnnouncement`,
 `onPlayerDesyncChange`, `onConsistencyResult`, `onTimeLimitReached`; they are free extensions.
 
+**Protected callbacks and errors.** The HBInit facade (`src/api/hbinit.ts`) calls every user callback inside a guard: a throw goes to `room.haxlite.onError` (default `console.error('[haxlite]', err)`), and a returned promise that rejects is reported the same way, so neither aborts the frame nor leaves an unhandled rejection; an `onError` that returns a rejected promise goes to `console.error` and is not fed back to itself. `onPlayerChat` is the exception (a synchronous throw kicks the sender as 'Bad actor', like official). `Sequencer.onFrameStepped`, `HostRoom.onEventApplied` and the recorder are guarded too: an exception goes to `onError`, the event is counted once and broadcast, and the sender is not kicked. `HostRoom` coalesces runs of identical errors: after `errorRepeatBurst` deliveries it counts them and delivers one `RepeatedError` (`count`, `cause` = the last) per `errorRepeatWindowMs`; up to 64 distinct messages are tracked. `RepeatedError` is not exported from the package (`err.name === 'RepeatedError'`).
+
 ### Actions (all emitted as player 0, official `oc`)
 
 `emit(ev)`, `emitTo(ev, playerId)` (msg 6), `sendChat(msg, targetId?)`,
@@ -161,6 +165,8 @@ error), `setDefaultStadium(name)` (throws `Stadium doesn't exist`), `setTeamsLoc
 `stopRecording()` → `.hbr2` bytes | null, `stopRecordingAsync()` (extension, also on the HBInit
 RoomObject: same bytes, recording stops at the call, only the deflate runs on the libuv
 threadpool), `update()` (catch up now). `recorder` is created on first use.
+
+`setStadium` / `setCustomStadium` throw, before applying anything, when the stadium cannot travel in a SetStadium event (`SetStadiumEvent.wireError()`: deflated over 65 535 bytes, or a list of more than 255 items); `emit(SetStadiumEvent)` of one reports it to `onError` and neither applies, broadcasts nor records it. `setMaxPlayers(n)` throws `RangeError` unless `n` is an integer in 0..255. The recorder is capped (`recorder.maxBytes` 16 MiB, `recorder.maxEvents` 2 097 152; see src/replay/README.md): `recordingTruncated` is true once it froze and `onError` gets one `replay recording truncated at frame F …` per recording.
 
 **Timing / parity.** Actions run synchronously (the state reflects them on return), except when
 called from inside a room hook / HostRoom callback that fires while events are applied: then
@@ -210,6 +216,9 @@ multicast tunnel message (the local backend loops `send`).
   (it changes no serialized state). Host actions stamp with the caught-up frame.
 * Exceptions in room hooks are reported via `onError` and never abort the frame loop (the
   official loop would abort and re-apply events later).
+* Player ids are u16 on the wire: after 0xFFFF the counter restarts at 1 and skips ids in use (connected, in the room, holding a ban for `clearBan(id)`, or the author of a queued event). When bans hold every other id the oldest ban's id is reused (the ban stays in force; `clearBan(oldId)` no longer finds it); with none free the peer is closed and `Error('no free player id')` goes to `onError`. The official counter has no cap.
+* The disc count that queued events (AutoTeams, SetPlayerTeam) can still add is bounded by the most players the room can hold at once, host player included (`Sequencer.playerLimit`; `discLimitViolation(rs, ev, queued, maxPlayers)`), so queued events that could never apply do not make a valid host or admin action fail near 255 discs.
+* A SetStadium from a client that inflates to more than 262 144 bytes (`STADIUM_INFLATE_LIMIT`) is a codec error and kicks the sender ('Bad actor'); one that decodes but does not fit the wire when we re-encode it is dropped and reported to `onError` without kicking the admin. The check runs before `onBeforeOperation` (the hook never sees an event that would be dropped) and again after it, in case the hook edited the stadium past the limits.
 * `setScoreLimit/TimeLimit` coerce to int (`| 0`): the official host applies a non-integer
   limit unconverted while clients read the i32, which can desync game-end logic.
 * node-haxball extensions (events 24–26) are neither sent nor accepted (a client sending one is

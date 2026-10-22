@@ -24,27 +24,60 @@
  *
  * Cost: when not recording every entry point is a single boolean test. While
  * recording, an event costs a few buffer writes into a long-lived Writer
- * (amortized zero allocations). Only `stop()`/`snapshot()` allocate: one
- * exact-size transient body (markers ++ events) for the deflate, plus the
- * output file. At stop, writers that grew past their initial capacity are
- * dropped (a 1 h match leaves ~8 MB of event log behind otherwise); small
- * ones are kept for the next recording. `stopAsync()`/`snapshotAsync()`
- * deflate on the libuv threadpool instead of the event loop (same bytes).
+ * (amortized zero allocations) and one size comparison. Only
+ * `stop()`/`snapshot()` allocate: one exact-size transient body (markers ++
+ * events) for the deflate, plus the output file. At stop, writers that grew
+ * past their initial capacity are dropped (a 1 h match leaves ~8 MB of event
+ * log behind otherwise); small ones are kept for the next recording.
+ * `stopAsync()`/`snapshotAsync()` deflate on the libuv threadpool instead of
+ * the event loop (same bytes, level 6).
+ *
+ * The synchronous `stop()`/`snapshot()` block the event loop for the whole
+ * deflate, so bodies past 64 KiB use a fast level there (about 3% larger
+ * files, a 10 to 100 times shorter stall); smaller ones keep level 6.
+ *
+ * The event log is capped ({@link ReplayRecorder.maxBytes},
+ * {@link ReplayRecorder.maxEvents}): events can come from any connected
+ * player, valid or not, and are all recorded. Past the cap the recording
+ * freezes where it is instead of growing without bound. With the default caps
+ * the file always reads back with the default {@link readReplay} limits.
  */
 import { Writer, deflateRaw } from '../codec/index.js';
 import { deflateRawAsync } from '../codec/compress.js';
 import type { TeamId } from '../protocol.js';
 import type { RoomEvent, RoomState } from '../room/index.js';
 import { writeEvent, writeRoomState } from '../room/index.js';
-import { REPLAY_HEADER_SIZE, REPLAY_MAGIC, REPLAY_VERSION } from './format.js';
+import { REPLAY_HEADER_SIZE, REPLAY_MAGIC, REPLAY_MAX_EVENTS, REPLAY_RECORD_MAX_BYTES, REPLAY_VERSION } from './format.js';
 
 /** Initial writer capacities (official `Jb` / `yc`); writers that grew past them are dropped at stop. */
 const MARKERS_CAPACITY = 1000;
 const EVENTS_CAPACITY = 16384;
 
+/**
+ * Bodies larger than this are deflated at {@link FAST_LEVEL} by the
+ * synchronous `stop()`/`snapshot()` (same threshold as the Bun fast path in
+ * `deflateRaw`); up to it, level 6 gives the bytes of the official recorder.
+ */
+const SYNC_FAST_BODY = 65536;
+/** Fastest sensible level: node:zlib's level 1 is the quickest and ~3% bigger than 6; Bun's level 1 is 50% bigger, its level 2 is not. */
+const FAST_LEVEL = typeof (globalThis as { Bun?: unknown }).Bun !== 'undefined' ? 2 : 1;
+
+/** Options of the {@link ReplayRecorder} constructor. */
+export interface ReplayRecorderOptions {
+  /** Initial value of {@link ReplayRecorder.maxBytes}. */
+  maxBytes?: number;
+  /** Initial value of {@link ReplayRecorder.maxEvents}. */
+  maxEvents?: number;
+}
+
 /** Anything exposing the host's current logical frame (e.g. the host engine itself). */
 export interface FrameClock {
   readonly frame: number;
+}
+
+/** Deflate level of the synchronous stop/snapshot for a body of `length` bytes. */
+function syncLevel(length: number): number {
+  return length > SYNC_FAST_BODY ? FAST_LEVEL : 6;
 }
 
 export class ReplayRecorder {
@@ -56,6 +89,13 @@ export class ReplayRecorder {
   private finalBodyLength = 0;
 
   private active = false;
+  /** Recording and not frozen: the only state in which events and markers are written. */
+  private open = false;
+  /** Frame the recording froze at, once {@link truncated}; the replay ends there. */
+  private capFrame = 0;
+  private frozen = false;
+  private limit: number;
+  private eventLimit: number;
   private startFrame = 0;
   private lastEventFrame = 0;
   private lastMarkerFrame = 0;
@@ -76,8 +116,56 @@ export class ReplayRecorder {
 
   /** Format version written in the header (official recorder is built with 3). */
   readonly version: number;
-  constructor(version: number = REPLAY_VERSION) {
+  /**
+   * Called once when the recording freezes at the {@link maxBytes} or
+   * {@link maxEvents} cap, with
+   * the frame it froze at (the replay ends there). It runs from inside
+   * {@link onEvent}, after the recording is already frozen.
+   */
+  onTruncated: ((frame: number) => void) | null = null;
+
+  constructor(version: number = REPLAY_VERSION, opts: ReplayRecorderOptions = {}) {
     this.version = version;
+    this.limit = REPLAY_RECORD_MAX_BYTES;
+    this.eventLimit = REPLAY_MAX_EVENTS;
+    if (opts.maxBytes !== undefined) this.maxBytes = opts.maxBytes;
+    if (opts.maxEvents !== undefined) this.maxEvents = opts.maxEvents;
+  }
+
+  /**
+   * Cap on the event log (the RoomState at start plus the events), in bytes;
+   * `Infinity` = none. Default {@link REPLAY_RECORD_MAX_BYTES} (16 MiB, about
+   * two hours of a regular match). Once the log reaches it the recording
+   * freezes: later events and goals are not recorded, the file ends at the
+   * frame of the first event left out and {@link truncated} is set. The log
+   * can exceed the cap by one event. Takes effect on the next event, so it
+   * may also be changed while recording; invalid values give the default.
+   */
+  get maxBytes(): number {
+    return this.limit;
+  }
+  set maxBytes(bytes: number) {
+    this.limit = bytes >= 0 ? bytes : REPLAY_RECORD_MAX_BYTES;
+  }
+
+  /**
+   * Cap on the number of events of a recording (`Infinity` = none); past it
+   * the recording freezes like at {@link maxBytes}. Default
+   * {@link REPLAY_MAX_EVENTS}, the default event limit of {@link readReplay}:
+   * events without payload take 4 bytes, so the byte cap alone would let a
+   * recording hold more events than a default read accepts. Takes effect on
+   * the next event; invalid values give the default.
+   */
+  get maxEvents(): number {
+    return this.eventLimit;
+  }
+  set maxEvents(events: number) {
+    this.eventLimit = events >= 0 ? events : REPLAY_MAX_EVENTS;
+  }
+
+  /** True once the current/last recording froze at the {@link maxBytes} / {@link maxEvents} cap (it keeps recording nothing until stopped). */
+  get truncated(): boolean {
+    return this.frozen;
   }
 
   /** True between {@link start} and {@link stop}. */
@@ -124,6 +212,8 @@ export class ReplayRecorder {
     // (the previous recording is lost): mirror that.
     if (this.active) this.unhook();
     this.active = true;
+    this.open = true;
+    this.frozen = false;
     this.startFrame = frame;
     this.lastEventFrame = frame;
     this.lastMarkerFrame = frame;
@@ -144,15 +234,26 @@ export class ReplayRecorder {
   /**
    * Records `ev` (its `byId`, type and payload) as applied at `frame`. Call it
    * right AFTER `ev.apply(rs)`, for every event applied to the room, in
-   * application order. No-op when not recording.
+   * application order. No-op when not recording. An event that fails to
+   * encode rethrows and leaves nothing in the log.
    */
   onEvent(ev: RoomEvent, frame: number): void {
-    if (!this.active) return;
+    if (!this.open) return;
     const w = this.events!;
-    w.varUint(frame - this.lastEventFrame);
+    const start = w.pos;
+    if (start >= this.limit || this.eventCount >= this.eventLimit) {
+      this.freeze(frame);
+      return;
+    }
+    try {
+      w.varUint(frame - this.lastEventFrame);
+      w.u16(ev.byId);
+      writeEvent(w, ev);
+    } catch (err) {
+      w.pos = start;
+      throw err;
+    }
     this.lastEventFrame = frame;
-    w.u16(ev.byId);
-    writeEvent(w, ev);
     this.eventCount++;
   }
 
@@ -162,7 +263,7 @@ export class ReplayRecorder {
    * recording.
    */
   onGoalMarker(goalOwner: TeamId, frame: number): void {
-    if (!this.active) return;
+    if (!this.open) return;
     const w = this.markers!;
     w.varUint(frame - this.lastMarkerFrame);
     this.lastMarkerFrame = frame;
@@ -177,10 +278,10 @@ export class ReplayRecorder {
    */
   stop(frame: number): Uint8Array {
     if (!this.active) throw new Error('ReplayRecorder: not recording');
-    const total = frame - this.startFrame;
+    const total = this.endFrame(frame) - this.startFrame;
     const body = this.body();
     this.end();
-    return this.file(total, deflateRaw(body));
+    return this.file(total, deflateRaw(body, syncLevel(body.length)));
   }
 
   /**
@@ -191,7 +292,7 @@ export class ReplayRecorder {
    */
   stopAsync(frame: number): Promise<Uint8Array> {
     if (!this.active) throw new Error('ReplayRecorder: not recording');
-    const total = frame - this.startFrame;
+    const total = this.endFrame(frame) - this.startFrame;
     const body = this.body();
     this.end();
     return deflateRawAsync(body).then((d) => this.file(total, d));
@@ -203,13 +304,14 @@ export class ReplayRecorder {
    */
   snapshot(frame: number): Uint8Array {
     if (!this.active) throw new Error('ReplayRecorder: not recording');
-    return this.file(frame - this.startFrame, deflateRaw(this.body()));
+    const body = this.body();
+    return this.file(this.endFrame(frame) - this.startFrame, deflateRaw(body, syncLevel(body.length)));
   }
 
-  /** {@link snapshot}, deflating on the libuv threadpool (same bytes). */
+  /** {@link snapshot}, deflating on the libuv threadpool (level 6 at any size). */
   snapshotAsync(frame: number): Promise<Uint8Array> {
     if (!this.active) throw new Error('ReplayRecorder: not recording');
-    const total = frame - this.startFrame;
+    const total = this.endFrame(frame) - this.startFrame;
     return deflateRawAsync(this.body()).then((d) => this.file(total, d));
   }
 
@@ -219,10 +321,25 @@ export class ReplayRecorder {
     else this.unhook();
   }
 
+  /** Cap reached at `frame`: nothing more is recorded and the replay ends there. */
+  private freeze(frame: number): void {
+    this.open = false;
+    this.frozen = true;
+    this.capFrame = frame;
+    const cb = this.onTruncated;
+    if (cb !== null) cb(frame);
+  }
+
+  /** Frame the replay ends at for a stop/snapshot called at `frame`. */
+  private endFrame(frame: number): number {
+    return this.frozen ? this.capFrame : frame;
+  }
+
   /** Recording over: restores the goal hook, drops writers that grew. */
   private end(): void {
     this.finalBodyLength = this.markers!.pos + this.events!.pos;
     this.active = false;
+    this.open = false;
     this.unhook();
     if (this.markers!.capacity > MARKERS_CAPACITY) this.markers = null;
     if (this.events!.capacity > EVENTS_CAPACITY) this.events = null;

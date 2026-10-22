@@ -32,6 +32,50 @@ describe('shared timer heap', () => {
     expect(sharedTimers.size).toBe(0);
   });
 
+  it('a throwing slot does not stop the batch, keeps the heap consistent, and surfaces once as uncaught', async () => {
+    // The heap's contract is crash, not containment: a slot that throws fires
+    // the rest of the due batch and rethrows asynchronously (exactly once), so
+    // an operator's uncaughtException handler sees it and the heap stays usable.
+    const prev = process.listeners('uncaughtException');
+    for (const l of prev) process.off('uncaughtException', l);
+    let uncaught = 0;
+    const caught: unknown[] = [];
+    const handler = (e: unknown): void => {
+      uncaught++;
+      caught.push(e);
+    };
+    process.on('uncaughtException', handler);
+    const order: string[] = [];
+    try {
+      const a = new TimerSlot(() => {
+        order.push('a');
+        throw new Error('boom-from-slot-a');
+      });
+      const b = new TimerSlot(() => order.push('b'));
+      const now = performance.now();
+      sharedTimers.set(a, now + 5);
+      sharedTimers.set(b, now + 5);
+      await sleep(40);
+      // Both slots fired despite the throw; the heap drained and is consistent.
+      expect(order.sort()).toEqual(['a', 'b']);
+      expect([a.index, b.index]).toEqual([-1, -1]);
+      expect(sharedTimers.size).toBe(0);
+      // Re-arming a slot after a throwing batch still works.
+      let again = 0;
+      const c = new TimerSlot(() => {
+        again++;
+      });
+      sharedTimers.set(c, performance.now() + 2);
+      await sleep(30);
+      expect(again).toBe(1);
+      expect(uncaught).toBe(1);
+      expect(String(caught[0])).toContain('boom-from-slot-a');
+    } finally {
+      process.off('uncaughtException', handler);
+      for (const l of prev) process.on('uncaughtException', l);
+    }
+  });
+
   it('a callback may re-arm its own slot', async () => {
     let n = 0;
     const s: TimerSlot = new TimerSlot(() => {

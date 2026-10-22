@@ -32,6 +32,34 @@ import { UdpIo, literalLookup, type PacketIo } from './udp.js';
 import { TurnRelay, turnServers, type TurnStats, type TurnServerSpec } from './turn.js';
 import { sameIp } from './gather.js';
 
+/**
+ * Throws a `RangeError` for a numeric option that would silently disable a
+ * limit or a timer: `NaN` passes no comparison, `Infinity` never expires, a
+ * port outside 0–65535 cannot be bound or announced. Absent options keep their defaults.
+ */
+function checkEndpointOptions(o: RtcEndpointOptions): void {
+  const int = (name: string, v: number | undefined, min: number, max: number, unbounded = false): void => {
+    if (v === undefined) return;
+    if (typeof v !== 'number' || !(v >= min) || (v === Infinity ? !unbounded : !Number.isInteger(v) || v > max)) {
+      throw new RangeError(`RtcEndpoint: ${name} must be an integer in ${min}..${max}${unbounded ? ' or Infinity' : ''} (got ${String(v)})`);
+    }
+  };
+  const ms = (name: string, v: number | undefined, unbounded: boolean): void => {
+    if (v === undefined) return;
+    if (typeof v !== 'number' || (unbounded ? !(v >= 0) : !(v > 0 && v < Infinity))) {
+      throw new RangeError(`RtcEndpoint: ${name} must be ${unbounded ? 'a number of ms >= 0 or Infinity' : 'a finite number of ms > 0'} (got ${String(v)})`);
+    }
+  };
+  int('port', o.port, 0, 65535);
+  int('publicPort', o.publicPort, 1, 65535);
+  int('maxSessions', o.maxSessions, 1, Number.MAX_SAFE_INTEGER);
+  int('maxTurnAllocations', o.maxTurnAllocations, 1, Number.MAX_SAFE_INTEGER);
+  int('turnPeersPerAllocation', o.turnPeersPerAllocation, 1, Number.MAX_SAFE_INTEGER, true);
+  ms('idleTimeoutMs', o.idleTimeoutMs, false);
+  ms('handshakeTimeoutMs', o.handshakeTimeoutMs, false);
+  ms('gatherRefreshMs', o.gatherRefreshMs, true);
+}
+
 /** A socket bound by {@link RtcEndpoint.listen}, before the endpoint wraps it. */
 interface RawBound {
   sock: Socket;
@@ -40,7 +68,7 @@ interface RawBound {
 }
 
 export interface RtcEndpointOptions {
-  /** UDP port (default 0 = ephemeral). With two families both sockets use the same port. */
+  /** UDP port, an integer 0–65535 (default 0 = ephemeral). With two families both sockets use the same port. */
   port?: number;
   /**
    * Bind address (default: the wildcard of each family present in
@@ -99,10 +127,11 @@ export interface RtcEndpointOptions {
    * addresses per allocation over its whole life (Cloudflare: ~10); a client uses one or two. The
    * endpoint keeps a pool of allocations (the first from its own socket, the others from sockets of
    * their own), gives each new session the relay candidate of one with room left, keeps a spare one
-   * ready, and deletes exhausted ones once their sessions are gone.
+   * ready, and deletes exhausted ones once their sessions are gone. An integer >= 1 (values below
+   * 2 count as 2) or `Infinity`.
    */
   turnPeersPerAllocation?: number;
-  /** TURN: most allocations at once (default 64). */
+  /** TURN: most allocations at once, a positive integer (default 64). */
   maxTurnAllocations?: number;
   /**
    * Which interface addresses become host candidates, and which remote
@@ -110,18 +139,22 @@ export interface RtcEndpointOptions {
    * `CandidatePolicy` in gather.ts). Not applied to {@link publicAddresses}.
    */
   candidatePolicy?: CandidatePolicy;
-  /** Re-query the STUN servers at a new session when the last result is older than this (default 60 000 ms). */
+  /**
+   * Re-query the STUN servers at a new session when the last result is older than this (default
+   * 60 000 ms; >= 0, `Infinity`: never).
+   */
   gatherRefreshMs?: number;
-  /** Advertised port when a 1:1 NAT maps a different one (default: the bound port). */
+  /** Advertised port (1–65535) when a 1:1 NAT maps a different one (default: the bound port). */
   publicPort?: number;
   /** DTLS identity (default: {@link certificateFile} if set, else the process-wide {@link RtcCertificate.processDefault}). */
   certificate?: RtcCertificate;
   /** Load/persist the DTLS identity in this PEM file ({@link RtcCertificate.loadOrCreate}). */
   certificateFile?: string;
-  /** Close an open session after this long without ICE consent (default 30 000 ms). */
+  /** Close an open session after this long without ICE consent (ms, finite, > 0; default 30 000). */
   idleTimeoutMs?: number;
-  /** Close a session not open this long after createSession (default 20 000 ms). */
+  /** Close a session not open this long after createSession (ms, finite, > 0; default 20 000). */
   handshakeTimeoutMs?: number;
+  /** Most sessions at once, a positive integer (default 10 000); `createSession` throws beyond it. */
   maxSessions?: number;
   /** Data-channel layer factory (default: `SctpAssociation` from ./sctp). */
   dataLayer?: SctpFactory;
@@ -189,6 +222,11 @@ export interface RtcEndpointStats {
   directDropped: number;
   /** The TURN allocation (null: no TURN server configured). */
   turn: TurnStats | null;
+  /**
+   * Received datagrams whose processing threw (a bug in a protocol layer or a data-layer callback):
+   * dropped, counted and logged (at most once every 10 s) instead of ending the process.
+   */
+  packetErrors: number;
 }
 
 const ICE_ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -199,6 +237,11 @@ function randomIceString(n: number): string {
   for (let i = 0; i < n; i++) s += ICE_ALNUM[b[i]! % 62]; // 256 % 62 bias is irrelevant here
   return s;
 }
+
+/** Internal errors (a datagram or a timer whose processing threw) are logged at most this often. */
+const ERROR_LOG_INTERVAL_MS = 10_000;
+/** A session whose datagrams throw this many times in a row is closed ('error'): its state is suspect. */
+const SESSION_PACKET_ERRORS = 5;
 
 /** Largest datagram whose exact-length scratch view is cached (≥ the 1200-byte SCTP MTU + DTLS overhead). */
 const VIEW_CACHE_MAX = 1536;
@@ -308,7 +351,10 @@ export class RtcEndpoint {
     stunResponses: 0,
     relayUnavailable: 0,
     directDropped: 0,
+    packetErrors: 0,
   };
+  /** When an internal error was last logged (see {@link internalError}). */
+  private errorLoggedAt = -ERROR_LOG_INTERVAL_MS;
 
   private constructor(opts: RtcEndpointOptions, raw: RawBound[], port: number, certificate: RtcCertificate, dataLayer: SctpFactory) {
     this.sockets = raw.map((b) => b.sock);
@@ -468,8 +514,9 @@ export class RtcEndpoint {
     this.gatherer.start();
   }
 
-  /** Binds the socket(s). */
+  /** Binds the socket(s). Rejects with a `RangeError` on an unusable numeric option (see {@link RtcEndpointOptions}). */
   static async listen(opts: RtcEndpointOptions): Promise<RtcEndpoint> {
+    checkEndpointOptions(opts);
     let pubs = opts.publicAddresses;
     const lite = opts.iceLite === true;
     const ipv6 = opts.ipv6 === true;
@@ -690,16 +737,22 @@ export class RtcEndpoint {
     c.packetsIn++;
     c.bytesIn += msg.length;
     if (msg.length === 0) return;
-    const r = this.relay;
-    if (r !== null && port === r.serverPort && sock === this.turnIo && r.serverAddress !== null) {
-      if ((address === r.serverAddress || sameIp(address, r.serverAddress)) && r.onServerPacket(msg)) return;
+    // straight from the socket's receive callback (relayed datagrams too, via onRelayPacket): a throw would be uncaught
+    try {
+      const r = this.relay;
+      if (r !== null && port === r.serverPort && sock === this.turnIo && r.serverAddress !== null) {
+        if ((address === r.serverAddress || sameIp(address, r.serverAddress)) && r.onServerPacket(msg)) return;
+      }
+      if (this.relayOnly) {
+        // nothing from a peer is answered unless it came through the relay
+        c.directDropped++;
+        return;
+      }
+      this.demux(sock, this.byAddress, msg, address, port);
+    } catch (err) {
+      c.packetErrors++;
+      this.internalError('datagram', err);
     }
-    if (this.relayOnly) {
-      // nothing from a peer is answered unless it came through the relay
-      c.directDropped++;
-      return;
-    }
-    this.demux(sock, this.byAddress, msg, address, port);
   }
 
   /** A peer's datagram unwrapped by the relay (packetsIn/bytesIn counted the outer datagram). */
@@ -714,9 +767,26 @@ export class RtcEndpoint {
     c.packetsIn++;
     c.bytesIn += msg.length;
     if (msg.length === 0 || this.closed) return;
-    const sa = relay.serverAddress;
-    if (port === relay.serverPort && sa !== null && (address === sa || sameIp(address, sa)) && relay.onServerPacket(msg)) return;
-    c.directDropped++;
+    try {
+      const sa = relay.serverAddress;
+      if (port === relay.serverPort && sa !== null && (address === sa || sameIp(address, sa)) && relay.onServerPacket(msg)) return;
+      c.directDropped++;
+    } catch (err) {
+      c.packetErrors++;
+      this.internalError('datagram', err);
+    }
+  }
+
+  /** A datagram or timer whose processing threw: logged (rate-limited), never propagated. */
+  private internalError(what: string, err: unknown): void {
+    const now = Date.now();
+    if (now - this.errorLoggedAt < ERROR_LOG_INTERVAL_MS) return;
+    this.errorLoggedAt = now;
+    try {
+      console.error(`[haxlite/rtc] error processing a ${what}:`, err);
+    } catch {
+      /* never propagate */
+    }
   }
 
   // ------------------------------------------------------------ TURN allocation pool
@@ -764,16 +834,26 @@ export class RtcEndpoint {
           return;
         }
         let relay: TurnRelay | null = null;
-        const io = new UdpIo(
-          sock,
-          (msg, address, port) => {
-            if (relay !== null) this.onRelaySocketPacket(relay, msg, address, port);
-          },
-          (err) => console.error('[haxlite/rtc] socket error:', err.message),
-        );
-        relay = this.makeRelay(io, false);
-        this.relaySockets.set(relay, sock);
-        relay.allocate();
+        // a throw here would reject this promise unhandled (fatal) and leak the socket
+        try {
+          const io = new UdpIo(
+            sock,
+            (msg, address, port) => {
+              if (relay !== null) this.onRelaySocketPacket(relay, msg, address, port);
+            },
+            (err) => console.error('[haxlite/rtc] socket error:', err.message),
+          );
+          relay = this.makeRelay(io, false);
+          this.relaySockets.set(relay, sock);
+          relay.allocate();
+        } catch (err) {
+          this.internalError('new TURN allocation', err);
+          const i = relay === null ? -1 : this.pool.indexOf(relay);
+          if (i >= 0) {
+            this.relaySockets.set(relay!, sock);
+            this.dropRelay(i); // closes the socket too
+          } else sock.close();
+        }
       },
       () => {
         this.spawning = false;
@@ -811,10 +891,19 @@ export class RtcEndpoint {
       if (r === this.relay || r === this.current[0] || r.state === 'allocating') continue;
       if ((this.relaySessions.get(r)?.size ?? 0) > 0) continue;
       if (r.ready && this.relayRoom(r) >= RtcEndpoint.RESERVE) continue; // a spare with room: kept
-      this.pool.splice(i, 1);
-      this.relayMaps.delete(r);
-      this.relaySessions.delete(r);
+      this.dropRelay(i);
+    }
+  }
+
+  /** Removes `pool[i]` from the pool, deletes its allocation and closes its own socket. */
+  private dropRelay(i: number): void {
+    const r = this.pool[i]!;
+    this.pool.splice(i, 1);
+    this.relayMaps.delete(r);
+    this.relaySessions.delete(r);
+    try {
       r.close();
+    } finally {
       const sock = this.relaySockets.get(r);
       this.relaySockets.delete(r);
       sock?.close();
@@ -838,10 +927,29 @@ export class RtcEndpoint {
         else c.dtlsUnknownSource++;
         return;
       }
-      v.session.handleDtls(msg, v);
+      const s = v.session;
+      try {
+        s.handleDtls(msg, v);
+      } catch (err) {
+        this.sessionPacketError(s, err);
+        return;
+      }
+      s.packetErrors = 0;
       return;
     }
     c.unknownPackets++;
+  }
+
+  /** A datagram of `s` threw: counted and logged like any other; a session that keeps throwing is closed. */
+  private sessionPacketError(s: RtcSessionImpl, err: unknown): void {
+    this.counters.packetErrors++;
+    this.internalError('datagram', err);
+    if (++s.packetErrors < SESSION_PACKET_ERRORS) return;
+    try {
+      s.terminate('error');
+    } catch (e) {
+      this.internalError('session teardown', e);
+    }
   }
 
   private onStun(sock: PacketIo, msg: Buffer, address: string, port: number): void {
@@ -877,10 +985,22 @@ export class RtcEndpoint {
     }
     const ufrag = msg.toString('latin1', m.usernameOffset, m.usernameOffset + colon);
     const s = this.byUfrag.get(ufrag);
-    if (s === undefined || !s.handleBinding(m, sock, address, port)) {
+    if (s === undefined) {
       c.stunRejected++;
       return;
     }
+    let ok: boolean;
+    try {
+      ok = s.handleBinding(m, sock, address, port);
+    } catch (err) {
+      this.sessionPacketError(s, err);
+      return;
+    }
+    if (!ok) {
+      c.stunRejected++;
+      return;
+    }
+    s.packetErrors = 0;
     c.stunAuthenticated++;
   }
 
@@ -937,7 +1057,19 @@ export class RtcEndpoint {
     const t = setInterval(() => {
       const now = Date.now();
       // forEach: no iterator result objects
-      this.byUfrag.forEach((s) => s.checkTimers(now, this.handshakeTimeoutMs, this.idleTimeoutMs));
+      this.byUfrag.forEach((s) => {
+        try {
+          s.checkTimers(now, this.handshakeTimeoutMs, this.idleTimeoutMs);
+        } catch (err) {
+          // a session in a state its timers do not expect: closed rather than failing every second
+          this.internalError('session timer', err);
+          try {
+            s.terminate('error');
+          } catch {
+            /* torn down as far as it goes */
+          }
+        }
+      });
       if (this.byUfrag.size === 0 && this.sweepTimer !== null) {
         clearInterval(this.sweepTimer);
         this.sweepTimer = null;

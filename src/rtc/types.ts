@@ -61,6 +61,8 @@ export interface SctpAssociationLike {
   input(packet: Uint8Array, off?: number, len?: number): void;
   /** Queues a user message; false when not open or over the buffer limit. */
   send(channelId: number, data: Uint8Array): boolean;
+  /** Bytes queued for sending or awaiting acknowledgement, every channel (absent: unknown). */
+  readonly bufferedAmount?: number;
   /** Tears down (best-effort ABORT/SHUTDOWN). No callback afterwards. Idempotent. */
   close(): void;
   /** Bundles subsequent sends into as few packets as possible until {@link uncork} (nestable). */
@@ -120,6 +122,12 @@ export interface RtcSession {
   onChannelClose?: (channelId: number) => void;
   /** Sends one message; false when not open or the data layer refused it. */
   send(channelId: number, data: Uint8Array): boolean;
+  /**
+   * Bytes accepted by {@link send} that the peer has not acknowledged yet
+   * (every channel; 0 before the data layer exists and once closed). A peer
+   * that keeps this high is not reading what it is sent.
+   */
+  readonly bufferedAmount: number;
   /**
    * Bundles the following {@link send}s (e.g. one game tick's messages) into
    * as few SCTP packets / DTLS records as possible until {@link uncork}.

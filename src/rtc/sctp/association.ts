@@ -63,7 +63,8 @@ export interface SctpAssociationOptions {
   onOpen(): void;
   /**
    * Association gone: 'shutdown' (graceful), 'abort' (peer ABORT), 'timeout',
-   * 'init-timeout', 'message-too-large'. At most once; never after close()/abort().
+   * 'init-timeout', 'message-too-large', 'internal-error' (a bug surfaced in a
+   * timer-driven send, also reported to `onError`). At most once; never after close()/abort().
    */
   onClose(reason: string): void;
   /** A channel was closed (stream reset by the peer, or our own reset completed). */
@@ -247,6 +248,14 @@ const COOKIE_LEN = 72;
 const COOKIE_LIFETIME = 60_000;
 const OUR_STREAMS = 65535;
 const MAX_TX_RECORDS = 1 << 20;
+/** RE-CONFIG request parameters processed per packet (one chunk carries at most 2). */
+const MAX_RECONF_REQS = 2;
+/**
+ * FORWARD-TSN stream-entry work per packet, in pending-map reads per receive
+ * window slot. Each entry costs at most its stream's pending count and those
+ * add up to at most one window, so only repeated entries can reach this.
+ */
+const FWD_WORK_PER_SLOT = 4;
 const EMPTY = new Uint8Array(0);
 
 // ---------------------------------------------------------------------------
@@ -411,6 +420,12 @@ export class SctpAssociation {
   private lastFwdAt = -1e12;
   private orphanScan = false;
   private cumAtInput = 0;
+  /** FORWARD-TSN entry work spent in the current packet (see FWD_WORK_PER_SLOT). */
+  private fwdWork = 0;
+  /** Scratch for FORWARD-TSN: distances of pending SSNs from the stream cursor. */
+  private fwdDist: Uint16Array | null = null;
+  /** The oversized-message check of a full receive buffer ran in this packet. */
+  private bigChecked = false;
   /** processAck inputs (see there). */
   private ackCum = 0;
   private ackRwnd = 0;
@@ -462,6 +477,8 @@ export class SctpAssociation {
   private reqSeq = 0;
   private peerReqExpected = 0;
   private lastPeerReqResult = RR_NOTHING;
+  /** RE-CONFIG request parameters seen in the current packet. */
+  private reconfReqs = 0;
   private reconfResp: number[] | null = null; // [seq, result] pairs to send
   private resetQueue: number[] = [];
   private reqInFlight: ResetRequest | null = null;
@@ -1381,6 +1398,9 @@ export class SctpAssociation {
       return;
     }
     this.pktHadData = false;
+    this.reconfReqs = 0;
+    this.fwdWork = 0;
+    this.bigChecked = false;
     let off = c0;
     while (off + 4 <= len && !this.dead) {
       const type = p[off];
@@ -1399,7 +1419,10 @@ export class SctpAssociation {
           if (ok) this.handleSack(p, off, clen);
           break;
         case CT_COOKIE_ECHO:
-          this.handleCookieEcho(p, off, clen, vtag);
+          // RFC 9260 §5.1: COOKIE ECHO is the first chunk of its packet, so
+          // only the first one can be genuine. This caps the cookie HMAC to
+          // one per packet (a packet could otherwise carry ~200 of them).
+          if (off === c0) this.handleCookieEcho(p, off, clen, vtag);
           break;
         case CT_HEARTBEAT:
           if (ok && clen >= 8) this.hbAck = p.slice(off + 4, off + clen);
@@ -1845,7 +1868,18 @@ export class SctpAssociation {
       if (hf[s] & H_PENDING) return; // slot busy with a deliverable message: drop, peer retransmits
       this.releaseSlot(s);
     }
-    if (d > 1 && this.heldBytes + dLen > this.rxBufferSize) return; // receive buffer full
+    // Receive buffer full. The next in-order TSN gets one message of headroom
+    // so it can always fill the gap that held data waits on; a peer that
+    // keeps sending fragments of a message that never ends hits this too.
+    if (this.heldBytes + dLen > (d > 1 ? this.rxBufferSize : this.rxBufferSize + this.maxRecvMessage)) {
+      // An in-order continuation of a message already past maxRecvMessage can
+      // never be delivered: fail now instead of stalling on the full buffer.
+      if (d === 1 && !(fl & F_B) && !this.bigChecked) {
+        this.bigChecked = true;
+        if (this.partialBytes((tsn - 1) >>> 0, sid, fl & F_U, ssn) + dLen > this.maxRecvMessage) this.fail('message-too-large');
+      }
+      return;
+    }
     hf[s] = H_HELD | fl;
     this.hTsn![s] = tsn;
     this.hSid![s] = sid;
@@ -1855,7 +1889,31 @@ export class SctpAssociation {
     this.heldBytes += dLen;
     this.markReceived(tsn, d);
     if (this.rHighest !== this.rCum) this.sackNow = true;
-    this.tryAssemble(tsn);
+    // A message can only complete if this fragment begins it or follows a
+    // held one, and ends it or precedes a held one: skip the walk otherwise.
+    const u = fl & F_U;
+    const pt = (tsn - 1) >>> 0;
+    const nt = (tsn + 1) >>> 0;
+    if ((fl & F_B || this.matches(pt & mask, pt, sid, u, ssn)) && (fl & F_E || this.matches(nt & mask, nt, sid, u, ssn))) {
+      this.tryAssemble(tsn);
+    }
+  }
+
+  /**
+   * Bytes of the unfinished message whose fragments end at `tsn` (held,
+   * contiguous, no E); stops once past maxRecvMessage.
+   */
+  private partialBytes(tsn: number, sid: number, u: number, ssn: number): number {
+    const mask = this.rxMask;
+    const hf = this.hFlags!;
+    let total = 0;
+    for (let t = tsn, n = 0; n < this.rxCap; t = (t - 1) >>> 0, n++) {
+      const s = t & mask;
+      if (!this.matches(s, t, sid, u, ssn) || hf[s] & F_E) break;
+      total += this.hData[s]!.length;
+      if (hf[s] & F_B || total > this.maxRecvMessage) break;
+    }
+    return total;
   }
 
   private addDup(tsn: number): void {
@@ -2196,6 +2254,9 @@ export class SctpAssociation {
     }
     // Gap blocks.
     if (p !== null && nGap > 0) {
+      // Well-formed blocks are disjoint, so together they cover at most the
+      // TSNs in (cum, lastSent]: overlapping blocks past that budget are ignored.
+      let budget = (lastSent - cum) >>> 0;
       for (let g = 0; g < nGap; g++) {
         const so = u16(p, gOff + g * 4);
         const eo = u16(p, gOff + g * 4 + 2);
@@ -2203,6 +2264,9 @@ export class SctpAssociation {
         let t = (cum + so) >>> 0;
         const end = (cum + eo) >>> 0;
         if (lt32(lastSent, t)) continue;
+        const span = ((lt32(lastSent, end) ? lastSent : end) - t + 1) >>> 0;
+        if (span > budget) break;
+        budget -= span;
         for (;;) {
           const i = t & mask;
           const f = this.txFlags[i];
@@ -2389,15 +2453,48 @@ export class SctpAssociation {
       const m = this.rPending[sid];
       if (m !== undefined && m !== null && m.size > 0) {
         // Deliver complete messages up to `ssn` in order, then skip the rest.
-        const keys = [...m.keys()].filter((k) => !lt16(ssn, k)).sort((a, b) => (lt16(a, b) ? -1 : 1));
-        for (const k of keys) {
-          const b = m.get(k)!;
-          m.delete(k);
-          this.deliverPending(b, sid);
+        // Pending SSNs all lie ahead of `next`: walk next..ssn when that is
+        // shorter than the map, else pick the map's SSNs in range once.
+        const dist = (ssn - next) & 0xffff;
+        const cost = dist < m.size ? dist + 1 : m.size;
+        // A sender lists each stream once; past the budget the rest of the
+        // packet's entries are ignored (only repeated entries get here).
+        if (this.fwdWork + cost > FWD_WORK_PER_SLOT * this.rxCap) break;
+        this.fwdWork += cost;
+        if (dist < m.size) {
+          for (let k = next; m.size > 0; k = (k + 1) & 0xffff) {
+            const b = m.get(k);
+            if (b !== undefined) {
+              m.delete(k);
+              this.deliverPending(b, sid);
+            }
+            if (k === ssn) break;
+          }
+        } else {
+          this.deliverPendingUpTo(m, sid, next, dist);
         }
       }
       this.rNextSsn[sid] = ssn + 1;
       this.drainPending(sid);
+    }
+  }
+
+  /** Delivers, in SSN order, the pending messages of `sid` within `dist` of `next`. */
+  private deliverPendingUpTo(m: Map<number, number>, sid: number, next: number, dist: number): void {
+    let sc = this.fwdDist;
+    if (sc === null || sc.length < m.size) sc = this.fwdDist = new Uint16Array(Math.max(m.size, this.rxCap));
+    let n = 0;
+    for (const k of m.keys()) {
+      const d = (k - next) & 0xffff;
+      if (d <= dist) sc[n++] = d;
+    }
+    if (n === 0) return;
+    if (n > 1) sc.subarray(0, n).sort();
+    for (let i = 0; i < n && !this.dead; i++) {
+      const k = (next + sc[i]) & 0xffff;
+      const b = m.get(k)!;
+      m.delete(k);
+      this.deliverPending(b, sid);
     }
   }
 
@@ -2466,10 +2563,14 @@ export class SctpAssociation {
     if (this.state !== S_ESTABLISHED && this.state !== S_SHUTDOWN_PENDING) return;
     const end = off + clen;
     let q = off + 4;
-    while (q + 4 <= end) {
+    while (q + 4 <= end && !this.dead) {
       const pt = u16(p, q);
       const pl = u16(p, q + 2);
       if (pl < 4 || q + pl > end) break;
+      const isReq = pt === PT_OUT_RESET || (pt >= PT_IN_RESET && pt <= 18 && pt !== PT_RECONF_RESPONSE);
+      // RFC 6525 §3.1: at most two requests per chunk. Extra ones in this
+      // packet are ignored (unanswered: a real peer retransmits them).
+      if (isReq && ++this.reconfReqs > MAX_RECONF_REQS) break;
       if (pt === PT_OUT_RESET && pl >= 16) {
         const seq = u32(p, q + 4);
         const lastTsn = u32(p, q + 12);
@@ -2676,7 +2777,12 @@ export class SctpAssociation {
     } catch (e) {
       this.reportError(e);
     }
-    if (!this.dead) this.flush();
+    if (this.dead) return;
+    try {
+      this.flush();
+    } catch (e) {
+      this.internalFailure(e);
+    }
   }
 
   private backoff(): void {
@@ -2768,6 +2874,22 @@ export class SctpAssociation {
     } catch (e) {
       this.reportError(e);
     }
+  }
+
+  /**
+   * A bug surfaced outside the input guard (timer-driven flush): count and
+   * report it, and drop only this association instead of the shared timer
+   * heap rethrowing it as an uncaught exception.
+   */
+  private internalFailure(e: unknown): void {
+    this.c.internalErrors++;
+    this.reportError(e);
+    try {
+      this.sendAbort('internal-error');
+    } catch {
+      /* the packet path itself is what failed */
+    }
+    this.terminate('internal-error', true);
   }
 
   private reportError(e: unknown): void {

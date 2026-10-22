@@ -18,7 +18,7 @@
  */
 import type dgram from 'node:dgram';
 import { createRequire } from 'node:module';
-import { isIP } from 'node:net';
+import { isIP, type LookupFunction } from 'node:net';
 import { WebSocket, type ClientOptions, type RawData } from './ws.js';
 import { Reader, Writer } from '../codec/index.js';
 import { CHANNELS } from './constants.js';
@@ -60,7 +60,18 @@ import type { NdcTunnelPlane } from './edge-ndc.js';
 export type EdgeDataPlane = 'udp' | 'webrtc' | 'ws';
 
 export interface EdgeOptions {
-  /** Control endpoint, e.g. `wss://edge.example.com:8443/tunnel` (`ws://` only for tests/LAN). */
+  /**
+   * Control endpoint, e.g. `wss://edge.example.com:8443/tunnel`. `ws://` has
+   * no TLS: anybody on the path can read the control channel and, on the
+   * WebSocket data plane, every player message. It is accepted for loopback
+   * and private-network hosts (RFC 1918, 100.64.0.0/10, link-local, fc00::/7,
+   * IPv4-mapped private addresses, single-label names and `.local`,
+   * `.internal`, `.lan` and `.home.arpa` names; the private ones log a
+   * warning). Such a name (e.g. a Docker service, `ws://edge:8443`) is checked
+   * on every connection: if it resolves to (or the socket reaches) a public
+   * address, the connection is refused like a public host. For any other host
+   * it is refused unless {@link allowInsecure} is set.
+   */
   url: string;
   /** API key issued by the edge operator: `"<keyId>:<secret>"`. */
   key: string;
@@ -68,9 +79,20 @@ export interface EdgeOptions {
    * When the UDP data plane (tunnel v2, or the legacy PeerConnection) cannot
    * be established within `dataPlaneTimeoutMs` (or the edge does not grant
    * it), carry all player traffic over the WebSocket instead (TCP:
-   * head-of-line blocking, slightly more latency). Default true.
+   * head-of-line blocking, slightly more latency). Default true, except for a
+   * public `ws://` url accepted through {@link allowInsecure} (or a `ws://`
+   * name that resolved to a public address), where it is false: the fallback
+   * carries player traffic in clear and could otherwise be forced by whoever
+   * sits on the path.
    */
   fallbackWs?: boolean;
+  /**
+   * Accept a `ws://` url whose host is neither loopback nor on a private
+   * network, or whose private-looking name resolves to a public address (no
+   * TLS: the control channel is readable on the path, see {@link url}; the
+   * key still authenticates the edge). Default false.
+   */
+  allowInsecure?: boolean;
   /**
    * `'udp'` (default): tunnel v2, SCTP over AES-GCM UDP datagrams to the
    * edge's tunnel port (pure TypeScript). `'webrtc'`: the legacy host↔edge
@@ -104,6 +126,14 @@ export interface EdgeOptions {
   /** Reconnect backoff: first delay (doubles up to `reconnectMaxMs`). Default 250 ms / 10 s. */
   reconnectMinMs?: number;
   reconnectMaxMs?: number;
+  /**
+   * A tunnel that stayed ready at least this long counts as healthy: when it
+   * drops the host reconnects at once (players are waiting) and the backoff
+   * restarts at `reconnectMinMs`. A shorter-lived one keeps the backoff
+   * growing, so an edge that accepts the session and drops it right away
+   * cannot make the host reconnect in a tight loop. Default 10 s.
+   */
+  reconnectStableMs?: number;
   /**
    * Application ping period and dead-tunnel timeout. Default 5 s / 15 s. With
    * the UDP tunnel the host also sends an authenticated UDP ping each period
@@ -155,6 +185,11 @@ export interface EdgeBackendStats {
   udp: UdpPlaneStats | null;
 }
 
+/** WebSocket data plane: above this much queued, unreliable (`uu`) frames are dropped instead of queued. */
+const WS_BUFFER_SOFT_LIMIT = 256 << 10;
+/** Queued WebSocket bytes that mean the edge is not reading: the tunnel is torn down. */
+const WS_BUFFER_HARD_LIMIT = 8 << 20;
+
 const Phase = {
   Hello: 0,
   Auth: 1,
@@ -177,6 +212,10 @@ class EdgeLink implements PeerLink {
   readonly session: TunnelSession;
   private readonly backend: EdgePeerBackend;
   remoteCandidates = 0;
+  /** Edge → host: candidates relayed so far, and whether the answer / end of gathering came. */
+  localCandidates = 0;
+  answered = false;
+  gathered = false;
 
   constructor(backend: EdgePeerBackend, session: TunnelSession, slot: number, ev: PeerLinkEvents) {
     this.backend = backend;
@@ -223,6 +262,14 @@ export class EdgePeerBackend implements PeerBackend {
   private backoff: number;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private sessions = 0;
+  /** When the current/last session became ready (`performance.now()`). */
+  private readyAt = 0;
+  /** Public `ws://` url accepted through {@link EdgeOptions.allowInsecure}. */
+  private insecure = false;
+  /** @internal `ws://` url whose host is a name taken as private: each connection checks where it resolves. */
+  readonly checkResolved: boolean = false;
+  /** @internal The current connection's name resolved to a public address (accepted through allowInsecure). */
+  resolvedPublic = false;
   /** @internal */ readonly counters = { bytesOut: 0, bytesIn: 0, messagesOut: 0, messagesIn: 0 };
 
   constructor(opts: EdgeOptions) {
@@ -233,6 +280,60 @@ export class EdgePeerBackend implements PeerBackend {
     this.mode = opts.dataPlane ?? 'udp';
     this.backoff = opts.reconnectMinMs ?? 250;
     if (!/^wss?:\/\//i.test(opts.url)) throw new Error('edge url must start with ws:// or wss://');
+    const scope = /^ws:\/\//i.test(opts.url) ? hostScope(urlHost(opts.url)) : null;
+    if (scope === 'private' || scope === 'public') {
+      if (scope === 'public') {
+        if (opts.allowInsecure !== true) {
+          throw new Error(
+            `ws:// edge url points to a public host (${urlHost(opts.url)}) without TLS: use wss://, or set allowInsecure: true in the edge options to accept plaintext ` +
+              '(the WebSocket fallback then defaults to off: add fallbackWs: true to enable it). ws:// needs no option for loopback and private-network hosts',
+          );
+        }
+        this.insecure = true;
+      } else if (isIP(urlHost(opts.url)) === 0) {
+        this.checkResolved = true;
+      }
+      this.log(`WARNING: ws:// edge url without TLS${scope === 'private' ? ' (private network)' : ''}: the control channel is readable by anyone on the path`);
+      if (secret.length < 22) this.log('WARNING: short edge key secret: a captured Auth lets an eavesdropper guess it offline');
+    } else if (scope === null && opts.wsOptions?.rejectUnauthorized === false) {
+      this.log('WARNING: TLS certificate verification is off: the edge is not authenticated');
+    }
+  }
+
+  /** @internal effective {@link EdgeOptions.fallbackWs} (its default depends on the url). */
+  get fallbackWs(): boolean {
+    return this.opts.fallbackWs ?? !(this.insecure || this.resolvedPublic);
+  }
+
+  /** @internal appended to "fallbackWs is off" errors when the default (public `ws://` url) turned it off. */
+  get fallbackWsHint(): string {
+    return this.opts.fallbackWs === undefined && (this.insecure || this.resolvedPublic)
+      ? ' (off by default for a public ws:// url: set fallbackWs: true to allow it)'
+      : '';
+  }
+
+  /**
+   * @internal Error for a connection to `address` (what the `ws://` name
+   * resolved to, or the socket's peer) when it is public and the url was only
+   * accepted as private; null if allowed (public with allowInsecure: noted,
+   * the WebSocket fallback then defaults to off).
+   */
+  resolvedCheck(address: string): EdgeError | null {
+    if (hostScope(address.replace(/%.*$/, '')) !== 'public') return null;
+    const host = urlHost(this.opts.url);
+    if (this.opts.allowInsecure !== true) {
+      return new EdgeError(
+        `ws:// edge name ${host} resolved to a public address (${printable(address, 64)}): ` +
+          'use wss://, or set allowInsecure: true in the edge options to accept plaintext',
+        'connect',
+        true,
+      );
+    }
+    if (!this.resolvedPublic) {
+      this.resolvedPublic = true;
+      this.log(`WARNING: ws:// edge name ${host} resolved to a public address (${printable(address, 64)}): plaintext over the Internet`);
+    }
+    return null;
   }
 
   get ready(): boolean {
@@ -321,7 +422,7 @@ export class EdgePeerBackend implements PeerBackend {
     if (s !== this.session) return;
     this.state = 'ready';
     this.sessions++;
-    this.backoff = this.opts.reconnectMinMs ?? 250;
+    this.readyAt = performance.now();
     this.log(`tunnel ready (session ${s.sessionId}, data plane ${s.mode})`);
     this.handlers?.onReady();
   }
@@ -329,6 +430,9 @@ export class EdgePeerBackend implements PeerBackend {
   /** @internal */ onSessionDown(s: TunnelSession, err: EdgeError | null, opts: { fallback?: boolean } = {}): void {
     if (s !== this.session) return;
     const wasReady = this.state === 'ready';
+    // a session that held up restarts the backoff; one that dropped soon after Ready does not
+    const stable = wasReady && performance.now() - this.readyAt >= (this.opts.reconnectStableMs ?? 10_000);
+    if (stable) this.backoff = this.opts.reconnectMinMs ?? 250;
     this.session = null;
     this.dropLinks();
     if (this.state === 'stopped') return;
@@ -342,8 +446,10 @@ export class EdgePeerBackend implements PeerBackend {
       delay = 0;
     } else if (err?.fatal) {
       delay = this.opts.reconnectMaxMs ?? 10_000;
-    } else if (wasReady) {
+    } else if (stable) {
       delay = 0; // first retry at once: players are waiting
+    } else if (wasReady) {
+      delay *= 0.8 + Math.random() * 0.4; // flapping tunnel: back off, spread out
     }
     this.backoff = Math.min(this.backoff * 2, this.opts.reconnectMaxMs ?? 10_000);
     this.reconnectTimer = setTimeout(() => this.connect(), delay);
@@ -368,22 +474,29 @@ export class EdgePeerBackend implements PeerBackend {
     const ev = link?.ev ?? null;
     if (link === undefined || ev === null) return;
     switch (type) {
-      case EdgeMsg.PeerAnswer:
-        ev.onLocalDescription(readStr(r, EdgeLimits.maxSdp));
+      case EdgeMsg.PeerAnswer: {
+        const sdp = readStr(r, EdgeLimits.maxSdp);
+        if (link.answered) return;
+        link.answered = true;
+        ev.onLocalDescription(sdp);
         return;
+      }
       case EdgeMsg.PeerLocalCandidate: {
         const cand = readStr(r, EdgeLimits.maxCandidate);
         const mid = readStr(r, EdgeLimits.maxMid);
+        if (++link.localCandidates > EdgeLimits.maxLocalCandidates) return;
         ev.onLocalCandidate(candidateLine(cand), mid);
         return;
       }
       case EdgeMsg.PeerGathered:
+        if (link.gathered) return;
+        link.gathered = true;
         ev.onGatheringComplete();
         return;
       case EdgeMsg.PeerChannelOpen: {
         const ch = r.u8();
         const addr = r.remaining > 0 ? readStr(r, 64) : '';
-        if (ch < CHANNELS.length) ev.onChannelOpen(ch, addr.length > 0 ? addr : null);
+        if (ch < CHANNELS.length) ev.onChannelOpen(ch, isIP(addr) !== 0 ? addr : null);
         return;
       }
       case EdgeMsg.PeerClosed: {
@@ -410,6 +523,65 @@ export class EdgePeerBackend implements PeerBackend {
 function urlHost(url: string): string {
   const h = new URL(url).hostname;
   return h.startsWith('[') && h.endsWith(']') ? h.slice(1, -1) : h;
+}
+
+type HostScope = 'loopback' | 'private' | 'public';
+
+/** Scope of an IPv4 address given its first two octets. */
+function v4Scope(a: number, b: number): HostScope {
+  if (a === 127) return 'loopback';
+  if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127)) return 'private';
+  return 'public';
+}
+
+/** The eight 16-bit groups of a valid IPv6 literal (compressed, lowercase, optional dotted IPv4 tail). */
+function v6Groups(literal: string): number[] {
+  let text = literal;
+  const tail = text.lastIndexOf('.') >= 0 ? text.lastIndexOf(':') : -1;
+  if (tail >= 0) {
+    const o = text.slice(tail + 1).split('.').map(Number);
+    text = `${text.slice(0, tail + 1)}${((o[0]! << 8) | o[1]!).toString(16)}:${((o[2]! << 8) | o[3]!).toString(16)}`;
+  }
+  const gap = text.indexOf('::');
+  const part = (s: string): number[] => (s === '' ? [] : s.split(':').map((g) => parseInt(g, 16)));
+  if (gap < 0) return part(text);
+  const head = part(text.slice(0, gap));
+  const rest = part(text.slice(gap + 2));
+  return [...head, ...new Array<number>(8 - head.length - rest.length).fill(0), ...rest];
+}
+
+/**
+ * Where a host name or literal (as normalised by `URL`) sits for the `ws://`
+ * policy: `localhost` and 127.0.0.0/8, `::1` and mapped 127.x are loopback;
+ * RFC 1918, 100.64.0.0/10, 169.254.0.0/16, fc00::/7, fe80::/10, mapped
+ * private IPv4, single-label names and `.local`/`.internal`/`.lan`/`.home.arpa`
+ * names are private; the rest is public.
+ */
+function hostScope(host: string): HostScope {
+  const h = host.toLowerCase();
+  const family = isIP(h);
+  if (family === 4) {
+    const [a, b] = h.split('.').map(Number);
+    return v4Scope(a!, b!);
+  }
+  if (family === 6) {
+    const g = v6Groups(h);
+    if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0) {
+      if (g[5] === 0xffff) return v4Scope(g[6]! >> 8, g[6]! & 0xff);
+      if (g[5] === 0 && g[6] === 0 && g[7] === 1) return 'loopback';
+    }
+    if ((g[0]! & 0xfe00) === 0xfc00 || (g[0]! & 0xffc0) === 0xfe80) return 'private';
+    return 'public';
+  }
+  const name = h.endsWith('.') ? h.slice(0, -1) : h;
+  if (name === 'localhost') return 'loopback';
+  if (!name.includes('.') || /\.(?:local|internal|lan|home\.arpa)$/.test(name)) return 'private';
+  return 'public';
+}
+
+/** Text from the edge made safe for logs and error messages: printable ASCII, bounded. */
+function printable(text: string, max = 200): string {
+  return text.slice(0, max).replace(/[^\x20-\x7e]/g, '?');
 }
 
 /** Granted ready data plane: the UDP tunnel or the legacy PeerConnection. */
@@ -441,11 +613,17 @@ class TunnelSession {
   private udpStartedAt = 0;
   private ndc: NdcTunnelPlane | null = null;
   private answerApplied = false;
+  private tunnelRemoteCandidates = 0;
   private readonly heldCandidates: [string, string][] = [];
   private readonly heldRemote: [string, string][] = [];
   private deadline: NodeJS.Timeout | null = null;
   private pingTimer: NodeJS.Timeout | null = null;
   private lastRx = performance.now();
+  /** Last `Pong` to one of our `Ping`s (tunnel v2: the edge answers them in every data plane). */
+  private lastPongAt = performance.now();
+  /** Protocol version negotiated in `Hello`. */
+  private version = 1;
+  private overflowed = false;
   private readonly w = new Writer(1024);
   private scratch = Buffer.allocUnsafe(4096);
 
@@ -473,8 +651,33 @@ class TunnelSession {
       ...o.wsOptions,
     };
     if (o.bindAddress !== undefined) wsOpts.localAddress = o.bindAddress;
+    let refused: EdgeError | null = null;
+    if (backend.checkResolved) {
+      // the name was taken as private by its look: hold every connection to what it resolves to
+      backend.resolvedPublic = false;
+      const extra = wsOpts as ClientOptions & { lookup?: LookupFunction };
+      const lookup: LookupFunction = extra.lookup ?? (createRequire(import.meta.url)('node:dns') as typeof import('node:dns')).lookup;
+      extra.lookup = (hostname, options, callback) => {
+        lookup(hostname, options, (err, address, family) => {
+          if (err === null) {
+            const list = typeof address === 'string' ? [address] : address.map((a) => a.address);
+            for (let i = 0; i < list.length && refused === null; i++) refused = backend.resolvedCheck(list[i]!);
+            if (refused !== null) err = Object.assign(new Error(refused.message), { code: 'EACCES' });
+          }
+          callback(err, address, family);
+        });
+      };
+    }
     this.ws = new WebSocket(o.url, wsOpts);
     this.ws.binaryType = 'nodebuffer';
+    if (backend.checkResolved) {
+      // also the peer actually reached (a lookup the runtime or an agent bypassed), before any Auth
+      this.ws.on('upgrade', (res) => {
+        const peer = res.socket.remoteAddress;
+        if (refused === null && peer !== undefined) refused = backend.resolvedCheck(peer);
+        if (refused !== null) this.fail(refused);
+      });
+    }
     this.deadline = setTimeout(() => this.fail(new EdgeError('connect/auth timeout', 'connect')), o.connectTimeoutMs ?? 10_000);
     this.ws.on('message', (data: RawData, isBinary: boolean) => {
       try {
@@ -485,16 +688,31 @@ class TunnelSession {
     });
     this.ws.on('close', (code: number, reason: Buffer) => this.onWsClose(code, reason.toString('utf8')));
     this.ws.on('error', (err: Error) => {
-      if (this.phase !== Phase.Closed) this.fail(new EdgeError(`websocket: ${err.message}`, 'connect'));
+      if (this.phase !== Phase.Closed) this.fail(refused ?? new EdgeError(`websocket: ${err.message}`, 'connect'));
     });
   }
 
   // ---------------------------------------------------------------- sending
 
   private sendWs(bytes: Uint8Array): boolean {
-    if (this.ws.readyState !== WebSocket.OPEN) return false;
-    this.ws.send(bytes);
+    const ws = this.ws;
+    if (ws.readyState !== WebSocket.OPEN) return false;
+    if (ws.bufferedAmount > WS_BUFFER_HARD_LIMIT) {
+      this.sendOverflow();
+      return false;
+    }
+    ws.send(bytes);
     return true;
+  }
+
+  /**
+   * The edge is not draining the WebSocket. Deferred: this runs inside the
+   * transport's send loops, and failing the session closes every link.
+   */
+  private sendOverflow(): void {
+    if (this.overflowed) return;
+    this.overflowed = true;
+    setImmediate(() => this.fail(new EdgeError('tunnel send buffer overflow (the edge does not read)', 'tunnel')));
   }
 
   private control(type: number): Writer {
@@ -549,6 +767,7 @@ class TunnelSession {
   sendData(ch: number, slot: number, data: Uint8Array): boolean {
     if (this.phase !== Phase.Ready) return false;
     if (this.mode === 'ws') {
+      if (ch === 2 && this.ws.bufferedAmount > WS_BUFFER_SOFT_LIMIT) return false; // unreliable: drop under backlog
       const buf = Buffer.allocUnsafe(3 + data.length);
       buf[0] = EdgeMsg.Data0 + ch;
       buf[1] = slot >>> 8;
@@ -575,6 +794,7 @@ class TunnelSession {
    */
   sendMulticast(ch: number, links: readonly EdgeLink[], data: Uint8Array): void {
     const ws = this.mode === 'ws';
+    if (ws && ch === 2 && this.ws.bufferedAmount > WS_BUFFER_SOFT_LIMIT) return; // unreliable: drop under backlog
     const lanes = ch === 0 && !ws ? this.lanes : 1;
     const plane = this.plane;
     plane?.cork?.();
@@ -660,7 +880,7 @@ class TunnelSession {
       case EdgeMsg.TunnelCandidate: {
         const c = readStr(r, EdgeLimits.maxCandidate);
         const m = readStr(r, EdgeLimits.maxMid);
-        if (this.ndc === null) return;
+        if (this.ndc === null || ++this.tunnelRemoteCandidates > EdgeLimits.maxRemoteCandidates) return;
         if (!this.answerApplied) {
           if (this.heldRemote.length < EdgeLimits.maxRemoteCandidates) this.heldRemote.push([c, m]);
         } else this.ndc.addRemoteCandidate(c, m);
@@ -673,13 +893,16 @@ class TunnelSession {
         this.sendWs(w.copyBytes());
         return;
       }
-      case EdgeMsg.Pong:
-        this.wsRttMs = performance.now() - r.f64();
+      case EdgeMsg.Pong: {
+        const now = performance.now();
+        this.lastPongAt = now;
+        this.wsRttMs = now - r.f64();
         return;
+      }
       case EdgeMsg.Error: {
         const code = r.u16();
         const msg = readStr(r, 1024);
-        this.backend.log(`edge error ${code}: ${msg}`);
+        this.backend.log(`edge error ${code}: ${printable(msg)}`);
         return;
       }
       case EdgeMsg.PeerAnswer:
@@ -705,6 +928,7 @@ class TunnelSession {
     const nonce = r.bytesCopy(EDGE_NONCE_LENGTH);
     this.nonce = nonce;
     const version = Math.min(r.remaining > 0 ? r.u8() : first, EDGE_PROTOCOL_VERSION);
+    this.version = version;
     const o = this.backend.opts;
     const lanes = o.roLanes !== false ? AuthFlag.RoLanes : 0;
     const w = this.control(EdgeMsg.Auth);
@@ -725,8 +949,8 @@ class TunnelSession {
     } else {
       // protocol-1 edge: no UDP tunnel
       if (this.mode === 'udp') {
-        if (o.fallbackWs === false) {
-          this.fail(new EdgeError('edge speaks protocol 1 (no UDP tunnel) and fallbackWs is off', 'version', true));
+        if (!this.backend.fallbackWs) {
+          this.fail(new EdgeError(`edge speaks protocol 1 (no UDP tunnel) and fallbackWs is off${this.backend.fallbackWsHint}`, 'version', true));
           return;
         }
         this.backend.log('edge speaks protocol 1: no UDP tunnel, using the WebSocket data plane');
@@ -778,8 +1002,8 @@ class TunnelSession {
     }
     // the edge put this session's data on the WebSocket
     if (this.requested !== 0) {
-      if (o.fallbackWs === false) {
-        this.fail(new EdgeError('the edge did not grant a UDP data plane and fallbackWs is off', 'tunnel'));
+      if (!this.backend.fallbackWs) {
+        this.fail(new EdgeError(`the edge did not grant a UDP data plane and fallbackWs is off${this.backend.fallbackWsHint}`, 'tunnel'));
         return;
       }
       this.backend.log('edge granted no UDP data plane: using the WebSocket');
@@ -790,8 +1014,9 @@ class TunnelSession {
     this.becomeReady();
   }
 
-  private onWsClose(code: number, reason: string): void {
+  private onWsClose(code: number, rawReason: string): void {
     if (this.phase === Phase.Closed) return;
+    const reason = printable(rawReason);
     let err: EdgeError;
     if (code === EdgeCloseCode.AuthFailed) err = new EdgeError(`edge rejected the key (${reason || code})`, 'auth', true);
     else if (code === EdgeCloseCode.Version) err = new EdgeError(`protocol version rejected (${reason || code})`, 'version', true);
@@ -809,7 +1034,7 @@ class TunnelSession {
     if (this.deadline !== null) clearTimeout(this.deadline);
     this.deadline = setTimeout(() => {
       if (this.phase !== Phase.DataPlane) return;
-      if (o.fallbackWs !== false) {
+      if (this.backend.fallbackWs) {
         this.backend.log('data plane timeout: falling back to WebSocket');
         this.fail(new EdgeError('UDP data plane timed out, falling back to WebSocket', 'tunnel'), true);
       } else this.fail(new EdgeError('UDP data plane timed out', 'tunnel'));
@@ -892,7 +1117,7 @@ class TunnelSession {
         if (this.udp === plane) plane.receive(msg);
       });
     })().catch((err: Error) => {
-      if (this.phase === Phase.DataPlane) this.fail(new EdgeError(`UDP tunnel: ${err.message}`, 'tunnel'), o.fallbackWs !== false);
+      if (this.phase === Phase.DataPlane) this.fail(new EdgeError(`UDP tunnel: ${err.message}`, 'tunnel'), this.backend.fallbackWs);
     });
   }
 
@@ -938,7 +1163,7 @@ class TunnelSession {
         this.sendWs(w.copyBytes());
       })
       .catch((err: Error) => {
-        if (this.phase === Phase.DataPlane) this.fail(new EdgeError(`tunnel peer connection: ${err.message}`, 'tunnel'), o.fallbackWs !== false);
+        if (this.phase === Phase.DataPlane) this.fail(new EdgeError(`tunnel peer connection: ${err.message}`, 'tunnel'), this.backend.fallbackWs);
       });
   }
 
@@ -981,11 +1206,16 @@ class TunnelSession {
     const o = this.backend.opts;
     const period = o.pingIntervalMs ?? 5_000;
     const timeout = o.pingTimeoutMs ?? 15_000;
-    this.lastRx = performance.now();
+    this.lastRx = this.lastPongAt = performance.now();
     this.pingTimer = setInterval(() => {
       const now = performance.now();
       if (now - this.lastRx > timeout) {
         this.fail(new EdgeError('tunnel timed out (no traffic from the edge)', 'tunnel'));
+        return;
+      }
+      // Pings the edge sends do not prove it reads ours: it must answer them (it queues behind our data)
+      if (this.version >= 2 && now - this.lastPongAt > Math.max(timeout, 2 * period)) {
+        this.fail(new EdgeError('tunnel timed out (the edge does not answer pings)', 'tunnel'));
         return;
       }
       const udp = this.udp;

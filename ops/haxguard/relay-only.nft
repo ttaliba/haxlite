@@ -1,20 +1,38 @@
 # Fuerza relay-only real en haxlite (bug libjuice: checks directos desde la IP real).
-# Uso: haxlite con portRange [40000, 40999] y rtc.iceTransportPolicy = "relay".
+# Uso: haxlite con portRange [40000, 40999] (= RELAY_PORTS) y rtc.iceTransportPolicy = "relay".
 # Mantener los sets turn4/turn6 al día con los A/AAAA de tu servidor TURN.
+# Validar: nft -c -f relay-only.nft     Cargar: nft -f relay-only.nft  (comprobar el rc: la carga es
+# atómica y, si falla, la tabla no se crea y la IP real sigue saliendo). Comprobar después con
+# `nft list table inet haxhost`. Quitar: nft delete table inet haxhost
+# Los sets llevan `flags interval`: sin él nft rechaza los prefijos (a.b.c.d/24).
+# Las dos primeras líneas hacen la carga idempotente sin depender de `destroy`: recargar no duplica reglas.
+#
+# Requisito: RELAY_PORTS tiene que quedar fuera de los puertos efímeros del kernel. Las reglas `drop` de abajo
+# afectan a CUALQUIER socket UDP del host, no solo al de haxlite: con el rango dentro de
+# net.ipv4.ip_local_port_range (32768-60999 por defecto) el kernel ata ahí ~3,5 % de los sockets sin puerto fijo
+# (resolver DNS, NTP, QUIC...) y su sendto falla con EPERM y sus respuestas se pierden. Reservarlo, de forma
+# persistente (p. ej. en /etc/sysctl.d/):
+#   sysctl -w net.ipv4.ip_local_reserved_ports=40000-40999
+# Excluye el rango solo del puerto automático (también en IPv6): haxlite ata sus puertos de forma explícita
+# (portRange) y no se ve afectado. Alternativa: mover RELAY_PORTS y portRange fuera de ip_local_port_range.
 
+define RELAY_PORTS = 40000-40999
+
+table inet haxhost
+delete table inet haxhost
 table inet haxhost {
-  set turn4 { type ipv4_addr; elements = { 141.101.90.1, 162.159.207.0/24 } }   # o la IP de tu relay
-  set turn6 { type ipv6_addr; elements = { 2a06:98c1:3200::1, 2606:4700:48::1 } }
+  set turn4 { type ipv4_addr; flags interval; elements = { 141.101.90.1, 162.159.207.0/24 } }   # o la IP de tu relay
+  set turn6 { type ipv6_addr; flags interval; elements = { 2a06:98c1:3200::1, 2606:4700:48::1 } }
   chain out {
     type filter hook output priority 0; policy accept;
-    udp sport 40000-40999 ip  daddr @turn4 accept
-    udp sport 40000-40999 ip6 daddr @turn6 accept
-    udp sport 40000-40999 drop          # checks directos de libjuice → nunca salen
+    udp sport $RELAY_PORTS ip  daddr @turn4 accept
+    udp sport $RELAY_PORTS ip6 daddr @turn6 accept
+    udp sport $RELAY_PORTS drop          # checks directos de libjuice → nunca salen
   }
   chain in {
     type filter hook input priority 0; policy accept;
-    udp dport 40000-40999 ip  saddr @turn4 accept
-    udp dport 40000-40999 ip6 saddr @turn6 accept
-    udp dport 40000-40999 drop
+    udp dport $RELAY_PORTS ip  saddr @turn4 accept
+    udp dport $RELAY_PORTS ip6 saddr @turn6 accept
+    udp dport $RELAY_PORTS drop
   }
 }

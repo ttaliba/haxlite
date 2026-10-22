@@ -279,7 +279,10 @@ export class SendChatEvent extends RoomEvent {
     w.string(truncate(this.message, 140));
   }
   read(r: Reader): void {
-    this.message = r.string();
+    const n = r.varUint();
+    // a code unit takes at most 6 bytes: a longer payload decodes to > 140 units
+    if (n > 6 * 140) throw new CodecError('message too long');
+    this.message = r.stringRaw(n);
     if (this.message.length > 140) throw new CodecError('message too long');
   }
   override validate(rs: RoomState): boolean {
@@ -465,7 +468,19 @@ export class SetGamePlayLimitEvent extends RoomEvent {
   }
 }
 
-/** 11 — off `V`. Payload: u16 n + deflateRaw(stadium). Admin-only filter, 10 / 2000 ms. */
+/** Largest deflated SetStadium payload (u16 length prefix). */
+export const STADIUM_PACKED_LIMIT = 0xffff;
+/**
+ * Upper bound of an inflated SetStadium payload. The largest stadium the
+ * wire can describe (255 items in every list, 255 spawn points per team)
+ * takes ~76 KB plus its name; a 64 KB deflate bomb inflates to ~67 MB.
+ */
+export const STADIUM_INFLATE_LIMIT = 262144;
+
+/**
+ * 11 — off `V`. Payload: u16 n + deflateRaw(stadium). Admin-only filter,
+ * 10 / 2000 ms; inflated size capped at {@link STADIUM_INFLATE_LIMIT}.
+ */
 export class SetStadiumEvent extends RoomEvent {
   stadium: Stadium | null = null;
   /**
@@ -485,7 +500,29 @@ export class SetStadiumEvent extends RoomEvent {
     e.stadium = stadium;
     return e;
   }
-  write(w: Writer): void {
+  /** Size of the deflated stadium (computed once and reused by {@link write}). */
+  packedSize(): number {
+    return this.pack().length;
+  }
+  /**
+   * Why the stadium cannot be sent (a list over 255 items: u8 counts; a
+   * deflated form over {@link STADIUM_PACKED_LIMIT}: u16 length), or null.
+   * The official host sends such a stadium anyway and clients fail to decode
+   * it (the join snapshot too), so a host should check before applying.
+   */
+  wireError(): string | null {
+    const s = this.stadium!;
+    if (
+      s.defaultStadiumId === 255 &&
+      (s.vertexes.length > 255 || s.segments.length > 255 || s.planes.length > 255 || s.goals.length > 255 ||
+        s.discs.length > 255 || s.joints.length > 255 || s.redSpawnPoints.length > 255 || s.blueSpawnPoints.length > 255)
+    ) {
+      return 'Stadium has a list over 255 items';
+    }
+    const n = this.pack().length;
+    return n > STADIUM_PACKED_LIMIT ? `Stadium too large: deflated ${n} > ${STADIUM_PACKED_LIMIT}` : null;
+  }
+  private pack(): Uint8Array {
     let packed = this.packed;
     if (packed === null || this.packedFor !== this.stadium) {
       const tmp = new Writer(1024);
@@ -494,11 +531,23 @@ export class SetStadiumEvent extends RoomEvent {
       packed = this.packed = deflateRaw(tmp.finish()).slice();
       this.packedFor = this.stadium;
     }
+    return packed;
+  }
+  /** Throws CodecError, before writing anything, on a {@link wireError}. */
+  write(w: Writer): void {
+    const err = this.wireError();
+    if (err !== null) throw new CodecError(err);
+    const packed = this.pack();
     w.u16(packed.length);
     w.bytes(packed);
   }
+  /**
+   * Re-encoding for the broadcast can need more than the u16 when the sender's
+   * deflate packed tighter than ours: the payload is valid, so it decodes
+   * fine and {@link wireError} reports it (a host drops such an event).
+   */
   read(r: Reader): void {
-    const raw = inflateRaw(r.bytes(r.u16()));
+    const raw = inflateRaw(r.bytes(r.u16()), STADIUM_INFLATE_LIMIT);
     this.stadium = readStadium(new Reader(raw));
     this.packed = this.packedFor = null;
   }
@@ -711,7 +760,10 @@ export class SetAvatarEvent extends RoomEvent {
     w.nullableString(this.avatar);
   }
   read(r: Reader): void {
-    this.avatar = r.nullableString();
+    const n = r.varUint();
+    // a code unit takes at most 6 bytes: a longer payload decodes to > 8 units
+    if (n - 1 > 6 * 8) throw new CodecError('avatar too long');
+    this.avatar = n <= 0 ? null : r.stringRaw(n - 1);
     if (this.avatar !== null) {
       if (this.avatar.length > 8) throw new CodecError('avatar too long');
       this.avatar = truncate(this.avatar, 2);

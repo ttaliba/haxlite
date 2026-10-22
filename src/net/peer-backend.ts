@@ -49,6 +49,12 @@ export interface PeerLink {
   addRemoteCandidate(candidate: string, mid: string): void;
   /** Sends on channel `index` (already known to be open). Returns false when nothing was sent. */
   send(index: number, data: Uint8Array): boolean;
+  /**
+   * Optional: bytes accepted by {@link send} and not yet delivered or
+   * acknowledged, all channels together. The transport closes a peer that
+   * keeps it high (`maxPeerBufferedBytes`); links without it are not checked.
+   */
+  queuedBytes?(): number;
   /** Releases everything; no event is delivered afterwards. Idempotent. */
   close(): void;
 }
@@ -280,6 +286,13 @@ export class LocalPeerLink implements PeerLink {
     } catch {
       return 0;
     }
+  }
+
+  /** {@link PeerLink.queuedBytes}: the three channels' {@link bufferedAmount}. */
+  queuedBytes(): number {
+    let n = 0;
+    for (let i = 0; i < this.channels.length; i++) n += this.bufferedAmount(i);
+    return n;
   }
 
   /**

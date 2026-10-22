@@ -249,8 +249,8 @@ stale-nonce=600
 haxlite ya permite `portRange`, y libjuice usa **un solo socket UDP por agente** para STUN, TURN y checks. Basta con dejar salir ese rango de puertos solo hacia los servidores TURN:
 ```nft
 table inet haxhost {
-  set turn4 { type ipv4_addr; elements = { 141.101.90.1, 162.159.207.0/24 } }   # o la IP de tu relay
-  set turn6 { type ipv6_addr; elements = { 2a06:98c1:3200::1, 2606:4700:48::1 } }
+  set turn4 { type ipv4_addr; flags interval; elements = { 141.101.90.1, 162.159.207.0/24 } }   # o la IP de tu relay
+  set turn6 { type ipv6_addr; flags interval; elements = { 2a06:98c1:3200::1, 2606:4700:48::1 } }
   chain out {
     type filter hook output priority 0; policy accept;
     udp sport 40000-40999 ip  daddr @turn4 accept
@@ -266,6 +266,8 @@ table inet haxhost {
 }
 ```
 - Configuración en haxlite: `portRange: [40000, 40999]` y `rtc: { iceTransportPolicy: 'relay' }`.
+- **El rango tiene que quedar fuera de los puertos efímeros del kernel.** Las reglas `drop` valen para cualquier proceso del host, no solo para haxlite: 40000-40999 cae dentro de `net.ipv4.ip_local_port_range` (32768-60999 por defecto) y el ~3,5 % de los sockets UDP sin puerto fijo (resolver DNS, NTP, QUIC) quedaría sin poder enviar (`EPERM`) ni recibir respuestas. Reserva el rango, de forma persistente (`/etc/sysctl.d/`): `sysctl -w net.ipv4.ip_local_reserved_ports=40000-40999`. Solo excluye el rango del puerto automático (IPv4 e IPv6): haxlite ata sus puertos de forma explícita y no se ve afectado. Alternativa: mover `portRange` y las reglas fuera de `ip_local_port_range`.
+- `flags interval` es obligatorio en cuanto un set lleve prefijos (`/24`): sin él `nft` rechaza el archivo entero y no se instala nada. Comprueba el código de salida de `nft -f` y el resultado de `nft list table inet haxhost`. La versión de `ops/haxguard/relay-only.nft` además se puede recargar sin duplicar reglas; úsala en vez de copiar este bloque.
 - Vigilar los A/AAAA de `turn.cloudflare.com` y actualizar los sets: Cloudflare exige hacerlo en menos de 14 días si cambian.
 - Esto hace que el único camino posible sea la relay, y que la IP real nunca llegue a un jugador.
 

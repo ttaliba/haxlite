@@ -5,13 +5,24 @@
  * `readReplay` decodes the whole file eagerly: header, goal markers, the
  * initial RoomState (kept as raw bytes so it can be decoded again for every
  * rewind) and the event list with absolute frames (relative to the start of
- * the recording, i.e. frame 0 = the moment `start` was called).
+ * the recording, i.e. frame 0 = the moment `start` was called). Because of
+ * that, the inflated size and the event count are capped by default
+ * ({@link ReplayReadOptions}): a few KB of deflated zeros would otherwise
+ * become millions of event objects.
  */
 import { CodecError, Reader, Writer, deflateRaw, inflateRaw } from '../codec/index.js';
 import type { TeamId } from '../protocol.js';
 import type { RoomEvent, RoomState } from '../room/index.js';
 import { readEvent, readRoomState, writeEvent } from '../room/index.js';
-import { REPLAY_HEADER_SIZE, REPLAY_MAGIC, REPLAY_VERSION, ReplayFormatError, ReplayVersionError } from './format.js';
+import {
+  REPLAY_HEADER_SIZE,
+  REPLAY_MAGIC,
+  REPLAY_MAX_BODY_BYTES,
+  REPLAY_MAX_EVENTS,
+  REPLAY_VERSION,
+  ReplayFormatError,
+  ReplayVersionError,
+} from './format.js';
 
 /** A goal marker: `team` owns the goal the ball entered (node-haxball `teamId`). */
 export interface ReplayGoalMarker {
@@ -53,6 +64,32 @@ export class ReplayData {
   }
 }
 
+/** Limits for reading a `.hbr2`; raise them for long trusted files, keep them for anything else. */
+export interface ReplayReadOptions {
+  /**
+   * Largest inflated body accepted, in bytes (`Infinity` = no limit).
+   * Default {@link REPLAY_MAX_BODY_BYTES} (32 MiB). A larger body is a
+   * {@link ReplayFormatError}.
+   */
+  maxBodyBytes?: number;
+  /**
+   * Most events decoded (`Infinity` = no limit). Default
+   * {@link REPLAY_MAX_EVENTS} (2^21). More is a {@link ReplayFormatError}.
+   */
+  maxEvents?: number;
+}
+
+/** Inflate limit for a `maxBodyBytes` option: none for `Infinity`, clamped to what zlib takes, the default for invalid values. */
+function inflateLimit(max: number | undefined): number | undefined {
+  if (max === undefined || max !== max || max < 0) return REPLAY_MAX_BODY_BYTES;
+  return max === Infinity ? undefined : Math.min(Math.floor(max), 0xffffffff);
+}
+
+/** Event limit for a `maxEvents` option (the default for invalid values). */
+function eventLimit(max: number | undefined): number {
+  return max === undefined || max !== max || max < 0 ? REPLAY_MAX_EVENTS : max;
+}
+
 function fail(what: string, err: unknown): never {
   if (err instanceof ReplayFormatError) throw err;
   const e = new ReplayFormatError(`${what}: ${err instanceof Error ? err.message : String(err)}`);
@@ -62,15 +99,22 @@ function fail(what: string, err: unknown): never {
 
 /**
  * Parses a `.hbr2` file. Throws {@link ReplayVersionError} for another format
- * version and {@link ReplayFormatError} for anything malformed.
+ * version and {@link ReplayFormatError} for anything malformed or past the
+ * limits in `opts`. The header's total frame count is not checked against the
+ * events: the official recorder writes replays with an event-free tail.
  */
-export function readReplay(bytes: Uint8Array): ReplayData {
+export function readReplay(bytes: Uint8Array, opts: ReplayReadOptions = {}): ReplayData {
   const { version, totalFrames } = readReplayHeader(bytes);
+  const maxEvents = eventLimit(opts.maxEvents);
 
+  const maxBody = inflateLimit(opts.maxBodyBytes);
   let body: Uint8Array;
   try {
-    body = inflateRaw(bytes.subarray(REPLAY_HEADER_SIZE));
+    body = inflateRaw(bytes.subarray(REPLAY_HEADER_SIZE), maxBody);
   } catch (err) {
+    if (maxBody !== undefined && err instanceof CodecError && err.message === 'Inflate size exceeds limit') {
+      fail(`replay body larger than maxBodyBytes (${maxBody})`, err);
+    }
     fail('corrupt replay body', err);
   }
   const r = new Reader(body);
@@ -95,6 +139,7 @@ export function readReplay(bytes: Uint8Array): ReplayData {
   let frame = 0;
   try {
     while (r.remaining > 0) {
+      if (events.length >= maxEvents) throw new ReplayFormatError(`too many events (more than maxEvents = ${maxEvents})`);
       frame += r.varUint();
       const byId = r.u16();
       const ev = readEvent(r);
@@ -146,11 +191,14 @@ export function writeReplay(data: ReplayData): Uint8Array {
   return file;
 }
 
-/** Inflated body of a `.hbr2` (markers + state + events), after header checks. For tests/tooling. */
-export function replayBody(bytes: Uint8Array): Uint8Array {
+/**
+ * Inflated body of a `.hbr2` (markers + state + events), after header checks.
+ * For tests/tooling. `maxBodyBytes` as in {@link ReplayReadOptions}.
+ */
+export function replayBody(bytes: Uint8Array, maxBodyBytes?: number): Uint8Array {
   const data = readReplayHeader(bytes);
   try {
-    return inflateRaw(bytes.subarray(REPLAY_HEADER_SIZE));
+    return inflateRaw(bytes.subarray(REPLAY_HEADER_SIZE), inflateLimit(maxBodyBytes));
   } catch (err) {
     fail(`corrupt replay body (version ${data.version})`, err);
   }

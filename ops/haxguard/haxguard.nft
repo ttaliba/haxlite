@@ -1,32 +1,82 @@
 #!/usr/sbin/nft -f
 # haxguard: allowlist UDP para salas haxlite (WebRTC) en el hook ingress (antes de conntrack/IP stack).
-# Cargar:  nft -f haxguard.nft      Validar: nft -c -f haxguard.nft
+# Cargar:  nft -f haxguard.nft      Validar: nft -c -f haxguard.nft      Quitar: nft delete table netdev haxguard
 # Requisitos: salas con enableIceUdpMux (1 puerto UDP por sala) en ROOM_PORTS, fuera de
 # net.ipv4.ip_local_port_range (32768-60999 por defecto) para no tirar respuestas de sockets salientes.
+#
+# Alcance: solo se filtra el UDP dirigido a ROOM_PORTS. TCP, ICMP, ARP/ND y el UDP a otros puertos
+# pasan por `policy accept` (SSH, WebSocket al master y vecinos L2 siguen funcionando). Excepciones:
+# deny4/6 descarta de esa IP todo salvo el UDP a puertos que no son de sala (la regla que lo deja pasar va
+# antes: TCP, ICMP y el UDP a ROOM_PORTS se descartan, el UDP a otros puertos sigue entrando; para un baneo
+# total del host hay que mover las dos reglas de deny antes de `udp dport != $ROOM_PORTS accept`, a costa
+# de un lookup más por cada paquete UDP ajeno); los fragmentos UDP IPv4 se descartan sea cual sea el
+# puerto (un fragmento no inicial no lleva cabecera UDP y WebRTC nunca fragmenta, pero un DNS/EDNS, IKE
+# o syslog grande al mismo host dejaría de llegar: si hay tales cargas, quitar la primera regla de la
+# cadena ingress); y los fragmentos IPv6 se descartan sea cual sea su protocolo (un fragmento no
+# inicial no permite saber si es UDP).
+#
+# Contrato con el sidecar (privilegiado; no existe en el repositorio). Escribe en los sets de abajo
+# con `nft` o netlink y debe tratar como error (y alertar) que un `add` falle por set lleno (size):
+#  - pending: al recibir la oferta de un jugador, SOLO la IP que vio el master y como mucho 2-4
+#    candidatos srflx que sean IP literal unicast global (sin loopback/privada/link-local/multicast ni
+#    repetidas entre ofertas); nunca la lista completa de candidatos de la oferta, que la elige el
+#    cliente. Poner un tope global de entradas pendientes (p. ej. max(256, 4 x salas)). No se refresca:
+#    caduca a los 20 s. Borrar la entrada al promover el jugador a active o si la negociación falla.
+#  - active: al abrirse el canal de datos. El timeout de 5 min es de seguridad: el sidecar refresca
+#    cada 60 s mientras el jugador siga en la sala y borra al salir. El tráfico NO lo refresca. Si el
+#    sidecar muere, a los 5 min dejan de pasar TODOS los jugadores (fail-closed): hay que supervisarlo
+#    y alertar. Hay que autorizar el origen que ve el kernel (para un jugador por TURN, la IP:puerto
+#    del servidor TURN), no la dirección interna del par que reporta haxlite.
+#  - deny: bans. Ponerles `timeout` explícito (no hay por defecto) y, en IPv6, banear el prefijo (/64).
+#  - Esta carga destruye la tabla y vacía todos los sets: tras cada `nft -f` el sidecar debe repoblar
+#    active (los jugadores conectados se cortan hasta entonces) y reponer los bans desde su registro.
 
 define WAN = "eth0"
 define ROOM_PORTS = 20000-20999
+# Máscara del cubo de limitación del STUN de desconocidos (5/s, ráfaga 10 por cubo).
+#  - IPv4: un cubo por IP origen. Varios jugadores tras el mismo CGNAT que aún no están en pending no se
+#    quitan la ráfaga entre sí. Quien posea un /24 obtiene 256 cubos; para que no multiplique su cuota,
+#    usar 255.255.255.0 (a costa de que los vecinos del prefijo compartan la ráfaga).
+#  - IPv6: un cubo por /64. No hay CGNAT en IPv6 y un /64 es lo que recibe un abonado: con la máscara
+#    completa quien tiene un /64 propio origina 2^64 direcciones sin suplantar, cada una con su ráfaga, y
+#    solo le frena el global de 2000/s que comparten todas las salas del host. Un /64 compartido (Wi-Fi
+#    público) se comporta como un NAT44: comparte ráfaga. No frena a quien tenga un /56 o un /48 (256 o
+#    65536 cubos): vigilar c_stun_ok y c_stun_over.
+# Si el set stunrate se llena (flood con orígenes suplantados) el límite por origen deja de aplicarse y
+# solo actúa el global, con cualquier máscara (c_stun_setfull).
+define STUN_V4_MASK = 255.255.255.255
+define STUN_V6_MASK = ffff:ffff:ffff:ffff::
 
-destroy table netdev haxguard
+table netdev haxguard
+delete table netdev haxguard
 table netdev haxguard {
 	# --- estado que mantiene haxlite (vía sidecar privilegiado) ---
 	# jugadores unidos: (IP origen . puerto de la sala). Timeout de seguridad: el sidecar refresca cada 60 s.
 	set active4 { type ipv4_addr . inet_service; flags timeout; timeout 5m; size 65536; }
 	set active6 { type ipv6_addr . inet_service; flags timeout; timeout 5m; size 65536; }
-	# uniéndose: IPs de la oferta (IP vista por el master + srflx + relay) . puerto de la sala; 20 s.
+	# uniéndose: IPs validadas de la oferta (IP vista por el master + pocos srflx) . puerto de la sala; 20 s.
 	set pending4 { type ipv4_addr . inet_service; flags timeout; timeout 20s; size 65536; }
 	set pending6 { type ipv6_addr . inet_service; flags timeout; timeout 20s; size 65536; }
-	# bans / kicks "Bad actor": se descartan antes que nada.
+	# bans / kicks "Bad actor": se descartan antes que cualquier carril de ROOM_PORTS (ver Alcance).
 	set deny4 { type ipv4_addr; flags interval, timeout; size 65536; }
 	set deny6 { type ipv6_addr; flags interval, timeout; size 65536; }
 	# servidores STUN propios (respuestas a las consultas srflx del host). Vacío si iceServers: [].
 	set stun_servers4 { type ipv4_addr . inet_service; }
-	# medidores dinámicos por origen para STUN de IPs desconocidas
-	set stunrate4 { type ipv4_addr; flags dynamic, timeout; timeout 30s; size 65536; }
-	set stunrate6 { type ipv6_addr; flags dynamic, timeout; timeout 30s; size 65536; }
+	# orígenes que nunca ganan el carril pending (no enrutables en Internet). Vaciar si los jugadores
+	# llegan por una red privada (LAN, VPN): sus IP caerían entonces en el carril de STUN de desconocidos.
+	set bogons4 { type ipv4_addr; flags interval; elements = { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } }
+	set bogons6 { type ipv6_addr; flags interval; elements = { ::/128, ::1/128, ::ffff:0:0/96, fc00::/7, fe80::/10, ff00::/8 } }
+	# medidores dinámicos por origen (STUN_V4_MASK/STUN_V6_MASK) para STUN de IPs desconocidas. Timeout
+	# corto: con orígenes suplantados el set se llena a size/timeout entradas por segundo (65536/10 s);
+	# los desconocidos legítimos son un puñado por segundo, así que no hace falta más tamaño.
+	set stunrate4 { type ipv4_addr; flags dynamic, timeout; timeout 10s; size 65536; }
+	set stunrate6 { type ipv6_addr; flags dynamic, timeout; timeout 10s; size 65536; }
 	# tope por jugador unido (un jugador malicioso inundando desde su IP real)
 	set actrate4 { type ipv4_addr; flags dynamic, timeout; timeout 30s; size 65536; }
 	set actrate6 { type ipv6_addr; flags dynamic, timeout; timeout 30s; size 65536; }
+	# tope por IP del carril pending (acotado por el tamaño de pending)
+	set pendrate4 { type ipv4_addr; flags dynamic, timeout; timeout 30s; size 65536; }
+	set pendrate6 { type ipv6_addr; flags dynamic, timeout; timeout 30s; size 65536; }
 	# puertos origen de reflectores UDP > 1023 (los < 1024 se tiran todos)
 	set amp_sports { type inet_service; elements = { 1900, 3283, 3478, 3702, 5353, 5683, 10001, 11211, 32414, 37810 } }
 
@@ -35,20 +85,26 @@ table netdev haxguard {
 	counter c_deny {}
 	counter c_active {}
 	counter c_pending {}
+	counter c_pending_over {}
 	counter c_amp {}
 	counter c_stun_ok {}
 	counter c_stun_over {}
+	# paquetes STUN de desconocidos que no pudieron entrar en stunrate4/6 (set lleno): el límite por
+	# origen no se aplicó y solo actuó el global. Si crece, hay un flood con orígenes variados.
+	counter c_stun_setfull {}
 	counter c_drop {}
 
 	chain ingress {
 		type filter hook ingress device $WAN priority -500; policy accept;
 
-		# 1) fragmentos UDP (WebRTC nunca fragmenta: DTLS/SCTP < MTU) y tráfico ajeno a las salas
+		# 1) fragmentos UDP IPv4 de cualquier puerto (WebRTC nunca fragmenta: DTLS/SCTP < MTU) y fragmentos
+		#    IPv6; todo lo que no sea UDP a los puertos de sala (TCP, ICMP, ARP/ND y UDP a otros puertos)
+		#    pasa sin filtrar
 		ip frag-off & 0x3fff != 0 meta l4proto udp counter name c_frag drop
 		ip6 nexthdr ipv6-frag counter name c_frag drop
 		udp dport != $ROOM_PORTS accept
 
-		# 2) baneados
+		# 2) baneados (TCP, ICMP y UDP a ROOM_PORTS; el UDP a otros puertos ya salió en 1)
 		ip saddr @deny4 counter name c_deny drop
 		ip6 saddr @deny6 counter name c_deny drop
 
@@ -65,9 +121,9 @@ table netdev haxguard {
 		# 5) reflectores > 1023 (después de active por si un NAT mapea justo ahí)
 		udp sport @amp_sports counter name c_amp drop
 
-		# 6) uniéndose (IPs anunciadas en la oferta)
-		ip saddr . udp dport @pending4 counter name c_pending accept
-		ip6 saddr . udp dport @pending6 counter name c_pending accept
+		# 6) uniéndose (IPs anunciadas en la oferta, sin bogons), con tope por IP y global
+		ip saddr != @bogons4 ip saddr . udp dport @pending4 jump pending_rate
+		ip6 saddr != @bogons6 ip6 saddr . udp dport @pending6 jump pending_rate
 
 		# 7) desconocidos: solo mensajes STUN (2 bits altos = 00, cookie 0x2112A442, >= 20 B): Binding
 		#    Request del cliente y Binding Success Response a los checks del host (el host es el agente
@@ -75,8 +131,8 @@ table netdev haxguard {
 		#    libjuice descarta los que no llevan un ufrag/MESSAGE-INTEGRITY válidos.
 		udp length >= 28 @th,64,2 0 @th,96,32 0x2112a442 jump stun_unknown
 
-		# 8) todo lo demás hacia los puertos de sala
-		counter name c_drop drop
+		# 8) todo lo demás hacia los puertos de sala (solo UDP: lo no-UDP no llega aquí con ROOM_PORTS)
+		udp dport $ROOM_PORTS counter name c_drop drop
 	}
 
 	chain active_rate {
@@ -85,9 +141,23 @@ table netdev haxguard {
 		counter name c_active accept
 	}
 
+	# Un join legítimo emite < 100 pps durante 1-2 s. El tope por IP va primero para que el flood de
+	# una sola IP no consuma el global; el global acota la suma de las IP pending (~3 % de un núcleo).
+	chain pending_rate {
+		meta protocol ip add @pendrate4 { ip saddr limit rate over 500/second burst 300 packets } counter name c_pending_over drop
+		meta protocol ip6 add @pendrate6 { ip6 saddr limit rate over 500/second burst 300 packets } counter name c_pending_over drop
+		limit rate over 10000/second burst 2000 packets counter name c_pending_over drop
+		counter name c_pending accept
+	}
+
+	# El `add` por origen va ANTES del global: una sola IP que inunda se corta con su propio cubo sin
+	# gastar el presupuesto compartido. Si el set está lleno el `add` no inserta y la regla no casa
+	# (fail-open hacia el global): las reglas `!= @stunrate` lo cuentan en c_stun_setfull.
 	chain stun_unknown {
-		meta protocol ip add @stunrate4 { ip saddr limit rate over 5/second burst 10 packets } counter name c_stun_over drop
-		meta protocol ip6 add @stunrate6 { ip6 saddr limit rate over 5/second burst 10 packets } counter name c_stun_over drop
+		meta protocol ip add @stunrate4 { ip saddr & $STUN_V4_MASK limit rate over 5/second burst 10 packets } counter name c_stun_over drop
+		meta protocol ip6 add @stunrate6 { ip6 saddr & $STUN_V6_MASK limit rate over 5/second burst 10 packets } counter name c_stun_over drop
+		meta protocol ip ip saddr & $STUN_V4_MASK != @stunrate4 counter name c_stun_setfull
+		meta protocol ip6 ip6 saddr & $STUN_V6_MASK != @stunrate6 counter name c_stun_setfull
 		limit rate 2000/second burst 500 packets counter name c_stun_ok accept
 		counter name c_stun_over drop
 	}

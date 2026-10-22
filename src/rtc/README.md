@@ -60,9 +60,10 @@ s.onClose = (reason) => {};            // once; never called after a local close
 s.onChannelClose = (channelId) => {};  // the browser closed one channel (dc.close() → stream reset); session still open
 s.send(0, bytes);       // false if not open / buffer full; bytes may be reused after return
 s.remoteAddress;        // { address, port } of the nominated pair, or null
+s.bufferedAmount;      // bytes accepted by send() and not yet acknowledged, every channel (0 once closed): a peer that keeps it high is not reading
 s.close();              // sends SCTP ABORT/close_notify best effort, idempotent
 await ep.close();       // closes every session ('endpoint-closed') and the socket(s)
-ep.stats();             // counters (see RtcEndpointStats in index.ts)
+ep.stats();             // counters (see RtcEndpointStats in index.ts), packetErrors included
 s.cork(); s.send(…); s.send(…); s.uncork(); // bundle several messages into one SCTP packet / DTLS record
 
 // one endpoint (one UDP socket) per process and configuration, refcounted (src/rtc/shared.ts)
@@ -78,6 +79,8 @@ scratch buffer: `transientDelivery`); copy what you keep.
 `'dtls-error:fingerprint-mismatch'`, `'dtls-error:no-client-certificate'`), `'sctp:<reason>'`
 (R2: `shutdown`, `abort`, `timeout`, `init-timeout`…), `'endpoint-closed'`. A local `close()` is
 never reported.
+
+More `onClose` reasons: `'dtls-error:internal-<message>'` (a failure while resending a handshake flight), `'dtls-error:sequence-exhausted'` (the 48-bit write sequence of an epoch ran out: closed asynchronously, no alert is sent), `'sctp:internal-error'` (a bug in a timer-driven send; also passed to `onError`), `'sctp:message-too-large'` (a message filled the receive buffer and already exceeds `maxReceiveMessageSize`) and `'error'` (5 datagrams in a row threw in the session, or its 1 Hz timer check threw). The endpoint discards a datagram whose processing throws, counts it in `ep.stats().packetErrors` and logs it with `console.error('[haxlite/rtc] error processing a …')` at most every 10 s; TURN and ICE-tick errors are logged as `[haxlite/rtc] error in …` without a rate limit. `s.bufferedAmount` is what `PeerLink.queuedBytes` reports to `HostTransport`, which closes a peer that keeps it above `maxPeerBufferedBytes` (1 MiB) for `peerBufferedTimeoutMs` (10 s) with the reason `'stalled'`; a custom backend has to report it for that limit to apply.
 
 ## Contract with R2 — `SctpAssociation` (`src/rtc/sctp/index.ts`)
 
@@ -106,6 +109,7 @@ assoc.close()         // no onClose afterwards
   right away; R2 may also send its own).
 * Path MTU: SCTP packets ≤ 1200 bytes (DTLS adds 29 bytes with AES-GCM, IP/UDP ≤ 48).
 * All callbacks run synchronously from `input()`/timers on the main thread.
+* Defensive limits against a peer that already joined (all preserve what the official client sends): `COOKIE-ECHO` is only processed as the first chunk of a packet (RFC 9260 §5.1); at most 2 RE-CONFIG request parameters per packet (`MAX_RECONF_REQS`), the rest are ignored; the gap blocks of a SACK get a budget equal to the TSNs between the cumulative ack and the last one sent; a FORWARD-TSN gets `4 × rxCap` pending-map reads per packet (`FWD_WORK_PER_SLOT`). The advertised `a_rwnd` is `receiveBufferSize` (default 1 MiB) minus what is held; the next in-order TSN is admitted with one more message of margin (`receiveBufferSize + maxReceiveMessageSize`), and a message that fills that buffer and already exceeds `maxReceiveMessageSize` closes the association with `'message-too-large'`. A failure in a timer-driven send closes it with `'internal-error'`.
 * `RtcEndpoint.listen({ dataLayer })` accepts any other factory `(opts) => SctpAssociationLike`;
   `rawDataLayer` (one DTLS record = one message, `[u8 channel][payload]`) is used by the DTLS
   tests against `openssl s_client`.
@@ -160,6 +164,8 @@ assoc.close()         // no onClose afterwards
   we answer a plain DTLS 1.2 ServerHello (no downgrade sentinel: we are not 1.3-capable), and
   Chromium connects with 1.2 (test/rtc/chromium-dtls.test.ts; also with the dtls13 interop
   condition after the HelloVerifyRequest was dropped).
+* **DTLS record numbers and failures.** Server epoch-0 records (flight 4 and its retransmissions) are numbered from 0 without `helloVerify` (full ICE). With `helloVerify` they continue from the record sequence number of the ClientHello that carries the cookie (its low 32 bits, only when the high 16 are 0; otherwise from 0), so the client's anti-replay window does not drop flight 4 for repeating the HelloVerifyRequest's number (RFC 6347 §4.2.1). Write sequence numbers are 48-bit per epoch; running out closes the session (`dtls-error:sequence-exhausted`) instead of wrapping (RFC 6347 §4.1). A failure while resending a flight closes that session only (`dtls-error:internal-…`) and never reaches the event loop.
+* **TURN relay peers** (`ice-agent.ts`): a session makes relay pairs (and permissions) for at most `MAX_RELAY_PEERS` = 4 live distinct signaled remote addresses and `MAX_RELAY_PEERS_TOTAL` = 8 over its life (a failed or evicted peer frees its slot); peer-reflexive relay pairs do not count. Cloudflare relays for only ~10 peer addresses per allocation (docs/10 §2.2), so one offer cannot use up an allocation. `IceAgent.describe()` reports `relay`. Address classes (`classifyIp`, `gather.ts`): IPv4-compatible `::a.b.c.d` is `reserved`; NAT64 `64:ff9b::/96` and 6to4 `2002::/16` take the class of the embedded IPv4 when it is not public, so `candidatePolicy: 'public'` sends them no checks.
 * Self-signed ECDSA P-256 certificate built with a minimal DER encoder (`cert.ts`), one per
   process by default, generated synchronously (≈ 1 ms; `generateAsync` remains). `loadOrCreate`
   uses synchronous file I/O too: an idle room never starts the libuv thread pool for it.
