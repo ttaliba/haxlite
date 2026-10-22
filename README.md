@@ -164,6 +164,12 @@ room.haxlite.onBeforeOperation = (event, byPlayerId, frame) => true; // false de
 | `setDiscPropertiesFor`, `clearDiscOverrides`… | **visuales privados**: cambia un disco solo en el mundo de un jugador sin desincronizar a nadie (máscaras de visión, marcadores) |
 | `hidePlayerFor`, `showPlayerFor`, `setPlayerHiddenFor`… | **jugadores ocultos**: el jugador desaparece solo para ese espectador (visión por zonas, espectadores que no deben ver a ciertos jugadores). No es seguridad: un cliente modificado sigue pudiendo saber dónde está |
 | `getPlayerConnection(id)` | `auth`, `conn`, IP, IPs *srflx*, ping |
+| `getConnectionQuality(id)` | cómo ha ido la conexión de un jugador, medida por el host: jitter, pings perdidos, inputs tardíos y lag del host, con ~5 min de historial (solo números) |
+| `getStadium()`, `getKickRateLimit()`, `getRecordingInfo()` | el estadio actual como datos (metas, vértices, segmentos…), los límites de patada y el estado de la grabación |
+| `trackTouches`, `getLastTouches()`, `onPlayerTouch` | quién tocó el balón último y penúltimo (para asistencias), opt-in: apagado no cuesta nada |
+| `onTimeLimitReached`, `onPlayerDesyncChange`, `onChatIndicator` | eventos del motor que la API oficial no cablea (fin por tiempo, desincronización, "está escribiendo") |
+| `getRoomSettings()`, `getGameInfo()`, `getPlayerInfo(id)` | estado que la API oficial no deja leer: bloqueo de equipos, estadio actual, fase del partido y quién saca, país y `desync` de un jugador |
+| `getTeamColors(team)`, `onTeamColorsChange` | uniformes de los equipos leídos de forma nativa (la API oficial no los expone) |
 | `setMaxPlayers`, `roomLink`, `frame`, `onError`, `host`, `transport` | utilidades y acceso al motor |
 
 ## Cómo se conectan los jugadores

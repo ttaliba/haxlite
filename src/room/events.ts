@@ -748,6 +748,8 @@ export class SetTeamColorsEvent extends RoomEvent {
     if (!isHostOrAdmin(rs, this.byId) || this.team === TeamId.Spectators) return;
     if (this.team === TeamId.Red) rs.redColors = this.colors;
     else rs.blueColors = this.colors;
+    const h = rs.hooks.onTeamColorsChange;
+    if (h !== null) h(getPlayer(rs, this.byId), this.team, this.colors);
   }
 }
 

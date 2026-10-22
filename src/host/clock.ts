@@ -26,6 +26,8 @@ export const TIMER_SLACK_MS = (process.versions as { bun?: string }).bun !== und
 export class ClockEntry {
   /** Absolute `performance.now()` ms of the next wake-up, Infinity = none. */
   wakeAt = Infinity;
+  /** How late (ms) the last wake-up fired compared with `wakeAt`: the host process was busy or stalled. */
+  lag = 0;
   /** Index in the clock's list, -1 when not registered. */
   index = -1;
   readonly wake: () => void;
@@ -119,6 +121,7 @@ export class SharedClock {
       for (let i = 0; i < list.length; ) {
         const e = list[i]!;
         if (e.wakeAt <= now) {
+          e.lag = now - e.wakeAt;
           e.wakeAt = Infinity;
           try {
             e.wake();

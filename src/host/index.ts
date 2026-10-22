@@ -14,9 +14,26 @@ export {
   defaultStadiumByName,
   type DiscProperties,
   type DiscPropsInput,
+  type GameInfo,
+  type KickRateLimit,
+  type GamePhaseName,
+  type PlayerInfo,
+  type LastTouches,
+  type RecordingInfo,
+  type RoomSettings,
+  type TouchInfo,
   type HostRoomOptions,
   type Scores,
+  type TeamColorsInfo,
 } from './host-room.js';
+export { stadiumObject, type StadiumDisc, type StadiumObject } from './stadium-info.js';
+export {
+  LINK_WINDOWS,
+  LINK_WINDOW_MS,
+  LinkStats,
+  type LinkQuality,
+  type LinkSample,
+} from './link-stats.js';
 export {
   MovingAverage,
   ProtocolViolation,

@@ -438,6 +438,44 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     set onJoinRequest(h: JoinRequestHandler | null) {
       joinHook = h ?? null;
     },
+    onTeamColorsChange: null,
+    onTimeLimitReached: null,
+    onPlayerDesyncChange: null,
+    onChatIndicator: null,
+    onPlayerTouch: null,
+    get trackTouches() {
+      return host.touchTracking;
+    },
+    set trackTouches(on: boolean) {
+      host.setTouchTracking(!!on);
+    },
+    getLastTouches() {
+      return host.getLastTouches();
+    },
+    getStadium() {
+      return host.getStadium();
+    },
+    getKickRateLimit() {
+      return host.getKickRateLimit();
+    },
+    getRecordingInfo() {
+      return host.getRecordingInfo();
+    },
+    getRoomSettings() {
+      return host.getRoomSettings();
+    },
+    getGameInfo() {
+      return host.getGameInfo();
+    },
+    getPlayerInfo(playerId: number) {
+      return host.getPlayerInfo(playerId);
+    },
+    getConnectionQuality(playerId: number) {
+      return host.getLinkQuality(playerId);
+    },
+    getTeamColors(team: TeamID) {
+      return host.getTeamColors(team);
+    },
     onRecaptcha: null,
     onError: null,
     useRecaptchaToken,
@@ -767,6 +805,26 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
   hooks.onKickRateLimitSet = (by, min, rate, burst) => {
     const cb = room.onKickRateLimitSet;
     if (cb != null) cb(min, rate, burst, playerObject(by));
+  };
+  hooks.onTimeLimitReached = () => {
+    const cb = ext.onTimeLimitReached;
+    if (cb != null) cb();
+  };
+  hooks.onPlayerDesyncChange = (p) => {
+    const cb = ext.onPlayerDesyncChange;
+    if (cb != null) cb(playerObject(p)!, p.desync);
+  };
+  hooks.onPlayerTouch = (p, previous) => {
+    const cb = ext.onPlayerTouch;
+    if (cb != null) cb(playerObject(p)!, previous === null ? null : playerObject(previous));
+  };
+  hooks.onChatIndicator = (p, value) => {
+    const cb = ext.onChatIndicator;
+    if (cb != null) cb(playerObject(p)!, value !== 0);
+  };
+  hooks.onTeamColorsChange = (by, team, tc) => {
+    const cb = ext.onTeamColorsChange;
+    if (cb != null) cb(team, { angle: (tc.angle * 360) / 256, textColor: tc.textColor, colors: tc.colors.slice() }, playerObject(by));
   };
   hooks.onTeamsLockChange = (by, locked) => {
     const cb = room.onTeamsLockChange;

@@ -6,6 +6,7 @@
  */
 import type { Disc, Stadium } from '../sim/types.js';
 import { World } from '../sim/types.js';
+import type { TouchTracker } from './touches.js';
 import { GamePhase, TeamId } from '../protocol.js';
 
 /**
@@ -94,6 +95,8 @@ export class Player {
   conn = '';
   /** Public auth key if the identity proof verified, else null. nh `auth`. */
   auth: string | null = null;
+  /** Contact / kick bits kept by {@link TouchTracker} (0 while tracking is off). nh `touchState`. */
+  touchState = 0;
 }
 
 /**
@@ -184,6 +187,10 @@ export class RoomHooks {
   onKickRateLimitSet: ((byPlayer: Player | null, min: number, rate: number, burst: number) => void) | null = null;
   /** off `ii`. */
   onTeamsLockChange: ((byPlayer: Player | null, locked: boolean) => void) | null = null;
+  /** SetTeamColors applied to a team (haxlite; the official host has no such callback). */
+  onTeamColorsChange: ((byPlayer: Player | null, team: TeamId, colors: TeamColors) => void) | null = null;
+  /** A different player than before started touching or kicked a `kick` disc; needs {@link RoomState.touches} (haxlite). */
+  onPlayerTouch: ((player: Player, previous: Player | null) => void) | null = null;
 }
 
 /**
@@ -220,6 +227,8 @@ export class RoomState {
   // ---- not serialized ----
   /** Callback slots (see {@link RoomHooks}). */
   hooks = new RoomHooks();
+  /** Last / previous toucher of the ball; null (the default) = not tracked, no cost. See {@link TouchTracker}. */
+  touches: TouchTracker | null = null;
 
   constructor() {
     this.redColors.colors.push(TEAMS[1].color);

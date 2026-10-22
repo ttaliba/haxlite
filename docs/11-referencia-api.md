@@ -244,6 +244,21 @@ Con edge: `room.haxlite.edgeStats()` devuelve `{ state, dataPlane, roLanes, sess
 | `useRecaptchaToken(respuesta)` | método | - | Reintenta el registro en el maestro con la respuesta al captcha | No hace nada si la sala está parada |
 | `onError` | `((err: unknown) => void) \| null` | `null` (→ `console.error('[haxlite]', err)`) | Errores de callbacks de sala, del transporte y de visuales privados rechazados | Si el propio manejador lanza, se ignora |
 | `getPlayerConnection(playerId)` | `PlayerConnectionInfo \| null` | - | Datos de conexión de un jugador | `null` para el host, ids desconocidos o jugadores ya cerrados |
+| `getTeamColors(team)` | `TeamColorsObject \| null` | - | Uniforme actual del equipo 1 (rojo) o 2 (azul), leído del estado de la sala | `null` para espectadores. Es una copia, con la misma forma que recibe `setTeamColors`: se puede leer y volver a aplicar (p. ej. un `swap`) sin grabar ni parsear un `.hbr2` |
+| `onTeamColorsChange` | `((team: TeamID, colors: TeamColorsObject, byPlayer: PlayerObject \| null) => void) \| null` | `null` | Un uniforme cambió (`setTeamColors` del host o de un admin) | No existe en el oficial |
+| `getRoomSettings()` | `RoomSettings` | - | Lo que la API oficial solo deja escribir: `name`, `teamsLocked`, `scoreLimit`, `timeLimit` (los configurados) y `stadium` (nombre del estadio actual) | |
+| `getGameInfo()` | `GameInfo \| null` | - | `phase` (`'beforeKickOff'` \| `'playing'` \| `'afterGoal'` \| `'ending'`), `paused` (congelada, incluye la cuenta atrás al reanudar) y `kickOffTeam` (1 o 2) | `null` sin partida |
+| `getPlayerInfo(playerId)` | `PlayerInfo \| null` | - | `flag` (país que informó el cliente), `desync` (el cliente se marcó desincronizado), `avatar` (el que eligió), `headlessAvatar` (el puesto con `setPlayerAvatar`) y `avatarNumber` (número del disco) | `null` para ids desconocidos |
+| `getStadium()` | `StadiumObject \| null` | - | El estadio actual como datos: `name`, `builtInId`, `bg`, `goals` (con su `team`), `vertexes`, `segments` (`curve` en grados), `planes`, `discs`, `joints`, puntos de aparición y `playerPhysics` | Copia sin `NaN`/`Infinity` (`strength: 'rigid'`); máscaras de colisión como números. Permite sacar líneas de gol o esquinas del mapa sin fijarlas a mano |
+| `getKickRateLimit()` | `{ min, rate, burst, max }` | - | Los valores actuales de `setKickRateLimit` | Con `rate` 0 el `burst` no se guarda y sale 0 |
+| `getRecordingInfo()` | `{ recording, frames, events, bytes }` | - | Si hay grabación `.hbr2` en curso y cuánto lleva | Barato; no crea el grabador |
+| `trackTouches` | `boolean` | `false` | Activa el rastreo de quién toca el balón. Apagado cuesta una comprobación de `null` por tick; encendido, un 8-11 % más por tick de física (unos 150 ns con 8 jugadores, medido en Node/Windows) | Al encenderlo empieza de cero. Es opt-in a propósito |
+| `getLastTouches()` | `{ last, previous } \| null` | - | Los dos últimos jugadores **distintos** que tocaron el balón desde el último saque, cada uno como `{ playerId, team, time, kick }` (`time` en segundos de partida, `kick` si fue una patada y no un simple roce) | `null` con `trackTouches` apagado; `last`/`previous` son `null` hasta que haya toque. En un `onTeamGoal`, `last` es quien marcó o desvió y `previous` el candidato a asistencia (el script comprueba el equipo). El contacto es físico: un empujón cuenta como toque. Se reinicia en cada saque y al terminar la partida |
+| `onPlayerTouch` | `(player: PlayerObject, previous: PlayerObject \| null) => void` | `null` | Un jugador distinto del anterior toca o patea el balón | Necesita `trackTouches`. `previous` es `null` en el saque o si ya se fue. Volver a tocar el mismo jugador no lo llama |
+| `onTimeLimitReached` | `(() => void) \| null` | `null` | Se acabó el tiempo con marcador **desigual**, justo antes de terminar la partida | Con empate la partida sigue y no se llama. Sirve para distinguir "terminó por tiempo" de "por límite de goles" |
+| `onPlayerDesyncChange` | `(player: PlayerObject, desync: boolean) => void` | `null` | Un cliente se marcó como desincronizado o se recuperó | No existe en el oficial |
+| `onChatIndicator` | `(player: PlayerObject, typing: boolean) => void` | `null` | Un jugador empieza o deja de escribir en el chat | No existe en el oficial |
+| `getConnectionQuality(playerId)` | `LinkQuality \| null` | - | Cómo le ha ido la conexión a un jugador, **medida por el host** | Ver [§2.5b](#25b-calidad-de-conexión). `null` para el host, ids desconocidos o jugadores ya cerrados |
 | `setMaxPlayers(n)` | método | - | Cambia la capacidad en caliente (no es posible en el oficial) | Mismo *cast* y recorte 2..30 que `maxPlayers`. Actualiza el cartel de la lista pública |
 | `setDiscPropertiesFor(viewerId, discIndex, props, opts?)` | método | - | Cambia un disco **solo** para un jugador | Ver [§2.6](#26-visuales-privados-y-jugadores-ocultos) |
 | `clearDiscOverrides(viewerId)` | método | - | Restaura los valores de la sala en los discos modificados para ese jugador | |
@@ -291,6 +306,23 @@ Con edge: `room.haxlite.edgeStats()` devuelve `{ state, dataPlane, roLanes, sess
 | `srflxIps` | `readonly string[]` | IPs *server-reflexive* de sus candidatos |
 | `ping` | `number` | ping declarado por el cliente (ms) |
 | `remoteAddress` | `string \| null` | dirección remota del par ICE elegido (vista por este host, o por el edge) |
+
+**`TeamColorsObject`** (lo que devuelve `getTeamColors`): `{ angle: number, textColor: number, colors: number[] }`. `angle` en grados (el estado lo guarda como `u8`, `256·grados/360`, y leído y reescrito da el mismo valor), `textColor` y hasta 3 `colors` como `0xRRGGBB`.
+
+### 2.5b Calidad de conexión
+
+El ping que ve la sala lo **declara el propio cliente** (mediana de 50 muestras de su RTT): no enseña picos ni dice quién los causa. `room.haxlite.getConnectionQuality(id)` lo mide en el host con lo que ya recibe:
+
+| Señal | De dónde sale | Qué indica |
+|---|---|---|
+| `jitter`, `uplinkDelay` | hora de llegada de cada ping menos el reloj del cliente (`echo`); solo se compara consigo misma, no hace falta sincronizar relojes | cola/variación en la **subida** del jugador |
+| `lostPings` | huecos de más de 1,5 s entre pings (el cliente manda 1 por segundo) | pérdida o congelación del lado del jugador (p. ej. pestaña en segundo plano) |
+| `lateInputs` / `inputs` | inputs que llegaron cuando su frame ya se había simulado | el jugador juega con retraso real |
+| `hostLag` | cuánto tarde dispara el temporizador del propio host | el proceso del host se atascó (event loop, GC, CPU); afecta a **todos** a la vez |
+
+Son solo números, sin veredicto: tú decides qué es demasiado. Un `hostLag` alto en varios jugadores a la vez no es de ellos, y durante un atasco del host sus números de subida también se inflan. `history` guarda ~5 min en ventanas de 10 s (`t` en ms desde que entró, la última sigue abierta) y `totals` acumula la sesión.
+
+Límites: la bajada del jugador no se mide directamente (solo se ve en el `ping` declarado), y un cliente modificado puede mentir en `echo`; es un diagnóstico, no una prueba antitrampas. Coste: unas operaciones aritméticas por ping (≈ 17 ns, 1 por segundo y jugador) y dos incrementos por input; sin temporizadores ni asignaciones hasta que se pide el informe.
 
 ### 2.6 Visuales privados y jugadores ocultos
 

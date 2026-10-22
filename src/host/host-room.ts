@@ -22,7 +22,7 @@
  */
 import { Reader, Writer } from '../codec/index.js';
 import type { HostTransport, JoinInfo, Peer, PeerCloseReason } from '../net/index.js';
-import { Channel, ClientMsg, EventType, TICKS_PER_MS, TeamId } from '../protocol.js';
+import { Channel, ClientMsg, EventType, GamePhase, TICKS_PER_MS, TeamId } from '../protocol.js';
 import {
   JoinRoomEvent,
   KickBanPlayerEvent,
@@ -46,6 +46,7 @@ import {
   TeamColors,
   DiscProp,
   PAUSED_TICKS,
+  TouchTracker,
   createRoomState,
   getPlayer,
   Player,
@@ -56,6 +57,8 @@ import {
 import { defaultStadium, parseHbs, type Disc, type Stadium } from '../sim/index.js';
 import { ReplayRecorder } from '../replay/index.js';
 import { ClockEntry, hostClock } from './clock.js';
+import { stadiumObject, type StadiumObject } from './stadium-info.js';
+import { HostLagTrack, LinkStats, type LinkQuality } from './link-stats.js';
 import {
   ProtocolViolation,
   Sequencer,
@@ -131,11 +134,15 @@ export class HostConnection extends SequencerClient {
   /** Removed from the room's connection tables. */
   closed = false;
 
-  constructor(playerId: number, peer: Peer, auth: string | null, conn: string) {
+  /** Connection quality measured by the host (see link-stats.ts). */
+  readonly link: LinkStats;
+
+  constructor(playerId: number, peer: Peer, auth: string | null, conn: string, now = 0, hostLag?: HostLagTrack) {
     super(playerId);
     this.peer = peer;
     this.auth = auth;
     this.conn = conn;
+    this.link = new LinkStats(now, this, hostLag);
   }
 }
 
@@ -163,6 +170,89 @@ export interface Scores {
   time: number;
   scoreLimit: number;
   timeLimit: number;
+}
+
+/** Room settings the official API only lets you write. */
+export interface RoomSettings {
+  name: string | null;
+  teamsLocked: boolean;
+  /** Configured limits (`setScoreLimit` / `setTimeLimit`); the running game keeps its own copy. */
+  scoreLimit: number;
+  /** Minutes. */
+  timeLimit: number;
+  /** Name of the current stadium. */
+  stadium: string | null;
+}
+
+export type GamePhaseName = 'beforeKickOff' | 'playing' | 'afterGoal' | 'ending';
+
+/** Running game details `getScores` does not give. */
+export interface GameInfo {
+  phase: GamePhaseName;
+  /** Frozen: fully paused or in the short resume countdown. */
+  paused: boolean;
+  /** Team that kicks off (the one that conceded last; red at the start). */
+  kickOffTeam: 1 | 2;
+}
+
+/** Per-player model fields the official `PlayerObject` leaves out. */
+export interface PlayerInfo {
+  /** Country code the client reported (null if none). */
+  flag: string | null;
+  /** Avatar the player chose (<= 2 chars), null if none. */
+  avatar: string | null;
+  /** Avatar set by the host with `setPlayerAvatar`; it overrides `avatar` on screen. */
+  headlessAvatar: string | null;
+  /** Number drawn on the disc (1-based slot in the team, set on reset / join). */
+  avatarNumber: number;
+  /** The client flagged itself as desynchronized (SetPlayerSync). */
+  desync: boolean;
+}
+
+const PHASE_NAMES: readonly GamePhaseName[] = ['beforeKickOff', 'playing', 'afterGoal', 'ending'];
+
+/** Kick-rate limit as `setKickRateLimit(min, rate, burst)` takes it. */
+export interface KickRateLimit {
+  min: number;
+  rate: number;
+  /** `max / rate`; 0 when `rate` is 0 (the burst is not stored then). */
+  burst: number;
+  /** The stored bucket size (`rate x burst`). */
+  max: number;
+}
+
+/** State of the `.hbr2` recording. */
+export interface RecordingInfo {
+  recording: boolean;
+  /** Frames (1/60 s) since `startRecording`. */
+  frames: number;
+  events: number;
+  /** Uncompressed size so far. */
+  bytes: number;
+}
+
+/** One touch of the ball. */
+export interface TouchInfo {
+  playerId: number;
+  /** Team the player was on at the time (1 red, 2 blue). */
+  team: number;
+  /** Game seconds (`getScores().time`) when it happened. */
+  time: number;
+  /** A kick; false = the player's disc just touched the ball. */
+  kick: boolean;
+}
+
+/** `previous` is always a different player than `last`; a field is null until there is such a touch. */
+export interface LastTouches {
+  last: TouchInfo | null;
+  previous: TouchInfo | null;
+}
+
+/** A team's kit as `setTeamColors` takes it (`angle` in degrees). */
+export interface TeamColorsInfo {
+  angle: number;
+  textColor: number;
+  colors: number[];
 }
 
 export type DiscPropsInput = Partial<Record<DiscPropName | 'bCoeff', number | null>>;
@@ -1027,6 +1117,103 @@ export class HostRoom {
     return getPlayer(this.state, playerId);
   }
 
+  /** Current kit of team 1 (red) or 2 (blue); null for spectators. A copy: `setTeamColors(team, ...)` accepts it as is. */
+  getTeamColors(team: number): TeamColorsInfo | null {
+    const t = teamOf(team);
+    if (t === TeamId.Spectators) return null;
+    const tc = t === TeamId.Red ? this.state.redColors : this.state.blueColors;
+    return { angle: (tc.angle * 360) / 256, textColor: tc.textColor, colors: tc.colors.slice() };
+  }
+
+  /**
+   * How `playerId`'s connection has gone, measured here (the declared ping is
+   * whatever the client says): jitter, lost pings, late inputs, host timer lag,
+   * and ~5 min of 10 s windows. Numbers only, no verdict.
+   * null for unknown ids and the host player. See link-stats.ts.
+   */
+  getLinkQuality(playerId: number): LinkQuality | null {
+    const c = this.connections.get(playerId);
+    if (c === undefined || c.closed) return null;
+    return c.link.report(playerId, this.now());
+  }
+
+  getRoomSettings(): RoomSettings {
+    const rs = this.state;
+    return {
+      name: rs.name,
+      teamsLocked: rs.teamsLocked,
+      scoreLimit: rs.scoreLimit,
+      timeLimit: rs.timeLimit,
+      stadium: rs.stadium === null ? null : rs.stadium.name,
+    };
+  }
+
+  /** null without a game. */
+  getGameInfo(): GameInfo | null {
+    const gs = this.state.gameState;
+    if (gs === null) return null;
+    return {
+      phase: PHASE_NAMES[gs.phase] ?? PHASE_NAMES[GamePhase.BeforeKickOff]!,
+      paused: gs.pauseGameTickCounter > 0,
+      kickOffTeam: gs.goalConcedingTeam === TeamId.Blue ? 2 : 1,
+    };
+  }
+
+  /** The room's current stadium as plain data (geometry, goals, discs, spawn points…); null if none. */
+  getStadium(): StadiumObject | null {
+    const st = this.state.stadium;
+    return st === null ? null : stadiumObject(st);
+  }
+
+  getKickRateLimit(): KickRateLimit {
+    const rs = this.state;
+    return { min: rs.kickRateMin, rate: rs.kickRateRate, burst: rs.kickRateRate > 0 ? rs.kickRateMax / rs.kickRateRate : 0, max: rs.kickRateMax };
+  }
+
+  /** Does not create the recorder when nothing was ever recorded. */
+  getRecordingInfo(): RecordingInfo {
+    const r = this.rec;
+    if (r === null || !r.isRecording) return { recording: false, frames: 0, events: 0, bytes: 0 };
+    return { recording: true, frames: this.sequencer.frame - r.firstFrame, events: r.recordedEvents, bytes: r.bodyLength };
+  }
+
+  /**
+   * Turns last / previous toucher tracking on or off (off by default: while off
+   * the game tick only pays one null check). Switching it on starts from
+   * "nobody has touched the ball".
+   */
+  setTouchTracking(on: boolean): void {
+    const rs = this.state;
+    if (!on) {
+      rs.touches = null;
+      for (let i = 0; i < rs.players.length; i++) rs.players[i]!.touchState = 0;
+    } else if (rs.touches === null) {
+      rs.touches = new TouchTracker();
+      rs.touches.reset(rs);
+    }
+  }
+
+  get touchTracking(): boolean {
+    return this.state.touches !== null;
+  }
+
+  /** null when tracking is off; otherwise the last two different players to touch the ball since the last kick-off. */
+  getLastTouches(): LastTouches | null {
+    const t = this.state.touches;
+    if (t === null) return null;
+    return {
+      last: t.lastId === -1 ? null : { playerId: t.lastId, team: t.lastTeam, time: t.lastTime, kick: t.lastKick },
+      previous: t.prevId === -1 ? null : { playerId: t.prevId, team: t.prevTeam, time: t.prevTime, kick: t.prevKick },
+    };
+  }
+
+  getPlayerInfo(playerId: number): PlayerInfo | null {
+    const p = getPlayer(this.state, playerId);
+    return p === null
+      ? null
+      : { flag: p.flag, desync: p.desync, avatar: p.avatar, headlessAvatar: p.headlessAvatar, avatarNumber: p.avatarNumber };
+  }
+
   /** Official `getScores` (null without a game; `timeLimit` in seconds). */
   getScores(): Scores | null {
     const gs = this.state.gameState;
@@ -1200,12 +1387,15 @@ export class HostRoom {
   /** Pre-bound so wake-ups allocate nothing. */
   private readonly catchUpFn = (): void => this.catchUp();
   private readonly pingFn = (): void => this.broadcastPings();
+  /** Worst lateness of this room's timer per 10 s window (link quality: host side). */
+  private readonly hostLag = new HostLagTrack();
 
   /** Shared clock callback: Ping event if due, else catch up. */
   private onWake(): void {
     this.wakeFrame = NaN; // always hand the clock a fresh wake-up time
     if (!this.running) return;
     const now = this.now();
+    this.hostLag.note(now, this.clockEntry.lag);
     if (now >= this.nextPingAt) {
       // setInterval-like cadence; never fire twice in a row after a stall
       let next = this.pingDue + this.pingIntervalMs;
@@ -1394,7 +1584,7 @@ export class HostRoom {
       if (peer.state !== 'joined' || !this.running) return;
       this.catchUp();
       const id = this.nextPlayerId++;
-      const c = new HostConnection(id, peer, info.auth, info.conn);
+      const c = new HostConnection(id, peer, info.auth, info.conn, this.now(), this.hostLag);
       peer.playerId = id;
       peer.userData = c;
       this.connections.set(id, c);
@@ -1467,7 +1657,9 @@ export class HostRoom {
     const echo = r.f64();
     c.ping = r.varUint();
     if (r.remaining > 0) throw new ProtocolViolation('trailing bytes');
-    const hostFrame = (this.now() - this.startTime) * TICKS_PER_MS + this.sequencer.inputDelayFrames;
+    const now = this.now();
+    c.link.onPing(now, echo, c.ping);
+    const hostFrame = (now - this.startTime) * TICKS_PER_MS + this.sequencer.inputDelayFrames;
     this.transport.send(c.peer, Channel.Unreliable, encodePong(this.pongWriter, hostFrame, echo));
   }
 

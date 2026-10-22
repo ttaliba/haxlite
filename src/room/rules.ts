@@ -115,6 +115,7 @@ function initGameState(rs: RoomState, gs: GameState): void {
 /** Destroys the game (StopGame / end of Ending phase): players lose disc and number. */
 export function destroyGame(rs: RoomState): void {
   rs.gameState = null;
+  if (rs.touches !== null) rs.touches.reset(rs);
   const players = rs.players;
   for (let i = 0; i < players.length; i++) {
     const p = players[i]!;
@@ -172,6 +173,7 @@ export function spawnPlayerDisc(gs: GameState, player: Player): void {
 export function resetPositions(rs: RoomState, gs: GameState): void {
   const players = rs.players;
   gs.phase = GamePhase.BeforeKickOff;
+  if (rs.touches !== null) rs.touches.reset(rs);
   const stadium = gs.stadium!;
   const sDiscs = stadium.discs;
   const wDiscs = gs.world.discs;
@@ -307,6 +309,7 @@ function stepGame(rs: RoomState, gs: GameState): void {
       }
       if (kicked) {
         if (hooks.onPlayerBallKick !== null) hooks.onPlayerBallKick(p);
+        if (rs.touches !== null && gs.phase <= GamePhase.Playing) rs.touches.kick(rs, p, gs.timeElapsed);
         p.isKicking = false;
         p.kickRateMinTickCounter = rs.kickRateMin;
         p.kickRateMaxTickCounter -= rs.kickRateRate;
@@ -344,6 +347,7 @@ function stepGame(rs: RoomState, gs: GameState): void {
   stepWorld(gs.world, 1);
 
   const phase = gs.phase;
+  if (rs.touches !== null && phase <= GamePhase.Playing) rs.touches.contacts(rs, gs);
   if (phase === GamePhase.BeforeKickOff) {
     const mask = PLAYER_CMASK | TEAMS[gs.goalConcedingTeam].koFlag;
     for (let i = 0; i < players.length; i++) {

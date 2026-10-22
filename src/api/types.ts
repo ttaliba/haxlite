@@ -22,7 +22,17 @@ import type {
   RtcBackendOptions,
 } from '../net/index.js';
 import type { RtcEndpointStats } from '../rtc/index.js';
-import type { HostRoom } from '../host/index.js';
+import type {
+  GameInfo,
+  HostRoom,
+  KickRateLimit,
+  LastTouches,
+  LinkQuality,
+  PlayerInfo,
+  RecordingInfo,
+  RoomSettings,
+  StadiumObject,
+} from '../host/index.js';
 import type { RoomEvent } from '../room/index.js';
 
 /** 0 = spectators, 1 = red, 2 = blue. */
@@ -354,6 +364,13 @@ export interface HaxliteBans {
   isAuthBanned(auth: string | null): boolean;
 }
 
+/** A team's kit: `angle` in degrees, `textColor` and up to 3 `colors` as `0xRRGGBB`. */
+export interface TeamColorsObject {
+  angle: number;
+  textColor: number;
+  colors: number[];
+}
+
 /** `room.haxlite`: namespaced haxlite extensions. */
 export interface HaxliteRoomExtensions {
   /** Input delay `Sb` (frames). Live-tunable. */
@@ -387,6 +404,78 @@ export interface HaxliteRoomExtensions {
   onError: ((err: unknown) => void) | null;
   /** Retries the master registration with a reCAPTCHA response. */
   useRecaptchaToken(response: string): void;
+
+  /**
+   * Current kit of team 1 (red) or 2 (blue), null for spectators. Same shape
+   * as `setTeamColors(team, angle, textColor, colors)` takes, so a kit can be
+   * read and re-applied (e.g. swapping sides) without a recording. The
+   * official host has no such getter.
+   */
+  getTeamColors(team: TeamID): TeamColorsObject | null;
+  /**
+   * The time limit ran out with an untied score, right before the game ends
+   * (so a script can tell "ended by time" from "ended by score limit"). A
+   * tied game at the limit just keeps playing and does not call this.
+   */
+  onTimeLimitReached: (() => void) | null;
+  /** A player's client flagged itself as desynchronized (`desync` true) or recovered. Not in the official API. */
+  onPlayerDesyncChange: ((player: PlayerObject, desync: boolean) => void) | null;
+  /** A player started or stopped typing in the chat. Not in the official API. */
+  onChatIndicator: ((player: PlayerObject, typing: boolean) => void) | null;
+  /** A team's kit changed (`setTeamColors`, by the host or an admin). Not in the official API. */
+  onTeamColorsChange: ((team: TeamID, colors: TeamColorsObject, byPlayer: PlayerObject | null) => void) | null;
+
+  /** Settings the official API only lets you write: `teamsLocked`, configured limits, current stadium name, room name. */
+  getRoomSettings(): RoomSettings;
+  /** Phase (`beforeKickOff` / `playing` / `afterGoal` / `ending`), whether the game is frozen and who kicks off; null without a game. */
+  getGameInfo(): GameInfo | null;
+  /**
+   * The current stadium as plain data (copy): name, bg, `goals` with their
+   * team, `vertexes`, `segments` (`curve` in degrees), `planes`, `discs`,
+   * `joints`, spawn points and `playerPhysics`. Lets a script derive goal
+   * lines, corners or field limits from the map instead of hardcoding them.
+   * The official API only lets you set a stadium. null if none.
+   */
+  getStadium(): StadiumObject | null;
+  /** Current `setKickRateLimit` values (the official API has no getter). */
+  getKickRateLimit(): KickRateLimit;
+  /** Is a `.hbr2` recording running, and how many frames / events / bytes it holds. Cheap; creates nothing. */
+  getRecordingInfo(): RecordingInfo;
+  /** `flag`, `desync`, `avatar`, `headlessAvatar` and `avatarNumber` of a player, which `PlayerObject` leaves out; null for unknown ids. */
+  getPlayerInfo(playerId: number): PlayerInfo | null;
+  /**
+   * How a player's connection has gone, measured by the host instead of
+   * trusting the ping the client declares: uplink jitter and delay, lost
+   * pings, inputs that arrived late, the host's own timer lag, and ~5
+   * minutes of 10 s windows (`history`). Host lag hits every player at once
+   * and inflates their numbers; the rest points at the player's own
+   * connection (Wi-Fi, a background browser tab…). Numbers only: no verdict.
+   * null for unknown ids and the host player. Costs a few arithmetic
+   * operations per ping message.
+   */
+  getConnectionQuality(playerId: number): LinkQuality | null;
+
+  /**
+   * Turns on last / previous toucher tracking (off by default; off costs one
+   * null check per tick, on roughly 8-11 % of a physics tick, ~150 ns with 8 players). Reading it back
+   * tells whether it is on. Switching it on starts from "nobody touched".
+   */
+  trackTouches: boolean;
+  /**
+   * The last two DIFFERENT players to touch the ball since the last kick-off,
+   * each as `{ playerId, team, time, kick }` (`time` = game seconds, `kick` =
+   * a kick rather than plain contact): at an `onTeamGoal` call `last` is
+   * whoever scored or deflected it, and `previous` the assist candidate (the
+   * script checks the team). null while `trackTouches` is off. Contact is
+   * physical, so a push counts like a touch.
+   */
+  getLastTouches(): LastTouches | null;
+  /**
+   * A player other than the previous one touched or kicked the ball; `previous`
+   * is the player it came from (null at kick-off or if they left). Needs
+   * `trackTouches`. Not in the official API.
+   */
+  onPlayerTouch: ((player: PlayerObject, previous: PlayerObject | null) => void) | null;
 
   /** Connection details of a joined player (null for the host player / unknown ids). */
   getPlayerConnection(playerId: number): PlayerConnectionInfo | null;

@@ -3,6 +3,20 @@
  * (official methods + on* callbacks) plus the namespaced `room.haxlite`
  * extensions. See README.md (sección haxlite) and src/host/README.md.
  */
+export type {
+  GameInfo,
+  GamePhaseName,
+  KickRateLimit,
+  LastTouches,
+  LinkQuality,
+  LinkSample,
+  PlayerInfo,
+  RecordingInfo,
+  RoomSettings,
+  StadiumDisc,
+  StadiumObject,
+  TouchInfo,
+} from '../host/index.js';
 export { HBInit, InvalidRoomTokenError, CollisionFlags, InputFlags } from './hbinit.js';
 export type {
   AnnouncementSound,
@@ -23,5 +37,6 @@ export type {
   RoomConfigObject,
   RoomObject,
   ScoresObject,
+  TeamColorsObject,
   TeamID,
 } from './types.js';

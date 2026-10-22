@@ -185,6 +185,9 @@ export class SequencerClient {
   readonly limiters: (TokenBucket | null)[] = [];
   /** Ping the client declares in its ping messages (off `ad`), broadcast by the Ping event. */
   ping = 0;
+  /** Input events (`delay` type) received, and those that arrived after the frame they asked for (link quality). */
+  inputCount = 0;
+  lateCount = 0;
 
   constructor(playerId: number) {
     this.playerId = playerId;
@@ -720,6 +723,8 @@ export class Sequencer {
     let f = requested < cur ? cur : requested > max ? max : requested;
     const lateness = requested - target;
     if (delay) {
+      client.inputCount++;
+      if (requested < cur) client.lateCount++;
       if (lateness < -sb - 3) f = target;
       else client.lateness.push(lateness < -sb ? -sb : lateness > sb ? sb : lateness);
       if (f < target && client.lateness.mean < -0.85) f = target;

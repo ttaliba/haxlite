@@ -137,6 +137,10 @@ facade's. Mapping to the official `HBInit` callbacks (from `hl.js` `F.fi`):
 | `onStadiumChange(by, stadium)` | `onStadiumChange(stadium.name, byPlayer)` |
 | `onKickRateLimitSet(by, min, rate, burst)` | `onKickRateLimitSet(min, rate, burst, byPlayer)` |
 | `onTeamsLockChange(by, locked)` | `onTeamsLockChange(locked, byPlayer)` |
+| `onTimeLimitReached()` | `haxlite.onTimeLimitReached()` (haxlite only) |
+| `onPlayerDesyncChange(player)` | `haxlite.onPlayerDesyncChange(player, desync)` (haxlite only) |
+| `onChatIndicator(player, value)` | `haxlite.onChatIndicator(player, typing)` (haxlite only) |
+| `onTeamColorsChange(by, team, colors)` | `haxlite.onTeamColorsChange(team, colors, byPlayer)` (haxlite only) |
 
 Official HBInit does NOT wire `onPlayerChat` (applied chat), `onChatIndicator`, `onAnnouncement`,
 `onPlayerDesyncChange`, `onConsistencyResult`, `onTimeLimitReached`; they are free extensions.
@@ -170,7 +174,7 @@ are thrown synchronously, as official.
 
 `getPlayerList()` / `getPlayer(id)` return live `Player` model objects (convert to HBInit
 `PlayerObject`: `{name, team, id, admin, position: disc ? {x, y} : null, auth, conn}`),
-`getScores()` (`timeLimit` in seconds), `getBallPosition()`, `getDiscProperties(i)`,
+`getLinkQuality(id)` (host-measured jitter / lost pings / late inputs / host timer lag, link-stats.ts), `getRoomSettings()`, `getGameInfo()`, `getPlayerInfo(id)`, `getStadium()` (plain data, src/host/stadium-info.ts), `getKickRateLimit()`, `getRecordingInfo()`, `setTouchTracking(on)` / `getLastTouches()` (opt-in last / previous ball toucher, src/room/touches.ts), `getScores()` (`timeLimit` in seconds), `getTeamColors(team)` (degrees, like `setTeamColors`), `getBallPosition()`, `getDiscProperties(i)`,
 `getPlayerDiscProperties(id)` (HBInit `DiscPropertiesObject`, `bCoeff`), `getDiscCount()`,
 `getConnection(id)` (peer, IP…), `frame`, `state`, `transport`, `sequencer`, `recorder`.
 
