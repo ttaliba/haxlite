@@ -26,6 +26,7 @@ import {
 import { defaultStadiums } from '../../src/sim/index.js';
 import { HostRoom, createHostRoomState, type HostRoomOptions } from '../../src/host/index.js';
 import { sleep, waitFor, withTimeout } from './harness.js';
+import { testTransportBackend } from '../peer-backend-env.js';
 
 let master: FakeMaster;
 const hosts: HostRoom[] = [];
@@ -42,7 +43,7 @@ afterAll(async () => {
 });
 
 async function startHost(opts: Partial<HostRoomOptions> = {}): Promise<{ host: HostRoom; roomId: string }> {
-  const transport = new HostTransport({ token: 'thr1.test', masterUrl: master.httpBase, iceServers: [], public: true });
+  const transport = new HostTransport({ token: 'thr1.test', masterUrl: master.httpBase, iceServers: [], public: true, ...testTransportBackend() });
   const host = new HostRoom({ state: createHostRoomState({ roomName: 'raw' }), ...opts, transport });
   hosts.push(host);
   const room = master.waitForRoom();

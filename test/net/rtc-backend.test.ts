@@ -18,6 +18,7 @@ import {
   type Peer,
   type PeerCloseReason,
 } from '../../src/net/index.js';
+import { resolvePeerBackend } from '../../src/net/transport.js';
 import { closeNative } from '../../src/net/webrtc.js';
 import { FakeStunServer } from '../rtc/nat-sim.js';
 
@@ -75,6 +76,23 @@ const nextClose = (t: HostTransport) =>
   withTimeout(new Promise<{ peer: Peer; reason: PeerCloseReason }>((resolve) => (t.onPeerClose = (peer, reason) => resolve({ peer, reason }))), 15_000, 'close');
 
 describe("peerBackend: 'rtc' configuration", () => {
+  it("is the default; node-datachannel settings (portRange, rtc) keep 'ndc' so they are not ignored", () => {
+    expect(resolvePeerBackend({})).toBe('rtc');
+    expect(resolvePeerBackend({ portRange: null, rtc: undefined })).toBe('rtc');
+    expect(resolvePeerBackend({ portRange: [40000, 40100] })).toBe('ndc');
+    expect(resolvePeerBackend({ rtc: { enableIceUdpMux: false } })).toBe('ndc');
+    expect(resolvePeerBackend({ peerBackend: 'rtc', portRange: [40000, 40100] })).toBe('rtc');
+    expect(resolvePeerBackend({ peerBackend: 'ndc' })).toBe('ndc');
+    expect(() => resolvePeerBackend({ peerBackend: 'bogus' as 'rtc' })).toThrow(/peerBackend/);
+    const base = { token: 't', masterUrl: 'http://127.0.0.1:9/' };
+    const implicit = new HostTransport(base);
+    expect(implicit.backend).toBeInstanceOf(RtcPeerBackend);
+    implicit.stop();
+    const ndc = new HostTransport({ ...base, portRange: [40000, 40100] });
+    expect(ndc.backend).not.toBeInstanceOf(RtcPeerBackend);
+    ndc.stop();
+  });
+
   it('publicAddresses must be IP literals; an empty list or an unknown backend is refused at construction', () => {
     const base = { token: 't', masterUrl: 'http://127.0.0.1:9/' };
     expect(() => new HostTransport({ ...base, peerBackend: 'rtc', rtcEndpoint: { publicAddresses: ['example.com'] } })).toThrow(/IP literals/);

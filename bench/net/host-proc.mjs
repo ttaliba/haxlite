@@ -125,6 +125,8 @@ const BUILTIN_VARIANTS = {
 };
 
 function variantOf(name) {
+  // plain `haxlite` is node-datachannel, as in every published table (the library default is now 'rtc')
+  if (name === 'haxlite') return BUILTIN_VARIANTS.ndc;
   if (!name.startsWith('haxlite:')) return {};
   const all = { ...BUILTIN_VARIANTS, ...JSON.parse(process.env.HAXLITE_BENCH_VARIANTS ?? '{}') };
   const v = all[name.slice('haxlite:'.length)];

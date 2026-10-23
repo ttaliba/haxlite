@@ -149,8 +149,8 @@ haxlite puede terminar las conexiones WebRTC de los jugadores de tres maneras. P
 
 | Opción | Pila | Notas |
 |---|---|---|
-| `peerBackend: 'ndc'` (por defecto) | node-datachannel / libdatachannel (nativo, opcional) | ICE completo con STUN, funciona tras NAT. Soporta TURN UDP/TCP/TLS |
-| `peerBackend: 'rtc'` | **haxlite-rtc**: TypeScript puro (ICE, DTLS 1.2, SCTP), un solo puerto UDP para todos los jugadores, sin hilos nativos | ≈ la mitad de CPU por jugador. Por defecto ICE completo con STUN (funciona tras NAT); TURN UDP. [docs/10](10-haxlite-rtc.md) |
+| `peerBackend: 'rtc'` (por defecto) | **haxlite-rtc**: TypeScript puro (ICE, DTLS 1.2, SCTP), un solo puerto UDP para todos los jugadores, sin hilos nativos | Mucha menos CPU por jugador. Por defecto ICE completo con STUN (funciona tras NAT); TURN UDP. [docs/10](10-haxlite-rtc.md) |
+| `peerBackend: 'ndc'` | node-datachannel / libdatachannel (nativo, opcional) | ICE completo con STUN, funciona tras NAT. Soporta TURN UDP/TCP/TLS |
 | `edge: { url, key }` | un [haxlite Edge](09-haxlite-edge.md) remoto termina el WebRTC | La IP del host nunca llega a un jugador |
 
 #### `iceServers`
@@ -166,7 +166,7 @@ Relay-only (la IP del host no aparece): `rtc: { iceTransportPolicy: 'relay' }` c
 
 #### `peerBackend`
 
-`'ndc' | 'rtc'`, por defecto `'ndc'`. Cualquier otro valor lanza `TypeError: peerBackend must be 'ndc' or 'rtc'` (rechaza `HBInit`). `rtc` solo se usa con `peerBackend: 'rtc'` y se ignora con `'ndc'` o con `edge`.
+`'ndc' | 'rtc'`, por defecto `'rtc'`; sin `peerBackend` pero con `transport.portRange` o `transport.rtc` (ajustes de node-datachannel) se usa `'ndc'`, para que esos ajustes no se ignoren en silencio. Con la política de candidatos por defecto (`'public'`), `rtc` no envía comprobaciones ICE a direcciones privadas ni de loopback del jugador (una oferta manipulada no puede hacer que el host sondee su LAN): un bot en la misma LAN o máquina que el host conecta por la IP pública (*hairpinning* del router); si el router no lo hace, usa `transport: { iceCandidatePolicy: 'private' }` o `peerBackend: 'ndc'`. Cualquier otro valor lanza `TypeError: peerBackend must be 'ndc' or 'rtc'` (rechaza `HBInit`). `rtc` solo se usa con `peerBackend: 'rtc'` y se ignora con `'ndc'` o con `edge`.
 
 #### `rtc` (tipo `RtcBackendOptions`)
 

@@ -75,7 +75,11 @@ Opciones de `config.haxlite.transport` (se pasan tal cual a `HostTransport`).
 
 ## 7. haxlite-rtc
 
-Sin opciones y sin efecto en clientes oficiales. Cambia lo que ocurre con pares hostiles o con fallos internos: ver [docs/10 §2.1 y §2.2](10-haxlite-rtc.md).
+| Cambio | Antes | Ahora | Cómo restaurar el comportamiento anterior | A quién afecta |
+|---|---|---|---|---|
+| Backend de jugadores por defecto | `peerBackend` sin dar = `'ndc'` (node-datachannel) | `'rtc'` (haxlite-rtc, TypeScript puro: un socket UDP, sin hilos nativos, mucha menos CPU por jugador). Sin `peerBackend`, dar `transport.portRange` o `transport.rtc` sigue eligiendo `'ndc'`. `HBInit` se resuelve cuando el socket UDP escucha (como ya hacía con `'rtc'`). Con la política de candidatos por defecto no se envían checks ICE a direcciones privadas ni de loopback del jugador | `haxlite: { peerBackend: 'ndc' }` (o `HostTransport({ peerBackend: 'ndc' })`) | Bots de node-haxball en la misma LAN o máquina que el host con un router sin *hairpinning* (alternativa: `transport: { iceCandidatePolicy: 'private' }`, que también anuncia la IP de LAN del host); quien necesita TURN por TCP/TLS; quien leía `rtcStats()`/`rtcPort` esperando `null` |
+
+Lo demás de esta sección no tiene opciones ni efecto en clientes oficiales. Cambia lo que ocurre con pares hostiles o con fallos internos: ver [docs/10 §2.1 y §2.2](10-haxlite-rtc.md).
 
 | Cambio | Antes | Ahora | Cómo restaurar el comportamiento anterior | A quién afecta |
 |---|---|---|---|---|

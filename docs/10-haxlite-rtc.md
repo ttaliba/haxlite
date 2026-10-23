@@ -279,7 +279,7 @@ Las salas de un mismo proceso con la misma configuración comparten endpoint aun
 credenciales distintas (la clave de compartición ignora usuario/clave); vale la última
 `setIceServers`.
 
-## 3. Cómo activarlo: `peerBackend: 'rtc'`
+## 3. Cómo configurarlo: `peerBackend: 'rtc'` (por defecto)
 
 ```ts
 // HBInit
@@ -1085,13 +1085,16 @@ así una sala inactiva no arranca los 4 hilos del *thread pool* de libuv.
   pendientes (§5.2). IPv6 (opcional, `ipv6: true`) no se pudo probar en esta VM.
 - La IP pública se autodetecta por STUN (el maestro no la da: el protocolo no la transmite).
 
-**Propuesta (no aplicada) sobre el `peerBackend` por defecto.** Con ICE completo `rtc` cubre lo que
-cubre `ndc` sin TURN, conecta igual de rápido y gasta la mitad de CPU (§6). A favor de cambiar el
-defecto a `'rtc'`: interoperabilidad verificada con Chromium 141 y libdatachannel (node-haxball) en
-todas las condiciones del banco (§5) y tras NAT simulado de puerto restringido, simétrico y doble
-(§4.4), y node-datachannel deja de cargarse (sin hilos nativos ni riesgo de SIGABRT/SIGSEGV, §1). En
-contra, por ahora: Firefox/Safari/móviles sin probar (§5.2), IPv6 sin probar en esta VM, NAT
-**reales** (CGNAT de operadoras, routers domésticos con *hairpinning* raro, firewalls que limitan UDP)
-sin probar fuera del simulador (TURN: §2.2). Recomendación: cambiarlo tras
-una prueba de campo con jugadores reales detrás de un NAT doméstico (y Firefox), dejando
-`peerBackend: 'ndc'` como salida.
+**`peerBackend` por defecto: `'rtc'` (aplicado).** Con ICE completo `rtc` cubre lo que cubre `ndc`
+sin TURN, conecta igual de rápido y gasta mucha menos CPU (§6; en una partida de 20 clientes del
+banco `game`, Windows 10, Node 26: ≈ 3 % de un núcleo frente a ≈ 18 % con `ndc`). Interoperabilidad
+verificada con Chromium 141 y libdatachannel (node-haxball) en todas las condiciones del banco (§5)
+y tras NAT simulado de puerto restringido, simétrico y doble (§4.4); node-datachannel deja de
+cargarse (sin hilos nativos ni riesgo de SIGABRT/SIGSEGV, §1). Sin `peerBackend`, dar
+`transport.portRange` o `transport.rtc` (ajustes de node-datachannel) sigue eligiendo `'ndc'`.
+Pendiente todavía: Firefox/Safari/móviles (§5.2), IPv6 y NAT **reales** (CGNAT de operadoras,
+routers domésticos con *hairpinning* raro, firewalls que limitan UDP) fuera del simulador (TURN:
+§2.2). Diferencia conocida con `ndc`: con la política por defecto no se envían checks a direcciones
+privadas o de loopback del jugador (§2.1, «Destinos permitidos»), así que un bot de node-haxball en
+la misma LAN o máquina conecta por la IP pública (*hairpinning*) o con
+`iceCandidatePolicy: 'private'`. Salida: `peerBackend: 'ndc'`.

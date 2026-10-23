@@ -55,7 +55,7 @@ haxlite habla el protocolo 9 bit a bit con los clientes oficiales del navegador 
 ```sh
 npm install https://github.com/ttaliba/haxlite/releases/download/v1.1.0/haxlite-1.1.0.tgz
 
-# sin node-datachannel: solo peerBackend 'rtc' o edge con 'rtc'
+# sin node-datachannel: peerBackend 'rtc' (el valor por defecto) o edge con 'rtc'
 npm install https://github.com/ttaliba/haxlite/releases/download/v1.1.0/haxlite-1.1.0.tgz --omit=optional
 
 # o, desde este repositorio:
@@ -64,7 +64,7 @@ npm install && npm run build         # genera dist/ con los .d.ts (JSDoc en la A
 
 El paquete se instala con el nombre `haxlite`. Todavía no está en npmjs.com; el archivo `.tgz` de cada versión se adjunta en [Releases](https://github.com/ttaliba/haxlite/releases).
 
-`node-datachannel` es una `optionalDependency`. Solo hace falta con `peerBackend: 'ndc'` (el valor por defecto), con los jugadores `'ndc'` del edge o con su túnel WebRTC legado. Si falta y se necesita, la negociación falla con «node-datachannel no está instalado: instálalo o usa peerBackend: 'rtc'». Un proyecto TypeScript con `skipLibCheck: false` puede ver TS2307 sin él, porque algunos `.d.ts` importan sus tipos.
+`node-datachannel` es una `optionalDependency`. Solo hace falta con `peerBackend: 'ndc'` (o sin `peerBackend` pero con `transport.portRange` / `transport.rtc`, que lo eligen), con los jugadores `'ndc'` del edge o con su túnel WebRTC legado. Si falta y se necesita, la negociación falla con «node-datachannel no está instalado: instálalo o usa peerBackend: 'rtc'». Un proyecto TypeScript con `skipLibCheck: false` puede ver TS2307 sin él, porque algunos `.d.ts` importan sus tipos.
 
 ### Token
 
@@ -178,8 +178,8 @@ room.haxlite.onBeforeOperation = (event, byPlayerId, frame) => true; // false de
 
 | Modo | Cuándo usarlo | Notas |
 |---|---|---|
-| `peerBackend: 'ndc'` (por defecto) | desarrollo, compatibilidad máxima | `node-datachannel` (libdatachannel nativo) |
-| `peerBackend: 'rtc'` | **producción** | WebRTC propio en TypeScript, un puerto UDP, sin hilos nativos, ≈ -35 % de CPU con 20 jugadores. ICE completo con STUN y TURN (RFC 8656): funciona detrás de NAT. [docs/10](docs/10-haxlite-rtc.md) |
+| `peerBackend: 'rtc'` (por defecto) | producción y desarrollo | WebRTC propio en TypeScript, un puerto UDP, sin hilos nativos, mucha menos CPU por jugador ([docs/07](docs/07-benchmarks.md)). ICE completo con STUN y TURN (RFC 8656): funciona detrás de NAT. [docs/10](docs/10-haxlite-rtc.md) |
+| `peerBackend: 'ndc'` | compatibilidad máxima (TURN TCP/TLS, bots en la misma LAN sin *hairpinning*) | `node-datachannel` (libdatachannel nativo). También se elige solo si das `transport.portRange` o `transport.rtc` sin `peerBackend` |
 | `edge: { url, key }` | ocultar la IP del host | los jugadores se conectan a un [haxlite Edge](docs/09-haxlite-edge.md) remoto; la IP del host no llega a ningún jugador |
 
 `rtc.sendBatchFrames: 1 | 2` agrupa las difusiones de eventos de cliente: de -23 % a -44 % de bytes por jugador a cambio de n × 8,3 ms de media en las entradas ajenas (por defecto 0). Para esconder la IP del host con Cloudflare TURN y firewall, ver [docs/08](docs/08-ocultar-ip.md) y [docs/ip](docs/ip/01-exposicion-ip.md).

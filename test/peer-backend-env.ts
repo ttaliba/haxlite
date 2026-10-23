@@ -25,12 +25,12 @@ export const LOOPBACK_RTC: { address: string; publicAddresses: string[]; sendBat
   ...(RTC_BATCH_FRAMES > 0 ? { sendBatchFrames: RTC_BATCH_FRAMES } : null),
 };
 
-/** HostTransport options selecting the backend under test. */
+/** HostTransport options selecting the backend under test ('ndc' explicitly: the library default is 'rtc'). */
 export function testTransportBackend(): Partial<HostTransportOptions> {
-  return RTC_UNDER_TEST ? { peerBackend: 'rtc', rtcEndpoint: { ...LOOPBACK_RTC } } : {};
+  return RTC_UNDER_TEST ? { peerBackend: 'rtc', rtcEndpoint: { ...LOOPBACK_RTC } } : { peerBackend: 'ndc' };
 }
 
 /** HBInit `haxlite` options selecting the backend under test. */
-export function testHaxliteBackend(): { peerBackend?: 'rtc'; rtc?: typeof LOOPBACK_RTC } {
-  return RTC_UNDER_TEST ? { peerBackend: 'rtc', rtc: { ...LOOPBACK_RTC } } : {};
+export function testHaxliteBackend(): { peerBackend: 'ndc' | 'rtc'; rtc?: typeof LOOPBACK_RTC } {
+  return RTC_UNDER_TEST ? { peerBackend: 'rtc', rtc: { ...LOOPBACK_RTC } } : { peerBackend: 'ndc' };
 }

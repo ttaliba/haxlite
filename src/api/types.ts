@@ -325,11 +325,12 @@ export interface HaxliteConfig {
    */
   edge?: EdgeOptions | null;
   /**
-   * Player connection stack when there is no `edge` ['ndc']:
-   * `'ndc'` node-datachannel (full ICE + STUN, works behind NAT);
-   * `'rtc'` haxlite-rtc (pure TypeScript ICE-lite/DTLS/SCTP: one UDP port for
-   * every player, no native threads, ≈ half the CPU per player) for servers
-   * with a public IP — configure it with {@link rtc}. See docs/10.
+   * Player connection stack when there is no `edge` ['rtc']:
+   * `'rtc'` haxlite-rtc (pure TypeScript full ICE + STUN/DTLS/SCTP, works
+   * behind NAT: one UDP port for every player, no native threads, a fraction
+   * of the CPU per player) — configure it with {@link rtc};
+   * `'ndc'` node-datachannel (full ICE + STUN, works behind NAT; the default
+   * when `transport.portRange` or `transport.rtc` is given). See docs/10.
    */
   peerBackend?: 'ndc' | 'rtc';
   /**

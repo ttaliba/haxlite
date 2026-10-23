@@ -17,9 +17,9 @@
  * opt-in.
  *
  * Where the player PeerConnections live is a {@link PeerBackend}: this
- * process — node-datachannel ({@link LocalPeerBackend}, `peerBackend: 'ndc'`,
- * default) or haxlite-rtc ({@link RtcPeerBackend}, `peerBackend: 'rtc'`: pure
- * TypeScript ICE-lite, one UDP port, needs a public address; docs/10) — or a
+ * process — haxlite-rtc ({@link RtcPeerBackend}, `peerBackend: 'rtc'`, default:
+ * pure TypeScript full ICE/DTLS/SCTP, one UDP port; docs/10) or
+ * node-datachannel ({@link LocalPeerBackend}, `peerBackend: 'ndc'`) — or a
  * remote haxlite Edge (`edge: {url, key}` → `EdgePeerBackend`, docs/09), which
  * keeps this machine's address away from players. Everything above (admission, answer
  * timing, challenge, handshake, flood, timeouts, bans) is identical for both.
@@ -412,17 +412,30 @@ export interface HostTransportOptions extends Omit<HostSignalingOptions, 'token'
   backend?: PeerBackend | null;
   /**
    * Where player connections are terminated when there is no `edge`:
-   * `'ndc'` (default) node-datachannel/libdatachannel — full ICE with STUN,
-   * works behind NAT; `'rtc'` haxlite-rtc (`src/rtc`) — pure TypeScript
-   * ICE/DTLS/SCTP, every player on one UDP port, no native threads, about
-   * half the CPU per player; also full ICE with STUN by default (works behind
-   * NAT), or ICE-lite with `rtcEndpoint.iceLite`. With `'rtc'`, `iceServers`
-   * and `iceCandidatePolicy` are the defaults of {@link rtcEndpoint}'s own;
-   * `portRange` and `rtc` are ignored. See docs/10.
+   * `'rtc'` haxlite-rtc (`src/rtc`) — pure TypeScript ICE/DTLS/SCTP, every
+   * player on one UDP port, no native threads, a fraction of the CPU per
+   * player; full ICE with STUN by default (works behind NAT), or ICE-lite
+   * with `rtcEndpoint.iceLite`; `'ndc'` node-datachannel/libdatachannel —
+   * full ICE with STUN, works behind NAT. Default: `'rtc'`, or `'ndc'` when
+   * `portRange` or `rtc` (node-datachannel settings) is given. With `'rtc'`,
+   * `iceServers` and `iceCandidatePolicy` are the defaults of
+   * {@link rtcEndpoint}'s own; `portRange` and `rtc` are ignored. See docs/10.
    */
   peerBackend?: 'ndc' | 'rtc';
   /** `peerBackend: 'rtc'` settings: UDP `port`, bind `address`, `publicAddresses`, timeouts… */
   rtcEndpoint?: RtcBackendOptions | null;
+}
+
+/**
+ * The local peer backend {@link HostTransportOptions.peerBackend} selects:
+ * the given one, else `'rtc'`, unless node-datachannel settings (`portRange`,
+ * `rtc`) were given, which keep `'ndc'` so they are not silently ignored.
+ */
+export function resolvePeerBackend(opts: Pick<HostTransportOptions, 'peerBackend' | 'portRange' | 'rtc'>): 'ndc' | 'rtc' {
+  const kind = opts.peerBackend;
+  if (kind === undefined) return opts.portRange != null || opts.rtc != null ? 'ndc' : 'rtc';
+  if (kind !== 'ndc' && kind !== 'rtc') throw new TypeError(`peerBackend must be 'ndc' or 'rtc' (got ${JSON.stringify(kind)})`);
+  return kind;
 }
 
 /** Default challenge delay for libdatachannel clients, see {@link HostTransportOptions.challengeDelayMs}. */
@@ -693,7 +706,7 @@ export class HostTransport {
     }
     if (opts.backend != null) this.backend = opts.backend;
     else if (opts.edge != null) this.backend = new EdgePeerBackend(opts.edge);
-    else if (opts.peerBackend === 'rtc') {
+    else if (resolvePeerBackend(opts) === 'rtc') {
       this.backend = new RtcPeerBackend(opts.rtcEndpoint ?? {}, {
         ...(opts.iceServers !== undefined ? { iceServers: opts.iceServers } : null),
         ...(opts.iceCandidatePolicy !== undefined ? { iceCandidatePolicy: opts.iceCandidatePolicy } : null),
@@ -701,9 +714,6 @@ export class HostTransport {
       });
     }
     else {
-      if (opts.peerBackend !== undefined && opts.peerBackend !== 'ndc') {
-        throw new TypeError(`peerBackend must be 'ndc' or 'rtc' (got ${JSON.stringify(opts.peerBackend)})`);
-      }
       const iceServers: (string | NativeIceServer)[] = toNativeIceServers(opts.iceServers ?? DEFAULT_ICE_SERVERS);
       const range = opts.portRange;
       const rtc: NdcRtcConfig = {
