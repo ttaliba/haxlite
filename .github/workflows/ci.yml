@@ -32,37 +32,6 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       # Both vitest projects (ndc + rtc). The Chromium-based tests under
-      # test/rtc skip themselves here (no browser); the interop job runs them.
+      # test/rtc skip themselves here (no browser); run them locally with
+      # HAXLITE_CHROMIUM set (and `npm run test:interop`).
       - run: npx vitest run
-
-  interop:
-    # Real-browser interop (Chromium via playwright-core). Optional: slow and
-    # sensitive to the runner's network, so it does not fail the workflow.
-    name: Interop (Chromium)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: '24.x'
-          cache: npm
-      - run: npm ci
-      # test/rtc-interop/harness/browser.ts (and test/rtc/*chromium*.test.ts)
-      # look for the browser at $HAXLITE_CHROMIUM, defaulting to
-      # /opt/pw-browsers/chromium-1194/chrome-linux/chrome. playwright-core is
-      # pinned (1.56.1 -> chromium-1194), so install that build and point
-      # HAXLITE_CHROMIUM at it.
-      - name: Locate browser install dir
-        run: |
-          echo "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/pw-browsers" >> "$GITHUB_ENV"
-          echo "HAXLITE_CHROMIUM=$RUNNER_TEMP/pw-browsers/chromium-1194/chrome-linux/chrome" >> "$GITHUB_ENV"
-      - name: Install Playwright Chromium
-        run: npx playwright-core install --with-deps chromium
-      - name: Check browser
-        run: test -x "$HAXLITE_CHROMIUM"
-      - name: Chromium unit tests (DTLS/SCTP against Chromium)
-        run: npx vitest run --project ndc test/rtc/chromium-dtls.test.ts test/rtc/sctp/chromium.test.ts
-      - name: Interop suite
-        run: npm run test:interop

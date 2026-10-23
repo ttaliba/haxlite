@@ -875,12 +875,11 @@ configuraciones para copiar y adaptar (verificado: ningún archivo de `src/` ni 
   `npm ci` → `npm run typecheck` → `npm run build` → `npx vitest run` (ambos proyectos, `ndc` y
   `rtc`). Las pruebas con Chromium se omiten (no hay navegador en el job).
   El job no instala `clang`, `libbpf-dev`, `nftables` ni usa `sudo`: los casos de `test/ops` que necesitan esas herramientas o privilegios (el XDP siempre; netns e IPv6 según el runner) se omiten diciendo el motivo, y no hay un job con `HAXLITE_REQUIRE_OPS=1` (§7, punto 7).
-* **Job `interop`** («Interop (Chromium)», Node 24.x, 45 min, `continue-on-error: true`: **no hace
-  fallar** el flujo): instala el Chromium que fija `playwright-core` con
-  `npx playwright-core install --with-deps chromium`; fija `PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/pw-browsers`
-  y `HAXLITE_CHROMIUM=$RUNNER_TEMP/pw-browsers/chromium-1194/chrome-linux/chrome`; comprueba que el
-  binario es ejecutable; ejecuta `npx vitest run --project ndc test/rtc/chromium-dtls.test.ts test/rtc/sctp/chromium.test.ts` y luego
-  `npm run test:interop`. No usa `HAXBALL_CLIENT_DIR`: las pruebas contra el cliente oficial se omiten.
+* **Sin job de navegador.** Las pruebas contra Chromium real (`test/rtc/chromium-dtls.test.ts`,
+  `test/rtc/sctp/chromium.test.ts` y `npm run test:interop`) se corren a mano en local con
+  `HAXLITE_CHROMIUM` apuntando al binario (con `playwright-core`:
+  `npx playwright-core install chromium`); el job que las corría en el CI se quitó porque fallaba por
+  la red del runner, no por el código.
 
 ### `publish.yml` - «Publish»
 
