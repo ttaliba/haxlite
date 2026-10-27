@@ -31,7 +31,15 @@ import {
   type HostTransportOptions,
   type JoinRequest,
 } from '../net/index.js';
-import { HostRoom, createHostRoomState, defaultStadiumByName, type BeforeOperationHook, type DiscPropsInput } from '../host/index.js';
+import {
+  HostRoom,
+  InputGuard,
+  MatchStats,
+  createHostRoomState,
+  defaultStadiumByName,
+  type BeforeOperationHook,
+  type DiscPropsInput,
+} from '../host/index.js';
 import { SetStadiumEvent, type Player } from '../room/index.js';
 import { parseHbs, type Stadium } from '../sim/index.js';
 import type {
@@ -455,6 +463,10 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     isAuthBanned: (auth) => bans.isAuthBanned(auth),
   };
 
+  // haxlite match extras (stats, input guard)
+  let stats: MatchStats | null = null;
+  let guard: InputGuard | null = null;
+
   const ext: HaxliteRoomExtensions = {
     get inputDelayFrames() {
       return host.inputDelayFrames;
@@ -521,6 +533,39 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     getLastTouches() {
       return host.getLastTouches();
     },
+    get trackStats() {
+      return stats !== null;
+    },
+    set trackStats(on: boolean) {
+      if (!on) stats = null;
+      else if (stats === null) {
+        host.setTouchTracking(true);
+        stats = new MatchStats();
+      }
+    },
+    getStats() {
+      return stats === null ? null : stats.snapshot();
+    },
+    get inputGuard() {
+      return guard === null ? null : { maxInputsPerSecond: guard.maxInputs, maxKicksPerSecond: guard.maxKicks };
+    },
+    set inputGuard(limits) {
+      if (limits == null) {
+        guard = null;
+        return;
+      }
+      guard = new InputGuard(limits);
+      guard.onAbuse = (p, kind, perSecond) => {
+        const cb = ext.onInputAbuse;
+        if (cb == null) return;
+        try {
+          settled(cb(playerObject(p)!, kind, perSecond));
+        } catch (err) {
+          reportError(err);
+        }
+      };
+    },
+    onInputAbuse: null,
     getStadium() {
       return host.getStadium();
     },
@@ -822,6 +867,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     if (cb != null) settled(cb(playerJoinObject(p)));
   };
   host.onPlayerLeave = (p) => {
+    guard?.remove(p.id);
     const cb = room.onPlayerLeave;
     if (cb != null) settled(cb(playerObject(p)!));
   };
@@ -850,6 +896,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     return r != 0;
   };
   hooks.onPlayerBallKick = (p) => {
+    stats?.kick(p);
     const cb = room.onPlayerBallKick;
     if (cb == null) return;
     try {
@@ -859,6 +906,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     }
   };
   hooks.onTeamGoal = (team) => {
+    stats?.goal(state, team);
     const cb = room.onTeamGoal;
     if (cb == null || state.gameState === null) return;
     try {
@@ -868,6 +916,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     }
   };
   hooks.onGameStart = (by) => {
+    stats?.reset();
     const cb = room.onGameStart;
     if (cb == null) return;
     try {
@@ -904,6 +953,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     }
   };
   hooks.onGameTick = () => {
+    stats?.tick(state);
     const cb = room.onGameTick;
     if (cb == null) return;
     try {
@@ -931,6 +981,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     }
   };
   hooks.onPlayerInput = (p, prev) => {
+    guard?.input(p, prev, host.frame);
     const a = room.onPlayerActivity;
     if (a != null) {
       try {
@@ -975,6 +1026,7 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     if (cb != null) cb(playerObject(p)!, p.desync);
   };
   hooks.onPlayerTouch = (p, previous) => {
+    stats?.touch(p, previous);
     const cb = ext.onPlayerTouch;
     if (cb != null) cb(playerObject(p)!, previous === null ? null : playerObject(previous));
   };

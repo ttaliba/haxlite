@@ -27,6 +27,8 @@ export {
   type TeamColorsInfo,
 } from './host-room.js';
 export { stadiumObject, type StadiumDisc, type StadiumObject } from './stadium-info.js';
+export { MatchStats, type MatchStatsSnapshot, type PlayerStats } from './match-stats.js';
+export { InputGuard, type InputAbuseKind, type InputGuardLimits } from './input-guard.js';
 export {
   LINK_WINDOWS,
   LINK_WINDOW_MS,

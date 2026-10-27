@@ -293,6 +293,10 @@ Con edge: `room.haxlite.edgeStats()` devuelve `{ state, dataPlane, roLanes, sess
 | `trackTouches` | `boolean` | `false` | Activa el rastreo de quién toca el balón. Apagado cuesta una comprobación de `null` por tick; encendido, un 8-11 % más por tick de física (unos 150 ns con 8 jugadores, medido en Node/Windows) | Al encenderlo empieza de cero. Es opt-in a propósito |
 | `getLastTouches()` | `{ last, previous } \| null` | - | Los dos últimos jugadores **distintos** que tocaron el balón desde el último saque, cada uno como `{ playerId, team, time, kick }` (`time` en segundos de partida, `kick` si fue una patada y no un simple roce) | `null` con `trackTouches` apagado; `last`/`previous` son `null` hasta que haya toque. En un `onTeamGoal`, `last` es quien marcó o desvió y `previous` el candidato a asistencia (el script comprueba el equipo). El contacto es físico: un empujón cuenta como toque. Se reinicia en cada saque y al terminar la partida |
 | `onPlayerTouch` | `(player: PlayerObject, previous: PlayerObject \| null) => void` | `null` | Un jugador distinto del anterior toca o patea el balón | Necesita `trackTouches`. `previous` es `null` en el saque o si ya se fue. Volver a tocar el mismo jugador no lo llama |
+| `trackStats` | `boolean` | `false` | Estadísticas del partido: goles, asistencias, autogoles, patadas, pases, recuperaciones y posesión por jugador y equipo | Encenderlo también enciende `trackTouches` (se construyen sobre él) y empieza de cero; cada `startGame` vuelve a cero. El gol es del último que tocó si es del equipo que marca (si no, autogol); la asistencia, del penúltimo si es del mismo equipo. Pase = toque de un compañero del anterior; recuperación = toque de un rival. La posesión cuenta los ticks de juego (fase `Playing`) del último que tocó |
+| `getStats()` | `MatchStatsSnapshot \| null` | - | `{ possessionFrames: { red, blue }, possession: { red, blue } (0 a 1), players: PlayerStats[] }`; cada `PlayerStats`: `id`, `name`, `team`, `goals`, `assists`, `ownGoals`, `kicks`, `passes`, `steals`, `possessionFrames` | `null` con `trackStats` apagado. Los que se van conservan su línea. Devuelve una copia |
+| `inputGuard` | `{ maxInputsPerSecond?, maxKicksPerSecond? } \| null` | `null` | Detecta macros y clientes modificados: inputs y pulsaciones de patada por segundo de juego (por defecto 40 y 15). Un humano no pasa de 15-20 inputs por segundo, porque el cliente oficial solo envía un input cuando cambia una tecla | Solo avisa (por `onInputAbuse`), no expulsa. `null` lo apaga |
+| `onInputAbuse` | `(player: PlayerObject, kind: 'inputs' \| 'kicks', perSecond: number) => void` | `null` | Un jugador superó un límite de `inputGuard` | Una vez por jugador, tipo y segundo mientras siga por encima |
 | `onTimeLimitReached` | `(() => void) \| null` | `null` | Se acabó el tiempo con marcador **desigual**, justo antes de terminar la partida | Con empate la partida sigue y no se llama. Sirve para distinguir "terminó por tiempo" de "por límite de goles" |
 | `onPlayerDesyncChange` | `(player: PlayerObject, desync: boolean) => void` | `null` | Un cliente se marcó como desincronizado o se recuperó | No existe en el oficial |
 | `onChatIndicator` | `(player: PlayerObject, typing: boolean) => void` | `null` | Un jugador empieza o deja de escribir en el chat | No existe en el oficial |
@@ -419,6 +423,17 @@ const room = await HBInit({
 });
 room.haxlite.onBackendState = (state, err) => console.log('edge', state, err?.message);
 setInterval(() => console.log(room.haxlite.edgeStats()), 60_000);
+```
+
+Estadísticas y anticheat:
+
+```js
+const x = room.haxlite;
+x.trackStats = true;
+x.inputGuard = { maxKicksPerSecond: 15 };
+x.onInputAbuse = (p, kind, n) => room.sendAnnouncement(`${p.name}: ${n} ${kind}/s`, null, 0xff8800);
+
+room.onTeamVictory = () => console.table(x.getStats().players);
 ```
 
 Filtrar eventos de cliente (`onBeforeOperation`) y limitar el chat con enlaces:

@@ -25,9 +25,12 @@ import type { RtcEndpointStats } from '../rtc/index.js';
 import type {
   GameInfo,
   HostRoom,
+  InputAbuseKind,
+  InputGuardLimits,
   KickRateLimit,
   LastTouches,
   LinkQuality,
+  MatchStatsSnapshot,
   PlayerInfo,
   RecordingInfo,
   RoomSettings,
@@ -508,6 +511,24 @@ export interface HaxliteRoomExtensions {
    * `trackTouches`. Not in the official API.
    */
   onPlayerTouch: ((player: PlayerObject, previous: PlayerObject | null) => void) | null;
+
+  /**
+   * Match statistics: goals, assists, own goals, kicks, passes, steals and
+   * possession per player and team (see {@link getStats}). Switching it on
+   * also turns on `trackTouches` (stats are built on it) and starts from zero;
+   * a new game also starts from zero. Off by default.
+   */
+  trackStats: boolean;
+  /** Statistics of the current / last game; null while `trackStats` is off. */
+  getStats(): MatchStatsSnapshot | null;
+  /**
+   * Input abuse detection (macros, "turbo kick", modified clients): limits of
+   * inputs and kick presses per second, or null (the default) for off.
+   * Reports through {@link onInputAbuse}; it never kicks by itself.
+   */
+  inputGuard: InputGuardLimits | null;
+  /** A player went over an `inputGuard` limit (once per player, kind and second). */
+  onInputAbuse: ((player: PlayerObject, kind: InputAbuseKind, perSecond: number) => void) | null;
 
   /** Connection details of a joined player (null for the host player / unknown ids). */
   getPlayerConnection(playerId: number): PlayerConnectionInfo | null;
