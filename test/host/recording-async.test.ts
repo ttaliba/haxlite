@@ -84,3 +84,24 @@ describe('HostRoom.stopRecordingAsync', () => {
     b.stop();
   });
 });
+
+describe('HostRoom.recordAnnouncement', () => {
+  it('lands in the replay only, at the current frame; no-op when not recording', () => {
+    const host = scriptedRoom();
+    const applied: Any[] = [];
+    host.onEventApplied = (ev) => applied.push(ev);
+    host.recordAnnouncement('pepito metió gol', 0xff0000, 1);
+    const bytes = host.stopRecording()!;
+    host.recordAnnouncement('ignored');
+    expect(applied.filter((e) => e.message !== undefined)).toEqual([]); // never applied in the room
+    const player = new ReplayPlayer(bytes);
+    const seen: Any[] = [];
+    player.onEvent = (ev: Any) => {
+      if (ev.message === 'pepito metió gol') seen.push([ev.color, ev.style]);
+    };
+    player.finish();
+    expect(seen.length).toBe(1);
+    expect(seen[0]).toEqual([0xff0000, 1]);
+    host.stop();
+  });
+});

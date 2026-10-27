@@ -9,7 +9,8 @@
  *    `setPlayerAdmin(id, true); getPlayer(id).admin` is still `false`;
  *  - validation errors (`.hbs` parse, unknown default stadium, bad casts)
  *    are thrown synchronously;
- *  - clearBan/clearBans/setPassword/setRequireRecaptcha/start-stopRecording
+ *  - clearBan/clearBans/setPassword/setRequireRecaptcha/start-stopRecording/
+ *    recordAnnouncement
  *    and every query are synchronous;
  *  - callbacks receive fresh plain objects with the official shapes and
  *    key order; `byPlayer` is null for actions of a host without player.
@@ -776,6 +777,10 @@ export async function HBInit(config: RoomConfigObject = {}): Promise<RoomObject>
     },
     stopRecordingAsync() {
       return host.stopRecordingAsync();
+    },
+    recordAnnouncement(msg: string, color?: number | null, style?: AnnouncementStyle | null, sound?: AnnouncementSound | null) {
+      const st = (style != null ? ANNOUNCEMENT_STYLES[style] : undefined) ?? 0;
+      host.recordAnnouncement(String(msg), color ?? -1, st, sound ?? 0);
     },
     CollisionFlags,
     InputFlags,

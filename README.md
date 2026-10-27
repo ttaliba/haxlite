@@ -163,6 +163,7 @@ room.haxlite.onBeforeOperation = (event, byPlayerId, frame) => true; // false de
 | `peerBackend`, `rtc`, `edge` | cómo se conectan los jugadores ([ver abajo](#cómo-se-conectan-los-jugadores)) |
 | `stop()` / `close()` | cierra temporizadores, señalización y conexiones; Node termina solo |
 | `stopRecordingAsync()` | como `stopRecording()` pero el deflate corre fuera del bucle (siempre con nivel 6; el síncrono usa nivel 1 en Node por encima de 64 KiB). La grabación tiene tope (16 MiB o 2 097 152 eventos): al alcanzarlo se congela y `room.haxlite.recordingTruncated` pasa a `true` |
+| `recordAnnouncement(msg, color?, style?, sound?)` | anuncio que va **solo al `.hbr2`** (los jugadores no lo ven), en el momento actual del replay. Ej.: `room.recordAnnouncement(p.name + ' metió gol a las ' + new Date().toLocaleTimeString())` |
 | `setDiscPropertiesFor`, `clearDiscOverrides`… | **visuales privados**: cambia un disco solo en el mundo de un jugador sin desincronizar a nadie (máscaras de visión, marcadores) |
 | `hidePlayerFor`, `showPlayerFor`, `setPlayerHiddenFor`… | **jugadores ocultos**: el jugador desaparece solo para ese espectador (visión por zonas, espectadores que no deben ver a ciertos jugadores). No es seguridad: un cliente modificado sigue pudiendo saber dónde está |
 | `getPlayerConnection(id)` | `auth`, `conn`, IP, IPs *srflx*, ping |

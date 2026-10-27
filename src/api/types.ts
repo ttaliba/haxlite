@@ -196,6 +196,18 @@ export interface RoomObject {
    * stops at the call; resolves null if not recording.
    */
   stopRecordingAsync(): Promise<Uint8Array | null>;
+  /**
+   * haxlite extension: announcement written only into the current `.hbr2`
+   * (players don't see it), at this moment of the replay. Synchronous;
+   * no-op when not recording. Same arguments as {@link sendAnnouncement},
+   * but `sound` defaults to 0.
+   */
+  recordAnnouncement(
+    msg: string,
+    color?: number | null,
+    style?: AnnouncementStyle | null,
+    sound?: AnnouncementSound | null,
+  ): void;
   setPassword(pass: string | null): void;
   setRequireRecaptcha(required: boolean): void;
   reorderPlayers(playerIdList: readonly number[], moveToTop: boolean): void;

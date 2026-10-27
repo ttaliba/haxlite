@@ -737,6 +737,18 @@ export class HostRoom {
     return this.recorder.stopAsync(this.sequencer.frame);
   }
 
+  /**
+   * Announcement written only into the current recording (players don't get
+   * it), at the current frame; shows in the replay chat. No-op when not
+   * recording. Same `color`/`style`/`sound` as {@link sendAnnouncement}.
+   */
+  recordAnnouncement(message: string, color = -1, style = 0, sound = 0): void {
+    const rec = this.rec;
+    if (rec === null || !rec.isRecording) return;
+    if (!this.sequencer.busy) this.catchUp();
+    rec.onEvent(SendAnnouncementEvent.create(message, color, style, sound), this.sequencer.frame);
+  }
+
   // ================================================================ host actions
 
   /** Emits any event as the host (official `oc`). The event object is consumed. */
