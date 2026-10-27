@@ -54,7 +54,7 @@ import {
   type RoomEvent,
   type RoomState,
 } from '../room/index.js';
-import { defaultStadium, parseHbs, type Disc, type Stadium } from '../sim/index.js';
+import { defaultStadium, parseHbs, writeStadiumBody, type Disc, type Stadium } from '../sim/index.js';
 import { ReplayRecorder } from '../replay/index.js';
 import { ClockEntry, hostClock } from './clock.js';
 import { stadiumObject, type StadiumObject } from './stadium-info.js';
@@ -824,6 +824,11 @@ export class HostRoom {
    * 255 of any element ({@link SetStadiumEvent.wireError}).
    */
   setStadium(stadium: Stadium): void {
+    const id = stadium.defaultStadiumId;
+    // a built-in id travels alone (1 byte): every client would load the original instead
+    if (id !== 255 && stadium !== defaultStadium(id) && !sameStadium(stadium, defaultStadium(id))) {
+      throw new Error(`setStadium: "${stadium.name}" says it is built-in stadium ${id} but differs from it; set defaultStadiumId = 255 to send it whole`);
+    }
     const ev = SetStadiumEvent.create(stadium);
     const err = ev.wireError();
     if (err !== null) throw new Error(err);
@@ -1940,4 +1945,13 @@ export class HostRoom {
       this.sequencer.hostEvent(KickBanPlayerEvent.create(c.playerId, bad ? 'Bad actor' : null, false));
     });
   }
+}
+
+/** Same serialized stadium body (what a client rebuilds). */
+function sameStadium(a: Stadium, b: Stadium): boolean {
+  const wa = new Writer(4096);
+  const wb = new Writer(4096);
+  writeStadiumBody(wa, a);
+  writeStadiumBody(wb, b);
+  return Buffer.compare(wa.finish(), wb.finish()) === 0;
 }
